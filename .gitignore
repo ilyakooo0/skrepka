@@ -1,0 +1,6 @@
+server
+*.schema.lock
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

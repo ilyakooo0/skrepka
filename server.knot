@@ -1,0 +1,309 @@
+-- Skrepka Relay Server
+-- Single-server implementation of the Skrepka protocol (v0.1)
+-- Binary data (keys, signatures, blobs) uses hex encoding (bytesToHex/bytesFromHex)
+
+-- ============================================
+-- Configuration
+-- ============================================
+
+serverHost = "localhost:8080"
+federationSecret = "" -- must be set to enable federation
+messageMaxAge = 86400000 -- 24 hours in milliseconds
+maxPresenceTtl = 3600 -- max presence TTL from gossip in seconds
+
+-- ============================================
+-- Types
+-- ============================================
+
+type PollEvent = {id: Text, eventType: Text, payload: Text}
+
+type GossipEvent = {eventType: Text, pubkey: Text, server: Text, timestamp: Int, ttl: Int}
+
+-- ============================================
+-- Persisted State
+-- ============================================
+
+*challenges : [{pubkey: Text, challenge: Text, expiresAt: Int}]
+
+*sessions : [{token: Text, pubkey: Text, expiresAt: Int}]
+
+*messages : [{messageId: Text, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int}]
+
+*presence : [{pubkey: Text, server: Text, expiresAt: Int}]
+
+-- ============================================
+-- Routes
+-- ============================================
+
+route AuthApi where
+  /auth
+    POST {pubkey: Text} /challenge
+      -> {challenge: Text}
+      = ReqChallenge
+    POST {pubkey: Text, challenge: Text, signature: Text} /verify
+      -> {token: Text, expiresAt: Int}
+      = VerifyAuth
+
+route ClientApi where
+  GET /poll headers {authorization: Text}
+    -> {events: [PollEvent], cursor: Text}
+    = Poll
+  /messages
+    POST {to: Text, encryptedBlob: Text, timestamp: Int} / headers {authorization: Text}
+      -> {status: Text, messageId: Text}
+      = SendMessage
+    POST {messageIds: [Text]} /ack headers {authorization: Text}
+      -> {ok: Bool}
+      = AckMessages
+  GET /lookup/{pubkey: Text} headers {authorization: Text}
+    -> {online: Bool, server: Text}
+    = LookupPresence
+
+route FederationApi where
+  /federation
+    POST {events: [GossipEvent], hopsRemaining: Int} /gossip headers {authorization: Text}
+      -> {ok: Bool}
+      = RecvGossip
+    POST {toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int, originServer: Text, messageId: Text} /forward headers {authorization: Text}
+      -> {ok: Bool}
+      = ForwardMessage
+    POST {messageIds: [Text], originServer: Text} /ack headers {authorization: Text}
+      -> {ok: Bool}
+      = FederationAck
+
+route Api = AuthApi | ClientApi | FederationApi
+
+-- ============================================
+-- Helpers
+-- ============================================
+
+genToken = do
+  a <- randomInt 2147483647
+  b <- randomInt 2147483647
+  c <- randomInt 2147483647
+  d <- randomInt 2147483647
+  yield (bytesToHex (textToBytes (show a ++ "." ++ show b ++ "." ++ show c ++ "." ++ show d)))
+
+lookupSession = \token t ->
+  single (do
+    s <- *sessions
+    where s.token == token
+    where s.expiresAt > t
+    yield s)
+
+extractToken = \authHeader ->
+  if take 7 authHeader == "Bearer "
+    then drop 7 authHeader
+    else ""
+
+verifyFederationAuth = \authorization ->
+  extractToken authorization == federationSecret && not (federationSecret == "")
+
+clampTtl = \ttl -> if ttl > maxPresenceTtl then maxPresenceTtl else ttl
+
+pruneExpired = \t -> do
+  set *challenges = do
+    c <- *challenges
+    where c.expiresAt > t
+    yield c
+  set *sessions = do
+    s <- *sessions
+    where s.expiresAt > t
+    yield s
+  set *presence = do
+    p <- *presence
+    where p.expiresAt > t
+    yield p
+  set *messages = do
+    m <- *messages
+    where m.timestamp > t - messageMaxAge
+    yield m
+
+-- ============================================
+-- Request Handler
+-- ============================================
+
+serve = \req -> case req of
+
+  ReqChallenge {pubkey, respond} -> do
+    challenge <- genToken
+    t <- now
+    pruneExpired t
+    set *challenges = union *challenges
+      [{pubkey: pubkey, challenge: challenge, expiresAt: t + 60000}]
+    respond {challenge: challenge}
+
+  VerifyAuth {pubkey, challenge, signature, respond} -> do
+    t <- now
+    case single (do
+      c <- *challenges
+      where c.pubkey == pubkey
+      where c.challenge == challenge
+      where c.expiresAt > t
+      yield c) of
+      Nothing {} ->
+        respond {token: "", expiresAt: 0}
+      _ -> do
+        set *challenges = do
+          c <- *challenges
+          where not (c.pubkey == pubkey && c.challenge == challenge)
+          yield c
+        if verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
+          then do
+            token <- genToken
+            let expiry = t + 3600000
+            set *sessions = union *sessions
+              [{token: token, pubkey: pubkey, expiresAt: expiry}]
+            set *presence = union
+              (do
+                p <- *presence
+                where not (p.pubkey == pubkey && p.server == serverHost)
+                yield p)
+              [{pubkey: pubkey, server: serverHost, expiresAt: expiry}]
+            respond {token: token, expiresAt: expiry}
+          else
+            respond {token: "", expiresAt: 0}
+
+  Poll {authorization, respond} -> do
+    t <- now
+    pruneExpired t
+    case lookupSession (extractToken authorization) t of
+      Nothing {} ->
+        respond {events: [], cursor: ""}
+      Just {value: session} -> do
+        let evts = do
+          m <- *messages
+          where m.toKey == session.pubkey
+          yield {id: m.messageId, eventType: "message",
+                 payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
+                                  encryptedBlob: m.encryptedBlob,
+                                  timestamp: m.timestamp}}
+        respond {events: evts, cursor: ""}
+
+  SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
+    t <- now
+    case lookupSession (extractToken authorization) t of
+      Nothing {} ->
+        respond {status: "unauthorized", messageId: ""}
+      Just {value: session} -> do
+        msgId <- genToken
+        set *messages = union *messages
+          [{messageId: msgId, toKey: to, fromKey: session.pubkey,
+            encryptedBlob: encryptedBlob, timestamp: t}]
+        let online = count (do
+          s <- *sessions
+          where s.pubkey == to
+          where s.expiresAt > t
+          yield s) > 0
+        respond {status: (if online then "delivered" else "queued"),
+                 messageId: msgId}
+
+  AckMessages {messageIds, authorization, respond} -> do
+    t <- now
+    case lookupSession (extractToken authorization) t of
+      Nothing {} ->
+        respond {ok: (False {})}
+      Just {value: session} -> do
+        set *messages = diff *messages (do
+          m <- *messages
+          mid <- messageIds
+          where m.messageId == mid
+          where m.toKey == session.pubkey
+          yield m)
+        respond {ok: (True {})}
+
+  LookupPresence {pubkey, authorization, respond} -> do
+    t <- now
+    case lookupSession (extractToken authorization) t of
+      Nothing {} ->
+        respond {online: (False {}), server: ""}
+      Just {value: _} ->
+        let valid = do
+              p <- *presence
+              where p.pubkey == pubkey
+              where p.expiresAt > t
+              yield p
+        in if count valid == 0
+          then respond {online: (False {}), server: ""}
+          else case single (do
+            p <- valid
+            where p.server == serverHost
+            yield p) of
+            Just {value: p} ->
+              respond {online: (True {}), server: p.server}
+            Nothing {} ->
+              case single valid of
+                Just {value: p} ->
+                  respond {online: (True {}), server: p.server}
+                Nothing {} ->
+                  respond {online: (True {}), server: ""}
+
+  RecvGossip {events, hopsRemaining, authorization, respond} ->
+    if not (verifyFederationAuth authorization)
+      then respond {ok: (False {})}
+      else if hopsRemaining < 1
+        then respond {ok: (False {})}
+        else do
+          t <- now
+          let onlineEntries = do
+            e <- events
+            where e.eventType == "online"
+            yield {pubkey: e.pubkey, server: e.server, expiresAt: t + clampTtl e.ttl * 1000}
+          let affectedKeys = do
+            e <- events
+            yield {pubkey: e.pubkey, server: e.server}
+          let cleaned = diff *presence (do
+            p <- *presence
+            k <- affectedKeys
+            where p.pubkey == k.pubkey
+            where p.server == k.server
+            yield p)
+          let deduped = do
+            e <- onlineEntries
+            where count (do
+              o <- onlineEntries
+              where o.pubkey == e.pubkey
+              where o.server == e.server
+              where o.expiresAt > e.expiresAt
+              yield o) == 0
+            yield e
+          set *presence = union cleaned deduped
+          respond {ok: (True {})}
+
+  ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} ->
+    if not (verifyFederationAuth authorization)
+      then respond {ok: (False {})}
+      else do
+        t <- now
+        let clampedTs = if timestamp > t then t else timestamp
+        let exists = count (do
+          m <- *messages
+          where m.messageId == messageId
+          where m.timestamp > t - messageMaxAge
+          yield m) > 0
+        if exists
+          then respond {ok: (True {})}
+          else do
+            set *messages = union *messages
+              [{messageId: messageId, toKey: toKey, fromKey: fromKey,
+                encryptedBlob: encryptedBlob, timestamp: clampedTs}]
+            respond {ok: (True {})}
+
+  FederationAck {messageIds, originServer, authorization, respond} ->
+    if not (verifyFederationAuth authorization)
+      then respond {ok: (False {})}
+      else do
+        set *messages = diff *messages (do
+          m <- *messages
+          mid <- messageIds
+          where m.messageId == mid
+          yield m)
+        respond {ok: (True {})}
+
+-- ============================================
+-- Entry Point
+-- ============================================
+
+main = do
+  println "Skrepka relay server starting on port 8080..."
+  listen 8080 serve
