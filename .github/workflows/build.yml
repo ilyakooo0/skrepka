@@ -1,0 +1,110 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            name: linux-x86_64
+          - runner: macos-latest
+            name: macos-arm64
+          - runner: macos-13
+            name: macos-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ilyakooo0/knot
+          path: knot
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            knot/target
+          key: ${{ matrix.name }}-cargo-${{ hashFiles('knot/Cargo.lock') }}
+
+      - name: Build knotc
+        working-directory: knot
+        run: cargo build --release -p knot-compiler
+
+      - name: Build musl runtime
+        if: runner.os == 'Linux'
+        working-directory: knot
+        run: cargo build --release -p knot-runtime --target x86_64-unknown-linux-musl
+
+      - name: Compile server (Linux static)
+        if: runner.os == 'Linux'
+        run: |
+          printf '#!/bin/sh\nexec musl-gcc -static "$@"\n' > /tmp/static-cc
+          chmod +x /tmp/static-cc
+          CC=/tmp/static-cc \
+          KNOT_RUNTIME_LIB=${{ github.workspace }}/knot/target/x86_64-unknown-linux-musl/release/libknot_runtime.a \
+          ./knot/target/release/knotc build server.knot
+
+      - name: Compile server (macOS)
+        if: runner.os == 'macOS'
+        run: ./knot/target/release/knotc build server.knot
+
+      - name: Verify binary
+        run: file server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.name }}
+          path: server
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Generate version
+        id: version
+        run: echo "tag=$(git -C repo log -1 --format='%cd' --date='format:%Y.%m.%d.%H%M')" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release assets
+        run: |
+          for dir in server-*/; do
+            name="${dir%/}"
+            mv "${dir}server" "${name}.tmp"
+            rm -rf "$dir"
+            mv "${name}.tmp" "$name"
+          done
+          chmod +x server-*
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          files: server-*

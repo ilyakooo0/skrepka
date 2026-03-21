@@ -1432,6 +1432,7 @@ processEvents xPriv myEdHex events seenIds =
         )
         ( [], seenIds, [] )
         events
+        |> (\( msgs, seen, acks ) -> ( List.reverse msgs, seen, acks ))
 
 
 
@@ -1632,7 +1633,7 @@ charToHexBytes c =
         , nibbleToHex (modBy 16 b2)
         ]
 
-    else
+    else if code < 65536 then
         -- 3-byte UTF-8
         let
             b1 =
@@ -1650,6 +1651,31 @@ charToHexBytes c =
         , nibbleToHex (modBy 16 b2)
         , nibbleToHex (b3 // 16)
         , nibbleToHex (modBy 16 b3)
+        ]
+
+    else
+        -- 4-byte UTF-8 (U+10000 and above: emoji, supplementary planes)
+        let
+            b1 =
+                0xF0 + (code // 262144)
+
+            b2 =
+                0x80 + modBy 64 (code // 4096)
+
+            b3 =
+                0x80 + modBy 64 (code // 64)
+
+            b4 =
+                0x80 + modBy 64 code
+        in
+        [ nibbleToHex (b1 // 16)
+        , nibbleToHex (modBy 16 b1)
+        , nibbleToHex (b2 // 16)
+        , nibbleToHex (modBy 16 b2)
+        , nibbleToHex (b3 // 16)
+        , nibbleToHex (modBy 16 b3)
+        , nibbleToHex (b4 // 16)
+        , nibbleToHex (modBy 16 b4)
         ]
 
 
