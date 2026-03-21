@@ -297,6 +297,11 @@ update msg model =
                                 timestamp =
                                     model.currentTime
 
+                                senderXPubHex =
+                                    model.xPub
+                                        |> Maybe.map X.publicKeyToHex
+                                        |> Maybe.withDefault ""
+
                                 plaintextJson =
                                     Encode.encode 0
                                         (Encode.object
@@ -304,11 +309,12 @@ update msg model =
                                             , ( "id", Encode.string msgId )
                                             , ( "timestamp", Encode.int timestamp )
                                             , ( "body", Encode.string model.draft )
+                                            , ( "xpub", Encode.string senderXPubHex )
                                             ]
                                         )
 
                                 blob =
-                                    encryptMessage edPriv edPub c.xPubHex ephSeedHex nonceHex plaintextJson
+                                    encryptMessage edPriv edPub senderXPubHex c.xPubHex ephSeedHex nonceHex plaintextJson
 
                                 outMsg =
                                     { id = msgId
@@ -390,36 +396,42 @@ update msg model =
 
                         updatedMessages =
                             List.foldl
-                                (\( from, chatMsg ) dict ->
+                                (\im dict ->
                                     let
                                         existing =
-                                            Dict.get from dict |> Maybe.withDefault []
+                                            Dict.get im.senderEdPubHex dict |> Maybe.withDefault []
                                     in
-                                    Dict.insert from (existing ++ [ chatMsg ]) dict
+                                    Dict.insert im.senderEdPubHex (existing ++ [ im.chatMsg ]) dict
                                 )
                                 model.messages
                                 newMessages
 
                         updatedContacts =
                             List.foldl
-                                (\( from, chatMsg ) dict ->
-                                    Dict.update from
+                                (\im dict ->
+                                    Dict.update im.senderEdPubHex
                                         (\existing ->
                                             case existing of
                                                 Just c ->
                                                     Just
                                                         { c
-                                                            | lastMessage = chatMsg.body
-                                                            , lastTime = chatMsg.timestamp
+                                                            | lastMessage = im.chatMsg.body
+                                                            , lastTime = im.chatMsg.timestamp
+                                                            , xPubHex =
+                                                                if String.isEmpty c.xPubHex && not (String.isEmpty im.senderXPubHex) then
+                                                                    im.senderXPubHex
+
+                                                                else
+                                                                    c.xPubHex
                                                         }
 
                                                 Nothing ->
                                                     Just
-                                                        { edPubHex = from
-                                                        , xPubHex = ""
-                                                        , name = String.left 8 from ++ "..."
-                                                        , lastMessage = chatMsg.body
-                                                        , lastTime = chatMsg.timestamp
+                                                        { edPubHex = im.senderEdPubHex
+                                                        , xPubHex = im.senderXPubHex
+                                                        , name = String.left 8 im.senderEdPubHex ++ "..."
+                                                        , lastMessage = im.chatMsg.body
+                                                        , lastTime = im.chatMsg.timestamp
                                                         , online = True
                                                         }
                                         )
@@ -1267,8 +1279,9 @@ encryptMessage :
     -> String
     -> String
     -> String
+    -> String
     -> Maybe String
-encryptMessage edPriv edPub recipientXPubHex ephSeedHex nonceHex plaintextJson =
+encryptMessage edPriv edPub senderXPubHex recipientXPubHex ephSeedHex nonceHex plaintextJson =
     case ( X.privateKeyFromHex ephSeedHex, X.publicKeyFromHex recipientXPubHex, Cipher.nonce24FromHex nonceHex ) of
         ( Just ephPriv, Just recipientXPub, Just nonce ) ->
             let
@@ -1379,6 +1392,15 @@ decryptMessage xPriv blob =
                 Nothing
 
 
+{-| Incoming message with sender info.
+-}
+type alias IncomingMessage =
+    { senderEdPubHex : String
+    , senderXPubHex : String
+    , chatMsg : ChatMessage
+    }
+
+
 {-| Process poll events: decrypt, dedup, collect ACK IDs.
 -}
 processEvents :
@@ -1386,7 +1408,7 @@ processEvents :
     -> String
     -> List PollEvent
     -> Set String
-    -> ( List ( String, ChatMessage ), Set String, List String )
+    -> ( List IncomingMessage, Set String, List String )
 processEvents xPriv myEdHex events seenIds =
     List.foldl
         (\event ( msgs, seen, acks ) ->
@@ -1418,13 +1440,15 @@ processEvents xPriv myEdHex events seenIds =
                                                 ( msgs, seen, event.id :: acks )
 
                                             else
-                                                ( ( senderPub
-                                                  , { id = payload.id
-                                                    , body = payload.body
-                                                    , timestamp = payload.timestamp
-                                                    , outgoing = False
-                                                    }
-                                                  )
+                                                ( { senderEdPubHex = senderPub
+                                                  , senderXPubHex = payload.xpub
+                                                  , chatMsg =
+                                                        { id = payload.id
+                                                        , body = payload.body
+                                                        , timestamp = payload.timestamp
+                                                        , outgoing = False
+                                                        }
+                                                  }
                                                     :: msgs
                                                 , Set.insert payload.id seen
                                                 , event.id :: acks
@@ -1525,16 +1549,22 @@ type alias MessagePayload =
     , id : String
     , timestamp : Int
     , body : String
+    , xpub : String
     }
 
 
 messagePayloadDecoder : Decoder MessagePayload
 messagePayloadDecoder =
-    Decode.map4 MessagePayload
+    Decode.map5 MessagePayload
         (Decode.field "type" Decode.string)
         (Decode.field "id" Decode.string)
         (Decode.field "timestamp" Decode.int)
         (Decode.field "body" Decode.string)
+        (Decode.oneOf
+            [ Decode.field "xpub" Decode.string
+            , Decode.succeed ""
+            ]
+        )
 
 
 type alias LookupResponse =
