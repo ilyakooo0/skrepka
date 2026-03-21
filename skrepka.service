@@ -1,0 +1,22 @@
+[Unit]
+Description=Skrepka relay server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/skrepka-server
+Restart=on-failure
+RestartSec=5
+
+DynamicUser=yes
+StateDirectory=skrepka
+WorkingDirectory=/var/lib/skrepka
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

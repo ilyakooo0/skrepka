@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<linker>
+  <assembly fullname="Skrepka">
+    <resource name="FSharpSignatureData.Skrepka" action="remove"></resource>
+    <resource name="FSharpSignatureCompressedData.Skrepka" action="remove"></resource>
+    <resource name="FSharpSignatureDataB.Skrepka" action="remove"></resource>
+    <resource name="FSharpSignatureCompressedDataB.Skrepka" action="remove"></resource>
+    <resource name="FSharpOptimizationData.Skrepka" action="remove"></resource>
+    <resource name="FSharpOptimizationCompressedData.Skrepka" action="remove"></resource>
+    <resource name="FSharpOptimizationDataB.Skrepka" action="remove"></resource>
+    <resource name="FSharpOptimizationCompressedDataB.Skrepka" action="remove"></resource>
+    <resource name="FSharpOptimizationInfo.Skrepka" action="remove"></resource>
+    <resource name="FSharpSignatureInfo.Skrepka" action="remove"></resource>
+  </assembly>
+</linker>

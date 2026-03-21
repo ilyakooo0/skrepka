@@ -1,0 +1,1 @@
+-v --force --timestamp=none --sign - /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-ios/iossimulator-arm64/Skrepka.app/libmono-component-hot_reload.dylib
