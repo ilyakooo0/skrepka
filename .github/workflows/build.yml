@@ -16,6 +16,10 @@ jobs:
         include:
           - runner: ubuntu-latest
             name: linux-x86_64
+            musl-target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            name: linux-arm64
+            musl-target: aarch64-unknown-linux-musl
           - runner: macos-latest
             name: macos-arm64
           - runner: macos-13
@@ -36,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          rustup target add x86_64-unknown-linux-musl
+          rustup target add ${{ matrix.musl-target }}
 
       - uses: actions/cache@v4
         with:
@@ -53,7 +57,7 @@ jobs:
       - name: Build musl runtime
         if: runner.os == 'Linux'
         working-directory: knot
-        run: cargo build --release -p knot-runtime --target x86_64-unknown-linux-musl
+        run: cargo build --release -p knot-runtime --target ${{ matrix.musl-target }}
 
       - name: Compile server (Linux static)
         if: runner.os == 'Linux'
@@ -61,7 +65,7 @@ jobs:
           printf '#!/bin/sh\nexec musl-gcc -static "$@"\n' > /tmp/static-cc
           chmod +x /tmp/static-cc
           CC=/tmp/static-cc \
-          KNOT_RUNTIME_LIB=${{ github.workspace }}/knot/target/x86_64-unknown-linux-musl/release/libknot_runtime.a \
+          KNOT_RUNTIME_LIB=${{ github.workspace }}/knot/target/${{ matrix.musl-target }}/release/libknot_runtime.a \
           ./knot/target/release/knotc build server.knot
 
       - name: Compile server (macOS)

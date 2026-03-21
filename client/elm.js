@@ -4752,6 +4752,38 @@ var _Crypto_noble=(()=>{var ie=Object.defineProperty;var Nn=Object.getOwnPropert
 @noble/curves/abstract/weierstrass.js:
 @noble/curves/secp256k1.js:
 @noble/curves/abstract/edwards.js:
+@noble/curves/abstract/montgomery.js:
+@noble/curves/ed25519.js:
+@noble/curves/nist.js:
+  (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
+*/
+/*! Bundled license information:
+
+@noble/hashes/utils.js:
+  (*! noble-hashes - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
+
+@noble/curves/utils.js:
+@noble/curves/abstract/modular.js:
+@noble/curves/abstract/curve.js:
+@noble/curves/abstract/weierstrass.js:
+@noble/curves/secp256k1.js:
+@noble/curves/abstract/edwards.js:
+@noble/curves/abstract/montgomery.js:
+@noble/curves/ed25519.js:
+@noble/curves/nist.js:
+  (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
+*/
+/*! Bundled license information:
+
+@noble/hashes/utils.js:
+  (*! noble-hashes - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
+
+@noble/curves/utils.js:
+@noble/curves/abstract/modular.js:
+@noble/curves/abstract/curve.js:
+@noble/curves/abstract/weierstrass.js:
+@noble/curves/secp256k1.js:
+@noble/curves/abstract/edwards.js:
 @noble/curves/ed25519.js:
 @noble/curves/nist.js:
   (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
@@ -7440,21 +7472,43 @@ var $author$project$Main$charToHexBytes = function (c) {
 					A2($elm$core$Basics$modBy, 16, b2))
 				]);
 		} else {
-			var b3 = 128 + A2($elm$core$Basics$modBy, 64, code);
-			var b2 = 128 + A2($elm$core$Basics$modBy, 64, (code / 64) | 0);
-			var b1 = 224 + ((code / 4096) | 0);
-			return _List_fromArray(
-				[
-					$author$project$Main$nibbleToHex((b1 / 16) | 0),
-					$author$project$Main$nibbleToHex(
-					A2($elm$core$Basics$modBy, 16, b1)),
-					$author$project$Main$nibbleToHex((b2 / 16) | 0),
-					$author$project$Main$nibbleToHex(
-					A2($elm$core$Basics$modBy, 16, b2)),
-					$author$project$Main$nibbleToHex((b3 / 16) | 0),
-					$author$project$Main$nibbleToHex(
-					A2($elm$core$Basics$modBy, 16, b3))
-				]);
+			if (code < 65536) {
+				var b3 = 128 + A2($elm$core$Basics$modBy, 64, code);
+				var b2 = 128 + A2($elm$core$Basics$modBy, 64, (code / 64) | 0);
+				var b1 = 224 + ((code / 4096) | 0);
+				return _List_fromArray(
+					[
+						$author$project$Main$nibbleToHex((b1 / 16) | 0),
+						$author$project$Main$nibbleToHex(
+						A2($elm$core$Basics$modBy, 16, b1)),
+						$author$project$Main$nibbleToHex((b2 / 16) | 0),
+						$author$project$Main$nibbleToHex(
+						A2($elm$core$Basics$modBy, 16, b2)),
+						$author$project$Main$nibbleToHex((b3 / 16) | 0),
+						$author$project$Main$nibbleToHex(
+						A2($elm$core$Basics$modBy, 16, b3))
+					]);
+			} else {
+				var b4 = 128 + A2($elm$core$Basics$modBy, 64, code);
+				var b3 = 128 + A2($elm$core$Basics$modBy, 64, (code / 64) | 0);
+				var b2 = 128 + A2($elm$core$Basics$modBy, 64, (code / 4096) | 0);
+				var b1 = 240 + ((code / 262144) | 0);
+				return _List_fromArray(
+					[
+						$author$project$Main$nibbleToHex((b1 / 16) | 0),
+						$author$project$Main$nibbleToHex(
+						A2($elm$core$Basics$modBy, 16, b1)),
+						$author$project$Main$nibbleToHex((b2 / 16) | 0),
+						$author$project$Main$nibbleToHex(
+						A2($elm$core$Basics$modBy, 16, b2)),
+						$author$project$Main$nibbleToHex((b3 / 16) | 0),
+						$author$project$Main$nibbleToHex(
+						A2($elm$core$Basics$modBy, 16, b3)),
+						$author$project$Main$nibbleToHex((b4 / 16) | 0),
+						$author$project$Main$nibbleToHex(
+						A2($elm$core$Basics$modBy, 16, b4))
+					]);
+			}
 		}
 	}
 };
@@ -7917,68 +7971,77 @@ var $author$project$Main$messagePayloadDecoder = A5(
 	A2($elm$json$Json$Decode$field, 'body', $elm$json$Json$Decode$string));
 var $author$project$Main$processEvents = F4(
 	function (xPriv, myEdHex, events, seenIds) {
-		return A3(
-			$elm$core$List$foldl,
-			F2(
-				function (event, _v0) {
-					var msgs = _v0.a;
-					var seen = _v0.b;
-					var acks = _v0.c;
-					if (event.eventType !== 'message') {
-						return _Utils_Tuple3(msgs, seen, acks);
-					} else {
-						var _v1 = A2($elm$json$Json$Decode$decodeString, $author$project$Main$envelopeDecoder, event.payload);
-						if (_v1.$ === 'Err') {
-							return _Utils_Tuple3(
-								msgs,
-								seen,
-								A2($elm$core$List$cons, event.id, acks));
+		return function (_v5) {
+			var msgs = _v5.a;
+			var seen = _v5.b;
+			var acks = _v5.c;
+			return _Utils_Tuple3(
+				$elm$core$List$reverse(msgs),
+				seen,
+				acks);
+		}(
+			A3(
+				$elm$core$List$foldl,
+				F2(
+					function (event, _v0) {
+						var msgs = _v0.a;
+						var seen = _v0.b;
+						var acks = _v0.c;
+						if (event.eventType !== 'message') {
+							return _Utils_Tuple3(msgs, seen, acks);
 						} else {
-							var envelope = _v1.a;
-							if (_Utils_eq(envelope.fromKey, myEdHex)) {
+							var _v1 = A2($elm$json$Json$Decode$decodeString, $author$project$Main$envelopeDecoder, event.payload);
+							if (_v1.$ === 'Err') {
 								return _Utils_Tuple3(
 									msgs,
 									seen,
 									A2($elm$core$List$cons, event.id, acks));
 							} else {
-								var _v2 = A2($author$project$Main$decryptMessage, xPriv, envelope.encryptedBlob);
-								if (_v2.$ === 'Nothing') {
+								var envelope = _v1.a;
+								if (_Utils_eq(envelope.fromKey, myEdHex)) {
 									return _Utils_Tuple3(
 										msgs,
 										seen,
 										A2($elm$core$List$cons, event.id, acks));
 								} else {
-									var _v3 = _v2.a;
-									var senderPub = _v3.a;
-									var json = _v3.b;
-									var _v4 = A2($elm$json$Json$Decode$decodeString, $author$project$Main$messagePayloadDecoder, json);
-									if (_v4.$ === 'Err') {
+									var _v2 = A2($author$project$Main$decryptMessage, xPriv, envelope.encryptedBlob);
+									if (_v2.$ === 'Nothing') {
 										return _Utils_Tuple3(
 											msgs,
 											seen,
 											A2($elm$core$List$cons, event.id, acks));
 									} else {
-										var payload = _v4.a;
-										return A2($elm$core$Set$member, payload.id, seen) ? _Utils_Tuple3(
-											msgs,
-											seen,
-											A2($elm$core$List$cons, event.id, acks)) : _Utils_Tuple3(
-											A2(
-												$elm$core$List$cons,
-												_Utils_Tuple2(
-													senderPub,
-													{body: payload.body, id: payload.id, outgoing: false, timestamp: payload.timestamp}),
-												msgs),
-											A2($elm$core$Set$insert, payload.id, seen),
-											A2($elm$core$List$cons, event.id, acks));
+										var _v3 = _v2.a;
+										var senderPub = _v3.a;
+										var json = _v3.b;
+										var _v4 = A2($elm$json$Json$Decode$decodeString, $author$project$Main$messagePayloadDecoder, json);
+										if (_v4.$ === 'Err') {
+											return _Utils_Tuple3(
+												msgs,
+												seen,
+												A2($elm$core$List$cons, event.id, acks));
+										} else {
+											var payload = _v4.a;
+											return A2($elm$core$Set$member, payload.id, seen) ? _Utils_Tuple3(
+												msgs,
+												seen,
+												A2($elm$core$List$cons, event.id, acks)) : _Utils_Tuple3(
+												A2(
+													$elm$core$List$cons,
+													_Utils_Tuple2(
+														senderPub,
+														{body: payload.body, id: payload.id, outgoing: false, timestamp: payload.timestamp}),
+													msgs),
+												A2($elm$core$Set$insert, payload.id, seen),
+												A2($elm$core$List$cons, event.id, acks));
+										}
 									}
 								}
 							}
 						}
-					}
-				}),
-			_Utils_Tuple3(_List_Nil, seenIds, _List_Nil),
-			events);
+					}),
+				_Utils_Tuple3(_List_Nil, seenIds, _List_Nil),
+				events));
 	});
 var $author$project$Main$GotChallenge = function (a) {
 	return {$: 'GotChallenge', a: a};
