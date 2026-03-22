@@ -41,6 +41,7 @@ module App =
           ServerUrl: string
           Conn: ConnState
           Contacts: Contact list
+          PollStatus: string
           Messages: Map<string, ChatMessage list>
           ComposeText: string
           NewPubkey: string
@@ -65,8 +66,9 @@ module App =
         | SetNewNickname of string
         | DoSaveContact
         | DoDeleteContact of string
-        | PollResult of (string * string * int64 * string) list
+        | PollResult of (string * string * int64 * string) list * string
         | DoPoll
+        | CopyPubKey
         | DismissError
 
     // ── CmdMsg ──
@@ -79,10 +81,11 @@ module App =
             token: string *
             toHex: string *
             privKey: byte[] *
-            pubKey: byte[] *
-            recipPub: byte[] *
+            pubKeyHex: string *
+            recipPubHex: string *
             text: string
         | CmdPoll of url: string * token: string * privKey: byte[]
+        | CmdCopyToClipboard of string
 
     // ── Helpers ──
 
@@ -103,6 +106,7 @@ module App =
           PubKeyHex = ""
           ServerUrl = "http://localhost:8080"
           Conn = Offline
+          PollStatus = ""
           Contacts = []
           Messages = Map.empty
           ComposeText = ""
@@ -157,18 +161,16 @@ module App =
                       Timestamp = DateTimeOffset.UtcNow
                       IsOutgoing = true }
                 let msgs = model.Messages |> Map.tryFind pk |> Option.defaultValue []
-                let pubKey = Crypto.fromHex model.PubKeyHex
-                let recipPub = Crypto.fromHex pk
 
                 { model with
                     ComposeText = ""
                     Messages = model.Messages |> Map.add pk (msgs @ [ outMsg ]) },
-                [ CmdSend(model.ServerUrl, token, pk, priv, pubKey, recipPub, text) ]
+                [ CmdSend(model.ServerUrl, token, pk, priv, model.PubKeyHex, pk, text) ]
             | _ -> model, []
 
         | Sent _ -> model, []
 
-        | PollResult incoming ->
+        | PollResult(incoming, status) ->
             let model' =
                 incoming
                 |> List.fold
@@ -193,7 +195,7 @@ module App =
                             { m with
                                 Contacts = contacts
                                 Messages = m.Messages |> Map.add fromPk (msgs @ [ newMsg ]) })
-                    model
+                    { model with PollStatus = status }
 
             match model'.Conn with
             | Online token -> model', [ CmdPoll(model'.ServerUrl, token, model'.PrivKey.Value) ]
@@ -235,17 +237,20 @@ module App =
                 Contacts = model.Contacts |> List.filter (fun c -> c.Pubkey <> pk) },
             []
 
+        | CopyPubKey -> model, [ CmdCopyToClipboard model.PubKeyHex ]
+
         | DismissError -> { model with Error = None }, []
 
     // ── mapCmd ──
 
     let private asyncCmd (op: Async<Msg>) : Cmd<Msg> =
         Cmd.ofEffect (fun dispatch ->
-            async {
-                let! msg = op
-                dispatch msg
-            }
-            |> Async.Start)
+            System.Threading.Tasks.Task.Run(Func<System.Threading.Tasks.Task>(fun () ->
+                task {
+                    let! msg = Async.StartAsTask op
+                    dispatch msg
+                }))
+            |> ignore)
 
     let mapCmd cmdMsg =
         match cmdMsg with
@@ -270,9 +275,11 @@ module App =
                     return AuthErr ex.Message
             })
 
-        | CmdSend(url, token, toHex, privKey, pubKey, recipPub, text) ->
+        | CmdSend(url, token, toHex, privKey, pubKeyHex, recipPubHex, text) ->
             asyncCmd (async {
                 try
+                    let pubKey = Crypto.fromHex pubKeyHex
+                    let recipPub = Crypto.fromHex recipPubHex
                     let id = Guid.NewGuid().ToString()
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
@@ -284,7 +291,7 @@ module App =
                     let! (_, msgId) = ApiClient.sendMessage url token toHex blobHex ts
                     return Sent(toHex, msgId)
                 with ex ->
-                    return AuthErr $"Send failed: {ex.Message}"
+                    return DismissError  // TODO: show send errors properly
             })
 
         | CmdPoll(url, token, privKey) ->
@@ -293,6 +300,7 @@ module App =
                     let! (events, _) = ApiClient.poll url token
                     let messages = ResizeArray()
                     let ackIds = ResizeArray()
+                    let errors = ResizeArray()
 
                     for (evtId, evtType, payload) in events do
                         if evtType = "message" then
@@ -311,20 +319,37 @@ module App =
                                         let msgId = ptRoot.GetProperty("id").GetString()
                                         let body = ptRoot.GetProperty("body").GetString()
                                         messages.Add((senderHex, body, ts, msgId))
-                                | None -> ()
 
-                                ackIds.Add(evtId)
-                            with _ ->
-                                ()
+                                    ackIds.Add(evtId)
+                                | None ->
+                                    errors.Add("decrypt failed")
+                            with ex ->
+                                errors.Add($"parse: {ex.Message}")
 
                     if ackIds.Count > 0 then
                         do! ApiClient.ackMessages url token (Seq.toList ackIds)
 
-                    return PollResult(Seq.toList messages)
-                with _ ->
+                    let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
+
+                    let status =
+                        $"[{now}] evts:{events.Length} msgs:{messages.Count} errs:{errors.Count}"
+                        + (if errors.Count > 0 then $" [{errors.[0]}]" else "")
+
+                    return PollResult(Seq.toList messages, status)
+                with
+                | :? System.Threading.Tasks.TaskCanceledException ->
+                    // Normal timeout from long poll — just retry
+                    return PollResult([], "polling...")
+                | ex ->
+                    let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
                     do! Async.Sleep 3000
-                    return DoPoll
+                    return PollResult([], $"[{now}] poll error: {ex.Message}")
             })
+
+        | CmdCopyToClipboard text ->
+            Cmd.ofEffect (fun _ ->
+                Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(text)
+                |> ignore)
 
     // ── View ──
 
@@ -359,6 +384,8 @@ module App =
                     Label(model.PubKeyHex)
                         .font(size = 9.)
 
+                    Button("Copy Public Key", CopyPubKey)
+
                     Label("Server:")
 
                     Entry(model.ServerUrl, SetServerUrl)
@@ -382,6 +409,20 @@ module App =
         )
 
     let private viewConversations model =
+        let connStr =
+            match model.Conn with
+            | Offline -> "OFFLINE"
+            | Connecting -> "CONNECTING"
+            | Online _ -> "ONLINE"
+
+        let contactNames =
+            model.Contacts
+            |> List.map _.Nickname
+            |> String.concat ", "
+
+        let totalMsgs =
+            model.Messages |> Map.fold (fun acc _ msgs -> acc + List.length msgs) 0
+
         ContentPage(
             ScrollView(
                 (VStack(spacing = 8.) {
@@ -392,6 +433,19 @@ module App =
                         Button("+", Nav AddContact)
                         Button("Settings", Nav Settings)
                     }
+
+                    Label($"conn:{connStr} contacts:{model.Contacts.Length} msgs:{totalMsgs}")
+                        .font(size = 10.)
+                        .textColor(Colors.DimGray)
+
+                    Label($"poll: {model.PollStatus}")
+                        .font(size = 10.)
+                        .textColor(Colors.DimGray)
+
+                    if contactNames <> "" then
+                        Label($"names: {contactNames}")
+                            .font(size = 10.)
+                            .textColor(Colors.DimGray)
 
                     if model.Contacts.IsEmpty then
                         Label("No contacts yet. Tap + to add one.")
@@ -429,18 +483,24 @@ module App =
                         .centerTextHorizontal()
                 }
 
-                ScrollView(
-                    (VStack(spacing = 4.) {
-                        for msg in msgs do
-                            if msg.IsOutgoing then
-                                Label($"You: {msg.Body}")
-                                    .textColor(Color.FromArgb("#1565C0"))
-                            else
-                                Label(msg.Body)
-                                    .textColor(Color.FromArgb("#333333"))
-                    })
-                        .padding(8.)
-                )
+                if model.Error.IsSome then
+                    Label(model.Error.Value)
+                        .textColor(Colors.Red)
+                        .font(size = 11.)
+
+                Label($"[{msgs.Length} message(s), compose: \"{model.ComposeText}\"]")
+                    .textColor(Colors.Gray)
+                    .font(size = 10.)
+
+                let allMessages =
+                    msgs
+                    |> List.map (fun m ->
+                        if m.IsOutgoing then $"You: {m.Body}" else m.Body)
+                    |> String.concat "\n"
+
+                Label(if allMessages = "" then "No messages yet" else allMessages)
+                    .padding(8.)
+                    .font(size = 14.)
 
                 HStack(spacing = 8.) {
                     Entry(model.ComposeText, SetCompose)

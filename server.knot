@@ -99,7 +99,7 @@ extractToken = \authHeader ->
 verifyFederationAuth = \authorization ->
   extractToken authorization == federationSecret && not (federationSecret == "")
 
-clampTtl = \ttl -> if ttl > maxPresenceTtl then maxPresenceTtl else ttl
+clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
 
 pruneExpired = \t -> do
   challenges <- *challenges
@@ -132,142 +132,146 @@ serve = \req -> case req of
   ReqChallenge {pubkey, respond} -> do
     challenge <- genToken
     t <- now
-    pruneExpired t
-    challenges <- *challenges
-    set *challenges = union challenges
-      [{pubkey: pubkey, challenge: challenge, expiresAt: t + 60000}]
+    atomic do
+      pruneExpired t
+      challenges <- *challenges
+      set *challenges = union challenges
+        [{pubkey: pubkey, challenge: challenge, expiresAt: t + 60000}]
     respond {challenge: challenge}
 
   VerifyAuth {pubkey, challenge, signature, respond} -> do
     t <- now
-    challenges <- *challenges
-    sessions <- *sessions
-    presence <- *presence
     token <- genToken
     let expiry = t + 3600000
-    let matched = single (do
-      c <- challenges
-      where c.pubkey == pubkey
-      where c.challenge == challenge
-      where c.expiresAt > t
-      yield c)
-    let sigValid = case matched of
-      Nothing {} -> False {}
-      _ -> verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
-    set *challenges = case matched of
-      Nothing {} -> challenges
-      _ -> do
+    result <- atomic do
+      challenges <- *challenges
+      sessions <- *sessions
+      presence <- *presence
+      let matched = single (do
         c <- challenges
-        where not (c.pubkey == pubkey && c.challenge == challenge)
-        yield c
-    set *sessions = if sigValid
-      then union sessions [{token: token, pubkey: pubkey, expiresAt: expiry}]
-      else sessions
-    set *presence = if sigValid
-      then union
-        (do
-          p <- presence
-          where not (p.pubkey == pubkey && p.server == serverHost)
-          yield p)
-        [{pubkey: pubkey, server: serverHost, expiresAt: expiry}]
-      else presence
-    let result = if sigValid
-      then {token: token, expiresAt: expiry}
-      else {token: "", expiresAt: 0}
+        where c.pubkey == pubkey
+        where c.challenge == challenge
+        where c.expiresAt > t
+        yield c)
+      let sigValid = case matched of
+        Nothing {} -> False {}
+        _ -> verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
+      set *challenges = case matched of
+        Nothing {} -> challenges
+        _ -> do
+          c <- challenges
+          where not (c.pubkey == pubkey && c.challenge == challenge)
+          yield c
+      set *sessions = if sigValid
+        then union sessions [{token: token, pubkey: pubkey, expiresAt: expiry}]
+        else sessions
+      set *presence = if sigValid
+        then union
+          (do
+            p <- presence
+            where not (p.pubkey == pubkey && p.server == serverHost)
+            yield p)
+          [{pubkey: pubkey, server: serverHost, expiresAt: expiry}]
+        else presence
+      if sigValid
+        then yield {token: token, expiresAt: expiry}
+        else yield {token: "", expiresAt: 0}
     respond result
 
   Poll {authorization, respond} -> do
     t <- now
-    pruneExpired t
-    sessions <- *sessions
-    let session = lookupSession sessions (extractToken authorization) t
-    evts <- case session of
-      Nothing {} -> yield []
-      Just {value: s} -> atomic do
-        messages <- *messages
-        let pending = do
-          m <- messages
-          where m.toKey == s.pubkey
-          yield {id: m.messageId, eventType: "message",
-                 payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
-                                  encryptedBlob: m.encryptedBlob,
-                                  timestamp: m.timestamp}}
-        if count pending == 0
-          then retry
-          else yield pending
-    respond {events: evts, cursor: ""}
+    result <- atomic do
+      sessions <- *sessions
+      let session = lookupSession sessions (extractToken authorization) t
+      case session of
+        Nothing {} -> yield {events: [], cursor: "unauthorized"}
+        Just {value: s} -> do
+          messages <- *messages
+          let pending = do
+            m <- messages
+            where m.toKey == s.pubkey
+            yield {id: m.messageId, eventType: "message",
+                   payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
+                                    encryptedBlob: m.encryptedBlob,
+                                    timestamp: m.timestamp}}
+          if count pending == 0
+            then retry
+            else yield {events: pending, cursor: ""}
+    respond result
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
-    sessions <- *sessions
-    messages <- *messages
-    let session = lookupSession sessions (extractToken authorization) t
     msgId <- genToken
-    set *messages = case session of
-      Nothing {} -> messages
-      Just {value: s} -> union messages
-        [{messageId: msgId, toKey: to, fromKey: s.pubkey,
-          encryptedBlob: encryptedBlob, timestamp: t}]
-    let online = case session of
-      Nothing {} -> False {}
-      Just {value: _} -> count (do
-        s <- sessions
-        where s.pubkey == to
-        where s.expiresAt > t
-        yield s) > 0
-    let result = case session of
-      Nothing {} -> {status: "unauthorized", messageId: ""}
-      _ -> {status: (if online then "delivered" else "queued"),
-            messageId: msgId}
+    result <- atomic do
+      sessions <- *sessions
+      messages <- *messages
+      let session = lookupSession sessions (extractToken authorization) t
+      set *messages = case session of
+        Nothing {} -> messages
+        Just {value: s} -> union messages
+          [{messageId: msgId, toKey: to, fromKey: s.pubkey,
+            encryptedBlob: encryptedBlob, timestamp: t}]
+      let online = case session of
+        Nothing {} -> False {}
+        Just {value: _} -> count (do
+          s <- sessions
+          where s.pubkey == to
+          where s.expiresAt > t
+          yield s) > 0
+      case session of
+        Nothing {} -> yield {status: "unauthorized", messageId: ""}
+        _ -> yield {status: (if online then "delivered" else "queued"),
+              messageId: msgId}
     respond result
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
-    sessions <- *sessions
-    messages <- *messages
-    let session = lookupSession sessions (extractToken authorization) t
-    set *messages = case session of
-      Nothing {} -> messages
-      Just {value: s} -> diff messages (do
-        m <- messages
-        mid <- messageIds
-        where m.messageId == mid
-        where m.toKey == s.pubkey
-        yield m)
-    let result = case session of
-      Nothing {} -> {ok: (False {})}
-      _ -> {ok: (True {})}
+    result <- atomic do
+      sessions <- *sessions
+      messages <- *messages
+      let session = lookupSession sessions (extractToken authorization) t
+      set *messages = case session of
+        Nothing {} -> messages
+        Just {value: s} -> diff messages (do
+          m <- messages
+          mid <- messageIds
+          where m.messageId == mid
+          where m.toKey == s.pubkey
+          yield m)
+      case session of
+        Nothing {} -> yield {ok: (False {})}
+        _ -> yield {ok: (True {})}
     respond result
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
-    sessions <- *sessions
-    presence <- *presence
-    let session = lookupSession sessions (extractToken authorization) t
-    let valid = do
-      p <- presence
-      where p.pubkey == pubkey
-      where p.expiresAt > t
-      yield p
-    let result = case session of
-      Nothing {} -> {online: (False {}), server: ""}
-      Just {value: _} ->
-        if count valid == 0
-          then {online: (False {}), server: ""}
-          else case single (do
-            p <- valid
-            where p.server == serverHost
-            yield p) of
-            Just {value: p} -> {online: (True {}), server: p.server}
-            Nothing {} ->
-              case single valid of
-                Just {value: p} -> {online: (True {}), server: p.server}
-                Nothing {} -> {online: (True {}), server: ""}
+    result <- atomic do
+      sessions <- *sessions
+      presence <- *presence
+      let session = lookupSession sessions (extractToken authorization) t
+      let valid = do
+        p <- presence
+        where p.pubkey == pubkey
+        where p.expiresAt > t
+        yield p
+      case session of
+        Nothing {} -> yield {online: (False {}), server: ""}
+        Just {value: _} ->
+          if count valid == 0
+            then yield {online: (False {}), server: ""}
+            else case single (do
+              p <- valid
+              where p.server == serverHost
+              yield p) of
+              Just {value: p} -> yield {online: (True {}), server: p.server}
+              Nothing {} ->
+                case single valid of
+                  Just {value: p} -> yield {online: (True {}), server: p.server}
+                  Nothing {} -> yield {online: (True {}), server: ""}
     respond result
 
   RecvGossip {events, hopsRemaining, authorization, respond} -> do
     t <- now
-    presence <- *presence
     let authorized = verifyFederationAuth authorization
     let validRequest = authorized && hopsRemaining >= 1
     let onlineEntries = do
@@ -277,12 +281,6 @@ serve = \req -> case req of
     let affectedKeys = do
       e <- events
       yield {pubkey: e.pubkey, server: e.server}
-    let cleaned = diff presence (do
-      p <- presence
-      k <- affectedKeys
-      where p.pubkey == k.pubkey
-      where p.server == k.server
-      yield p)
     let deduped = do
       e <- onlineEntries
       where count (do
@@ -292,40 +290,51 @@ serve = \req -> case req of
         where o.expiresAt > e.expiresAt
         yield o) == 0
       yield e
-    set *presence = if validRequest
-      then union cleaned deduped
-      else presence
+    atomic do
+      presence <- *presence
+      let cleaned = diff presence (do
+        p <- presence
+        k <- affectedKeys
+        where p.pubkey == k.pubkey
+        where p.server == k.server
+        yield p)
+      set *presence = if validRequest
+        then union cleaned deduped
+        else presence
     respond {ok: validRequest}
 
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
     t <- now
-    messages <- *messages
     let authorized = verifyFederationAuth authorization
     let clampedTs = if timestamp > t then t else timestamp
-    let exists = count (do
-      m <- messages
-      where m.messageId == messageId
-      where m.timestamp > t - messageMaxAge
-      yield m) > 0
-    let shouldInsert = authorized && not exists
-    set *messages = if shouldInsert
-      then union messages
-        [{messageId: messageId, toKey: toKey, fromKey: fromKey,
-          encryptedBlob: encryptedBlob, timestamp: clampedTs}]
-      else messages
+    atomic do
+      messages <- *messages
+      let exists = count (do
+        m <- messages
+        where m.messageId == messageId
+        where m.timestamp > t - messageMaxAge
+        yield m) > 0
+      let shouldInsert = authorized && not exists
+      set *messages = if shouldInsert
+        then union messages
+          [{messageId: messageId, toKey: toKey, fromKey: fromKey,
+            encryptedBlob: encryptedBlob, timestamp: clampedTs}]
+        else messages
     respond {ok: authorized}
 
   FederationAck {messageIds, originServer, authorization, respond} -> do
-    messages <- *messages
     let authorized = verifyFederationAuth authorization
-    set *messages = if authorized
-      then diff messages (do
-        m <- messages
-        mid <- messageIds
-        where m.messageId == mid
-        yield m)
-      else messages
-    respond {ok: authorized}
+    let validAck = authorized && originServer == serverHost
+    atomic do
+      messages <- *messages
+      set *messages = if validAck
+        then diff messages (do
+          m <- messages
+          mid <- messageIds
+          where m.messageId == mid
+          yield m)
+        else messages
+    respond {ok: validAck}
 
 -- ============================================
 -- Entry Point

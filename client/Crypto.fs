@@ -31,7 +31,7 @@ module Crypto =
         let key = HKDF.DeriveKey(HashAlgorithmName.SHA256, rawSecret, 32, salt, info)
         let nonce = SodiumCore.GetRandomBytes(24)
         let ptBytes = Encoding.UTF8.GetBytes(plaintext)
-        let ciphertext = SecretAeadChaCha20Poly1305.Encrypt(ptBytes, nonce, key)
+        let ciphertext = SecretAeadXChaCha20Poly1305.Encrypt(ptBytes, nonce, key)
         let signature = PublicKeyAuth.SignDetached(ciphertext, senderPrivKey)
         Array.concat [| ephKp.PublicKey; nonce; ciphertext; senderPubKey; signature |]
 
@@ -58,7 +58,7 @@ module Crypto =
                     let salt = Array.append ephPub recipientX25519Pub
                     let info = Encoding.UTF8.GetBytes("skrepka-v1")
                     let key = HKDF.DeriveKey(HashAlgorithmName.SHA256, rawSecret, 32, salt, info)
-                    let plaintext = SecretAeadChaCha20Poly1305.Decrypt(ciphertext, nonce, key)
+                    let plaintext = SecretAeadXChaCha20Poly1305.Decrypt(ciphertext, nonce, key)
                     Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
             with _ ->
                 None
