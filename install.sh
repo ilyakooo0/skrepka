@@ -5,6 +5,14 @@ REPO="ilyakooo0/skrepka"
 INSTALL_BIN="/usr/local/bin/skrepka-server"
 UNIT_DEST="/etc/systemd/system/skrepka.service"
 
+DOMAIN="${DOMAIN:-${1:-}}"
+
+if [ -z "$DOMAIN" ]; then
+  echo "error: DOMAIN is required" >&2
+  echo "usage: DOMAIN=skrepka.example.com sh install.sh" >&2
+  exit 1
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "error: must be run as root" >&2
   exit 1
@@ -76,12 +84,30 @@ NoNewPrivileges=yes
 WantedBy=multi-user.target
 EOF
 
+    if ! command -v caddy >/dev/null 2>&1; then
+      echo "Installing Caddy..."
+      apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+      apt-get update
+      apt-get install -y caddy
+    fi
+
+    mkdir -p /etc/caddy
+    cat > /etc/caddy/Caddyfile <<CADDYEOF
+${DOMAIN} {
+    reverse_proxy localhost:8080
+}
+CADDYEOF
+
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
-      echo "Opening port 8080 (ufw)..."
-      ufw allow 8080/tcp
+      echo "Opening ports 80, 443 (ufw)..."
+      ufw allow 80/tcp
+      ufw allow 443/tcp
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-      echo "Opening port 8080 (firewalld)..."
-      firewall-cmd --add-port=8080/tcp --permanent
+      echo "Opening ports 80, 443 (firewalld)..."
+      firewall-cmd --add-port=80/tcp --permanent
+      firewall-cmd --add-port=443/tcp --permanent
       firewall-cmd --reload
     fi
 
@@ -94,6 +120,9 @@ EOF
       systemctl enable --now skrepka
       echo "Service enabled and started."
     fi
+
+    systemctl restart caddy
+    echo "Caddy configured for https://${DOMAIN}"
     echo "Check status with: systemctl status skrepka"
     ;;
   *)
