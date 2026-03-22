@@ -180,17 +180,21 @@ serve = \req -> case req of
     t <- now
     pruneExpired t
     sessions <- *sessions
-    messages <- *messages
     let session = lookupSession sessions (extractToken authorization) t
-    let evts = case session of
-      Nothing {} -> []
-      Just {value: s} -> do
-        m <- messages
-        where m.toKey == s.pubkey
-        yield {id: m.messageId, eventType: "message",
-               payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
-                                encryptedBlob: m.encryptedBlob,
-                                timestamp: m.timestamp}}
+    evts <- case session of
+      Nothing {} -> yield []
+      Just {value: s} -> atomic do
+        messages <- *messages
+        let pending = do
+          m <- messages
+          where m.toKey == s.pubkey
+          yield {id: m.messageId, eventType: "message",
+                 payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
+                                  encryptedBlob: m.encryptedBlob,
+                                  timestamp: m.timestamp}}
+        if count pending == 0
+          then retry
+          else yield pending
     respond {events: evts, cursor: ""}
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
