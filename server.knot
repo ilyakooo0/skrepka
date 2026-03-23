@@ -144,6 +144,7 @@ serve = \req -> case req of
     token <- genToken
     let expiry = t + 3600000
     sigValid <- atomic do
+      pruneExpired t
       challenges <- *challenges
       sessions <- *sessions
       presence <- *presence
@@ -180,12 +181,14 @@ serve = \req -> case req of
 
   Poll {authorization, respond} -> do
     t <- now
-    evts <- atomic do
+    let token = extractToken authorization
+    session <- atomic do
       sessions <- *sessions
-      let session = lookupSession sessions (extractToken authorization) t
-      case session of
-        Nothing {} -> yield []
-        Just {value: s} -> do
+      yield (lookupSession sessions token t)
+    case session of
+      Nothing {} -> respond {events: [], cursor: "unauthorized"}
+      Just {value: s} -> do
+        evts <- atomic do
           messages <- *messages
           let pending = do
             m <- messages
@@ -194,15 +197,14 @@ serve = \req -> case req of
                    payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
                                     encryptedBlob: m.encryptedBlob,
                                     timestamp: m.timestamp}}
-          if count pending == 0
-            then retry
-            else yield pending
-    respond {events: evts, cursor: ""}
+          yield pending
+        respond {events: evts, cursor: ""}
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
     msgId <- genToken
     status <- atomic do
+      pruneExpired t
       sessions <- *sessions
       messages <- *messages
       let session = lookupSession sessions (extractToken authorization) t
@@ -265,10 +267,7 @@ serve = \req -> case req of
               where p.server == serverHost
               yield p) of
               Just {value: p} -> p.server
-              Nothing {} ->
-                case single valid of
-                  Just {value: p} -> p.server
-                  Nothing {} -> ""
+              Nothing {} -> fold (\_ p -> p.server) "" valid
       yield foundServer
     respond {online: not (foundServer == ""), server: foundServer}
 
