@@ -143,7 +143,7 @@ serve = \req -> case req of
     t <- now
     token <- genToken
     let expiry = t + 3600000
-    result <- atomic do
+    sigValid <- atomic do
       challenges <- *challenges
       sessions <- *sessions
       presence <- *presence
@@ -173,18 +173,18 @@ serve = \req -> case req of
             yield p)
           [{pubkey: pubkey, server: serverHost, expiresAt: expiry}]
         else presence
-      if sigValid
-        then yield {token: token, expiresAt: expiry}
-        else yield {token: "", expiresAt: 0}
-    respond result
+      yield sigValid
+    if sigValid
+      then respond {token: token, expiresAt: expiry}
+      else respond {token: "", expiresAt: 0}
 
   Poll {authorization, respond} -> do
     t <- now
-    result <- atomic do
+    evts <- atomic do
       sessions <- *sessions
       let session = lookupSession sessions (extractToken authorization) t
       case session of
-        Nothing {} -> yield {events: [], cursor: "unauthorized"}
+        Nothing {} -> yield []
         Just {value: s} -> do
           messages <- *messages
           let pending = do
@@ -196,13 +196,13 @@ serve = \req -> case req of
                                     timestamp: m.timestamp}}
           if count pending == 0
             then retry
-            else yield {events: pending, cursor: ""}
-    respond result
+            else yield pending
+    respond {events: evts, cursor: ""}
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
     msgId <- genToken
-    result <- atomic do
+    status <- atomic do
       sessions <- *sessions
       messages <- *messages
       let session = lookupSession sessions (extractToken authorization) t
@@ -218,15 +218,15 @@ serve = \req -> case req of
           where s.pubkey == to
           where s.expiresAt > t
           yield s) > 0
-      case session of
-        Nothing {} -> yield {status: "unauthorized", messageId: ""}
-        _ -> yield {status: (if online then "delivered" else "queued"),
-              messageId: msgId}
-    respond result
+      let status = case session of
+        Nothing {} -> "unauthorized"
+        _ -> if online then "delivered" else "queued"
+      yield status
+    respond {status: status, messageId: (if status == "unauthorized" then "" else msgId)}
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
-    result <- atomic do
+    ok <- atomic do
       sessions <- *sessions
       messages <- *messages
       let session = lookupSession sessions (extractToken authorization) t
@@ -238,14 +238,15 @@ serve = \req -> case req of
           where m.messageId == mid
           where m.toKey == s.pubkey
           yield m)
-      case session of
-        Nothing {} -> yield {ok: (False {})}
-        _ -> yield {ok: (True {})}
-    respond result
+      let ok = case session of
+        Nothing {} -> False {}
+        _ -> True {}
+      yield ok
+    respond {ok: ok}
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
-    result <- atomic do
+    foundServer <- atomic do
       sessions <- *sessions
       presence <- *presence
       let session = lookupSession sessions (extractToken authorization) t
@@ -254,21 +255,22 @@ serve = \req -> case req of
         where p.pubkey == pubkey
         where p.expiresAt > t
         yield p
-      case session of
-        Nothing {} -> yield {online: (False {}), server: ""}
+      let foundServer = case session of
+        Nothing {} -> ""
         Just {value: _} ->
           if count valid == 0
-            then yield {online: (False {}), server: ""}
+            then ""
             else case single (do
               p <- valid
               where p.server == serverHost
               yield p) of
-              Just {value: p} -> yield {online: (True {}), server: p.server}
+              Just {value: p} -> p.server
               Nothing {} ->
                 case single valid of
-                  Just {value: p} -> yield {online: (True {}), server: p.server}
-                  Nothing {} -> yield {online: (True {}), server: ""}
-    respond result
+                  Just {value: p} -> p.server
+                  Nothing {} -> ""
+      yield foundServer
+    respond {online: not (foundServer == ""), server: foundServer}
 
   RecvGossip {events, hopsRemaining, authorization, respond} -> do
     t <- now
