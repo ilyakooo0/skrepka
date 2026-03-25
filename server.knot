@@ -185,31 +185,32 @@ serve = \req -> case req of
   Poll {authorization, respond} -> do
     t <- now
     let token = extractToken authorization
-    session <- atomic do
+    result <- atomic do
       pruneExpired t
       sessions <- *sessions
-      yield (lookupSession sessions token t)
-    case session of
-      Nothing {} -> respond {events: [], cursor: "unauthorized"}
-      Just {value: s} -> do
-        evts <- atomic do
-          messages <- *messages
-          let pending = do
-            m <- messages
-            where m.toKey == s.pubkey
-            where m.timestamp > t - messageMaxAge
-            yield {id: m.messageId, eventType: "message",
-                   payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
-                                    encryptedBlob: m.encryptedBlob,
-                                    timestamp: m.timestamp}}
-          yield pending
-        respond {events: evts, cursor: ""}
+      messages <- *messages
+      let session = lookupSession sessions token t
+      let evts = case session of
+        Nothing {} -> []
+        Just {value: s} -> do
+          m <- messages
+          where m.toKey == s.pubkey
+          where m.timestamp > t - messageMaxAge
+          yield {id: m.messageId, eventType: "message",
+                 payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
+                                  encryptedBlob: m.encryptedBlob,
+                                  timestamp: m.timestamp}}
+      let cursor = case session of
+        Nothing {} -> "unauthorized"
+        _ -> ""
+      yield {events: evts, cursor: cursor}
+    respond result
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
     msgId <- genToken
     let clampedTs = if timestamp > t then t else timestamp
-    status <- atomic do
+    result <- atomic do
       pruneExpired t
       sessions <- *sessions
       messages <- *messages
@@ -220,7 +221,7 @@ serve = \req -> case req of
         Just {value: s} -> union messages
           [{messageId: msgId, toKey: to, fromKey: s.pubkey,
             encryptedBlob: encryptedBlob, timestamp: clampedTs}]
-      let online = case session of
+      let localOnline = case session of
         Nothing {} -> False {}
         Just {value: _} -> count (do
           p <- presence
@@ -228,11 +229,30 @@ serve = \req -> case req of
           where p.server == serverHost
           where p.expiresAt > t
           yield p) > 0
+      let remoteServer = case session of
+        Nothing {} -> ""
+        Just {value: _} -> fold (\_ p -> p.server) "" (do
+          p <- presence
+          where p.pubkey == to
+          where not (p.server == serverHost)
+          where p.expiresAt > t
+          yield p)
+      let fromKey = case session of
+        Nothing {} -> ""
+        Just {value: s} -> s.pubkey
       let status = case session of
         Nothing {} -> "unauthorized"
-        _ -> if online then "delivered" else "queued"
-      yield status
-    respond {status: status, messageId: (if status == "unauthorized" then "" else msgId)}
+        _ -> if localOnline then "delivered"
+             else if not (remoteServer == "") then "federated"
+             else "queued"
+      yield {status: status, remoteServer: remoteServer, fromKey: fromKey}
+    if result.status == "federated" && not (result.remoteServer == "") && not (federationSecret == "")
+      then httpPost ("http://" ++ result.remoteServer ++ "/federation/forward")
+        {authorization: "Bearer " ++ federationSecret}
+        {toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
+         timestamp: clampedTs, originServer: serverHost, messageId: msgId}
+      else yield {}
+    respond {status: result.status, messageId: (if result.status == "unauthorized" then "" else msgId)}
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -290,10 +310,16 @@ serve = \req -> case req of
       where e.eventType == "online"
       where not (e.server == serverHost)
       yield {pubkey: e.pubkey, server: e.server, expiresAt: t + (clampTtl e.ttl) * 1000}
-    let affectedKeys = do
+    let offlineEntries = do
       e <- events
+      where e.eventType == "offline"
       where not (e.server == serverHost)
       yield {pubkey: e.pubkey, server: e.server}
+    let affectedKeys = union
+      (do
+        e <- onlineEntries
+        yield {pubkey: e.pubkey, server: e.server})
+      offlineEntries
     let deduped = fold (\acc e ->
         if count (do
             a <- acc
@@ -349,11 +375,18 @@ serve = \req -> case req of
     atomic do
       pruneExpired t
       messages <- *messages
+      presence <- *presence
       set *messages = if validAck
         then diff messages (do
           m <- messages
           mid <- messageIds
           where m.messageId == mid
+          where count (do
+            p <- presence
+            where p.pubkey == m.toKey
+            where p.server == serverHost
+            where p.expiresAt > t
+            yield p) == 0
           yield m)
         else messages
     respond {ok: validAck}
