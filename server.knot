@@ -8,6 +8,7 @@
 
 serverHost = "localhost:8080"
 federationSecret = "" -- must be set to enable federation
+federationScheme = "https://" -- scheme for federation HTTP calls
 messageMaxAge = 86400000 -- 24 hours in milliseconds
 maxPresenceTtl = 3600 -- max presence TTL from gossip in seconds
 
@@ -106,7 +107,7 @@ forwardToAll = \servers path headers body ->
     then yield False {}
     else do
       let server = fold (\acc s -> if acc == "" then s else acc) "" servers
-      result <- httpPost ("http://" ++ server ++ path) headers body
+      result <- httpPost (federationScheme ++ server ++ path) headers body
       restOk <- forwardToAll (do s <- servers; where not (s == server); yield s) path headers body
       yield (if result.ok then True {} else restOk)
 
@@ -302,7 +303,7 @@ serve = \req -> case req of
       else union acc [m.originServer]) [] fedMessages
     if result.ok && count originServers > 0 && not (federationSecret == "")
       then sendToEach originServers (\server ->
-        httpPost ("http://" ++ server ++ "/federation/ack")
+        httpPost (federationScheme ++ server ++ "/federation/ack")
           {authorization: "Bearer " ++ federationSecret}
           {messageIds: (do m <- fedMessages; where m.originServer == server; yield m.messageId),
            originServer: server})
@@ -343,11 +344,15 @@ serve = \req -> case req of
       e <- events
       where e.eventType == "online"
       where not (e.server == serverHost)
-      yield {pubkey: e.pubkey, server: e.server, expiresAt: t + (clampTtl e.ttl) * 1000}
+      where e.timestamp <= t
+      where e.timestamp + (clampTtl e.ttl) * 1000 > t
+      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000}
     let offlineEntries = do
       e <- events
       where e.eventType == "offline"
       where not (e.server == serverHost)
+      where e.timestamp <= t
+      where t - e.timestamp < (clampTtl e.ttl) * 1000
       yield {pubkey: e.pubkey, server: e.server}
     let affectedKeys = union
       (do
@@ -380,12 +385,32 @@ serve = \req -> case req of
       set *presence = if validRequest
         then union cleaned deduped
         else presence
+    if validRequest && hopsRemaining > 1 && not (federationSecret == "")
+      then do
+        peerServers <- atomic do
+          presence <- *presence
+          yield (fold (\acc p ->
+            if p.server == serverHost then acc
+            else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
+            else union acc [p.server]) [] presence)
+        let senderServers = fold (\acc e ->
+          if count (do a <- acc; where a == e.server; yield a) > 0 then acc
+          else union acc [e.server]) [] events
+        let targets = do
+          s <- peerServers
+          where count (do ss <- senderServers; where ss == s; yield ss) == 0
+          yield s
+        sendToEach targets (\server ->
+          httpPost (federationScheme ++ server ++ "/federation/gossip")
+            {authorization: "Bearer " ++ federationSecret}
+            {events: events, hopsRemaining: hopsRemaining - 1})
+      else yield {}
     respond {ok: validRequest}
 
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
-    let clampedTs = if timestamp > t then t else timestamp
+    let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
     atomic do
       pruneExpired t
       messages <- *messages
