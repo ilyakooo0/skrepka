@@ -46,8 +46,8 @@ route AuthApi where
       = VerifyAuth
 
 route ClientApi where
-  GET /poll headers {authorization: Text}
-    -> {events: [PollEvent], cursor: Text}
+  GET {cursor: Int} /poll headers {authorization: Text}
+    -> {events: [PollEvent], cursor: Int}
     = Poll
   /messages
     POST {to: Text, encryptedBlob: Text, timestamp: Int} / headers {authorization: Text}
@@ -169,7 +169,7 @@ serve = \req -> case req of
     t <- now
     token <- genToken
     let expiry = t + 3600000
-    sigValid <- atomic do
+    result <- atomic do
       pruneExpired t
       challenges <- *challenges
       sessions <- *sessions
@@ -195,16 +195,17 @@ serve = \req -> case req of
         where s.expiresAt > t
         yield s
       let oldestExpiry = fold (\acc s -> if s.expiresAt < acc then s.expiresAt else acc) expiry existingForKey
+      let cappedFold = fold (\acc s ->
+          if not acc.removed && s.pubkey == pubkey && s.expiresAt == oldestExpiry
+            then {removed: True {}, sessions: acc.sessions}
+            else {removed: acc.removed, sessions: union acc.sessions [s]}) {removed: False {}, sessions: []} sessions
       let sessionsCapped = if count existingForKey >= 10
-        then do
-          s <- sessions
-          where not (s.pubkey == pubkey && s.expiresAt == oldestExpiry)
-          yield s
+        then cappedFold.sessions
         else sessions
       set *sessions = if sigValid
         then union sessionsCapped [{token: token, pubkey: pubkey, expiresAt: expiry}]
         else sessions
-      set *presence = if sigValid
+      let updatedPresence = if sigValid
         then union
           (do
             p <- presence
@@ -212,25 +213,25 @@ serve = \req -> case req of
             yield p)
           [{pubkey: pubkey, server: serverHost, expiresAt: expiry}]
         else presence
-      yield sigValid
-    if sigValid
+      set *presence = updatedPresence
+      let peerServers = if sigValid && not (federationSecret == "")
+        then fold (\acc p ->
+          if p.server == serverHost then acc
+          else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
+          else union acc [p.server]) [] updatedPresence
+        else []
+      yield {sigValid: sigValid, peerServers: peerServers}
+    if result.sigValid
       then respond {token: token, expiresAt: expiry}
       else respond {token: "", expiresAt: 0}
-    if sigValid && not (federationSecret == "")
-      then do
-        peerServers <- atomic do
-          presence <- *presence
-          yield (fold (\acc p ->
-            if p.server == serverHost then acc
-            else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
-            else union acc [p.server]) [] presence)
-        sendToEach peerServers (\server ->
-          httpPost (federationScheme ++ server ++ "/federation/gossip")
-            {authorization: "Bearer " ++ federationSecret}
-            {events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2})
+    if result.sigValid && not (federationSecret == "")
+      then sendToEach result.peerServers (\server ->
+        httpPost (federationScheme ++ server ++ "/federation/gossip")
+          {authorization: "Bearer " ++ federationSecret}
+          {events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2})
       else yield {}
 
-  Poll {authorization, respond} -> do
+  Poll {cursor, authorization, respond} -> do
     t <- now
     let token = extractToken authorization
     result <- atomic do
@@ -244,20 +245,22 @@ serve = \req -> case req of
           m <- messages
           where m.toKey == s.pubkey
           where m.timestamp >= t - messageMaxAge
+          where m.timestamp >= cursor
           yield {id: m.messageId, eventType: "message",
                  payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
                                   encryptedBlob: m.encryptedBlob,
                                   timestamp: m.timestamp}}
-      let cursor = case session of
-        Nothing {} -> "unauthorized"
-        _ -> show t
-      yield {events: evts, cursor: cursor}
+      let newCursor = case session of
+        Nothing {} -> 0
+        _ -> t
+      yield {events: evts, cursor: newCursor}
     respond result
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
     msgId <- genToken
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
+    let validInput = not (to == "") && not (encryptedBlob == "")
     result <- atomic do
       pruneExpired t
       sessions <- *sessions
@@ -266,9 +269,11 @@ serve = \req -> case req of
       let session = lookupSession sessions (extractToken authorization) t
       set *messages = case session of
         Nothing {} -> messages
-        Just {value: s} -> union messages
-          [{messageId: msgId, toKey: to, fromKey: s.pubkey,
-            encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: ""}]
+        Just {value: s} -> if validInput
+          then union messages
+            [{messageId: msgId, toKey: to, fromKey: s.pubkey,
+              encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: ""}]
+          else messages
       let localOnline = case session of
         Nothing {} -> False {}
         Just {value: _} -> count (do
@@ -290,7 +295,8 @@ serve = \req -> case req of
         Just {value: s} -> s.pubkey
       let status = case session of
         Nothing {} -> "unauthorized"
-        _ -> if localOnline then "delivered"
+        _ -> if not validInput then "invalid"
+             else if localOnline then "delivered"
              else if count remoteServers > 0 then "federated"
              else "queued"
       yield {status: status, remoteServers: remoteServers, fromKey: fromKey}
@@ -302,7 +308,7 @@ serve = \req -> case req of
            timestamp: clampedTs, originServer: serverHost, messageId: msgId}
         yield (if anyOk then "federated" else "queued")
       else yield result.status
-    respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else msgId)}
+    respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else msgId)}
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -477,6 +483,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == "") && not (originServer == serverHost)
+    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "")
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     atomic do
       pruneExpired t
@@ -486,13 +493,13 @@ serve = \req -> case req of
         where m.messageId == messageId
         where m.timestamp >= t - messageMaxAge
         yield m) > 0
-      let shouldInsert = authorized && validOrigin && not exists
+      let shouldInsert = authorized && validOrigin && validFields && not exists
       set *messages = if shouldInsert
         then union messages
           [{messageId: messageId, toKey: toKey, fromKey: fromKey,
             encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer}]
         else messages
-    respond {ok: authorized && validOrigin}
+    respond {ok: authorized && validOrigin && validFields}
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
@@ -513,12 +520,6 @@ serve = \req -> case req of
             where p.server == serverHost
             where p.expiresAt > t
             yield p) == 0
-          where count (do
-            p <- presence
-            where p.pubkey == m.toKey
-            where p.server == fromServer
-            where p.expiresAt > t
-            yield p) > 0
           yield m)
         else messages
     respond {ok: validAck}
