@@ -62,7 +62,7 @@ route ClientApi where
 
 route FederationApi where
   /federation
-    POST {events: [GossipEvent], hopsRemaining: Int} /gossip headers {authorization: Text}
+    POST {events: [GossipEvent], hopsRemaining: Int, fromServer: Text} /gossip headers {authorization: Text}
       -> {ok: Bool}
       = RecvGossip
     POST {toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int, originServer: Text, messageId: Text} /forward headers {authorization: Text}
@@ -231,7 +231,7 @@ serve = \req -> case req of
       then sendToEach result.peerServers (\server ->
         httpPost (federationScheme ++ server ++ "/federation/gossip")
           {authorization: "Bearer " ++ federationSecret}
-          {events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2})
+          {events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2, fromServer: serverHost})
       else yield {}
 
   Poll {cursor, authorization, respond} -> do
@@ -315,6 +315,9 @@ serve = \req -> case req of
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
+    let dedupedIds = fold (\acc mid ->
+      if count (do a <- acc; where a == mid; yield a) > 0 then acc
+      else union acc [mid]) [] messageIds
     result <- atomic do
       pruneExpired t
       sessions <- *sessions
@@ -324,7 +327,7 @@ serve = \req -> case req of
         Nothing {} -> []
         Just {value: s} -> do
           m <- messages
-          mid <- messageIds
+          mid <- dedupedIds
           where m.messageId == mid
           where m.toKey == s.pubkey
           yield m
@@ -383,7 +386,7 @@ serve = \req -> case req of
       then respond {online: not (result.foundServer == ""), server: result.foundServer}
       else respond {online: False {}, server: "unauthorized"}
 
-  RecvGossip {events, hopsRemaining, authorization, respond} -> do
+  RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
@@ -448,7 +451,14 @@ serve = \req -> case req of
       set *presence = if validRequest
         then union cleaned deduped
         else presence
-    if validRequest && cappedHops > 1 && not (federationSecret == "")
+    let validEvents = do
+      e <- events
+      where not (e.server == "")
+      where not (e.pubkey == "")
+      where e.timestamp <= t
+      where e.timestamp + (clampTtl e.ttl) * 1000 > t
+      yield e
+    if validRequest && cappedHops > 1 && not (federationSecret == "") && count validEvents > 0
       then do
         peerServers <- atomic do
           presence <- *presence
@@ -458,7 +468,7 @@ serve = \req -> case req of
             else union acc [p.server]) [] presence)
         let senderServers = fold (\acc e ->
           if count (do a <- acc; where a == e.server; yield a) > 0 then acc
-          else union acc [e.server]) [] events
+          else union acc [e.server]) (if fromServer == "" then [] else [fromServer]) events
         let targets = do
           s <- peerServers
           where count (do ss <- senderServers; where ss == s; yield ss) == 0
@@ -466,7 +476,7 @@ serve = \req -> case req of
         sendToEach targets (\server ->
           httpPost (federationScheme ++ server ++ "/federation/gossip")
             {authorization: "Bearer " ++ federationSecret}
-            {events: events, hopsRemaining: cappedHops - 1})
+            {events: validEvents, hopsRemaining: cappedHops - 1, fromServer: serverHost})
       else yield {}
     respond {ok: validRequest}
 
