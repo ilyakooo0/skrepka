@@ -107,17 +107,25 @@ forwardToAll = \servers path headers body ->
     then yield False {}
     else do
       let server = fold (\acc s -> if acc == "" then s else acc) "" servers
-      result <- httpPost (federationScheme ++ server ++ path) headers body
-      restOk <- forwardToAll (do s <- servers; where not (s == server); yield s) path headers body
-      yield (if result.ok then True {} else restOk)
+      let rest = do s <- servers; where not (s == server); yield s
+      if server == ""
+        then yield False {}
+        else do
+          result <- httpPost (federationScheme ++ server ++ path) headers body
+          restOk <- forwardToAll rest path headers body
+          yield (if result.ok then True {} else restOk)
 
 sendToEach = \servers action ->
   if count servers == 0
     then yield {}
     else do
       let server = fold (\acc s -> if acc == "" then s else acc) "" servers
-      action server
-      sendToEach (do s <- servers; where not (s == server); yield s) action
+      let rest = do s <- servers; where not (s == server); yield s
+      if server == ""
+        then yield {}
+        else do
+          action server
+          sendToEach rest action
 
 pruneExpired = \t -> do
   challenges <- *challenges
@@ -138,7 +146,7 @@ pruneExpired = \t -> do
   messages <- *messages
   set *messages = do
     m <- messages
-    where m.timestamp > t - messageMaxAge
+    where m.timestamp >= t - messageMaxAge
     yield m
 
 -- ============================================
@@ -181,8 +189,20 @@ serve = \req -> case req of
           c <- challenges
           where not (c.pubkey == pubkey && c.challenge == challenge)
           yield c
+      let existingForKey = do
+        s <- sessions
+        where s.pubkey == pubkey
+        where s.expiresAt > t
+        yield s
+      let oldestExpiry = fold (\acc s -> if s.expiresAt < acc then s.expiresAt else acc) expiry existingForKey
+      let sessionsCapped = if count existingForKey >= 10
+        then do
+          s <- sessions
+          where not (s.pubkey == pubkey && s.expiresAt == oldestExpiry)
+          yield s
+        else sessions
       set *sessions = if sigValid
-        then union sessions [{token: token, pubkey: pubkey, expiresAt: expiry}]
+        then union sessionsCapped [{token: token, pubkey: pubkey, expiresAt: expiry}]
         else sessions
       set *presence = if sigValid
         then union
@@ -223,21 +243,21 @@ serve = \req -> case req of
         Just {value: s} -> do
           m <- messages
           where m.toKey == s.pubkey
-          where m.timestamp > t - messageMaxAge
+          where m.timestamp >= t - messageMaxAge
           yield {id: m.messageId, eventType: "message",
                  payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
                                   encryptedBlob: m.encryptedBlob,
                                   timestamp: m.timestamp}}
       let cursor = case session of
         Nothing {} -> "unauthorized"
-        _ -> ""
+        _ -> show t
       yield {events: evts, cursor: cursor}
     respond result
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
     msgId <- genToken
-    let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
+    let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     result <- atomic do
       pruneExpired t
       sessions <- *sessions
@@ -299,9 +319,13 @@ serve = \req -> case req of
           where m.messageId == mid
           where m.toKey == s.pubkey
           yield m
+      let localAcked = do
+        m <- ackedMessages
+        where m.originServer == ""
+        yield m
       set *messages = case session of
         Nothing {} -> messages
-        Just {value: _} -> diff messages ackedMessages
+        Just {value: _} -> diff messages localAcked
       let ok = case session of
         Nothing {} -> False {}
         _ -> True {}
@@ -315,11 +339,20 @@ serve = \req -> case req of
       if count (do a <- acc; where a == m.originServer; yield a) > 0 then acc
       else union acc [m.originServer]) [] fedMessages
     if result.ok && count originServers > 0 && not (federationSecret == "")
-      then sendToEach originServers (\server ->
-        httpPost (federationScheme ++ server ++ "/federation/ack")
+      then sendToEach originServers (\server -> do
+        ackResult <- httpPost (federationScheme ++ server ++ "/federation/ack")
           {authorization: "Bearer " ++ federationSecret}
           {messageIds: (do m <- fedMessages; where m.originServer == server; yield m.messageId),
-           originServer: server, fromServer: serverHost})
+           originServer: server, fromServer: serverHost}
+        if ackResult.ok
+          then atomic do
+            messages <- *messages
+            set *messages = diff messages (do
+              m <- messages
+              mid <- (do fm <- fedMessages; where fm.originServer == server; yield fm.messageId)
+              where m.messageId == mid
+              yield m)
+          else yield {})
       else yield {}
     respond {ok: result.ok}
 
@@ -361,6 +394,8 @@ serve = \req -> case req of
     let onlineEntries = do
       e <- events
       where e.eventType == "online"
+      where not (e.server == "")
+      where not (e.pubkey == "")
       where not (e.server == serverHost)
       where e.timestamp <= t
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
@@ -368,6 +403,8 @@ serve = \req -> case req of
     let offlineEntries = do
       e <- events
       where e.eventType == "offline"
+      where not (e.server == "")
+      where not (e.pubkey == "")
       where not (e.server == serverHost)
       where e.timestamp <= t
       where t - e.timestamp < (clampTtl e.ttl) * 1000
@@ -378,7 +415,7 @@ serve = \req -> case req of
         o <- offlineEntries
         where o.pubkey == e.pubkey
         where o.server == e.server
-        where o.timestamp > e.timestamp
+        where o.timestamp >= e.timestamp
         yield o) == 0
       yield {pubkey: e.pubkey, server: e.server, expiresAt: e.expiresAt}
     let affectedKeys = union
@@ -440,14 +477,14 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == "") && not (originServer == serverHost)
-    let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
+    let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     atomic do
       pruneExpired t
       messages <- *messages
       let exists = count (do
         m <- messages
         where m.messageId == messageId
-        where m.timestamp > t - messageMaxAge
+        where m.timestamp >= t - messageMaxAge
         yield m) > 0
       let shouldInsert = authorized && validOrigin && not exists
       set *messages = if shouldInsert
