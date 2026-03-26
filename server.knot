@@ -16,6 +16,7 @@ maxBlobLen = 65536
 maxSignatureLen = 256
 maxMessageIds = 100
 maxGossipEvents = 100
+clockSkewTolerance = 5000 -- 5 seconds tolerance for clock skew between federated servers
 
 -- ============================================
 -- Types
@@ -94,6 +95,8 @@ genToken = do
 
 tooLong = \s maxLen -> not (drop maxLen s == "")
 
+isValidHex = \s -> not (s == "") && bytesToHex (bytesFromHex s) == s
+
 lookupSession = \sessions token t ->
   single (do
     s <- sessions
@@ -148,6 +151,10 @@ pruneExpired = \t -> do
     where s.expiresAt > t
     yield s
   presenceBefore <- *presence
+  let peerServersBefore = fold (\acc p ->
+    if p.server == serverHost then acc
+    else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
+    else union acc [p.server]) [] presenceBefore
   let presenceAfter = do
     p <- presenceBefore
     where p.expiresAt > t
@@ -158,7 +165,7 @@ pruneExpired = \t -> do
     m <- messages
     where m.timestamp >= t - messageMaxAge
     yield m
-  yield (do
+  yield {expiredLocal: (do
     p <- presenceBefore
     where p.expiresAt <= t
     where p.server == serverHost
@@ -167,20 +174,14 @@ pruneExpired = \t -> do
       where q.pubkey == p.pubkey
       where q.server == serverHost
       yield q) == 0
-    yield p)
+    yield p), peerServers: peerServersBefore}
 
-broadcastOfflineGossip = \t expiredLocal -> do
+broadcastOfflineGossip = \t peerServers expiredLocal -> do
   let expiredPubkeys = fold (\acc p ->
     if count (do a <- acc; where a == p.pubkey; yield a) > 0 then acc
     else union acc [p.pubkey]) [] expiredLocal
-  if not (federationSecret == "") && count expiredPubkeys > 0
+  if not (federationSecret == "") && count expiredPubkeys > 0 && count peerServers > 0
     then do
-      peerServers <- atomic do
-        presence <- *presence
-        yield (fold (\acc p ->
-          if p.server == serverHost then acc
-          else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
-          else union acc [p.server]) [] presence)
       let gossipEvents = do
         pk <- expiredPubkeys
         yield {eventType: "offline", pubkey: pk, server: serverHost, timestamp: t, ttl: 3600}
@@ -202,21 +203,21 @@ serve = \req -> case req of
       else do
         challenge <- genToken
         t <- now
-        expiredLocal <- atomic do
-          el <- pruneExpired t
+        pruneResult <- atomic do
+          pr <- pruneExpired t
           challenges <- *challenges
           set *challenges = union challenges
             [{pubkey: pubkey, challenge: challenge, expiresAt: t + 60000}]
-          yield el
+          yield pr
         respond {challenge: challenge}
-        broadcastOfflineGossip t expiredLocal
+        broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal
 
   VerifyAuth {pubkey, challenge, signature, respond} -> do
     t <- now
     token <- genToken
     let expiry = t + 3600000
     result <- atomic do
-      expiredLocal <- pruneExpired t
+      pr <- pruneExpired t
       challenges <- *challenges
       sessions <- *sessions
       presence <- *presence
@@ -229,6 +230,8 @@ serve = \req -> case req of
       let sigValid = case matched of
         Nothing {} -> False {}
         _ -> if tooLong signature maxSignatureLen
+          then False {}
+          else if not (isValidHex pubkey) || not (isValidHex signature)
           then False {}
           else verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
       set *challenges = if sigValid
@@ -268,7 +271,7 @@ serve = \req -> case req of
           else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
           else union acc [p.server]) [] updatedPresence
         else []
-      yield {sigValid: sigValid, peerServers: peerServers, expiredLocal: expiredLocal}
+      yield {sigValid: sigValid, peerServers: peerServers, expiredLocal: pr.expiredLocal, offlinePeers: pr.peerServers}
     if result.sigValid
       then respond {token: token, expiresAt: expiry}
       else respond {token: "", expiresAt: 0}
@@ -278,13 +281,13 @@ serve = \req -> case req of
           {authorization: "Bearer " ++ federationSecret}
           {events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2, fromServer: serverHost})
       else yield {}
-    broadcastOfflineGossip t result.expiredLocal
+    broadcastOfflineGossip t result.offlinePeers result.expiredLocal
 
   Poll {cursor, authorization, respond} -> do
     t <- now
     let token = extractToken authorization
     result <- atomic do
-      expiredLocal <- pruneExpired t
+      pr <- pruneExpired t
       sessions <- *sessions
       messages <- *messages
       seqCounter <- *seqCounter
@@ -301,11 +304,11 @@ serve = \req -> case req of
                                   encryptedBlob: m.encryptedBlob,
                                   timestamp: m.timestamp}}
       let newCursor = case session of
-        Nothing {} -> 0
+        Nothing {} -> -1
         _ -> if seqCounter > cursor then seqCounter else cursor
-      yield {events: evts, cursor: newCursor, expiredLocal: expiredLocal}
+      yield {events: evts, cursor: newCursor, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     respond {events: result.events, cursor: result.cursor}
-    broadcastOfflineGossip t result.expiredLocal
+    broadcastOfflineGossip t result.peerServers result.expiredLocal
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
@@ -313,7 +316,7 @@ serve = \req -> case req of
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     let validInput = not (to == "") && not (encryptedBlob == "") && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen)
     result <- atomic do
-      expiredLocal <- pruneExpired t
+      pr <- pruneExpired t
       sessions <- *sessions
       messages <- *messages
       presence <- *presence
@@ -356,7 +359,7 @@ serve = \req -> case req of
              else if localOnline then "delivered"
              else if count remoteServers > 0 then "federated"
              else "queued"
-      yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: expiredLocal}
+      yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     finalStatus <- if result.status == "federated" && not (federationSecret == "")
       then do
         anyOk <- forwardToAll result.remoteServers "/federation/forward"
@@ -366,7 +369,7 @@ serve = \req -> case req of
         yield (if anyOk then "federated" else "queued")
       else yield result.status
     respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else msgId)}
-    broadcastOfflineGossip t result.expiredLocal
+    broadcastOfflineGossip t result.peerServers result.expiredLocal
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -376,7 +379,7 @@ serve = \req -> case req of
       else if count (do a <- acc; where a == mid; yield a) > 0 then acc
       else union acc [mid]) [] messageIds
     result <- atomic do
-      expiredLocal <- pruneExpired t
+      pr <- pruneExpired t
       sessions <- *sessions
       messages <- *messages
       let session = lookupSession sessions (extractToken authorization) t
@@ -394,7 +397,7 @@ serve = \req -> case req of
       let ok = case session of
         Nothing {} -> False {}
         _ -> True {}
-      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: expiredLocal}
+      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     let fedMessages = do
       m <- result.ackedMessages
       where not (m.originServer == "")
@@ -411,12 +414,12 @@ serve = \req -> case req of
            originServer: server, fromServer: serverHost})
       else yield {}
     respond {ok: result.ok}
-    broadcastOfflineGossip t result.expiredLocal
+    broadcastOfflineGossip t result.peerServers result.expiredLocal
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
     result <- atomic do
-      expiredLocal <- pruneExpired t
+      pr <- pruneExpired t
       sessions <- *sessions
       presence <- *presence
       let session = lookupSession sessions (extractToken authorization) t
@@ -439,15 +442,15 @@ serve = \req -> case req of
               yield p) of
               Just {value: p} -> p.server
               Nothing {} -> fold (\_ p -> p.server) "" valid
-      yield {foundServer: foundServer, authorized: authorized, expiredLocal: expiredLocal}
+      yield {foundServer: foundServer, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized}
-    broadcastOfflineGossip t result.expiredLocal
+    broadcastOfflineGossip t result.peerServers result.expiredLocal
 
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
-    let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && count events <= maxGossipEvents
+    let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && not (tooLong fromServer maxPubkeyLen) && count events <= maxGossipEvents
     let onlineEntries = do
       e <- events
       where validRequest
@@ -457,7 +460,7 @@ serve = \req -> case req of
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
       where not (e.server == serverHost)
-      where e.timestamp <= t
+      where e.timestamp <= t + clockSkewTolerance
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
       yield {pubkey: e.pubkey, server: e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp}
     let offlineEntries = do
@@ -469,7 +472,7 @@ serve = \req -> case req of
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
       where not (e.server == serverHost)
-      where e.timestamp <= t
+      where e.timestamp <= t + clockSkewTolerance
       where t - e.timestamp < (clampTtl e.ttl) * 1000
       yield {pubkey: e.pubkey, server: e.server, timestamp: e.timestamp}
     let filteredOnline = do
@@ -503,7 +506,7 @@ serve = \req -> case req of
               yield a)
             [e]) [] filteredOnline
     gossipResult <- atomic do
-      expiredLocal <- pruneExpired t
+      pr <- pruneExpired t
       presence <- *presence
       let appliedOnline = do
         e <- deduped
@@ -561,7 +564,7 @@ serve = \req -> case req of
       set *presence = if validRequest
         then afterOffline
         else presence
-      yield {appliedKeys: (union appliedOnline appliedOffline), expiredLocal: expiredLocal}
+      yield {appliedKeys: (union appliedOnline appliedOffline), expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     let validEvents = do
       e <- events
       where validRequest
@@ -570,7 +573,7 @@ serve = \req -> case req of
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
       where not (e.server == serverHost)
-      where e.timestamp <= t
+      where e.timestamp <= t + clockSkewTolerance
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
       where not (e.eventType == "online" && count (do
         o <- offlineEntries
@@ -593,7 +596,7 @@ serve = \req -> case req of
             else union acc [p.server]) [] presence)
         let senderServers = fold (\acc e ->
           if count (do a <- acc; where a == e.server; yield a) > 0 then acc
-          else union acc [e.server]) (if fromServer == "" then [] else [fromServer]) validEvents
+          else union acc [e.server]) (if fromServer == "" then [] else [fromServer]) effectiveEvents
         let targets = do
           s <- peerServers
           where count (do ss <- senderServers; where ss == s; yield ss) == 0
@@ -604,7 +607,7 @@ serve = \req -> case req of
             {events: effectiveEvents, hopsRemaining: cappedHops - 1, fromServer: serverHost})
       else yield {}
     respond {ok: validRequest}
-    broadcastOfflineGossip t gossipResult.expiredLocal
+    broadcastOfflineGossip t gossipResult.peerServers gossipResult.expiredLocal
 
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
     t <- now
@@ -612,8 +615,8 @@ serve = \req -> case req of
     let validOrigin = not (originServer == "") && not (originServer == serverHost)
     let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen)
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
-    expiredLocal <- atomic do
-      el <- pruneExpired t
+    pruneResult <- atomic do
+      pr <- pruneExpired t
       messages <- *messages
       seqCounter <- *seqCounter
       let seqTs = if t > seqCounter then t else seqCounter + 1
@@ -629,9 +632,9 @@ serve = \req -> case req of
           [{messageId: messageId, toKey: toKey, fromKey: fromKey,
             encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
         else messages
-      yield el
+      yield pr
     respond {ok: authorized && validOrigin && validFields}
-    broadcastOfflineGossip t expiredLocal
+    broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
@@ -642,8 +645,8 @@ serve = \req -> case req of
       else if count (do a <- acc; where a == mid; yield a) > 0 then acc
       else union acc [mid]) [] messageIds
     let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen) && count messageIds <= maxMessageIds
-    expiredLocal <- atomic do
-      el <- pruneExpired t
+    pruneResult <- atomic do
+      pr <- pruneExpired t
       messages <- *messages
       presence <- *presence
       set *messages = if validAck
@@ -651,6 +654,7 @@ serve = \req -> case req of
           m <- messages
           mid <- dedupedIds
           where m.messageId == mid
+          where m.originServer == ""
           where count (do
             p <- presence
             where p.pubkey == m.toKey
@@ -659,9 +663,9 @@ serve = \req -> case req of
             yield p) == 0
           yield m)
         else messages
-      yield el
+      yield pr
     respond {ok: validAck}
-    broadcastOfflineGossip t expiredLocal
+    broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal
 
 -- ============================================
 -- Entry Point
