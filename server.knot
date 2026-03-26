@@ -378,6 +378,7 @@ serve = \req -> case req of
     t <- now
     let dedupedIds = fold (\acc mid ->
       if mid == "" then acc
+      else if tooLong mid maxPubkeyLen then acc
       else if count acc >= maxMessageIds then acc
       else if count (do a <- acc; where a == mid; yield a) > 0 then acc
       else union acc [mid]) [] messageIds
@@ -437,7 +438,7 @@ serve = \req -> case req of
       let foundServer = case session of
         Nothing {} -> ""
         Just {value: _} ->
-          if pubkey == "" || tooLong pubkey maxPubkeyLen || count valid == 0
+          if pubkey == "" || tooLong pubkey maxPubkeyLen || not (isValidHex pubkey) || count valid == 0
             then ""
             else case single (do
               p <- valid
@@ -575,6 +576,7 @@ serve = \req -> case req of
       where validRequest
       where not (e.server == "")
       where not (e.pubkey == "")
+      where isValidHex e.pubkey
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
       where not (e.server == serverHost)
@@ -618,7 +620,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == "") && not (originServer == serverHost)
-    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen)
+    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && isValidHex toKey && isValidHex fromKey && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen)
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     pruneResult <- atomic do
       pr <- pruneExpired t
@@ -646,10 +648,11 @@ serve = \req -> case req of
     let authorized = verifyFederationAuth authorization
     let dedupedIds = fold (\acc mid ->
       if mid == "" then acc
+      else if tooLong mid maxPubkeyLen then acc
       else if count acc >= maxMessageIds then acc
       else if count (do a <- acc; where a == mid; yield a) > 0 then acc
       else union acc [mid]) [] messageIds
-    let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen) && count dedupedIds <= maxMessageIds
+    let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen)
     pruneResult <- atomic do
       pr <- pruneExpired t
       messages <- *messages
