@@ -55,7 +55,7 @@ route AuthApi where
 
 route ClientApi where
   GET {cursor: Int} /poll headers {authorization: Text}
-    -> {events: [PollEvent], cursor: Int}
+    -> {events: [PollEvent], cursor: Int, authorized: Bool}
     = Poll
   /messages
     POST {to: Text, encryptedBlob: Text, timestamp: Int} / headers {authorization: Text}
@@ -163,7 +163,7 @@ pruneExpired = \t -> do
   messages <- *messages
   set *messages = do
     m <- messages
-    where m.timestamp >= t - messageMaxAge
+    where m.receivedAt >= t - messageMaxAge
     yield m
   yield {expiredLocal: (do
     p <- presenceBefore
@@ -198,7 +198,7 @@ broadcastOfflineGossip = \t peerServers expiredLocal -> do
 serve = \req -> case req of
 
   ReqChallenge {pubkey, respond} ->
-    if pubkey == "" || tooLong pubkey maxPubkeyLen
+    if pubkey == "" || tooLong pubkey maxPubkeyLen || not (isValidHex pubkey)
       then respond {challenge: ""}
       else do
         challenge <- genToken
@@ -297,24 +297,27 @@ serve = \req -> case req of
         Just {value: s} -> do
           m <- messages
           where m.toKey == s.pubkey
-          where m.timestamp >= t - messageMaxAge
+          where m.receivedAt >= t - messageMaxAge
           where m.receivedAt > cursor
           yield {id: m.messageId, eventType: "message",
                  payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
                                   encryptedBlob: m.encryptedBlob,
                                   timestamp: m.timestamp}}
+      let authorized = case session of
+        Nothing {} -> False {}
+        _ -> True {}
       let newCursor = case session of
         Nothing {} -> -1
         _ -> if seqCounter > cursor then seqCounter else cursor
-      yield {events: evts, cursor: newCursor, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
-    respond {events: result.events, cursor: result.cursor}
+      yield {events: evts, cursor: newCursor, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
+    respond {events: result.events, cursor: result.cursor, authorized: result.authorized}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
     msgId <- genToken
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
-    let validInput = not (to == "") && not (encryptedBlob == "") && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen)
+    let validInput = not (to == "") && not (encryptedBlob == "") && isValidHex to && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen)
     result <- atomic do
       pr <- pruneExpired t
       sessions <- *sessions
@@ -450,13 +453,14 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
-    let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && not (tooLong fromServer maxPubkeyLen) && count events <= maxGossipEvents
+    let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen) && count events <= maxGossipEvents
     let onlineEntries = do
       e <- events
       where validRequest
       where e.eventType == "online"
       where not (e.server == "")
       where not (e.pubkey == "")
+      where isValidHex e.pubkey
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
       where not (e.server == serverHost)
@@ -469,6 +473,7 @@ serve = \req -> case req of
       where e.eventType == "offline"
       where not (e.server == "")
       where not (e.pubkey == "")
+      where isValidHex e.pubkey
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
       where not (e.server == serverHost)
@@ -623,7 +628,7 @@ serve = \req -> case req of
       let exists = count (do
         m <- messages
         where m.messageId == messageId
-        where m.timestamp >= t - messageMaxAge
+        where m.receivedAt >= t - messageMaxAge
         yield m) > 0
       let shouldInsert = authorized && validOrigin && validFields && not exists
       set *seqCounter = if shouldInsert then seqTs else seqCounter
@@ -644,7 +649,7 @@ serve = \req -> case req of
       else if count acc >= maxMessageIds then acc
       else if count (do a <- acc; where a == mid; yield a) > 0 then acc
       else union acc [mid]) [] messageIds
-    let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen) && count messageIds <= maxMessageIds
+    let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen) && count dedupedIds <= maxMessageIds
     pruneResult <- atomic do
       pr <- pruneExpired t
       messages <- *messages
