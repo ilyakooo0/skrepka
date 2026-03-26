@@ -11,6 +11,11 @@ federationSecret = "" -- must be set to enable federation
 federationScheme = "https://" -- scheme for federation HTTP calls
 messageMaxAge = 86400000 -- 24 hours in milliseconds
 maxPresenceTtl = 3600 -- max presence TTL from gossip in seconds
+maxPubkeyLen = 256
+maxBlobLen = 65536
+maxSignatureLen = 256
+maxMessageIds = 100
+maxGossipEvents = 100
 
 -- ============================================
 -- Types
@@ -30,7 +35,7 @@ type GossipEvent = {eventType: Text, pubkey: Text, server: Text, timestamp: Int,
 
 *messages : [{messageId: Text, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int, originServer: Text, receivedAt: Int}]
 
-*presence : [{pubkey: Text, server: Text, expiresAt: Int}]
+*presence : [{pubkey: Text, server: Text, expiresAt: Int, timestamp: Int}]
 
 -- ============================================
 -- Routes
@@ -57,7 +62,7 @@ route ClientApi where
       -> {ok: Bool}
       = AckMessages
   GET /lookup/{pubkey: Text} headers {authorization: Text}
-    -> {online: Bool, server: Text}
+    -> {online: Bool, server: Text, authorized: Bool}
     = LookupPresence
 
 route FederationApi where
@@ -84,6 +89,8 @@ genToken = do
   c <- randomInt 2147483647
   d <- randomInt 2147483647
   yield (bytesToHex (textToBytes (show a ++ "." ++ show b ++ "." ++ show c ++ "." ++ show d)))
+
+tooLong = \s maxLen -> not (drop maxLen s == "")
 
 lookupSession = \sessions token t ->
   single (do
@@ -156,7 +163,7 @@ pruneExpired = \t -> do
 serve = \req -> case req of
 
   ReqChallenge {pubkey, respond} ->
-    if pubkey == ""
+    if pubkey == "" || tooLong pubkey maxPubkeyLen
       then respond {challenge: ""}
       else do
         challenge <- genToken
@@ -214,7 +221,7 @@ serve = \req -> case req of
             p <- presence
             where not (p.pubkey == pubkey && p.server == serverHost)
             yield p)
-          [{pubkey: pubkey, server: serverHost, expiresAt: expiry}]
+          [{pubkey: pubkey, server: serverHost, expiresAt: expiry, timestamp: t}]
         else presence
       set *presence = updatedPresence
       let peerServers = if sigValid && not (federationSecret == "")
@@ -239,12 +246,18 @@ serve = \req -> case req of
     let token = extractToken authorization
     result <- atomic do
       presenceBeforePrune <- *presence
+      pruneExpired t
+      presenceAfterPrune <- *presence
       let expiredLocal = do
         p <- presenceBeforePrune
         where p.expiresAt <= t
         where p.server == serverHost
+        where count (do
+          q <- presenceAfterPrune
+          where q.pubkey == p.pubkey
+          where q.server == serverHost
+          yield q) == 0
         yield p
-      pruneExpired t
       sessions <- *sessions
       messages <- *messages
       let session = lookupSession sessions token t
@@ -289,7 +302,7 @@ serve = \req -> case req of
     t <- now
     msgId <- genToken
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
-    let validInput = not (to == "") && not (encryptedBlob == "")
+    let validInput = not (to == "") && not (encryptedBlob == "") && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen)
     result <- atomic do
       pruneExpired t
       sessions <- *sessions
@@ -344,7 +357,9 @@ serve = \req -> case req of
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
     let dedupedIds = fold (\acc mid ->
-      if count (do a <- acc; where a == mid; yield a) > 0 then acc
+      if mid == "" then acc
+      else if count acc >= maxMessageIds then acc
+      else if count (do a <- acc; where a == mid; yield a) > 0 then acc
       else union acc [mid]) [] messageIds
     result <- atomic do
       pruneExpired t
@@ -383,47 +398,43 @@ serve = \req -> case req of
       else yield {}
     respond {ok: result.ok}
 
-  LookupPresence {pubkey, authorization, respond} ->
-    if pubkey == ""
-      then respond {online: False {}, server: ""}
-      else do
-        t <- now
-        result <- atomic do
-          pruneExpired t
-          sessions <- *sessions
-          presence <- *presence
-          let session = lookupSession sessions (extractToken authorization) t
-          let valid = do
-            p <- presence
-            where p.pubkey == pubkey
-            where p.expiresAt > t
-            yield p
-          let foundServer = case session of
-            Nothing {} -> ""
-            Just {value: _} ->
-              if count valid == 0
-                then ""
-                else case single (do
-                  p <- valid
-                  where p.server == serverHost
-                  yield p) of
-                  Just {value: p} -> p.server
-                  Nothing {} -> fold (\_ p -> p.server) "" valid
-          let authorized = case session of
-            Nothing {} -> False {}
-            _ -> True {}
-          yield {foundServer: foundServer, authorized: authorized}
-        if result.authorized
-          then respond {online: not (result.foundServer == ""), server: result.foundServer}
-          else respond {online: False {}, server: ""}
+  LookupPresence {pubkey, authorization, respond} -> do
+    t <- now
+    result <- atomic do
+      pruneExpired t
+      sessions <- *sessions
+      presence <- *presence
+      let session = lookupSession sessions (extractToken authorization) t
+      let authorized = case session of
+        Nothing {} -> False {}
+        _ -> True {}
+      let valid = do
+        p <- presence
+        where p.pubkey == pubkey
+        where p.expiresAt > t
+        yield p
+      let foundServer = case session of
+        Nothing {} -> ""
+        Just {value: _} ->
+          if pubkey == "" || tooLong pubkey maxPubkeyLen || count valid == 0
+            then ""
+            else case single (do
+              p <- valid
+              where p.server == serverHost
+              yield p) of
+              Just {value: p} -> p.server
+              Nothing {} -> fold (\_ p -> p.server) "" valid
+      yield {foundServer: foundServer, authorized: authorized}
+    respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized}
 
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
-    let validRequest = authorized && cappedHops >= 1
+    let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && count events <= maxGossipEvents
     let onlineEntries = do
       e <- events
+      where validRequest
       where e.eventType == "online"
       where not (e.server == "")
       where not (e.pubkey == "")
@@ -433,6 +444,7 @@ serve = \req -> case req of
       yield {pubkey: e.pubkey, server: e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp}
     let offlineEntries = do
       e <- events
+      where validRequest
       where e.eventType == "offline"
       where not (e.server == "")
       where not (e.pubkey == "")
@@ -448,7 +460,7 @@ serve = \req -> case req of
         where o.server == e.server
         where o.timestamp >= e.timestamp
         yield o) == 0
-      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.expiresAt}
+      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.expiresAt, timestamp: e.timestamp}
     let affectedKeys = union
       (do
         e <- onlineEntries
@@ -500,7 +512,7 @@ serve = \req -> case req of
           o <- offlineEntries
           where o.pubkey == k.pubkey
           where o.server == k.server
-          where o.timestamp >= p.expiresAt - maxPresenceTtl * 1000
+          where o.timestamp >= p.timestamp
           yield o) > 0
         yield p)
       set *presence = if validRequest
@@ -508,6 +520,7 @@ serve = \req -> case req of
         else presence
     let validEvents = do
       e <- events
+      where validRequest
       where not (e.server == "")
       where not (e.pubkey == "")
       where not (e.server == serverHost)
@@ -540,7 +553,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == "") && not (originServer == serverHost)
-    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "")
+    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen)
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     atomic do
       pruneExpired t
@@ -563,7 +576,7 @@ serve = \req -> case req of
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
-    let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost)
+    let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && count messageIds <= maxMessageIds
     atomic do
       pruneExpired t
       messages <- *messages
