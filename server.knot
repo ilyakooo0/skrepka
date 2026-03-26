@@ -620,7 +620,7 @@ serve = \req -> case req of
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
-    let validOrigin = not (originServer == "") && not (originServer == serverHost)
+    let validOrigin = not (originServer == "") && not (originServer == serverHost) && not (tooLong originServer maxPubkeyLen)
     let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && isValidHex toKey && isValidHex fromKey && isValidHex messageId && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen)
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     pruneResult <- atomic do
