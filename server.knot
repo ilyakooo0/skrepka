@@ -68,7 +68,7 @@ route FederationApi where
     POST {toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int, originServer: Text, messageId: Text} /forward headers {authorization: Text}
       -> {ok: Bool}
       = ForwardMessage
-    POST {messageIds: [Text], originServer: Text} /ack headers {authorization: Text}
+    POST {messageIds: [Text], originServer: Text, fromServer: Text} /ack headers {authorization: Text}
       -> {ok: Bool}
       = FederationAck
 
@@ -196,6 +196,19 @@ serve = \req -> case req of
     if sigValid
       then respond {token: token, expiresAt: expiry}
       else respond {token: "", expiresAt: 0}
+    if sigValid && not (federationSecret == "")
+      then do
+        peerServers <- atomic do
+          presence <- *presence
+          yield (fold (\acc p ->
+            if p.server == serverHost then acc
+            else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
+            else union acc [p.server]) [] presence)
+        sendToEach peerServers (\server ->
+          httpPost (federationScheme ++ server ++ "/federation/gossip")
+            {authorization: "Bearer " ++ federationSecret}
+            {events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2})
+      else yield {}
 
   Poll {authorization, respond} -> do
     t <- now
@@ -306,13 +319,13 @@ serve = \req -> case req of
         httpPost (federationScheme ++ server ++ "/federation/ack")
           {authorization: "Bearer " ++ federationSecret}
           {messageIds: (do m <- fedMessages; where m.originServer == server; yield m.messageId),
-           originServer: server})
+           originServer: server, fromServer: serverHost})
       else yield {}
     respond {ok: result.ok}
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
-    foundServer <- atomic do
+    result <- atomic do
       pruneExpired t
       sessions <- *sessions
       presence <- *presence
@@ -333,8 +346,13 @@ serve = \req -> case req of
               yield p) of
               Just {value: p} -> p.server
               Nothing {} -> fold (\_ p -> p.server) "" valid
-      yield foundServer
-    respond {online: not (foundServer == ""), server: foundServer}
+      let authorized = case session of
+        Nothing {} -> False {}
+        _ -> True {}
+      yield {foundServer: foundServer, authorized: authorized}
+    if result.authorized
+      then respond {online: not (result.foundServer == ""), server: result.foundServer}
+      else respond {online: False {}, server: "unauthorized"}
 
   RecvGossip {events, hopsRemaining, authorization, respond} -> do
     t <- now
@@ -346,19 +364,30 @@ serve = \req -> case req of
       where not (e.server == serverHost)
       where e.timestamp <= t
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
-      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000}
+      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp}
     let offlineEntries = do
       e <- events
       where e.eventType == "offline"
       where not (e.server == serverHost)
       where e.timestamp <= t
       where t - e.timestamp < (clampTtl e.ttl) * 1000
-      yield {pubkey: e.pubkey, server: e.server}
+      yield {pubkey: e.pubkey, server: e.server, timestamp: e.timestamp}
+    let filteredOnline = do
+      e <- onlineEntries
+      where count (do
+        o <- offlineEntries
+        where o.pubkey == e.pubkey
+        where o.server == e.server
+        where o.timestamp > e.timestamp
+        yield o) == 0
+      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.expiresAt}
     let affectedKeys = union
       (do
         e <- onlineEntries
         yield {pubkey: e.pubkey, server: e.server})
-      offlineEntries
+      (do
+        e <- offlineEntries
+        yield {pubkey: e.pubkey, server: e.server})
     let deduped = fold (\acc e ->
         if count (do
             a <- acc
@@ -372,7 +401,7 @@ serve = \req -> case req of
               a <- acc
               where not (a.pubkey == e.pubkey && a.server == e.server)
               yield a)
-            [e]) [] onlineEntries
+            [e]) [] filteredOnline
     atomic do
       pruneExpired t
       presence <- *presence
@@ -410,6 +439,7 @@ serve = \req -> case req of
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
+    let validOrigin = not (originServer == "") && not (originServer == serverHost)
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
     atomic do
       pruneExpired t
@@ -419,18 +449,18 @@ serve = \req -> case req of
         where m.messageId == messageId
         where m.timestamp > t - messageMaxAge
         yield m) > 0
-      let shouldInsert = authorized && not exists
+      let shouldInsert = authorized && validOrigin && not exists
       set *messages = if shouldInsert
         then union messages
           [{messageId: messageId, toKey: toKey, fromKey: fromKey,
             encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer}]
         else messages
-    respond {ok: authorized}
+    respond {ok: authorized && validOrigin}
 
-  FederationAck {messageIds, originServer, authorization, respond} -> do
+  FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
-    let validAck = authorized && originServer == serverHost
+    let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost)
     atomic do
       pruneExpired t
       messages <- *messages
@@ -446,6 +476,12 @@ serve = \req -> case req of
             where p.server == serverHost
             where p.expiresAt > t
             yield p) == 0
+          where count (do
+            p <- presence
+            where p.pubkey == m.toKey
+            where p.server == fromServer
+            where p.expiresAt > t
+            yield p) > 0
           yield m)
         else messages
     respond {ok: validAck}
