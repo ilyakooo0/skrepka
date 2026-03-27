@@ -114,18 +114,9 @@ verifyFederationAuth = \authorization ->
 
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
 
-forwardToAll = \servers path headers body ->
-  if count servers == 0
-    then yield False {}
-    else do
-      let server = fold (\acc s -> if acc == "" then s else acc) "" servers
-      let rest = do s <- servers; where not (s == server); yield s
-      if server == ""
-        then yield False {}
-        else do
-          result <- httpPost (federationScheme ++ server ++ path) headers body
-          restOk <- forwardToAll rest path headers body
-          yield (if result.ok then True {} else restOk)
+forwardToAll = \servers action -> do
+  sendToEach servers (\server -> action server)
+  yield (count servers > 0)
 
 sendToEach = \servers action ->
   if count servers == 0
@@ -186,9 +177,9 @@ broadcastOfflineGossip = \t peerServers expiredLocal -> do
         pk <- expiredPubkeys
         yield {eventType: "offline", pubkey: pk, server: serverHost, timestamp: t, ttl: 3600}
       sendToEach peerServers (\server ->
-        httpPost (federationScheme ++ server ++ "/federation/gossip")
-          {authorization: "Bearer " ++ federationSecret}
-          {events: gossipEvents, hopsRemaining: 2, fromServer: serverHost})
+        fetch (federationScheme ++ server) (RecvGossip {
+          authorization: "Bearer " ++ federationSecret,
+          events: gossipEvents, hopsRemaining: 2, fromServer: serverHost}))
     else yield {}
 
 -- ============================================
@@ -197,20 +188,21 @@ broadcastOfflineGossip = \t peerServers expiredLocal -> do
 
 serve = \req -> case req of
 
-  ReqChallenge {pubkey, respond} ->
-    if pubkey == "" || tooLong pubkey maxPubkeyLen || not (isValidHex pubkey)
-      then respond {challenge: ""}
-      else do
-        challenge <- genToken
-        t <- now
+  ReqChallenge {pubkey, respond} -> do
+    let valid = not (pubkey == "") && not (tooLong pubkey maxPubkeyLen) && isValidHex pubkey
+    challenge <- genToken
+    t <- now
+    if valid
+      then do
         pruneResult <- atomic do
           pr <- pruneExpired t
           challenges <- *challenges
           set *challenges = union challenges
             [{pubkey: pubkey, challenge: challenge, expiresAt: t + 60000}]
           yield pr
-        respond {challenge: challenge}
         broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal
+      else yield {}
+    respond {challenge: (if valid then challenge else "")}
 
   VerifyAuth {pubkey, challenge, signature, respond} -> do
     t <- now
@@ -272,16 +264,16 @@ serve = \req -> case req of
           else union acc [p.server]) [] updatedPresence
         else []
       yield {sigValid: sigValid, peerServers: peerServers, expiredLocal: pr.expiredLocal, offlinePeers: pr.peerServers}
+    if result.sigValid && not (federationSecret == "")
+      then sendToEach result.peerServers (\server ->
+        fetch (federationScheme ++ server) (RecvGossip {
+          authorization: "Bearer " ++ federationSecret,
+          events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2, fromServer: serverHost}))
+      else yield {}
+    broadcastOfflineGossip t result.offlinePeers result.expiredLocal
     if result.sigValid
       then respond {token: token, expiresAt: expiry}
       else respond {token: "", expiresAt: 0}
-    if result.sigValid && not (federationSecret == "")
-      then sendToEach result.peerServers (\server ->
-        httpPost (federationScheme ++ server ++ "/federation/gossip")
-          {authorization: "Bearer " ++ federationSecret}
-          {events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2, fromServer: serverHost})
-      else yield {}
-    broadcastOfflineGossip t result.offlinePeers result.expiredLocal
 
   Poll {cursor, authorization, respond} -> do
     t <- now
@@ -310,8 +302,8 @@ serve = \req -> case req of
         Nothing {} -> -1
         _ -> if seqCounter > cursor then seqCounter else cursor
       yield {events: evts, cursor: newCursor, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
-    respond {events: result.events, cursor: result.cursor, authorized: result.authorized}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
+    respond {events: result.events, cursor: result.cursor, authorized: result.authorized}
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
@@ -365,14 +357,15 @@ serve = \req -> case req of
       yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     finalStatus <- if result.status == "federated" && not (federationSecret == "")
       then do
-        anyOk <- forwardToAll result.remoteServers "/federation/forward"
-          {authorization: "Bearer " ++ federationSecret}
-          {toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
-           timestamp: clampedTs, originServer: serverHost, messageId: msgId}
+        anyOk <- forwardToAll result.remoteServers (\server ->
+          fetch (federationScheme ++ server) (ForwardMessage {
+            toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
+            timestamp: clampedTs, originServer: serverHost, messageId: msgId,
+            authorization: "Bearer " ++ federationSecret}))
         yield (if anyOk then "federated" else "queued")
       else yield result.status
-    respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else msgId)}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
+    respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else msgId)}
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -413,13 +406,13 @@ serve = \req -> case req of
       else union acc [m.originServer]) [] fedMessages
     if result.ok && count originServers > 0 && not (federationSecret == "")
       then sendToEach originServers (\server ->
-        httpPost (federationScheme ++ server ++ "/federation/ack")
-          {authorization: "Bearer " ++ federationSecret}
-          {messageIds: (do m <- fedMessages; where m.originServer == server; yield m.messageId),
-           originServer: server, fromServer: serverHost})
+        fetch (federationScheme ++ server) (FederationAck {
+          authorization: "Bearer " ++ federationSecret,
+          messageIds: (do m <- fedMessages; where m.originServer == server; yield m.messageId),
+          originServer: server, fromServer: serverHost}))
       else yield {}
-    respond {ok: result.ok}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
+    respond {ok: result.ok}
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
@@ -448,8 +441,8 @@ serve = \req -> case req of
               Just {value: p} -> p.server
               Nothing {} -> fold (\_ p -> p.server) "" valid
       yield {foundServer: foundServer, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
-    respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
+    respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized}
 
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
@@ -610,12 +603,12 @@ serve = \req -> case req of
           where count (do ss <- senderServers; where ss == s; yield ss) == 0
           yield s
         sendToEach targets (\server ->
-          httpPost (federationScheme ++ server ++ "/federation/gossip")
-            {authorization: "Bearer " ++ federationSecret}
-            {events: effectiveEvents, hopsRemaining: cappedHops - 1, fromServer: serverHost})
+          fetch (federationScheme ++ server) (RecvGossip {
+            authorization: "Bearer " ++ federationSecret,
+            events: effectiveEvents, hopsRemaining: cappedHops - 1, fromServer: serverHost}))
       else yield {}
-    respond {ok: validRequest}
     broadcastOfflineGossip t gossipResult.peerServers gossipResult.expiredLocal
+    respond {ok: validRequest}
 
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
     t <- now
@@ -642,8 +635,8 @@ serve = \req -> case req of
             encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
         else messages
       yield pr
-    respond {ok: authorized && validOrigin && validFields}
     broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal
+    respond {ok: authorized && validOrigin && validFields}
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
@@ -675,8 +668,8 @@ serve = \req -> case req of
           yield m)
         else messages
       yield pr
-    respond {ok: validAck}
     broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal
+    respond {ok: validAck}
 
 -- ============================================
 -- Entry Point
