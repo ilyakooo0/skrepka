@@ -317,7 +317,7 @@ serve = \req -> case req of
     t <- now
     msgId <- genToken
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
-    let validInput = not (to == "") && not (encryptedBlob == "") && isValidHex to && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen)
+    let validInput = not (to == "") && not (encryptedBlob == "") && isValidHex to && isValidHex encryptedBlob && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen)
     result <- atomic do
       pr <- pruneExpired t
       sessions <- *sessions
@@ -621,7 +621,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == "") && not (originServer == serverHost) && not (tooLong originServer maxPubkeyLen)
-    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && isValidHex toKey && isValidHex fromKey && isValidHex messageId && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen)
+    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && isValidHex toKey && isValidHex fromKey && isValidHex encryptedBlob && isValidHex messageId && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen)
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     pruneResult <- atomic do
       pr <- pruneExpired t
@@ -631,6 +631,7 @@ serve = \req -> case req of
       let exists = count (do
         m <- messages
         where m.messageId == messageId
+        where m.toKey == toKey
         where m.receivedAt >= t - messageMaxAge
         yield m) > 0
       let shouldInsert = authorized && validOrigin && validFields && not exists
