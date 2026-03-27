@@ -46,7 +46,8 @@ module App =
           ComposeText: string
           NewPubkey: string
           NewNickname: string
-          Error: string option }
+          Error: string option
+          PollCursor: int64 }
 
     // ── Msg ──
 
@@ -66,7 +67,7 @@ module App =
         | SetNewNickname of string
         | DoSaveContact
         | DoDeleteContact of string
-        | PollResult of (string * string * int64 * string) list * string
+        | PollResult of (string * string * int64 * string) list * string * int64
         | DoPoll
         | CopyPubKey
         | DismissError
@@ -84,7 +85,7 @@ module App =
             pubKeyHex: string *
             recipPubHex: string *
             text: string
-        | CmdPoll of url: string * token: string * privKey: byte[]
+        | CmdPoll of url: string * token: string * privKey: byte[] * cursor: int64
         | CmdCopyToClipboard of string
 
     // ── Helpers ──
@@ -112,7 +113,8 @@ module App =
           ComposeText = ""
           NewPubkey = ""
           NewNickname = ""
-          Error = None },
+          Error = None
+          PollCursor = 0L },
         []
 
     // ── Update ──
@@ -143,7 +145,7 @@ module App =
                 Conn = Online token
                 Page = Conversations
                 Error = None },
-            [ CmdPoll(model.ServerUrl, token, model.PrivKey.Value) ]
+            [ CmdPoll(model.ServerUrl, token, model.PrivKey.Value, model.PollCursor) ]
 
         | AuthErr err -> { model with Conn = Offline; Error = Some err }, []
 
@@ -170,7 +172,7 @@ module App =
 
         | Sent _ -> model, []
 
-        | PollResult(incoming, status) ->
+        | PollResult(incoming, status, newCursor) ->
             let model' =
                 incoming
                 |> List.fold
@@ -195,15 +197,15 @@ module App =
                             { m with
                                 Contacts = contacts
                                 Messages = m.Messages |> Map.add fromPk (msgs @ [ newMsg ]) })
-                    { model with PollStatus = status }
+                    { model with PollStatus = status; PollCursor = newCursor }
 
             match model'.Conn with
-            | Online token -> model', [ CmdPoll(model'.ServerUrl, token, model'.PrivKey.Value) ]
+            | Online token -> model', [ CmdPoll(model'.ServerUrl, token, model'.PrivKey.Value, model'.PollCursor) ]
             | _ -> model', []
 
         | DoPoll ->
             match model.Conn, model.PrivKey with
-            | Online token, Some priv -> model, [ CmdPoll(model.ServerUrl, token, priv) ]
+            | Online token, Some priv -> model, [ CmdPoll(model.ServerUrl, token, priv, model.PollCursor) ]
             | _ -> model, []
 
         | SetNewPubkey pk -> { model with NewPubkey = pk }, []
@@ -294,10 +296,10 @@ module App =
                     return DismissError  // TODO: show send errors properly
             })
 
-        | CmdPoll(url, token, privKey) ->
+        | CmdPoll(url, token, privKey, cursor) ->
             asyncCmd (async {
                 try
-                    let! (events, _) = ApiClient.poll url token
+                    let! (events, newCursor) = ApiClient.poll url token cursor
                     let messages = ResizeArray()
                     let ackIds = ResizeArray()
                     let errors = ResizeArray()
@@ -335,15 +337,15 @@ module App =
                         $"[{now}] evts:{events.Length} msgs:{messages.Count} errs:{errors.Count}"
                         + (if errors.Count > 0 then $" [{errors.[0]}]" else "")
 
-                    return PollResult(Seq.toList messages, status)
+                    return PollResult(Seq.toList messages, status, newCursor)
                 with
                 | :? System.Threading.Tasks.TaskCanceledException ->
                     // Normal timeout from long poll — just retry
-                    return PollResult([], "polling...")
+                    return PollResult([], "polling...", cursor)
                 | ex ->
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
                     do! Async.Sleep 3000
-                    return PollResult([], $"[{now}] poll error: {ex.Message}")
+                    return PollResult([], $"[{now}] poll error: {ex.Message}", cursor)
             })
 
         | CmdCopyToClipboard text ->

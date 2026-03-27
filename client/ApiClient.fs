@@ -81,16 +81,16 @@ module ApiClient =
         c.Timeout <- System.Threading.Timeout.InfiniteTimeSpan
         c
 
-    let poll (serverUrl: string) (token: string) =
+    let poll (serverUrl: string) (token: string) (cursor: int64) =
         async {
-            let request = new HttpRequestMessage(HttpMethod.Get, $"{serverUrl}/poll?timeout=30")
+            let request = new HttpRequestMessage(HttpMethod.Get, $"{serverUrl}/poll?cursor={cursor}&timeout=30")
             request.Headers.Add("Authorization", $"Bearer {token}")
 
             let! response = pollClient.SendAsync(request) |> Async.AwaitTask
             let! text = response.Content.ReadAsStringAsync() |> Async.AwaitTask
             let doc = JsonDocument.Parse(text)
             let root = expectObject doc "/poll"
-            let cursor = root.GetProperty("cursor").GetString()
+            let cursor = root.GetProperty("cursor").GetInt64()
 
             // Knot runtime wraps relations as [[record1, record2, ...]]
             let eventsOuter = root.GetProperty("events")
