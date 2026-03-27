@@ -47,7 +47,8 @@ module App =
           NewPubkey: string
           NewNickname: string
           Error: string option
-          PollCursor: int64 }
+          PollCursor: int64
+          LastSendStatus: string }
 
     // ── Msg ──
 
@@ -114,7 +115,8 @@ module App =
           NewPubkey = ""
           NewNickname = ""
           Error = None
-          PollCursor = 0L },
+          PollCursor = 0L
+          LastSendStatus = "" },
         []
 
     // ── Update ──
@@ -170,7 +172,7 @@ module App =
                 [ CmdSend(model.ServerUrl, token, pk, priv, model.PubKeyHex, pk, text) ]
             | _ -> model, []
 
-        | Sent _ -> model, []
+        | Sent(_, status) -> { model with LastSendStatus = status }, []
 
         | PollResult(incoming, status, newCursor) ->
             let model' =
@@ -290,8 +292,8 @@ module App =
 
                     let blob = Crypto.encrypt privKey pubKey recipPub payload
                     let blobHex = Crypto.toHex blob
-                    let! (_, msgId) = ApiClient.sendMessage url token toHex blobHex ts
-                    return Sent(toHex, msgId)
+                    let! (status, msgId) = ApiClient.sendMessage url token toHex blobHex ts
+                    return Sent(toHex, $"{status}:{msgId}")
                 with ex ->
                     return DismissError  // TODO: show send errors properly
             })
@@ -309,7 +311,12 @@ module App =
                             try
                                 let doc = JsonDocument.Parse(payload)
                                 let blobHex = doc.RootElement.GetProperty("encryptedBlob").GetString()
-                                let ts = doc.RootElement.GetProperty("timestamp").GetInt64()
+                                let tsEl = doc.RootElement.GetProperty("timestamp")
+                                let ts =
+                                    if tsEl.ValueKind = JsonValueKind.String then
+                                        Int64.Parse(tsEl.GetString())
+                                    else
+                                        tsEl.GetInt64()
                                 let blob = Crypto.fromHex blobHex
 
                                 match Crypto.decrypt privKey blob with
@@ -490,7 +497,7 @@ module App =
                         .textColor(Colors.Red)
                         .font(size = 11.)
 
-                Label($"[{msgs.Length} message(s), compose: \"{model.ComposeText}\"]")
+                Label($"[{msgs.Length} message(s), compose: \"{model.ComposeText}\", send: \"{model.LastSendStatus}\"]")
                     .textColor(Colors.Gray)
                     .font(size = 10.)
 

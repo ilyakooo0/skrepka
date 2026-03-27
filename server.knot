@@ -114,10 +114,6 @@ verifyFederationAuth = \authorization ->
 
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
 
-forwardToAll = \servers action -> do
-  sendToEach servers (\server -> action server)
-  yield (count servers > 0)
-
 sendToEach = \servers action ->
   if count servers == 0
     then yield {}
@@ -270,7 +266,10 @@ serve = \req -> case req of
           authorization: "Bearer " ++ federationSecret,
           events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2, fromServer: serverHost}))
       else yield {}
-    broadcastOfflineGossip t result.offlinePeers result.expiredLocal
+    broadcastOfflineGossip t result.offlinePeers (do
+      p <- result.expiredLocal
+      where not (p.pubkey == pubkey)
+      yield p)
     if result.sigValid
       then respond {token: token, expiresAt: expiry}
       else respond {token: "", expiresAt: 0}
@@ -309,7 +308,7 @@ serve = \req -> case req of
     t <- now
     msgId <- genToken
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
-    let validInput = not (to == "") && not (encryptedBlob == "") && isValidHex to && isValidHex encryptedBlob && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen)
+    let validInput = not (to == "") && not (encryptedBlob == "") && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && isValidHex to && isValidHex encryptedBlob
     result <- atomic do
       pr <- pruneExpired t
       sessions <- *sessions
@@ -357,13 +356,13 @@ serve = \req -> case req of
       yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     finalStatus <- if result.status == "federated" && not (federationSecret == "")
       then do
-        anyOk <- forwardToAll result.remoteServers (\server ->
+        sendToEach result.remoteServers (\server ->
           fetch (federationScheme ++ server) (ForwardMessage {
             toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
             timestamp: clampedTs, originServer: serverHost, messageId: msgId,
             authorization: "Bearer " ++ federationSecret}))
-        yield (if anyOk then "federated" else "queued")
-      else yield result.status
+        yield "federated"
+      else yield (if result.status == "federated" then "queued" else result.status)
     broadcastOfflineGossip t result.peerServers result.expiredLocal
     respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else msgId)}
 
@@ -371,9 +370,9 @@ serve = \req -> case req of
     t <- now
     let dedupedIds = fold (\acc mid ->
       if mid == "" then acc
-      else if not (isValidHex mid) then acc
-      else if tooLong mid maxPubkeyLen then acc
       else if count acc >= maxMessageIds then acc
+      else if tooLong mid maxPubkeyLen then acc
+      else if not (isValidHex mid) then acc
       else if count (do a <- acc; where a == mid; yield a) > 0 then acc
       else union acc [mid]) [] messageIds
     result <- atomic do
@@ -439,7 +438,7 @@ serve = \req -> case req of
               where p.server == serverHost
               yield p) of
               Just {value: p} -> p.server
-              Nothing {} -> fold (\_ p -> p.server) "" valid
+              Nothing {} -> (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
       yield {foundServer: foundServer, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
     respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized}
@@ -455,9 +454,9 @@ serve = \req -> case req of
       where e.eventType == "online"
       where not (e.server == "")
       where not (e.pubkey == "")
-      where isValidHex e.pubkey
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
+      where isValidHex e.pubkey
       where not (e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
@@ -468,9 +467,9 @@ serve = \req -> case req of
       where e.eventType == "offline"
       where not (e.server == "")
       where not (e.pubkey == "")
-      where isValidHex e.pubkey
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
+      where isValidHex e.pubkey
       where not (e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where t - e.timestamp < (clampTtl e.ttl) * 1000
@@ -570,9 +569,9 @@ serve = \req -> case req of
       where validRequest
       where not (e.server == "")
       where not (e.pubkey == "")
-      where isValidHex e.pubkey
       where not (tooLong e.pubkey maxPubkeyLen)
       where not (tooLong e.server maxPubkeyLen)
+      where isValidHex e.pubkey
       where not (e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
@@ -614,7 +613,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == "") && not (originServer == serverHost) && not (tooLong originServer maxPubkeyLen)
-    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && isValidHex toKey && isValidHex fromKey && isValidHex encryptedBlob && isValidHex messageId && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen)
+    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen) && isValidHex toKey && isValidHex fromKey && isValidHex encryptedBlob && isValidHex messageId
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     pruneResult <- atomic do
       pr <- pruneExpired t
@@ -643,9 +642,9 @@ serve = \req -> case req of
     let authorized = verifyFederationAuth authorization
     let dedupedIds = fold (\acc mid ->
       if mid == "" then acc
-      else if not (isValidHex mid) then acc
-      else if tooLong mid maxPubkeyLen then acc
       else if count acc >= maxMessageIds then acc
+      else if tooLong mid maxPubkeyLen then acc
+      else if not (isValidHex mid) then acc
       else if count (do a <- acc; where a == mid; yield a) > 0 then acc
       else union acc [mid]) [] messageIds
     let validAck = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen)

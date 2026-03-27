@@ -107,7 +107,12 @@ module ApiClient =
                       if e.ValueKind = JsonValueKind.Object then
                           let id = e.GetProperty("id").GetString()
                           let evtType = e.GetProperty("eventType").GetString()
-                          let payload = e.GetProperty("payload").GetString()
+                          let payloadEl = e.GetProperty("payload")
+                          let payload =
+                              if payloadEl.ValueKind = JsonValueKind.String then
+                                  payloadEl.GetString()
+                              else
+                                  payloadEl.GetRawText()
                           yield (id, evtType, payload) ]
 
             return (events, cursor)
