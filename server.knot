@@ -98,16 +98,31 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 -- Helpers
 -- ============================================
 
+hexDigit = \n ->
+  if n == 0 then "0" else if n == 1 then "1" else if n == 2 then "2" else if n == 3 then "3"
+  else if n == 4 then "4" else if n == 5 then "5" else if n == 6 then "6" else if n == 7 then "7"
+  else if n == 8 then "8" else if n == 9 then "9" else if n == 10 then "a" else if n == 11 then "b"
+  else if n == 12 then "c" else if n == 13 then "d" else if n == 14 then "e" else "f"
+
+byteToHex = \n -> hexDigit (n / 16) ++ hexDigit (n - (n / 16) * 16)
+
+intTo3Hex = \n ->
+  let b0 = n / 65536
+  let r0 = n - b0 * 65536
+  let b1 = r0 / 256
+  let b2 = r0 - b1 * 256
+  byteToHex b0 ++ byteToHex b1 ++ byteToHex b2
+
 genToken = do
-  a <- randomInt 2147483647
-  b <- randomInt 2147483647
-  c <- randomInt 2147483647
-  d <- randomInt 2147483647
-  e <- randomInt 2147483647
-  f <- randomInt 2147483647
-  g <- randomInt 2147483647
-  h <- randomInt 2147483647
-  yield (bytesToHex (textToBytes (show a ++ show b ++ show c ++ show d ++ show e ++ show f ++ show g ++ show h)))
+  a <- randomInt 16777216
+  b <- randomInt 16777216
+  c <- randomInt 16777216
+  d <- randomInt 16777216
+  e <- randomInt 16777216
+  f <- randomInt 16777216
+  g <- randomInt 16777216
+  h <- randomInt 16777216
+  yield (intTo3Hex a ++ intTo3Hex b ++ intTo3Hex c ++ intTo3Hex d ++ intTo3Hex e ++ intTo3Hex f ++ intTo3Hex g ++ intTo3Hex h)
 
 tooLong = \s maxLen -> not (drop maxLen s == "")
 
@@ -202,8 +217,8 @@ verifyMaintenanceAuth = \authorization ->
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
 
 safeCompareLoop = \s1 s2 result ->
-  if s1 == ""
-    then result + (if s2 == "" then 0 else 1)
+  if s1 == "" && s2 == ""
+    then result
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b -> safeCompareLoop a b 0 == 0
@@ -575,7 +590,7 @@ serve = \req -> case req of
 
   LookupPresence {pubkey, authorization, respond} -> do
     let validPubkey = not (pubkey == "") && not (tooLong pubkey maxPubkeyLen) && isValidHex pubkey
-    let pubkey = normalizeHex pubkey
+    let pubkey = if isValidHex pubkey then normalizeHex pubkey else pubkey
     t <- now
     result <- atomic do
       pr <- pruneExpired t
