@@ -103,7 +103,8 @@ isValidHex = \s -> not (s == "") && bytesToHex (bytesFromHex s) == s
 
 containsBadUrlChar = \s ->
   if s == "" then False {}
-  else if take 1 s == "/" || take 1 s == "?" || take 1 s == "#" || take 1 s == " " || take 1 s == "@"
+  else if take 1 s == "/" || take 1 s == "?" || take 1 s == "#" || take 1 s == " " || take 1 s == "@" || take 1 s == "%"
+    || take 1 (bytesToHex (textToBytes (take 1 s))) == "0" || take 1 (bytesToHex (textToBytes (take 1 s))) == "1" || bytesToHex (textToBytes (take 1 s)) == "7f"
     then True {}
     else containsBadUrlChar (drop 1 s)
 
@@ -115,7 +116,13 @@ lookupSession = \sessions token t ->
     yield s)
 
 extractToken = \authHeader ->
-  if take 7 authHeader == "Bearer " || take 7 authHeader == "bearer "
+  if (take 1 authHeader == "B" || take 1 authHeader == "b")
+    && (take 1 (drop 1 authHeader) == "e" || take 1 (drop 1 authHeader) == "E")
+    && (take 1 (drop 2 authHeader) == "a" || take 1 (drop 2 authHeader) == "A")
+    && (take 1 (drop 3 authHeader) == "r" || take 1 (drop 3 authHeader) == "R")
+    && (take 1 (drop 4 authHeader) == "e" || take 1 (drop 4 authHeader) == "E")
+    && (take 1 (drop 5 authHeader) == "r" || take 1 (drop 5 authHeader) == "R")
+    && take 1 (drop 6 authHeader) == " "
     then drop 7 authHeader
     else ""
 
@@ -514,7 +521,6 @@ serve = \req -> case req of
       where not (tooLong e.server maxPubkeyLen)
       where not (containsBadUrlChar e.server)
       where isValidHex e.pubkey
-      where e.server == fromServer
       where not (e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
@@ -529,7 +535,6 @@ serve = \req -> case req of
       where not (tooLong e.server maxPubkeyLen)
       where not (containsBadUrlChar e.server)
       where isValidHex e.pubkey
-      where e.server == fromServer
       where not (e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where t - e.timestamp < (clampTtl e.ttl) * 1000
@@ -681,7 +686,6 @@ serve = \req -> case req of
       where not (tooLong e.server maxPubkeyLen)
       where not (containsBadUrlChar e.server)
       where isValidHex e.pubkey
-      where e.server == fromServer
       where not (e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
