@@ -27,6 +27,7 @@ maxMessageIdLen = 128
 maxTokenLen = 256
 maxChallenges = 10000
 maxSessions = 10000
+maxAckedIds = 10000
 maxChallengesPerKey = 5
 maxSessionsPerKey = 10
 challengeExpiry = 60000 -- 1 minute in milliseconds
@@ -167,18 +168,22 @@ isCgnatRange = \s ->
   if not (take 4 s == "100.") then False {}
   else if (take 1 (drop 4 s) == "7" || take 1 (drop 4 s) == "8" || take 1 (drop 4 s) == "9")
     && isDigitChar (take 1 (drop 5 s)) && take 1 (drop 6 s) == "."
+    && isAllDigitsOrDotsUntilColonOrEnd (drop 7 s)
     then True {}
   else if take 1 (drop 4 s) == "6"
     && (take 1 (drop 5 s) == "4" || take 1 (drop 5 s) == "5" || take 1 (drop 5 s) == "6" || take 1 (drop 5 s) == "7" || take 1 (drop 5 s) == "8" || take 1 (drop 5 s) == "9")
     && take 1 (drop 6 s) == "."
+    && isAllDigitsOrDotsUntilColonOrEnd (drop 7 s)
     then True {}
   else if take 1 (drop 4 s) == "1" && (take 1 (drop 5 s) == "0" || take 1 (drop 5 s) == "1")
     && isDigitChar (take 1 (drop 6 s)) && take 1 (drop 7 s) == "."
+    && isAllDigitsOrDotsUntilColonOrEnd (drop 8 s)
     then True {}
   else if take 1 (drop 4 s) == "1" && take 1 (drop 5 s) == "2"
     && (take 1 (drop 6 s) == "0" || take 1 (drop 6 s) == "1" || take 1 (drop 6 s) == "2" || take 1 (drop 6 s) == "3"
       || take 1 (drop 6 s) == "4" || take 1 (drop 6 s) == "5" || take 1 (drop 6 s) == "6" || take 1 (drop 6 s) == "7")
     && take 1 (drop 7 s) == "."
+    && isAllDigitsOrDotsUntilColonOrEnd (drop 8 s)
     then True {}
   else False {}
 
@@ -328,8 +333,8 @@ verifyMaintenanceAuth = \authorization ->
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
 
 safeCompareLoop = \s1 s2 result ->
-  if s1 == "" && s2 == ""
-    then result
+  if s2 == ""
+    then result + (if s1 == "" then 0 else 1)
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
@@ -344,11 +349,8 @@ sendToEach = \servers action ->
       if server == ""
         then yield {}
         else do
-          catch (action server) (\err -> do
-            println ("federation: error reaching " ++ server ++ ", retrying: " ++ show err)
-            catch (action server) (\err2 -> do
-              println ("federation: retry failed for " ++ server ++ ": " ++ show err2)
-              yield {}))
+          catch (action server) (\err ->
+            println ("federation: error reaching " ++ server ++ ": " ++ show err))
           sendToEach rest action
 
 pruneExpired = \t -> do
@@ -436,10 +438,12 @@ retryPendingForwards = \pending ->
       if f.messageId == ""
         then yield {}
         else do
-          catch (fetch (federationScheme ++ f.toServer) (ForwardMessage {
-            toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob,
-            timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
-            authorization: "Bearer " ++ federationSecret})) (\err ->
+          catch (do
+            fetch (federationScheme ++ f.toServer) (ForwardMessage {
+              toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob,
+              timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
+              authorization: "Bearer " ++ federationSecret})
+            yield {}) (\err ->
             println ("prune: retry forward to " ++ f.toServer ++ " failed: " ++ show err))
           retryPendingForwards rest
 
@@ -676,7 +680,7 @@ serve = \req -> case req of
         then union forwards (do s <- remoteServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
         else forwards
       yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
-    let finalStatus = if result.status == "federated" && federationSecret == "" then "queued" else result.status
+    let finalStatus = if result.status == "federated" && (federationSecret == "" || result.forwardsAtCapacity) then "queued" else result.status
     respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else msgId)}
     if count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (federationSecret == "")
       then sendToEach result.remoteServers (\server ->
@@ -721,7 +725,16 @@ serve = \req -> case req of
         where not (m.originServer == serverHostN)
         yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t}
       ackedIds <- *ackedIds
-      set *ackedIds = union ackedIds ackedFederated
+      let combinedAckedIds = union ackedIds ackedFederated
+      let oldestAckedAt = if count combinedAckedIds > maxAckedIds
+        then fold (\acc a -> if acc == -1 || a.ackedAt < acc then a.ackedAt else acc) -1 combinedAckedIds
+        else -1
+      set *ackedIds = if oldestAckedAt >= 0
+        then (fold (\acc a ->
+          if not acc.removed && a.ackedAt == oldestAckedAt
+            then {removed: True {}, items: acc.items}
+            else {removed: acc.removed, items: union acc.items [a]}) {removed: False {}, items: []} combinedAckedIds).items
+        else combinedAckedIds
       let ok = case session of
         Nothing {} -> False {}
         _ -> True {}
