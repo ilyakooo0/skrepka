@@ -22,6 +22,10 @@ maxPresenceEntries = 10000
 maxMessagesPerRecipient = 500
 clockSkewTolerance = 5000 -- 5 seconds tolerance for clock skew between federated servers
 maxForwardsEntries = 10000
+maxServerNameLen = 128
+maxMessageIdLen = 128
+maxTokenLen = 256
+maxChallenges = 10000
 
 -- ============================================
 -- Types
@@ -174,8 +178,43 @@ containsDoubleColon = \s ->
   else if take 1 s == ":" && take 1 (drop 1 s) == ":" then True {}
   else containsDoubleColon (drop 1 s)
 
+containsColon = \s ->
+  if s == "" then False {}
+  else if take 1 s == ":" then True {}
+  else containsColon (drop 1 s)
+
+containsMultipleColons = \s ->
+  if s == "" then False {}
+  else if take 1 s == ":" then containsColon (drop 1 s)
+  else containsMultipleColons (drop 1 s)
+
+hasOctalOctet = \s ->
+  if take 1 s == "0" && isDigitChar (take 1 (drop 1 s)) then True {}
+  else hasOctalOctetAfterDot s
+
+hasOctalOctetAfterDot = \s ->
+  if s == "" then False {}
+  else if take 1 s == "." && take 1 (drop 1 s) == "0" && isDigitChar (take 1 (drop 2 s)) then True {}
+  else hasOctalOctetAfterDot (drop 1 s)
+
+hasHexPrefix = \s ->
+  if take 2 s == "0x" || take 2 s == "0X" then True {}
+  else hasHexPrefixAfterDot s
+
+hasHexPrefixAfterDot = \s ->
+  if s == "" then False {}
+  else if take 1 s == "." && (take 2 (drop 1 s) == "0x" || take 2 (drop 1 s) == "0X") then True {}
+  else hasHexPrefixAfterDot (drop 1 s)
+
+isAllDigitsUntilColonOrEnd = \s ->
+  if s == "" then True {}
+  else if take 1 s == ":" then True {}
+  else if isDigitChar (take 1 s) then isAllDigitsUntilColonOrEnd (drop 1 s)
+  else False {}
+
 isBadServerName = \s ->
-  containsBadUrlChar s
+  s == ""
+  || containsBadUrlChar s
   || s == "localhost" || take 10 s == "localhost:"
   || take 4 s == "127." || take 3 s == "10."
   || take 8 s == "192.168." || take 7 s == "169.254."
@@ -187,7 +226,10 @@ isBadServerName = \s ->
   || take 7 s == "198.18." || take 7 s == "198.19."
   || take 2 s == "::"
   || isCgnatRange s
-  || containsDoubleColon s
+  || containsMultipleColons s
+  || hasOctalOctet s
+  || hasHexPrefix s
+  || (isDigitChar (take 1 s) && isAllDigitsUntilColonOrEnd s)
 
 lookupSession = \sessions token t ->
   single (do
@@ -204,6 +246,7 @@ extractToken = \authHeader ->
     && (take 1 (drop 4 authHeader) == "e" || take 1 (drop 4 authHeader) == "E")
     && (take 1 (drop 5 authHeader) == "r" || take 1 (drop 5 authHeader) == "R")
     && take 1 (drop 6 authHeader) == " "
+    && not (tooLong (drop 7 authHeader) maxTokenLen)
     then drop 7 authHeader
     else ""
 
@@ -234,8 +277,10 @@ sendToEach = \servers action ->
         else do
           catch (action server) (\err -> do
             println ("federation: error reaching " ++ server ++ ", retrying (1/2): " ++ show err)
+            sleep 1000
             catch (action server) (\err2 -> do
               println ("federation: retry 1 failed for " ++ server ++ ", retrying (2/2): " ++ show err2)
+              sleep 2000
               catch (action server) (\err3 -> do
                 println ("federation: all retries exhausted for " ++ server ++ ": " ++ show err3)
                 yield {})))
@@ -336,8 +381,17 @@ serve = \req -> case req of
                 then {removed: True {}, items: acc.items}
                 else {removed: acc.removed, items: union acc.items [c]}) {removed: False {}, items: []} challenges
             else {removed: False {}, items: challenges}
+          let globalOldestExpiry = if count cappedChallenges.items >= maxChallenges
+            then fold (\acc c -> if acc == -1 || c.expiresAt < acc then c.expiresAt else acc) -1 cappedChallenges.items
+            else -1
+          let globalCapped = if globalOldestExpiry >= 0
+            then (fold (\acc c ->
+              if not acc.removed && c.expiresAt == globalOldestExpiry
+                then {removed: True {}, items: acc.items}
+                else {removed: acc.removed, items: union acc.items [c]}) {removed: False {}, items: []} cappedChallenges.items).items
+            else cappedChallenges.items
           set *challenges = union
-            cappedChallenges.items
+            globalCapped
             [{pubkey: pubkey, challenge: challenge, expiresAt: t + 60000}]
           yield pr
         respond {challenge: challenge}
@@ -546,7 +600,7 @@ serve = \req -> case req of
     let dedupedIds = fold (\acc mid ->
       if mid == "" then acc
       else if count acc >= maxMessageIds then acc
-      else if tooLong mid maxPubkeyLen then acc
+      else if tooLong mid maxMessageIdLen then acc
       else if not (isValidHex mid) then acc
       else if count (do a <- acc; where a == normalizeHex mid; yield a) > 0 then acc
       else union acc [normalizeHex mid]) [] messageIds
@@ -566,10 +620,15 @@ serve = \req -> case req of
       set *messages = case session of
         Nothing {} -> messages
         Just {value: _} -> diff messages ackedMessages
+      presence <- *presence
+      let knownPeers = fold (\acc p ->
+        if p.server == serverHost then acc
+        else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
+        else union acc [p.server]) [] presence
       let ok = case session of
         Nothing {} -> False {}
         _ -> True {}
-      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
+      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, knownPeers: knownPeers}
     let fedMessages = do
       m <- result.ackedMessages
       where not (m.originServer == "")
@@ -577,6 +636,7 @@ serve = \req -> case req of
       yield m
     let originServers = fold (\acc m ->
       if count (do a <- acc; where a == m.originServer; yield a) > 0 then acc
+      else if count (do k <- result.knownPeers; where k == m.originServer; yield k) == 0 then acc
       else union acc [m.originServer]) [] fedMessages
     respond {ok: result.ok}
     if result.ok && count originServers > 0 && not (federationSecret == "")
@@ -624,7 +684,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
-    let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen) && not (isBadServerName fromServer) && count events <= maxGossipEvents
+    let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxServerNameLen) && not (isBadServerName fromServer) && count events <= maxGossipEvents
     let onlineEntries = do
       e <- events
       where validRequest
@@ -632,7 +692,7 @@ serve = \req -> case req of
       where not (e.server == "")
       where not (e.pubkey == "")
       where not (tooLong e.pubkey maxPubkeyLen)
-      where not (tooLong e.server maxPubkeyLen)
+      where not (tooLong e.server maxServerNameLen)
       where not (isBadServerName e.server)
       where isValidHex e.pubkey
       where not (e.server == serverHost)
@@ -646,7 +706,7 @@ serve = \req -> case req of
       where not (e.server == "")
       where not (e.pubkey == "")
       where not (tooLong e.pubkey maxPubkeyLen)
-      where not (tooLong e.server maxPubkeyLen)
+      where not (tooLong e.server maxServerNameLen)
       where not (isBadServerName e.server)
       where isValidHex e.pubkey
       where not (e.server == serverHost)
@@ -823,7 +883,7 @@ serve = \req -> case req of
       where not (e.server == "")
       where not (e.pubkey == "")
       where not (tooLong e.pubkey maxPubkeyLen)
-      where not (tooLong e.server maxPubkeyLen)
+      where not (tooLong e.server maxServerNameLen)
       where not (isBadServerName e.server)
       where isValidHex e.pubkey
       where not (e.server == serverHost)
@@ -861,14 +921,14 @@ serve = \req -> case req of
     broadcastOfflineGossip t gossipResult.peerServers gossipResult.expiredLocal
 
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
-    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxPubkeyLen) && isValidHex toKey && isValidHex fromKey && isValidHex encryptedBlob && isValidHex messageId
+    let validFields = not (toKey == "") && not (fromKey == "") && not (encryptedBlob == "") && not (messageId == "") && not (tooLong toKey maxPubkeyLen) && not (tooLong fromKey maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && not (tooLong messageId maxMessageIdLen) && isValidHex toKey && isValidHex fromKey && isValidHex encryptedBlob && isValidHex messageId
     let toKey = if isValidHex toKey then normalizeHex toKey else toKey
     let fromKey = if isValidHex fromKey then normalizeHex fromKey else fromKey
     let encryptedBlob = if isValidHex encryptedBlob then normalizeHex encryptedBlob else encryptedBlob
     let messageId = if isValidHex messageId then normalizeHex messageId else messageId
     t <- now
     let authorized = verifyFederationAuth authorization
-    let validOrigin = not (originServer == "") && not (originServer == serverHost) && not (tooLong originServer maxPubkeyLen) && not (isBadServerName originServer)
+    let validOrigin = not (originServer == "") && not (originServer == serverHost) && not (tooLong originServer maxServerNameLen) && not (isBadServerName originServer)
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t else timestamp
     result <- atomic do
       pr <- pruneExpired t
@@ -903,11 +963,11 @@ serve = \req -> case req of
     let dedupedIds = fold (\acc mid ->
       if mid == "" then acc
       else if count acc >= maxMessageIds then acc
-      else if tooLong mid maxPubkeyLen then acc
+      else if tooLong mid maxMessageIdLen then acc
       else if not (isValidHex mid) then acc
       else if count (do a <- acc; where a == normalizeHex mid; yield a) > 0 then acc
       else union acc [normalizeHex mid]) [] messageIds
-    let validAckFields = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxPubkeyLen) && not (isBadServerName fromServer)
+    let validAckFields = authorized && originServer == serverHost && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxServerNameLen) && not (isBadServerName fromServer)
     pruneResult <- atomic do
       pr <- pruneExpired t
       forwards <- *forwards
