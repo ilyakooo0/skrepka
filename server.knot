@@ -150,6 +150,7 @@ containsBadUrlChar = \s ->
   if s == "" then False {}
   else if take 1 s == "/" || take 1 s == "?" || take 1 s == "#" || take 1 s == " " || take 1 s == "@" || take 1 s == "%" || take 1 s == "\\"
     || take 1 (bytesToHex (textToBytes (take 1 s))) == "0" || take 1 (bytesToHex (textToBytes (take 1 s))) == "1" || bytesToHex (textToBytes (take 1 s)) == "7f"
+    || not (drop 2 (bytesToHex (textToBytes (take 1 s))) == "")
     then True {}
     else containsBadUrlChar (drop 1 s)
 
@@ -207,12 +208,6 @@ hasHexPrefixAfterDot = \s ->
   else if take 1 s == "." && (take 2 (drop 1 s) == "0x" || take 2 (drop 1 s) == "0X") then True {}
   else hasHexPrefixAfterDot (drop 1 s)
 
-isAllDigitsUntilColonOrEnd = \s ->
-  if s == "" then True {}
-  else if take 1 s == ":" then True {}
-  else if isDigitChar (take 1 s) then isAllDigitsUntilColonOrEnd (drop 1 s)
-  else False {}
-
 isAllDigitsOrDotsUntilColonOrEnd = \s ->
   if s == "" then True {}
   else if take 1 s == ":" then True {}
@@ -247,7 +242,8 @@ stripTrailingDot = \s ->
   else take 1 s ++ stripTrailingDot (drop 1 s)
 
 isReservedHighRange = \s ->
-  (take 2 s == "22" && (take 1 (drop 2 s) == "4" || take 1 (drop 2 s) == "5" || take 1 (drop 2 s) == "6" || take 1 (drop 2 s) == "7" || take 1 (drop 2 s) == "8" || take 1 (drop 2 s) == "9") && take 1 (drop 3 s) == ".")
+  isAllDigitsOrDotsUntilColonOrEnd s
+  && ((take 2 s == "22" && (take 1 (drop 2 s) == "4" || take 1 (drop 2 s) == "5" || take 1 (drop 2 s) == "6" || take 1 (drop 2 s) == "7" || take 1 (drop 2 s) == "8" || take 1 (drop 2 s) == "9") && take 1 (drop 3 s) == ".")
   || (take 2 s == "23" && isDigitChar (take 1 (drop 2 s)) && take 1 (drop 3 s) == ".")
   || (take 2 s == "24" && isDigitChar (take 1 (drop 2 s)) && take 1 (drop 3 s) == ".")
   || (take 3 s == "250" && take 1 (drop 3 s) == ".")
@@ -255,13 +251,20 @@ isReservedHighRange = \s ->
   || (take 3 s == "252" && take 1 (drop 3 s) == ".")
   || (take 3 s == "253" && take 1 (drop 3 s) == ".")
   || (take 3 s == "254" && take 1 (drop 3 s) == ".")
-  || (take 3 s == "255" && take 1 (drop 3 s) == ".")
+  || (take 3 s == "255" && take 1 (drop 3 s) == "."))
+
+containsLocalhostSuffix = \s ->
+  if s == "" then False {}
+  else if take 10 s == ".localhost" && (drop 10 s == "" || take 1 (drop 10 s) == ":") then True {}
+  else containsLocalhostSuffix (drop 1 s)
 
 isBadServerName = \s ->
   let sn = toLower (stripTrailingDot s)
   sn == ""
   || containsBadUrlChar sn
   || sn == "localhost" || take 10 sn == "localhost:"
+  || sn == "localhost.localdomain" || take 22 sn == "localhost.localdomain:"
+  || containsLocalhostSuffix sn
   || take 4 sn == "127." || take 3 sn == "10."
   || take 8 sn == "192.168." || take 7 sn == "169.254."
   || take 2 sn == "0." || take 1 sn == "["
@@ -635,7 +638,7 @@ serve = \req -> case req of
              else "queued"
       forwards <- *forwards
       let forwardsAtCapacity = count forwards >= maxForwardsEntries
-      set *forwards = if shouldInsert && not forwardsAtCapacity
+      set *forwards = if shouldInsert && not forwardsAtCapacity && not localOnline
         then union forwards (do s <- remoteServers; yield {messageId: msgId, toServer: s, createdAt: t})
         else forwards
       yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
