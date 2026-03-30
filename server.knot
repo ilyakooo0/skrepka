@@ -27,6 +27,11 @@ maxMessageIdLen = 128
 maxTokenLen = 256
 maxChallenges = 10000
 maxSessions = 10000
+maxChallengesPerKey = 5
+maxSessionsPerKey = 10
+challengeExpiry = 60000 -- 1 minute in milliseconds
+sessionExpiry = 3600000 -- 1 hour in milliseconds
+onlineGossipTtl = 3600 -- 1 hour in seconds
 
 -- ============================================
 -- Types
@@ -241,17 +246,7 @@ stripTrailingDot = \s ->
   else if take 1 s == "." && isTrailingDots (drop 1 s) then stripTrailingDot (drop 1 s)
   else take 1 s ++ stripTrailingDot (drop 1 s)
 
-isReservedHighRange = \s ->
-  isAllDigitsOrDotsUntilColonOrEnd s
-  && ((take 2 s == "22" && (take 1 (drop 2 s) == "4" || take 1 (drop 2 s) == "5" || take 1 (drop 2 s) == "6" || take 1 (drop 2 s) == "7" || take 1 (drop 2 s) == "8" || take 1 (drop 2 s) == "9") && take 1 (drop 3 s) == ".")
-  || (take 2 s == "23" && isDigitChar (take 1 (drop 2 s)) && take 1 (drop 3 s) == ".")
-  || (take 2 s == "24" && isDigitChar (take 1 (drop 2 s)) && take 1 (drop 3 s) == ".")
-  || (take 3 s == "250" && take 1 (drop 3 s) == ".")
-  || (take 3 s == "251" && take 1 (drop 3 s) == ".")
-  || (take 3 s == "252" && take 1 (drop 3 s) == ".")
-  || (take 3 s == "253" && take 1 (drop 3 s) == ".")
-  || (take 3 s == "254" && take 1 (drop 3 s) == ".")
-  || (take 3 s == "255" && take 1 (drop 3 s) == "."))
+normalizeServerName = \s -> toLower (stripTrailingDot s)
 
 containsLocalhostSuffix = \s ->
   if s == "" then False {}
@@ -278,7 +273,6 @@ isBadServerName = \s ->
   || take 10 sn == "192.88.99."
   || take 12 sn == "198.51.100."
   || take 11 sn == "203.0.113."
-  || isReservedHighRange sn
   || take 2 sn == "::"
   || isCgnatRange sn
   || containsMultipleColons sn
@@ -319,7 +313,8 @@ safeCompareLoop = \s1 s2 result ->
     then result + (if s1 == "" then 0 else 1)
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
-safeCompare = \a b -> not (a == "") && not (b == "") && safeCompareLoop a b 0 == 0
+safeCompare = \a b ->
+  safeCompareLoop a b 0 + (if a == "" then 1 else 0) + (if b == "" then 1 else 0) == 0
 
 sendToEach = \servers action ->
   if count servers == 0
@@ -409,6 +404,22 @@ broadcastOfflineGossip = \t peerServers expiredLocal -> do
       sendBatchedGossip peerServers gossipEvents
     else yield {}
 
+retryPendingForwards = \pending ->
+  if count pending == 0
+    then yield {}
+    else do
+      let f = fold (\acc x -> if acc.messageId == "" then x else acc) {messageId: "", toServer: "", toKey: "", fromKey: "", encryptedBlob: "", timestamp: 0} pending
+      let rest = do x <- pending; where not (x.messageId == f.messageId && x.toServer == f.toServer); yield x
+      if f.messageId == ""
+        then yield {}
+        else do
+          catch (fetch (federationScheme ++ f.toServer) (ForwardMessage {
+            toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob,
+            timestamp: f.timestamp, originServer: serverHost, messageId: f.messageId,
+            authorization: "Bearer " ++ federationSecret})) (\err ->
+            println ("prune: retry forward to " ++ f.toServer ++ " failed: " ++ show err))
+          retryPendingForwards rest
+
 -- ============================================
 -- Request Handler
 -- ============================================
@@ -427,7 +438,7 @@ serve = \req -> case req of
           challenges <- *challenges
           let existingCount = count (do c <- challenges; where c.pubkey == pubkey; yield c)
           let oldestChallengeExpiry = fold (\acc c2 -> if c2.pubkey == pubkey && (acc == -1 || c2.expiresAt < acc) then c2.expiresAt else acc) -1 challenges
-          let cappedChallenges = if existingCount >= 5 && oldestChallengeExpiry >= 0
+          let cappedChallenges = if existingCount >= maxChallengesPerKey && oldestChallengeExpiry >= 0
             then fold (\acc c ->
               if not acc.removed && c.pubkey == pubkey && c.expiresAt == oldestChallengeExpiry
                 then {removed: True {}, items: acc.items}
@@ -444,7 +455,7 @@ serve = \req -> case req of
             else cappedChallenges.items
           set *challenges = union
             globalCapped
-            [{pubkey: pubkey, challenge: challenge, expiresAt: t + 60000}]
+            [{pubkey: pubkey, challenge: challenge, expiresAt: t + challengeExpiry}]
           yield pr
         respond {challenge: challenge}
         broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal
@@ -454,7 +465,7 @@ serve = \req -> case req of
     let pubkey = if isValidHex pubkey then normalizeHex pubkey else pubkey
     t <- now
     token <- genToken
-    let expiry = t + 3600000
+    let expiry = t + sessionExpiry
     result <- atomic do
       pr <- pruneExpired t
       challenges <- *challenges
@@ -489,7 +500,7 @@ serve = \req -> case req of
           if not acc.removed && s.pubkey == pubkey && s.expiresAt == oldestExpiry
             then {removed: True {}, sessions: acc.sessions}
             else {removed: acc.removed, sessions: union acc.sessions [s]}) {removed: False {}, sessions: []} sessions
-      let sessionsCapped = if count existingForKey >= 10 && oldestExpiry >= 0
+      let sessionsCapped = if count existingForKey >= maxSessionsPerKey && oldestExpiry >= 0
         then cappedFold.sessions
         else sessions
       let globalOldestSessionExpiry = if count sessionsCapped >= maxSessions
@@ -533,7 +544,7 @@ serve = \req -> case req of
       then sendToEach result.peerServers (\server ->
         fetch (federationScheme ++ server) (RecvGossip {
           authorization: "Bearer " ++ federationSecret,
-          events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: 3600}], hopsRemaining: 2, fromServer: serverHost}))
+          events: [{eventType: "online", pubkey: pubkey, server: serverHost, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHost}))
       else yield {}
     broadcastOfflineGossip t result.offlinePeers (do
       p <- result.expiredLocal
@@ -638,20 +649,20 @@ serve = \req -> case req of
              else "queued"
       forwards <- *forwards
       let forwardsAtCapacity = count forwards >= maxForwardsEntries
-      set *forwards = if shouldInsert && not forwardsAtCapacity && not localOnline
+      set *forwards = if shouldInsert && not forwardsAtCapacity && count remoteServers > 0
         then union forwards (do s <- remoteServers; yield {messageId: msgId, toServer: s, createdAt: t})
         else forwards
       yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
     let finalStatus = if result.status == "federated" && federationSecret == "" then "queued" else result.status
     respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else msgId)}
-    if result.status == "federated" && not (federationSecret == "")
+    if count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (federationSecret == "")
       then sendToEach result.remoteServers (\server ->
         fetch (federationScheme ++ server) (ForwardMessage {
           toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
           timestamp: clampedTs, originServer: serverHost, messageId: msgId,
           authorization: "Bearer " ++ federationSecret}))
       else yield {}
-    if result.forwardsAtCapacity && result.status == "federated"
+    if result.forwardsAtCapacity && count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid")
       then println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
@@ -739,6 +750,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
+    let fromServer = normalizeServerName fromServer
     let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && not (fromServer == serverHost) && not (tooLong fromServer maxServerNameLen) && not (isBadServerName fromServer) && count events <= maxGossipEvents
     let onlineEntries = do
       e <- events
@@ -750,10 +762,10 @@ serve = \req -> case req of
       where not (tooLong e.server maxServerNameLen)
       where not (isBadServerName e.server)
       where isValidHex e.pubkey
-      where not (e.server == serverHost)
+      where not (normalizeServerName e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
-      yield {pubkey: normalizeHex e.pubkey, server: e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp}
+      yield {pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp}
     let offlineEntries = do
       e <- events
       where validRequest
@@ -764,10 +776,10 @@ serve = \req -> case req of
       where not (tooLong e.server maxServerNameLen)
       where not (isBadServerName e.server)
       where isValidHex e.pubkey
-      where not (e.server == serverHost)
+      where not (normalizeServerName e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where t - e.timestamp < (clampTtl e.ttl) * 1000
-      yield {pubkey: normalizeHex e.pubkey, server: e.server, timestamp: e.timestamp}
+      yield {pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, timestamp: e.timestamp}
     let filteredOnline = do
       e <- onlineEntries
       where count (do
@@ -941,20 +953,20 @@ serve = \req -> case req of
       where not (tooLong e.server maxServerNameLen)
       where not (isBadServerName e.server)
       where isValidHex e.pubkey
-      where not (e.server == serverHost)
+      where not (normalizeServerName e.server == serverHost)
       where e.timestamp <= t + clockSkewTolerance
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
       where not (e.eventType == "online" && count (do
         o <- offlineEntries
         where o.pubkey == normalizeHex e.pubkey
-        where o.server == e.server
+        where o.server == normalizeServerName e.server
         where o.timestamp > e.timestamp
         yield o) > 0)
       yield e
     let effectiveEvents = do
       e <- validEvents
-      where count (do a <- gossipResult.appliedKeys; where a.pubkey == normalizeHex e.pubkey; where a.server == e.server; yield a) > 0
-      yield {eventType: e.eventType, pubkey: normalizeHex e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl}
+      where count (do a <- gossipResult.appliedKeys; where a.pubkey == normalizeHex e.pubkey; where a.server == normalizeServerName e.server; yield a) > 0
+      yield {eventType: e.eventType, pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, timestamp: e.timestamp, ttl: e.ttl}
     respond {ok: validRequest}
     if not gossipResult.withinCapacity
       then println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer)
@@ -981,6 +993,7 @@ serve = \req -> case req of
     let fromKey = if isValidHex fromKey then normalizeHex fromKey else fromKey
     let encryptedBlob = if isValidHex encryptedBlob then normalizeHex encryptedBlob else encryptedBlob
     let messageId = if isValidHex messageId then normalizeHex messageId else messageId
+    let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == "") && not (originServer == serverHost) && not (tooLong originServer maxServerNameLen) && not (isBadServerName originServer)
@@ -1013,6 +1026,8 @@ serve = \req -> case req of
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
+    let fromServer = normalizeServerName fromServer
+    let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
     let dedupedIds = fold (\acc mid ->
@@ -1027,13 +1042,14 @@ serve = \req -> case req of
       pr <- pruneExpired t
       forwards <- *forwards
       let validAck = validAckFields
+      let forwardsToRemove = do
+        f <- forwards
+        mid <- dedupedIds
+        where f.messageId == mid
+        where f.toServer == fromServer
+        yield f
       set *forwards = if validAck
-        then diff forwards (do
-          f <- forwards
-          mid <- dedupedIds
-          where f.messageId == mid
-          where f.toServer == fromServer
-          yield f)
+        then diff forwards forwardsToRemove
         else forwards
       yield {peerServers: pr.peerServers, expiredLocal: pr.expiredLocal, validAck: validAck}
     respond {ok: pruneResult.validAck}
@@ -1046,9 +1062,20 @@ serve = \req -> case req of
       then do
         result <- atomic do
           pr <- pruneExpired t
-          yield pr
+          forwards <- *forwards
+          messages <- *messages
+          let pendingForwards = do
+            f <- forwards
+            m <- messages
+            where m.messageId == f.messageId
+            where m.originServer == ""
+            yield {toServer: f.toServer, toKey: m.toKey, fromKey: m.fromKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp, messageId: m.messageId}
+          yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards}
         respond {ok: True {}}
         broadcastOfflineGossip t result.peerServers result.expiredLocal
+        if not (federationSecret == "") && count result.pendingForwards > 0
+          then retryPendingForwards result.pendingForwards
+          else yield {}
       else respond {ok: False {}}
 
 -- ============================================
