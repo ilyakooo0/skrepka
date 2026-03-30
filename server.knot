@@ -10,7 +10,7 @@ serverHost = "localhost:8080"
 federationSecret = "" -- must be set to enable federation
 maintenanceSecret = "" -- set to enable /maintenance/prune independently of federation
 federationScheme = "https://" -- scheme for federation HTTP calls
-messageMaxAge = 86400000 -- 24 hours in milliseconds
+messageMaxAge = 2592000000 -- 30 days in milliseconds
 maxPresenceTtl = 3600 -- max presence TTL from gossip in seconds
 maxPubkeyLen = 256
 maxBlobLen = 65536
@@ -59,6 +59,8 @@ type GossipEvent = {eventType: Text, pubkey: Text, server: Text, timestamp: Int,
 *forwards : [{messageId: Text, toServer: Text, createdAt: Int, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int}]
 
 *ackedIds : [{messageId: Text, toKey: Text, ackedAt: Int}]
+
+*lastPrunedAt : Int
 
 -- ============================================
 -- Routes
@@ -112,6 +114,7 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 -- ============================================
 
 hexDigit = \n ->
+  let n = if n < 0 then 0 else if n > 15 then 15 else n
   if n == 0 then "0" else if n == 1 then "1" else if n == 2 then "2" else if n == 3 then "3"
   else if n == 4 then "4" else if n == 5 then "5" else if n == 6 then "6" else if n == 7 then "7"
   else if n == 8 then "8" else if n == 9 then "9" else if n == 10 then "a" else if n == 11 then "b"
@@ -327,8 +330,10 @@ verifyFederationAuth = \authorization ->
   not (federationSecret == "") && safeCompare (extractToken authorization) federationSecret
 
 verifyMaintenanceAuth = \authorization ->
-  verifyFederationAuth authorization
-  || (not (maintenanceSecret == "") && safeCompare (extractToken authorization) maintenanceSecret)
+  let token = extractToken authorization
+  let fedOk = not (federationSecret == "") && safeCompare token federationSecret
+  let maintOk = not (maintenanceSecret == "") && safeCompare token maintenanceSecret
+  fedOk || maintOk
 
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
 
@@ -400,6 +405,14 @@ pruneExpired = \t -> do
       yield q) == 0
     yield p), peerServers: peerServersBefore}
 
+maybePrune = \t -> do
+  lastPruned <- *lastPrunedAt
+  if t - lastPruned < 1000
+    then yield {expiredLocal: [], peerServers: []}
+    else do
+      set *lastPrunedAt = t
+      pruneExpired t
+
 sendBatchedGossip = \peerServers allEvents ->
   if count allEvents == 0
     then yield {}
@@ -461,7 +474,7 @@ serve = \req -> case req of
     if valid
       then do
         pruneResult <- atomic do
-          pr <- pruneExpired t
+          pr <- maybePrune t
           challenges <- *challenges
           let existingCount = count (do c <- challenges; where c.pubkey == pubkey; yield c)
           let oldestChallengeExpiry = fold (\acc c2 -> if c2.pubkey == pubkey && (acc == -1 || c2.expiresAt < acc) then c2.expiresAt else acc) -1 challenges
@@ -494,7 +507,7 @@ serve = \req -> case req of
     token <- genToken
     let expiry = t + sessionExpiry
     result <- atomic do
-      pr <- pruneExpired t
+      pr <- maybePrune t
       challenges <- *challenges
       sessions <- *sessions
       presence <- *presence
@@ -582,7 +595,7 @@ serve = \req -> case req of
     t <- now
     let token = extractToken authorization
     result <- atomic do
-      pr <- pruneExpired t
+      pr <- maybePrune t
       sessions <- *sessions
       messages <- *messages
       seqCounter <- *seqCounter
@@ -626,7 +639,7 @@ serve = \req -> case req of
     msgId <- genToken
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
     result <- atomic do
-      pr <- pruneExpired t
+      pr <- maybePrune t
       sessions <- *sessions
       messages <- *messages
       presence <- *presence
@@ -696,15 +709,16 @@ serve = \req -> case req of
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
-    let dedupedIds = fold (\acc mid ->
-      if mid == "" then acc
-      else if count acc >= maxMessageIds then acc
-      else if tooLong mid maxMessageIdLen then acc
-      else if not (isValidHex mid) then acc
-      else if count (do a <- acc; where a == normalizeHex mid; yield a) > 0 then acc
-      else union acc [normalizeHex mid]) [] messageIds
+    let dedupedIds = if count messageIds > maxMessageIds then []
+      else fold (\acc mid ->
+        if mid == "" then acc
+        else if count acc >= maxMessageIds then acc
+        else if tooLong mid maxMessageIdLen then acc
+        else if not (isValidHex mid) then acc
+        else if count (do a <- acc; where a == normalizeHex mid; yield a) > 0 then acc
+        else union acc [normalizeHex mid]) [] messageIds
     result <- atomic do
-      pr <- pruneExpired t
+      pr <- maybePrune t
       sessions <- *sessions
       messages <- *messages
       let session = lookupSession sessions (extractToken authorization) t
@@ -762,7 +776,7 @@ serve = \req -> case req of
     let pubkey = if isValidHex pubkey then normalizeHex pubkey else pubkey
     t <- now
     result <- atomic do
-      pr <- pruneExpired t
+      pr <- maybePrune t
       sessions <- *sessions
       presence <- *presence
       let session = lookupSession sessions (extractToken authorization) t
@@ -854,7 +868,7 @@ serve = \req -> case req of
               yield a)
             [e]) [] filteredOnline
     gossipResult <- atomic do
-      pr <- pruneExpired t
+      pr <- maybePrune t
       presence <- *presence
       let fromServerTrusted = count (do p <- presence; where p.server == fromServer; yield p) > 0
       let trustedDeduped = do
@@ -1042,7 +1056,7 @@ serve = \req -> case req of
     let validOrigin = not (originServer == "") && not (originServer == serverHostN) && not (tooLong originServer maxServerNameLen) && not (isBadServerName originServer)
     let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
     result <- atomic do
-      pr <- pruneExpired t
+      pr <- maybePrune t
       messages <- *messages
       seqCounter <- *seqCounter
       let seqTs = if t > seqCounter then t else seqCounter + 1
@@ -1080,16 +1094,17 @@ serve = \req -> case req of
     let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
-    let dedupedIds = fold (\acc mid ->
-      if mid == "" then acc
-      else if count acc >= maxMessageIds then acc
-      else if tooLong mid maxMessageIdLen then acc
-      else if not (isValidHex mid) then acc
-      else if count (do a <- acc; where a == normalizeHex mid; yield a) > 0 then acc
-      else union acc [normalizeHex mid]) [] messageIds
+    let dedupedIds = if count messageIds > maxMessageIds then []
+      else fold (\acc mid ->
+        if mid == "" then acc
+        else if count acc >= maxMessageIds then acc
+        else if tooLong mid maxMessageIdLen then acc
+        else if not (isValidHex mid) then acc
+        else if count (do a <- acc; where a == normalizeHex mid; yield a) > 0 then acc
+        else union acc [normalizeHex mid]) [] messageIds
     let validAckFields = authorized && originServer == serverHostN && not (fromServer == "") && not (fromServer == serverHostN) && not (tooLong fromServer maxServerNameLen) && not (isBadServerName fromServer)
     pruneResult <- atomic do
-      pr <- pruneExpired t
+      pr <- maybePrune t
       forwards <- *forwards
       let validAck = validAckFields
       let forwardsToRemove = do
