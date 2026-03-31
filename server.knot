@@ -76,7 +76,7 @@ route AuthApi where
       = VerifyAuth
 
 route ClientApi where
-  GET {cursor: Int} /poll headers {authorization: Text}
+  GET {cursor: Int, timeout: Int} /poll headers {authorization: Text}
     -> {events: [PollEvent], cursor: Int, authorized: Bool}
     = Poll
   /messages
@@ -524,12 +524,12 @@ serve = \req -> case req of
           else if not (isValidHex pubkey) || not (isValidHex signature)
           then False {}
           else verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
-      set *challenges = if sigValid
-        then do
+      set *challenges = case matched of
+        Just {value: _} -> do
           c <- challenges
           where not (c.pubkey == pubkey && c.challenge == challenge)
           yield c
-        else challenges
+        Nothing {} -> challenges
       let existingForKey = do
         s <- sessions
         where s.pubkey == pubkey
@@ -591,43 +591,49 @@ serve = \req -> case req of
       where not (p.pubkey == pubkey)
       yield p)
 
-  Poll {cursor, authorization, respond} -> do
+  Poll {cursor, timeout, authorization, respond} -> do
     t <- now
+    let clampedTimeout = if timeout < 0 then 0 else if timeout > 60000 then 60000 else timeout
+    let deadline = t + clampedTimeout
     let token = extractToken authorization
     result <- atomic do
-      pr <- maybePrune t
+      tNow <- now
+      pr <- maybePrune tNow
       sessions <- *sessions
       messages <- *messages
       seqCounter <- *seqCounter
-      let session = lookupSession sessions token t
+      let session = lookupSession sessions token tNow
       let clampedCursor = if cursor < 0 then 0 else if cursor > seqCounter then seqCounter else cursor
       let matchingMsgs = case session of
         Nothing {} -> []
         Just {value: s} -> do
           m <- messages
           where m.toKey == s.pubkey
-          where m.receivedAt >= t - messageMaxAge
+          where m.receivedAt >= tNow - messageMaxAge
           where m.receivedAt > clampedCursor
           yield m
       let limitedMsgs = fold (\acc m ->
         if count acc >= maxPollEvents then acc
         else union acc [m]) [] matchingMsgs
-      let evts = do
-        m <- limitedMsgs
-        yield {id: m.messageId, eventType: "message",
-               payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
-                                encryptedBlob: m.encryptedBlob,
-                                timestamp: m.timestamp}}
-      let lastReceivedAt = fold (\acc m -> if m.receivedAt > acc then m.receivedAt else acc) clampedCursor limitedMsgs
       let authorized = case session of
         Nothing {} -> False {}
         _ -> True {}
-      let newCursor = case session of
-        Nothing {} -> -1
-        _ -> if count limitedMsgs >= maxPollEvents
-          then lastReceivedAt
-          else if seqCounter > clampedCursor then seqCounter else clampedCursor
-      yield {events: evts, cursor: newCursor, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
+      if authorized && count limitedMsgs == 0 && tNow < deadline
+        then retry
+        else do
+          let evts = do
+            m <- limitedMsgs
+            yield {id: m.messageId, eventType: "message",
+                   payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
+                                    encryptedBlob: m.encryptedBlob,
+                                    timestamp: m.timestamp}}
+          let lastReceivedAt = fold (\acc m -> if m.receivedAt > acc then m.receivedAt else acc) clampedCursor limitedMsgs
+          let newCursor = case session of
+            Nothing {} -> -1
+            _ -> if count limitedMsgs >= maxPollEvents
+              then lastReceivedAt
+              else if seqCounter > clampedCursor then seqCounter else clampedCursor
+          yield {events: evts, cursor: newCursor, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     respond {events: result.events, cursor: result.cursor, authorized: result.authorized}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
@@ -709,8 +715,7 @@ serve = \req -> case req of
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
-    let dedupedIds = if count messageIds > maxMessageIds then []
-      else fold (\acc mid ->
+    let dedupedIds = fold (\acc mid ->
         if mid == "" then acc
         else if count acc >= maxMessageIds then acc
         else if tooLong mid maxMessageIdLen then acc
@@ -1019,6 +1024,12 @@ serve = \req -> case req of
         where o.server == normalizeServerName e.server
         where o.timestamp > e.timestamp
         yield o) > 0)
+      where not (e.eventType == "offline" && count (do
+        o <- onlineEntries
+        where o.pubkey == normalizeHex e.pubkey
+        where o.server == normalizeServerName e.server
+        where o.timestamp > e.timestamp
+        yield o) > 0)
       yield e
     let effectiveEvents = do
       e <- validEvents
@@ -1030,12 +1041,9 @@ serve = \req -> case req of
       else yield {}
     if validRequest && cappedHops > 1 && not (federationSecret == "") && count effectiveEvents > 0
       then do
-        let senderServers = fold (\acc e ->
-          if count (do a <- acc; where a == e.server; yield a) > 0 then acc
-          else union acc [e.server]) (if fromServer == "" then [] else [fromServer]) effectiveEvents
         let targets = do
           s <- gossipResult.gossipPeerServers
-          where count (do ss <- senderServers; where ss == s; yield ss) == 0
+          where not (s == fromServer)
           yield s
         sendToEach targets (\server ->
           fetch (federationScheme ++ server) (RecvGossip {
@@ -1094,8 +1102,7 @@ serve = \req -> case req of
     let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
-    let dedupedIds = if count messageIds > maxMessageIds then []
-      else fold (\acc mid ->
+    let dedupedIds = fold (\acc mid ->
         if mid == "" then acc
         else if count acc >= maxMessageIds then acc
         else if tooLong mid maxMessageIdLen then acc
