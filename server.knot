@@ -433,7 +433,7 @@ maybePrune = \t -> do
       set *lastPrunedAt = t
       pruneExpired t
 
-sendBatchedGossip = \peerServers allEvents ->
+sendBatchedGossipToServer = \server allEvents ->
   if count allEvents == 0
     then yield {}
     else do
@@ -441,21 +441,28 @@ sendBatchedGossip = \peerServers allEvents ->
         if count acc >= maxGossipEvents then acc
         else union acc [e]) [] allEvents
       let rest = diff allEvents batch
-      sendToEach peerServers (\server ->
-        fetch (federationScheme ++ server) (RecvGossip {
-          authorization: "Bearer " ++ federationSecret,
-          events: batch, hopsRemaining: 2, fromServer: serverHostN}))
-      sendBatchedGossip peerServers rest
+      fetch (federationScheme ++ server) (RecvGossip {
+        authorization: "Bearer " ++ federationSecret,
+        events: batch, hopsRemaining: 2, fromServer: serverHostN})
+      sendBatchedGossipToServer server rest
+
+sendBatchedGossip = \peerServers allEvents ->
+  if count allEvents == 0
+    then yield {}
+    else sendToEach peerServers (\server ->
+      sendBatchedGossipToServer server allEvents)
 
 broadcastOfflineGossip = \t peerServers expiredLocal -> do
   let expiredEntries = fold (\acc p ->
-    if count (do a <- acc; where a.pubkey == p.pubkey; yield a) > 0 then acc
-    else union acc [{pubkey: p.pubkey, ttl: clampTtl ((p.expiresAt - p.timestamp) / 1000)}]) [] expiredLocal
+    if count (do a <- acc; where a.pubkey == p.pubkey; where a.expiresAt >= p.expiresAt; yield a) > 0 then acc
+    else union
+      (do a <- acc; where not (a.pubkey == p.pubkey); yield a)
+      [{pubkey: p.pubkey, ttl: clampTtl ((p.expiresAt - p.timestamp) / 1000), expiresAt: p.expiresAt}]) [] expiredLocal
   if not (federationSecret == "") && count expiredEntries > 0 && count peerServers > 0
     then do
       let gossipEvents = do
         e <- expiredEntries
-        yield {eventType: "offline", pubkey: e.pubkey, server: serverHostN, timestamp: t, ttl: e.ttl}
+        yield {eventType: "offline", pubkey: e.pubkey, server: serverHostN, timestamp: e.expiresAt, ttl: e.ttl}
       sendBatchedGossip peerServers gossipEvents
     else yield {}
 
@@ -520,9 +527,21 @@ pollOnce = \token cursor ->
         where m.receivedAt >= t - messageMaxAge
         where m.receivedAt > clampedCursor
         yield m
-    let limitedMsgs = fold (\acc m ->
-      if count acc >= maxPollEvents then acc
-      else union acc [m]) [] matchingMsgs
+    let limitedMsgs = (fold (\acc m ->
+      if acc.size < maxPollEvents
+        then
+          let newHeap = union acc.heap [m]
+          {size: count newHeap, heap: newHeap, heapMax: if m.receivedAt > acc.heapMax then m.receivedAt else acc.heapMax}
+        else if m.receivedAt < acc.heapMax
+          then
+            let removed = fold (\r x ->
+              if not r.done && x.receivedAt == acc.heapMax
+                then {done: True {}, items: r.items}
+                else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap
+            let newHeap = union removed.items [m]
+            let newMax = fold (\best x -> if x.receivedAt > best then x.receivedAt else best) -1 newHeap
+            {size: acc.size, heap: newHeap, heapMax: newMax}
+          else acc) {size: 0, heap: [], heapMax: -1} matchingMsgs).heap
     let authorized = case session of
       Nothing {} -> False {}
       _ -> True {}
@@ -566,22 +585,25 @@ serve = \req -> case req of
           pr <- maybePrune t
           challenges <- *challenges
           let existingCount = count (do c <- challenges; where c.pubkey == pubkey; where c.expiresAt > t; yield c)
-          let oldestChallengeExpiry = fold (\acc c2 -> if c2.pubkey == pubkey && (acc == -1 || c2.expiresAt < acc) then c2.expiresAt else acc) -1 challenges
+          let oldestChallengeExpiry = fold (\acc c2 -> if c2.pubkey == pubkey && c2.expiresAt > t && (acc == -1 || c2.expiresAt < acc) then c2.expiresAt else acc) -1 challenges
           let cappedChallenges = if existingCount >= maxChallengesPerKey && oldestChallengeExpiry >= 0
             then fold (\acc c ->
               if not acc.removed && c.pubkey == pubkey && c.expiresAt == oldestChallengeExpiry
                 then {removed: True {}, items: acc.items}
                 else {removed: acc.removed, items: union acc.items [c]}) {removed: False {}, items: []} challenges
             else {removed: False {}, items: challenges}
-          let globalOldestExpiry = if count cappedChallenges.items >= maxChallenges
-            then fold (\acc c -> if acc == -1 || c.expiresAt < acc then c.expiresAt else acc) -1 cappedChallenges.items
+          let withoutExpired = if count cappedChallenges.items >= maxChallenges
+            then do c <- cappedChallenges.items; where c.expiresAt > t; yield c
+            else cappedChallenges.items
+          let globalOldestExpiry = if count withoutExpired >= maxChallenges
+            then fold (\acc c -> if acc == -1 || c.expiresAt < acc then c.expiresAt else acc) -1 withoutExpired
             else -1
           let globalCapped = if globalOldestExpiry >= 0
             then (fold (\acc c ->
               if not acc.removed && c.expiresAt == globalOldestExpiry
                 then {removed: True {}, items: acc.items}
-                else {removed: acc.removed, items: union acc.items [c]}) {removed: False {}, items: []} cappedChallenges.items).items
-            else cappedChallenges.items
+                else {removed: acc.removed, items: union acc.items [c]}) {removed: False {}, items: []} withoutExpired).items
+            else withoutExpired
           set *challenges = union
             globalCapped
             [{pubkey: pubkey, challenge: challenge, expiresAt: t + challengeExpiry}]
@@ -852,13 +874,18 @@ serve = \req -> case req of
               originServer: server, fromServer: serverHostN})
             yield {}) (\err -> do
             println ("federation: error sending evicted ack to " ++ server ++ ": " ++ show err)
-            atomic do
+            evicted <- atomic do
               ackedIds <- *ackedIds
               let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
-              let available = maxAckedIds - count ackedIds
-              let toReinsert = if available <= 0 then []
-                else fold (\acc a -> if count acc >= available then acc else union acc [a]) [] reinsert
-              set *ackedIds = union ackedIds toReinsert))
+              let combined = union ackedIds reinsert
+              let excess = count combined - maxAckedIds
+              let afterEviction = if excess <= 0 then combined
+                else evictOldestAckedIds combined excess
+              set *ackedIds = afterEviction
+              yield (count combined - count afterEviction)
+            if evicted > 0
+              then println ("federation: evicted " ++ show evicted ++ " old ack entries to reinsert failed acks for " ++ server)
+              else yield {}))
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
@@ -874,7 +901,7 @@ serve = \req -> case req of
       let authorized = case session of
         Nothing {} -> False {}
         _ -> True {}
-      let valid = do
+      let valid = if not validPubkey then [] else do
         p <- presence
         where p.pubkey == pubkey
         where p.expiresAt > t
@@ -1151,22 +1178,25 @@ serve = \req -> case req of
       messages <- *messages
       seqCounter <- *seqCounter
       let seqTs = if t > seqCounter then t else seqCounter + 1
-      let recipientMsgCount = count (do
-        m <- messages
-        where m.toKey == toKey
-        where m.receivedAt >= t - messageMaxAge
-        yield m)
-      let existsInMessages = count (do
-        m <- messages
-        where m.messageId == messageId
-        where m.toKey == toKey
-        yield m) > 0
+      let recipientMsgCount = if not (authorized && validOrigin && validFields) then 0
+        else count (do
+          m <- messages
+          where m.toKey == toKey
+          where m.receivedAt >= t - messageMaxAge
+          yield m)
+      let existsInMessages = if not (authorized && validOrigin && validFields) then False {}
+        else count (do
+          m <- messages
+          where m.messageId == messageId
+          where m.toKey == toKey
+          yield m) > 0
       ackedIds <- *ackedIds
-      let existsInAcked = count (do
-        a <- ackedIds
-        where a.messageId == messageId
-        where a.toKey == toKey
-        yield a) > 0
+      let existsInAcked = if not (authorized && validOrigin && validFields) then False {}
+        else count (do
+          a <- ackedIds
+          where a.messageId == messageId
+          where a.toKey == toKey
+          yield a) > 0
       let exists = existsInMessages || existsInAcked
       let shouldInsert = authorized && validOrigin && validFields && not exists && recipientMsgCount < maxMessagesPerRecipient
       set *seqCounter = if shouldInsert then seqTs else seqCounter
