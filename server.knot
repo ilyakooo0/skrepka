@@ -342,7 +342,9 @@ evictOldestAckedIds = \items n ->
   else
     let toEvict = (fold (\acc a ->
       if acc.size < n
-        then {size: acc.size + 1, heap: union acc.heap [a], heapMax: if a.ackedAt > acc.heapMax then a.ackedAt else acc.heapMax}
+        then
+          let newHeap = union acc.heap [a]
+          {size: count newHeap, heap: newHeap, heapMax: if a.ackedAt > acc.heapMax then a.ackedAt else acc.heapMax}
         else if a.ackedAt < acc.heapMax
           then
             let removed = fold (\r x ->
@@ -438,10 +440,7 @@ sendBatchedGossip = \peerServers allEvents ->
       let batch = fold (\acc e ->
         if count acc >= maxGossipEvents then acc
         else union acc [e]) [] allEvents
-      let rest = (fold (\acc e ->
-        if acc.taken < maxGossipEvents
-          then {taken: acc.taken + 1, items: acc.items}
-          else {taken: acc.taken, items: union acc.items [e]}) {taken: 0, items: []} allEvents).items
+      let rest = diff allEvents batch
       sendToEach peerServers (\server ->
         fetch (federationScheme ++ server) (RecvGossip {
           authorization: "Bearer " ++ federationSecret,
@@ -566,7 +565,7 @@ serve = \req -> case req of
         pruneResult <- atomic do
           pr <- maybePrune t
           challenges <- *challenges
-          let existingCount = count (do c <- challenges; where c.pubkey == pubkey; yield c)
+          let existingCount = count (do c <- challenges; where c.pubkey == pubkey; where c.expiresAt > t; yield c)
           let oldestChallengeExpiry = fold (\acc c2 -> if c2.pubkey == pubkey && (acc == -1 || c2.expiresAt < acc) then c2.expiresAt else acc) -1 challenges
           let cappedChallenges = if existingCount >= maxChallengesPerKey && oldestChallengeExpiry >= 0
             then fold (\acc c ->
@@ -857,10 +856,9 @@ serve = \req -> case req of
               ackedIds <- *ackedIds
               let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
               let available = maxAckedIds - count ackedIds
-              let needed = count reinsert - available
-              let afterEvict = if needed <= 0 then ackedIds
-                else evictOldestAckedIds ackedIds needed
-              set *ackedIds = union afterEvict reinsert))
+              let toReinsert = if available <= 0 then []
+                else fold (\acc a -> if count acc >= available then acc else union acc [a]) [] reinsert
+              set *ackedIds = union ackedIds toReinsert))
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
@@ -886,12 +884,9 @@ serve = \req -> case req of
         Just {value: _} ->
           if not validPubkey || count valid == 0
             then ""
-            else case single (do
-              p <- valid
-              where p.server == serverHostN
-              yield p) of
-              Just {value: p} -> p.server
-              Nothing {} -> (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
+            else if count (do p <- valid; where p.server == serverHostN; yield p) > 0
+              then serverHostN
+              else (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
       yield {foundServer: foundServer, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
