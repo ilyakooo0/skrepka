@@ -329,9 +329,11 @@ verifyMaintenanceAuth = \authorization ->
   let token = extractToken authorization
   let fedResult = safeCompare token (if federationSecret == "" then "x" else federationSecret)
   let maintResult = safeCompare token (if maintenanceSecret == "" then "x" else maintenanceSecret)
-  let fedOk = not (federationSecret == "") && fedResult
-  let maintOk = not (maintenanceSecret == "") && maintResult
-  fedOk || maintOk
+  let fedN = if fedResult then 1 else 0
+  let maintN = if maintResult then 1 else 0
+  let fedSecretSet = if federationSecret == "" then 0 else 1
+  let maintSecretSet = if maintenanceSecret == "" then 0 else 1
+  fedN * fedSecretSet + maintN * maintSecretSet > 0
 
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
 
@@ -354,8 +356,8 @@ evictOldestAckedIds = \items n ->
     in diff items toEvict
 
 safeCompareLoop = \s1 s2 n result ->
-  if n <= 0
-    then result + (if s1 == "" then 0 else 1) + (if s2 == "" then 0 else 1)
+  if n <= 0 && s1 == "" && s2 == ""
+    then result
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
@@ -795,13 +797,17 @@ serve = \req -> case req of
       ackedIds <- *ackedIds
       let combinedAckedIds = union ackedIds ackedFederated
       let excessCount = count combinedAckedIds - maxAckedIds
-      set *ackedIds = if excessCount <= 0
+      let afterEviction = if excessCount <= 0
         then combinedAckedIds
         else evictOldestAckedIds combinedAckedIds excessCount
+      let evictedEntries = if excessCount <= 0
+        then []
+        else diff combinedAckedIds afterEviction
+      set *ackedIds = afterEviction
       let ok = case session of
         Nothing {} -> False {}
         _ -> True {}
-      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
+      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, evictedEntries: evictedEntries}
     let fedMessages = do
       m <- result.ackedMessages
       where not (m.originServer == "")
@@ -817,6 +823,17 @@ serve = \req -> case req of
           m <- fedMessages
           yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
         sendAcksAndClean pendingAcks originServers
+      else yield {}
+    if count result.evictedEntries > 0 && not (federationSecret == "")
+      then do
+        let evictedOriginServers = fold (\acc a ->
+          if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
+          else union acc [a.originServer]) [] result.evictedEntries
+        sendToEach evictedOriginServers (\server ->
+          fetch (federationScheme ++ server) (FederationAck {
+            authorization: "Bearer " ++ federationSecret,
+            messageIds: (do a <- result.evictedEntries; where a.originServer == server; yield a.messageId),
+            originServer: server, fromServer: serverHostN}))
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
@@ -1121,7 +1138,6 @@ serve = \req -> case req of
         m <- messages
         where m.messageId == messageId
         where m.toKey == toKey
-        where m.receivedAt >= t - messageMaxAge
         yield m) > 0
       ackedIds <- *ackedIds
       let existsInAcked = count (do
