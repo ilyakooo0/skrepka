@@ -336,16 +336,24 @@ clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresen
 evictOldestAckedIds = \items n ->
   if n <= 0 then items
   else
-    let oldest = fold (\acc a -> if acc.ackedAt == -1 || a.ackedAt < acc.ackedAt then a else acc) {messageId: "", toKey: "", ackedAt: -1, originServer: ""} items
-    in if oldest.ackedAt == -1 then items
-       else evictOldestAckedIds (fold (\acc a ->
-         if not acc.removed && a == oldest
-           then {removed: True {}, items: acc.items}
-           else {removed: acc.removed, items: union acc.items [a]}) {removed: False {}, items: []} items).items (n - 1)
+    let toEvict = (fold (\acc a ->
+      if acc.size < n
+        then {size: acc.size + 1, heap: union acc.heap [a], heapMax: if a.ackedAt > acc.heapMax then a.ackedAt else acc.heapMax}
+        else if a.ackedAt < acc.heapMax
+          then
+            let removed = fold (\r x ->
+              if not r.done && x.ackedAt == acc.heapMax
+                then {done: True {}, items: r.items}
+                else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap
+            let newHeap = union removed.items [a]
+            let newMax = fold (\best x -> if x.ackedAt > best then x.ackedAt else best) -1 newHeap
+            {size: acc.size, heap: newHeap, heapMax: newMax}
+          else acc) {size: 0, heap: [], heapMax: -1} items).heap
+    in diff items toEvict
 
 safeCompareLoop = \s1 s2 result ->
-  if s2 == ""
-    then result + (if s1 == "" then 0 else 1)
+  if s1 == "" && s2 == ""
+    then result
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
@@ -465,6 +473,71 @@ retryPendingForwards = \pending ->
             yield {}) (\err ->
             println ("prune: retry forward to " ++ f.toServer ++ " failed: " ++ show err))
           retryPendingForwards rest
+
+sendAcksAndClean = \pendingAcks servers ->
+  if count servers == 0
+    then yield {}
+    else do
+      let server = fold (\acc s -> if acc == "" then s else acc) "" servers
+      let rest = do s <- servers; where not (s == server); yield s
+      if server == ""
+        then yield {}
+        else do
+          let serverAcks = do a <- pendingAcks; where a.originServer == server; yield a
+          catch (do
+            fetch (federationScheme ++ server) (FederationAck {
+              authorization: "Bearer " ++ federationSecret,
+              messageIds: (do a <- serverAcks; yield a.messageId),
+              originServer: server, fromServer: serverHostN})
+            atomic do
+              ackedIds <- *ackedIds
+              set *ackedIds = diff ackedIds serverAcks) (\err ->
+            println ("federation: error sending ack to " ++ server ++ ": " ++ show err))
+          sendAcksAndClean pendingAcks rest
+
+pollOnce = \token cursor ->
+  atomic do
+    t <- now
+    sessions <- *sessions
+    messages <- *messages
+    let session = lookupSession sessions token t
+    let clampedCursor = if cursor < 0 then 0 else if cursor > t then t else cursor
+    let matchingMsgs = case session of
+      Nothing {} -> []
+      Just {value: s} -> do
+        m <- messages
+        where m.toKey == s.pubkey
+        where m.receivedAt >= t - messageMaxAge
+        where m.receivedAt > clampedCursor
+        yield m
+    let limitedMsgs = fold (\acc m ->
+      if count acc >= maxPollEvents then acc
+      else union acc [m]) [] matchingMsgs
+    let authorized = case session of
+      Nothing {} -> False {}
+      _ -> True {}
+    let evts = do
+      m <- limitedMsgs
+      yield {id: m.messageId, eventType: "message",
+             payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
+                              encryptedBlob: m.encryptedBlob,
+                              timestamp: m.timestamp}}
+    let lastReceivedAt = fold (\acc m -> if m.receivedAt > acc then m.receivedAt else acc) clampedCursor limitedMsgs
+    let newCursor = case session of
+      Nothing {} -> -1
+      _ -> lastReceivedAt
+    yield {events: evts, cursor: newCursor, authorized: authorized}
+
+pollLoop = \token cursor deadline -> do
+  result <- pollOnce token cursor
+  t <- now
+  if result.authorized && count result.events == 0 && t < deadline
+    then do
+      let remaining = deadline - t
+      let sleepMs = if remaining > 500 then 500 else remaining
+      sleep sleepMs
+      pollLoop token cursor deadline
+    else yield result
 
 -- ============================================
 -- Request Handler
@@ -602,47 +675,12 @@ serve = \req -> case req of
     let clampedTimeout = if timeout < 0 then 0 else if timeout > 60000 then 60000 else timeout
     let deadline = t + clampedTimeout
     let token = extractToken authorization
-    result <- atomic do
-      tNow <- now
-      pr <- maybePrune tNow
-      sessions <- *sessions
-      messages <- *messages
-      seqCounter <- *seqCounter
-      let session = lookupSession sessions token tNow
-      let clampedCursor = if cursor < 0 then 0 else if cursor > seqCounter then seqCounter else cursor
-      let matchingMsgs = case session of
-        Nothing {} -> []
-        Just {value: s} -> do
-          m <- messages
-          where m.toKey == s.pubkey
-          where m.receivedAt >= tNow - messageMaxAge
-          where m.receivedAt > clampedCursor
-          yield m
-      let limitedMsgs = fold (\acc m ->
-        if count acc >= maxPollEvents then acc
-        else union acc [m]) [] matchingMsgs
-      let authorized = case session of
-        Nothing {} -> False {}
-        _ -> True {}
-      if authorized && count limitedMsgs == 0 && tNow < deadline
-        then retry
-        else do
-          let evts = do
-            m <- limitedMsgs
-            yield {id: m.messageId, eventType: "message",
-                   payload: toJson {toKey: m.toKey, fromKey: m.fromKey,
-                                    encryptedBlob: m.encryptedBlob,
-                                    timestamp: m.timestamp}}
-          let lastReceivedAt = fold (\acc m -> if m.receivedAt > acc then m.receivedAt else acc) clampedCursor limitedMsgs
-          let newCursor = case session of
-            Nothing {} -> -1
-            _ -> if count limitedMsgs >= maxPollEvents
-              then lastReceivedAt
-              else if seqCounter > clampedCursor then seqCounter else clampedCursor
-          yield {events: evts, cursor: newCursor, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
+    result <- pollLoop token cursor deadline
     respond {events: result.events, cursor: result.cursor, authorized: result.authorized}
     tAfterPoll <- now
-    broadcastOfflineGossip tAfterPoll result.peerServers result.expiredLocal
+    pruneResult <- atomic do
+      maybePrune tAfterPoll
+    broadcastOfflineGossip tAfterPoll pruneResult.peerServers pruneResult.expiredLocal
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     let validInput = not (to == "") && not (encryptedBlob == "") && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && isValidHex to && isValidHex encryptedBlob
@@ -1158,11 +1196,7 @@ serve = \req -> case req of
             let ackOriginServers = fold (\acc a ->
               if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
               else union acc [a.originServer]) [] result.pendingAcks
-            sendToEach ackOriginServers (\server ->
-              fetch (federationScheme ++ server) (FederationAck {
-                authorization: "Bearer " ++ federationSecret,
-                messageIds: (do a <- result.pendingAcks; where a.originServer == server; yield a.messageId),
-                originServer: server, fromServer: serverHostN}))
+            sendAcksAndClean result.pendingAcks ackOriginServers
           else yield {}
       else respond {ok: False {}}
 
@@ -1170,6 +1204,18 @@ serve = \req -> case req of
 -- Entry Point
 -- ============================================
 
+backgroundPrune = do
+  sleep 30000
+  t <- now
+  catch (do
+    pruneResult <- atomic do
+      set *lastPrunedAt = t
+      pruneExpired t
+    broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal) (\err ->
+    println ("background prune: " ++ show err))
+  backgroundPrune
+
 main = do
   println "Skrepka relay server starting on port 8080..."
+  spawn backgroundPrune
   listen 8080 serve
