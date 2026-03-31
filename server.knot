@@ -356,8 +356,8 @@ evictOldestAckedIds = \items n ->
     in diff items toEvict
 
 safeCompareLoop = \s1 s2 n result ->
-  if n <= 0
-    then result + (if s1 == s2 then 0 else 1)
+  if n <= 0 && s1 == "" && s2 == ""
+    then result
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
@@ -759,11 +759,17 @@ serve = \req -> case req of
     let finalStatus = if result.status == "federated" && (federationSecret == "" || result.forwardsAtCapacity) then "queued" else result.status
     respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else if result.status == "rejected" then "" else msgId)}
     if count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (result.status == "rejected") && not (federationSecret == "")
-      then sendToEach result.remoteServers (\server ->
+      then sendToEach result.remoteServers (\server -> do
         fetch (federationScheme ++ server) (ForwardMessage {
           toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
           timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
-          authorization: "Bearer " ++ federationSecret}))
+          authorization: "Bearer " ++ federationSecret})
+        atomic do
+          forwards <- *forwards
+          set *forwards = do
+            x <- forwards
+            where not (x.messageId == msgId && x.toServer == server)
+            yield x)
       else yield {}
     if result.forwardsAtCapacity && count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (result.status == "rejected")
       then println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
@@ -851,9 +857,10 @@ serve = \req -> case req of
               ackedIds <- *ackedIds
               let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
               let available = maxAckedIds - count ackedIds
-              let limitedReinsert = if available >= count reinsert then reinsert
-                else fold (\acc x -> if count acc >= available then acc else union acc [x]) [] reinsert
-              set *ackedIds = union ackedIds limitedReinsert))
+              let needed = count reinsert - available
+              let afterEvict = if needed <= 0 then ackedIds
+                else evictOldestAckedIds ackedIds needed
+              set *ackedIds = union afterEvict reinsert))
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
