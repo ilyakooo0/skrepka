@@ -58,7 +58,7 @@ type GossipEvent = {eventType: Text, pubkey: Text, server: Text, timestamp: Int,
 
 *forwards : [{messageId: Text, toServer: Text, createdAt: Int, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int}]
 
-*ackedIds : [{messageId: Text, toKey: Text, ackedAt: Int}]
+*ackedIds : [{messageId: Text, toKey: Text, ackedAt: Int, originServer: Text}]
 
 *lastPrunedAt : Int
 
@@ -635,7 +635,8 @@ serve = \req -> case req of
               else if seqCounter > clampedCursor then seqCounter else clampedCursor
           yield {events: evts, cursor: newCursor, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     respond {events: result.events, cursor: result.cursor, authorized: result.authorized}
-    broadcastOfflineGossip t result.peerServers result.expiredLocal
+    tAfterPoll <- now
+    broadcastOfflineGossip tAfterPoll result.peerServers result.expiredLocal
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     let validInput = not (to == "") && not (encryptedBlob == "") && not (tooLong to maxPubkeyLen) && not (tooLong encryptedBlob maxBlobLen) && isValidHex to && isValidHex encryptedBlob
@@ -742,7 +743,7 @@ serve = \req -> case req of
         m <- ackedMessages
         where not (m.originServer == "")
         where not (m.originServer == serverHostN)
-        yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t}
+        yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
       ackedIds <- *ackedIds
       let combinedAckedIds = union ackedIds ackedFederated
       let oldestAckedAt = if count combinedAckedIds > maxAckedIds
@@ -1133,16 +1134,34 @@ serve = \req -> case req of
     if authorized
       then do
         result <- atomic do
+          set *lastPrunedAt = t
           pr <- pruneExpired t
           forwards <- *forwards
           let pendingForwards = do
             f <- forwards
             yield {toServer: f.toServer, toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, messageId: f.messageId}
-          yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards}
+          ackedIds <- *ackedIds
+          let pendingAcks = do
+            a <- ackedIds
+            where not (a.originServer == "")
+            where not (a.originServer == serverHostN)
+            yield a
+          yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
         respond {ok: True {}}
         broadcastOfflineGossip t result.peerServers result.expiredLocal
         if not (federationSecret == "") && count result.pendingForwards > 0
           then retryPendingForwards result.pendingForwards
+          else yield {}
+        if not (federationSecret == "") && count result.pendingAcks > 0
+          then do
+            let ackOriginServers = fold (\acc a ->
+              if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
+              else union acc [a.originServer]) [] result.pendingAcks
+            sendToEach ackOriginServers (\server ->
+              fetch (federationScheme ++ server) (FederationAck {
+                authorization: "Bearer " ++ federationSecret,
+                messageIds: (do a <- result.pendingAcks; where a.originServer == server; yield a.messageId),
+                originServer: server, fromServer: serverHostN}))
           else yield {}
       else respond {ok: False {}}
 
