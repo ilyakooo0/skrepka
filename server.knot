@@ -327,8 +327,10 @@ verifyFederationAuth = \authorization ->
 
 verifyMaintenanceAuth = \authorization ->
   let token = extractToken authorization
-  let fedOk = not (federationSecret == "") && safeCompare token federationSecret
-  let maintOk = not (maintenanceSecret == "") && safeCompare token maintenanceSecret
+  let fedResult = safeCompare token (if federationSecret == "" then "x" else federationSecret)
+  let maintResult = safeCompare token (if maintenanceSecret == "" then "x" else maintenanceSecret)
+  let fedOk = not (federationSecret == "") && fedResult
+  let maintOk = not (maintenanceSecret == "") && maintResult
   fedOk || maintOk
 
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
@@ -351,13 +353,13 @@ evictOldestAckedIds = \items n ->
           else acc) {size: 0, heap: [], heapMax: -1} items).heap
     in diff items toEvict
 
-safeCompareLoop = \s1 s2 result ->
-  if s1 == "" && s2 == ""
-    then result
-    else safeCompareLoop (drop 1 s1) (drop 1 s2) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
+safeCompareLoop = \s1 s2 n result ->
+  if n <= 0
+    then result + (if s1 == "" then 0 else 1) + (if s2 == "" then 0 else 1)
+    else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
-  safeCompareLoop a b 0 + (if a == "" then 1 else 0) + (if b == "" then 1 else 0) == 0
+  safeCompareLoop a b maxTokenLen 0 + (if a == "" then 1 else 0) + (if b == "" then 1 else 0) == 0
 
 sendToEach = \servers action ->
   if count servers == 0
@@ -500,8 +502,10 @@ pollOnce = \token cursor ->
     t <- now
     sessions <- *sessions
     messages <- *messages
+    seqCounter <- *seqCounter
     let session = lookupSession sessions token t
-    let clampedCursor = if cursor < 0 then 0 else if cursor > t then t else cursor
+    let cursorCeil = if seqCounter > t then seqCounter else t
+    let clampedCursor = if cursor < 0 then 0 else if cursor > cursorCeil then cursorCeil else cursor
     let matchingMsgs = case session of
       Nothing {} -> []
       Just {value: s} -> do
@@ -808,11 +812,11 @@ serve = \req -> case req of
       else union acc [m.originServer]) [] fedMessages
     respond {ok: result.ok}
     if result.ok && count originServers > 0 && not (federationSecret == "")
-      then sendToEach originServers (\server ->
-        fetch (federationScheme ++ server) (FederationAck {
-          authorization: "Bearer " ++ federationSecret,
-          messageIds: (do m <- fedMessages; where m.originServer == server; yield m.messageId),
-          originServer: server, fromServer: serverHostN}))
+      then do
+        let pendingAcks = do
+          m <- fedMessages
+          yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
+        sendAcksAndClean pendingAcks originServers
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
@@ -1208,10 +1212,31 @@ backgroundPrune = do
   sleep 30000
   t <- now
   catch (do
-    pruneResult <- atomic do
+    result <- atomic do
       set *lastPrunedAt = t
-      pruneExpired t
-    broadcastOfflineGossip t pruneResult.peerServers pruneResult.expiredLocal) (\err ->
+      pr <- pruneExpired t
+      forwards <- *forwards
+      let pendingForwards = do
+        f <- forwards
+        yield {toServer: f.toServer, toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, messageId: f.messageId}
+      ackedIds <- *ackedIds
+      let pendingAcks = do
+        a <- ackedIds
+        where not (a.originServer == "")
+        where not (a.originServer == serverHostN)
+        yield a
+      yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
+    broadcastOfflineGossip t result.peerServers result.expiredLocal
+    if not (federationSecret == "") && count result.pendingForwards > 0
+      then retryPendingForwards result.pendingForwards
+      else yield {}
+    if not (federationSecret == "") && count result.pendingAcks > 0
+      then do
+        let ackOriginServers = fold (\acc a ->
+          if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
+          else union acc [a.originServer]) [] result.pendingAcks
+        sendAcksAndClean result.pendingAcks ackOriginServers
+      else yield {}) (\err ->
     println ("background prune: " ++ show err))
   backgroundPrune
 
