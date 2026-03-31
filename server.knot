@@ -356,8 +356,8 @@ evictOldestAckedIds = \items n ->
     in diff items toEvict
 
 safeCompareLoop = \s1 s2 n result ->
-  if n <= 0 && s1 == "" && s2 == ""
-    then result
+  if n <= 0
+    then result + (if s1 == s2 then 0 else 1)
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
@@ -474,7 +474,12 @@ retryPendingForwards = \pending ->
               toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob,
               timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
               authorization: "Bearer " ++ federationSecret})
-            yield {}) (\err ->
+            atomic do
+              forwards <- *forwards
+              set *forwards = do
+                x <- forwards
+                where not (x.messageId == f.messageId && x.toServer == f.toServer)
+                yield x) (\err ->
             println ("prune: retry forward to " ++ f.toServer ++ " failed: " ++ show err))
           retryPendingForwards rest
 
@@ -825,23 +830,30 @@ serve = \req -> case req of
           yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
         sendAcksAndClean pendingAcks originServers
       else yield {}
-    if count result.evictedEntries > 0 && not (federationSecret == "")
+    let evictedToRetry = do
+      a <- result.evictedEntries
+      where count (do m <- fedMessages; where m.messageId == a.messageId; where m.toKey == a.toKey; yield m) == 0
+      yield a
+    if count evictedToRetry > 0 && not (federationSecret == "")
       then do
         let evictedOriginServers = fold (\acc a ->
           if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
-          else union acc [a.originServer]) [] result.evictedEntries
+          else union acc [a.originServer]) [] evictedToRetry
         sendToEach evictedOriginServers (\server ->
           catch (do
             fetch (federationScheme ++ server) (FederationAck {
               authorization: "Bearer " ++ federationSecret,
-              messageIds: (do a <- result.evictedEntries; where a.originServer == server; yield a.messageId),
+              messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
               originServer: server, fromServer: serverHostN})
             yield {}) (\err -> do
             println ("federation: error sending evicted ack to " ++ server ++ ": " ++ show err)
             atomic do
               ackedIds <- *ackedIds
-              let reinsert = do a <- result.evictedEntries; where a.originServer == server; yield a
-              set *ackedIds = union ackedIds reinsert))
+              let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
+              let available = maxAckedIds - count ackedIds
+              let limitedReinsert = if available >= count reinsert then reinsert
+                else fold (\acc x -> if count acc >= available then acc else union acc [x]) [] reinsert
+              set *ackedIds = union ackedIds limitedReinsert))
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
@@ -990,7 +1002,7 @@ serve = \req -> case req of
             o <- trustedOffline
             where o.pubkey == k.pubkey
             where o.server == k.server
-            where o.timestamp >= p.timestamp
+            where o.timestamp > p.timestamp
             yield o) > 0
           yield p) > 0
         yield {pubkey: k.pubkey, server: k.server}
@@ -1003,7 +1015,7 @@ serve = \req -> case req of
           o <- trustedOffline
           where o.pubkey == k.pubkey
           where o.server == k.server
-          where o.timestamp >= p.timestamp
+          where o.timestamp > p.timestamp
           yield o) > 0
         yield p)
       let withinCapacity = count afterOffline <= maxPresenceEntries
@@ -1034,7 +1046,7 @@ serve = \req -> case req of
             o <- trustedOffline
             where o.pubkey == k.pubkey
             where o.server == k.server
-            where o.timestamp >= p.timestamp
+            where o.timestamp > p.timestamp
             yield o) > 0
           yield p)
       let reclaimCapacity = if withinCapacity then 0 else maxPresenceEntries - count updatesOnlyAfterOffline
