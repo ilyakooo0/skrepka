@@ -741,6 +741,7 @@ serve = \req -> case req of
       let status = case session of
         Nothing {} -> "unauthorized"
         _ -> if not validInput then "invalid"
+             else if recipientMsgCount >= maxMessagesPerRecipient then "rejected"
              else if localOnline then "delivered"
              else if count remoteServers > 0 then "federated"
              else "queued"
@@ -751,15 +752,15 @@ serve = \req -> case req of
         else forwards
       yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
     let finalStatus = if result.status == "federated" && (federationSecret == "" || result.forwardsAtCapacity) then "queued" else result.status
-    respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else msgId)}
-    if count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (federationSecret == "")
+    respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "invalid" then "" else if result.status == "rejected" then "" else msgId)}
+    if count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (result.status == "rejected") && not (federationSecret == "")
       then sendToEach result.remoteServers (\server ->
         fetch (federationScheme ++ server) (ForwardMessage {
           toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
           timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
           authorization: "Bearer " ++ federationSecret}))
       else yield {}
-    if result.forwardsAtCapacity && count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid")
+    if result.forwardsAtCapacity && count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (result.status == "rejected")
       then println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
@@ -830,10 +831,17 @@ serve = \req -> case req of
           if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
           else union acc [a.originServer]) [] result.evictedEntries
         sendToEach evictedOriginServers (\server ->
-          fetch (federationScheme ++ server) (FederationAck {
-            authorization: "Bearer " ++ federationSecret,
-            messageIds: (do a <- result.evictedEntries; where a.originServer == server; yield a.messageId),
-            originServer: server, fromServer: serverHostN}))
+          catch (do
+            fetch (federationScheme ++ server) (FederationAck {
+              authorization: "Bearer " ++ federationSecret,
+              messageIds: (do a <- result.evictedEntries; where a.originServer == server; yield a.messageId),
+              originServer: server, fromServer: serverHostN})
+            yield {}) (\err -> do
+            println ("federation: error sending evicted ack to " ++ server ++ ": " ++ show err)
+            atomic do
+              ackedIds <- *ackedIds
+              let reinsert = do a <- result.evictedEntries; where a.originServer == server; yield a
+              set *ackedIds = union ackedIds reinsert))
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
@@ -936,14 +944,14 @@ serve = \req -> case req of
     gossipResult <- atomic do
       pr <- maybePrune t
       presence <- *presence
-      let fromServerTrusted = count (do p <- presence; where p.server == fromServer; yield p) > 0
+      let fromServerTrusted = count (do p <- presence; where p.server == fromServer; where p.expiresAt > t; yield p) > 0
       let trustedDeduped = do
         e <- deduped
-        where e.server == fromServer || fromServerTrusted || count (do p <- presence; where p.server == e.server; yield p) > 0
+        where e.server == fromServer || fromServerTrusted || count (do p <- presence; where p.server == e.server; where p.expiresAt > t; yield p) > 0
         yield e
       let trustedOffline = do
         e <- offlineEntries
-        where e.server == fromServer || fromServerTrusted || count (do p <- presence; where p.server == e.server; yield p) > 0
+        where e.server == fromServer || fromServerTrusted || count (do p <- presence; where p.server == e.server; where p.expiresAt > t; yield p) > 0
         yield e
       let appliedOnline = do
         e <- trustedDeduped
