@@ -33,6 +33,7 @@ maxSessionsPerKey = 10
 challengeExpiry = 60000 -- 1 minute in milliseconds
 sessionExpiry = 3600000 -- 1 hour in milliseconds
 onlineGossipTtl = 3600 -- 1 hour in seconds
+offlineGossipMinTtl = 60 -- minimum TTL for offline gossip events in seconds
 
 -- ============================================
 -- Types
@@ -323,7 +324,10 @@ extractToken = \authHeader ->
     else ""
 
 verifyFederationAuth = \authorization ->
-  not (federationSecret == "") && safeCompare (extractToken authorization) federationSecret
+  let token = extractToken authorization
+  let result = safeCompare token (if federationSecret == "" then "x" else federationSecret)
+  let secretSet = if federationSecret == "" then 0 else 1
+  (if result then 1 else 0) * secretSet > 0
 
 verifyMaintenanceAuth = \authorization ->
   let token = extractToken authorization
@@ -344,7 +348,10 @@ evictOldestAckedIds = \items n ->
       if acc.size < n
         then
           let newHeap = union acc.heap [a]
-          {size: count newHeap, heap: newHeap, heapMax: if a.ackedAt > acc.heapMax then a.ackedAt else acc.heapMax}
+          let newSize = count newHeap
+          if newSize > acc.size
+            then {size: newSize, heap: newHeap, heapMax: if a.ackedAt > acc.heapMax then a.ackedAt else acc.heapMax}
+            else acc
         else if a.ackedAt < acc.heapMax
           then
             let removed = fold (\r x ->
@@ -358,8 +365,8 @@ evictOldestAckedIds = \items n ->
     in diff items toEvict
 
 safeCompareLoop = \s1 s2 n result ->
-  if n <= 0 && s1 == "" && s2 == ""
-    then result
+  if n <= 0
+    then result + (if s1 == "" then 0 else 1) + (if s2 == "" then 0 else 1)
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
@@ -457,7 +464,7 @@ broadcastOfflineGossip = \t peerServers expiredLocal -> do
     if count (do a <- acc; where a.pubkey == p.pubkey; where a.expiresAt >= p.expiresAt; yield a) > 0 then acc
     else union
       (do a <- acc; where not (a.pubkey == p.pubkey); yield a)
-      [{pubkey: p.pubkey, ttl: clampTtl ((p.expiresAt - p.timestamp) / 1000), expiresAt: p.expiresAt}]) [] expiredLocal
+      [{pubkey: p.pubkey, ttl: (let rawTtl = (p.expiresAt - p.timestamp) / 1000 in clampTtl (if rawTtl < offlineGossipMinTtl then offlineGossipMinTtl else rawTtl)), expiresAt: p.expiresAt}]) [] expiredLocal
   if not (federationSecret == "") && count expiredEntries > 0 && count peerServers > 0
     then do
       let gossipEvents = do
@@ -535,7 +542,10 @@ pollOnce = \token cursor ->
       if acc.size < maxPollEvents
         then
           let newHeap = union acc.heap [m]
-          {size: count newHeap, heap: newHeap, heapMax: if m.receivedAt > acc.heapMax then m.receivedAt else acc.heapMax}
+          let newSize = count newHeap
+          if newSize > acc.size
+            then {size: newSize, heap: newHeap, heapMax: if m.receivedAt > acc.heapMax then m.receivedAt else acc.heapMax}
+            else acc
         else if m.receivedAt < acc.heapMax
           then
             let removed = fold (\r x ->
@@ -857,45 +867,48 @@ serve = \req -> case req of
           yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
         sendAcksAndClean pendingAcks originServers
       else yield {}
-    evictedEntries <- atomic do
-      ackedIds <- *ackedIds
-      let excessCount = count ackedIds - maxAckedIds
-      if excessCount <= 0
-        then yield []
-        else do
-          let afterEviction = evictOldestAckedIds ackedIds excessCount
-          let evicted = diff ackedIds afterEviction
-          set *ackedIds = afterEviction
-          yield evicted
-    let evictedToRetry = do
-      a <- evictedEntries
-      where count (do m <- fedMessages; where m.messageId == a.messageId; where m.toKey == a.toKey; yield m) == 0
-      yield a
-    if count evictedToRetry > 0 && not (federationSecret == "")
+    if result.ok
       then do
-        let evictedOriginServers = fold (\acc a ->
-          if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
-          else union acc [a.originServer]) [] evictedToRetry
-        sendToEach evictedOriginServers (\server ->
-          catch (do
-            fetch (federationScheme ++ server) (FederationAck {
-              authorization: "Bearer " ++ federationSecret,
-              messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
-              originServer: server, fromServer: serverHostN})
-            yield {}) (\err -> do
-            println ("federation: error sending evicted ack to " ++ server ++ ": " ++ show err)
-            evicted <- atomic do
-              ackedIds <- *ackedIds
-              let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
-              let combined = union ackedIds reinsert
-              let excess = count combined - maxAckedIds
-              let afterEviction = if excess <= 0 then combined
-                else evictOldestAckedIds combined excess
+        evictedEntries <- atomic do
+          ackedIds <- *ackedIds
+          let excessCount = count ackedIds - maxAckedIds
+          if excessCount <= 0
+            then yield []
+            else do
+              let afterEviction = evictOldestAckedIds ackedIds excessCount
+              let evicted = diff ackedIds afterEviction
               set *ackedIds = afterEviction
-              yield (count combined - count afterEviction)
-            if evicted > 0
-              then println ("federation: evicted " ++ show evicted ++ " old ack entries to reinsert failed acks for " ++ server)
-              else yield {}))
+              yield evicted
+        let evictedToRetry = do
+          a <- evictedEntries
+          where count (do m <- fedMessages; where m.messageId == a.messageId; where m.toKey == a.toKey; yield m) == 0
+          yield a
+        if count evictedToRetry > 0 && not (federationSecret == "")
+          then do
+            let evictedOriginServers = fold (\acc a ->
+              if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
+              else union acc [a.originServer]) [] evictedToRetry
+            sendToEach evictedOriginServers (\server ->
+              catch (do
+                fetch (federationScheme ++ server) (FederationAck {
+                  authorization: "Bearer " ++ federationSecret,
+                  messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
+                  originServer: server, fromServer: serverHostN})
+                yield {}) (\err -> do
+                println ("federation: error sending evicted ack to " ++ server ++ ": " ++ show err)
+                evicted <- atomic do
+                  ackedIds <- *ackedIds
+                  let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
+                  let combined = union ackedIds reinsert
+                  let excess = count combined - maxAckedIds
+                  let afterEviction = if excess <= 0 then combined
+                    else evictOldestAckedIds combined excess
+                  set *ackedIds = afterEviction
+                  yield (count combined - count afterEviction)
+                if evicted > 0
+                  then println ("federation: evicted " ++ show evicted ++ " old ack entries to reinsert failed acks for " ++ server)
+                  else yield {}))
+          else yield {}
       else yield {}
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
