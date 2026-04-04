@@ -506,7 +506,11 @@ sendAcksAndClean = \pendingAcks servers ->
               originServer: server, fromServer: serverHostN})
             atomic do
               ackedIds <- *ackedIds
-              set *ackedIds = diff ackedIds serverAcks) (\err ->
+              let ackMsgIds = do a <- serverAcks; yield a.messageId
+              set *ackedIds = do
+                a <- ackedIds
+                where not (a.originServer == server && count (do mid <- ackMsgIds; where mid == a.messageId; yield mid) > 0)
+                yield a) (\err ->
             println ("federation: error sending ack to " ++ server ++ ": " ++ show err))
           sendAcksAndClean pendingAcks rest
 
@@ -635,12 +639,14 @@ serve = \req -> case req of
           else if not (isValidHex pubkey) || not (isValidHex signature)
           then False {}
           else verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
-      set *challenges = case matched of
-        Just {value: _} -> do
-          c <- challenges
-          where not (c.pubkey == pubkey && c.challenge == challenge)
-          yield c
-        Nothing {} -> challenges
+      set *challenges = if sigValid
+        then (case matched of
+          Just {value: _} -> do
+            c <- challenges
+            where not (c.pubkey == pubkey && c.challenge == challenge)
+            yield c
+          Nothing {} -> challenges)
+        else challenges
       let existingForKey = do
         s <- sessions
         where s.pubkey == pubkey
@@ -654,15 +660,16 @@ serve = \req -> case req of
       let sessionsCapped = if count existingForKey >= maxSessionsPerKey && oldestExpiry >= 0
         then cappedFold.sessions
         else sessions
-      let globalOldestSessionExpiry = if count sessionsCapped >= maxSessions
-        then fold (\acc s -> if acc == -1 || s.expiresAt < acc then s.expiresAt else acc) -1 sessionsCapped
+      let activeSessionsCapped = do s <- sessionsCapped; where s.expiresAt > t; yield s
+      let globalOldestSessionExpiry = if count activeSessionsCapped >= maxSessions
+        then fold (\acc s -> if acc == -1 || s.expiresAt < acc then s.expiresAt else acc) -1 activeSessionsCapped
         else -1
       let globalSessionsCapped = if globalOldestSessionExpiry >= 0
         then (fold (\acc s ->
           if not acc.removed && s.expiresAt == globalOldestSessionExpiry
             then {removed: True {}, items: acc.items}
-            else {removed: acc.removed, items: union acc.items [s]}) {removed: False {}, items: []} sessionsCapped).items
-        else sessionsCapped
+            else {removed: acc.removed, items: union acc.items [s]}) {removed: False {}, items: []} activeSessionsCapped).items
+        else activeSessionsCapped
       set *sessions = if sigValid
         then union globalSessionsCapped [{token: token, pubkey: pubkey, expiresAt: expiry}]
         else sessions
@@ -829,18 +836,11 @@ serve = \req -> case req of
         yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
       ackedIds <- *ackedIds
       let combinedAckedIds = union ackedIds ackedFederated
-      let excessCount = count combinedAckedIds - maxAckedIds
-      let afterEviction = if excessCount <= 0
-        then combinedAckedIds
-        else evictOldestAckedIds combinedAckedIds excessCount
-      let evictedEntries = if excessCount <= 0
-        then []
-        else diff combinedAckedIds afterEviction
-      set *ackedIds = afterEviction
+      set *ackedIds = combinedAckedIds
       let ok = case session of
         Nothing {} -> False {}
         _ -> True {}
-      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, evictedEntries: evictedEntries}
+      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     let fedMessages = do
       m <- result.ackedMessages
       where not (m.originServer == "")
@@ -857,8 +857,18 @@ serve = \req -> case req of
           yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
         sendAcksAndClean pendingAcks originServers
       else yield {}
+    evictedEntries <- atomic do
+      ackedIds <- *ackedIds
+      let excessCount = count ackedIds - maxAckedIds
+      if excessCount <= 0
+        then yield []
+        else do
+          let afterEviction = evictOldestAckedIds ackedIds excessCount
+          let evicted = diff ackedIds afterEviction
+          set *ackedIds = afterEviction
+          yield evicted
     let evictedToRetry = do
-      a <- result.evictedEntries
+      a <- evictedEntries
       where count (do m <- fedMessages; where m.messageId == a.messageId; where m.toKey == a.toKey; yield m) == 0
       yield a
     if count evictedToRetry > 0 && not (federationSecret == "")
@@ -1031,7 +1041,7 @@ serve = \req -> case req of
             o <- trustedOffline
             where o.pubkey == k.pubkey
             where o.server == k.server
-            where o.timestamp > p.timestamp
+            where (if o.timestamp > t then t else o.timestamp) > p.timestamp
             yield o) > 0
           yield p) > 0
         yield {pubkey: k.pubkey, server: k.server}
@@ -1044,7 +1054,7 @@ serve = \req -> case req of
           o <- trustedOffline
           where o.pubkey == k.pubkey
           where o.server == k.server
-          where o.timestamp > p.timestamp
+          where (if o.timestamp > t then t else o.timestamp) > p.timestamp
           yield o) > 0
         yield p)
       let withinCapacity = count afterOffline <= maxPresenceEntries
@@ -1075,7 +1085,7 @@ serve = \req -> case req of
             o <- trustedOffline
             where o.pubkey == k.pubkey
             where o.server == k.server
-            where o.timestamp > p.timestamp
+            where (if o.timestamp > t then t else o.timestamp) > p.timestamp
             yield o) > 0
           yield p)
       let reclaimCapacity = if withinCapacity then 0 else maxPresenceEntries - count updatesOnlyAfterOffline
@@ -1259,17 +1269,20 @@ serve = \req -> case req of
             yield a
           yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
         respond {ok: True {}}
-        broadcastOfflineGossip t result.peerServers result.expiredLocal
-        if not (federationSecret == "") && count result.pendingForwards > 0
+        catch (broadcastOfflineGossip t result.peerServers result.expiredLocal) (\err ->
+          println ("prune: gossip failed: " ++ show err))
+        catch (if not (federationSecret == "") && count result.pendingForwards > 0
           then retryPendingForwards result.pendingForwards
-          else yield {}
-        if not (federationSecret == "") && count result.pendingAcks > 0
+          else yield {}) (\err ->
+          println ("prune: forward retry failed: " ++ show err))
+        catch (if not (federationSecret == "") && count result.pendingAcks > 0
           then do
             let ackOriginServers = fold (\acc a ->
               if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
               else union acc [a.originServer]) [] result.pendingAcks
             sendAcksAndClean result.pendingAcks ackOriginServers
-          else yield {}
+          else yield {}) (\err ->
+          println ("prune: ack send failed: " ++ show err))
       else respond {ok: False {}}
 
 -- ============================================
@@ -1294,17 +1307,20 @@ backgroundPrune = do
         where not (a.originServer == serverHostN)
         yield a
       yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
-    broadcastOfflineGossip t result.peerServers result.expiredLocal
-    if not (federationSecret == "") && count result.pendingForwards > 0
+    catch (broadcastOfflineGossip t result.peerServers result.expiredLocal) (\err ->
+      println ("background prune: gossip failed: " ++ show err))
+    catch (if not (federationSecret == "") && count result.pendingForwards > 0
       then retryPendingForwards result.pendingForwards
-      else yield {}
-    if not (federationSecret == "") && count result.pendingAcks > 0
+      else yield {}) (\err ->
+      println ("background prune: forward retry failed: " ++ show err))
+    catch (if not (federationSecret == "") && count result.pendingAcks > 0
       then do
         let ackOriginServers = fold (\acc a ->
           if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
           else union acc [a.originServer]) [] result.pendingAcks
         sendAcksAndClean result.pendingAcks ackOriginServers
       else yield {}) (\err ->
+      println ("background prune: ack send failed: " ++ show err))) (\err ->
     println ("background prune: " ++ show err))
   backgroundPrune
 
