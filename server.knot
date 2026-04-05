@@ -320,7 +320,7 @@ isBadServerName = \s ->
 lookupSession = \sessions token t ->
   single (do
     s <- sessions
-    where s.token == token
+    where safeCompare s.token token
     where s.expiresAt > t
     yield s)
 
@@ -859,11 +859,16 @@ serve = \req -> case req of
         yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
       ackedIds <- *ackedIds
       let combinedAckedIds = union ackedIds ackedFederated
-      set *ackedIds = combinedAckedIds
+      let excessCount = count combinedAckedIds - maxAckedIds
+      let afterEviction = if excessCount <= 0 then combinedAckedIds
+        else evictOldestAckedIds combinedAckedIds excessCount
+      let evictedEntries = if excessCount <= 0 then []
+        else diff combinedAckedIds afterEviction
+      set *ackedIds = afterEviction
       let ok = case session of
         Nothing {} -> False {}
         _ -> True {}
-      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
+      yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, evictedEntries: evictedEntries}
     let fedMessages = do
       m <- result.ackedMessages
       where not (m.originServer == "")
@@ -882,18 +887,8 @@ serve = \req -> case req of
       else yield {}
     if result.ok
       then do
-        evictedEntries <- atomic do
-          ackedIds <- *ackedIds
-          let excessCount = count ackedIds - maxAckedIds
-          if excessCount <= 0
-            then yield []
-            else do
-              let afterEviction = evictOldestAckedIds ackedIds excessCount
-              let evicted = diff ackedIds afterEviction
-              set *ackedIds = afterEviction
-              yield evicted
         let evictedToRetry = do
-          a <- evictedEntries
+          a <- result.evictedEntries
           where count (do m <- fedMessages; where m.messageId == a.messageId; where m.toKey == a.toKey; yield m) == 0
           yield a
         if count evictedToRetry > 0 && not (federationSecret == "")
