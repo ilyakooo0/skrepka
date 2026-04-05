@@ -4,3 +4,6 @@ server
 *.db-journal
 *.db-wal
 *.db-shm
+.fake
+client/bin
+client/obj
