@@ -115,7 +115,7 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 -- ============================================
 
 hexDigit = \n ->
-  let n = if n < 0 then 0 else if n > 15 then 15 else n
+  let n = if n < 0 then 0 else if n > 15 then 15 else n in
   if n == 0 then "0" else if n == 1 then "1" else if n == 2 then "2" else if n == 3 then "3"
   else if n == 4 then "4" else if n == 5 then "5" else if n == 6 then "6" else if n == 7 then "7"
   else if n == 8 then "8" else if n == 9 then "9" else if n == 10 then "a" else if n == 11 then "b"
@@ -124,10 +124,10 @@ hexDigit = \n ->
 byteToHex = \n -> hexDigit (n / 16) ++ hexDigit (n - (n / 16) * 16)
 
 intTo3Hex = \n ->
-  let b0 = n / 65536
-  let r0 = n - b0 * 65536
-  let b1 = r0 / 256
-  let b2 = r0 - b1 * 256
+  let b0 = n / 65536 in
+  let r0 = n - b0 * 65536 in
+  let b1 = r0 / 256 in
+  let b2 = r0 - b1 * 256 in
   byteToHex b0 ++ byteToHex b1 ++ byteToHex b2
 
 genToken = do
@@ -278,7 +278,7 @@ containsInternalSuffix = \s ->
   else containsInternalSuffix (drop 1 s)
 
 isBadServerName = \s ->
-  let sn = toLower (stripTrailingDot s)
+  let sn = toLower (stripTrailingDot s) in
   sn == ""
   || take 1 sn == "."
   || take 1 sn == ":"
@@ -337,19 +337,19 @@ extractToken = \authHeader ->
     else ""
 
 verifyFederationAuth = \authorization ->
-  let token = extractToken authorization
-  let result = safeCompare token (if federationSecret == "" then "x" else federationSecret)
-  let secretSet = if federationSecret == "" then 0 else 1
+  let token = extractToken authorization in
+  let result = safeCompare token (if federationSecret == "" then "x" else federationSecret) in
+  let secretSet = if federationSecret == "" then 0 else 1 in
   (if result then 1 else 0) * secretSet > 0
 
 verifyMaintenanceAuth = \authorization ->
-  let token = extractToken authorization
-  let fedResult = safeCompare token (if federationSecret == "" then "x" else federationSecret)
-  let maintResult = safeCompare token (if maintenanceSecret == "" then "x" else maintenanceSecret)
-  let fedN = if fedResult then 1 else 0
-  let maintN = if maintResult then 1 else 0
-  let fedSecretSet = if federationSecret == "" then 0 else 1
-  let maintSecretSet = if maintenanceSecret == "" then 0 else 1
+  let token = extractToken authorization in
+  let fedResult = safeCompare token (if federationSecret == "" then "x" else federationSecret) in
+  let maintResult = safeCompare token (if maintenanceSecret == "" then "x" else maintenanceSecret) in
+  let fedN = if fedResult then 1 else 0 in
+  let maintN = if maintResult then 1 else 0 in
+  let fedSecretSet = if federationSecret == "" then 0 else 1 in
+  let maintSecretSet = if maintenanceSecret == "" then 0 else 1 in
   fedN * fedSecretSet + maintN * maintSecretSet > 0
 
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
@@ -360,8 +360,8 @@ evictOldestAckedIds = \items n ->
     let toEvict = (fold (\acc a ->
       if acc.size < n
         then
-          let newHeap = union acc.heap [a]
-          let newSize = count newHeap
+          let newHeap = union acc.heap [a] in
+          let newSize = count newHeap in
           if newSize > acc.size
             then {size: newSize, heap: newHeap, heapMax: if a.ackedAt > acc.heapMax then a.ackedAt else acc.heapMax}
             else acc
@@ -370,9 +370,9 @@ evictOldestAckedIds = \items n ->
             let removed = fold (\r x ->
               if not r.done && x.ackedAt == acc.heapMax
                 then {done: True {}, items: r.items}
-                else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap
-            let newHeap = union removed.items [a]
-            let newMax = fold (\best x -> if x.ackedAt > best then x.ackedAt else best) -1 newHeap
+                else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
+            let newHeap = union removed.items [a] in
+            let newMax = fold (\best x -> if x.ackedAt > best then x.ackedAt else best) (-1) newHeap in
             {size: acc.size, heap: newHeap, heapMax: newMax}
           else acc) {size: 0, heap: [], heapMax: -1} items).heap
     in diff items toEvict
@@ -554,8 +554,8 @@ pollOnce = \token cursor ->
     let limitedMsgs = (fold (\acc m ->
       if acc.size < maxPollEvents
         then
-          let newHeap = union acc.heap [m]
-          let newSize = count newHeap
+          let newHeap = union acc.heap [m] in
+          let newSize = count newHeap in
           if newSize > acc.size
             then {size: newSize, heap: newHeap, heapMax: if m.receivedAt > acc.heapMax then m.receivedAt else acc.heapMax}
             else acc
@@ -564,9 +564,9 @@ pollOnce = \token cursor ->
             let removed = fold (\r x ->
               if not r.done && x.receivedAt == acc.heapMax
                 then {done: True {}, items: r.items}
-                else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap
-            let newHeap = union removed.items [m]
-            let newMax = fold (\best x -> if x.receivedAt > best then x.receivedAt else best) -1 newHeap
+                else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
+            let newHeap = union removed.items [m] in
+            let newMax = fold (\best x -> if x.receivedAt > best then x.receivedAt else best) (-1) newHeap in
             {size: acc.size, heap: newHeap, heapMax: newMax}
           else acc) {size: 0, heap: [], heapMax: -1} matchingMsgs).heap
     let authorized = case session of
@@ -612,7 +612,7 @@ serve = \req -> case req of
           pr <- maybePrune t
           challenges <- *challenges
           let existingCount = count (do c <- challenges; where c.pubkey == pubkey; where c.expiresAt > t; yield c)
-          let oldestChallengeExpiry = fold (\acc c2 -> if c2.pubkey == pubkey && c2.expiresAt > t && (acc == -1 || c2.expiresAt < acc) then c2.expiresAt else acc) -1 challenges
+          let oldestChallengeExpiry = fold (\acc c2 -> if c2.pubkey == pubkey && c2.expiresAt > t && (acc == -1 || c2.expiresAt < acc) then c2.expiresAt else acc) (-1) challenges
           let cappedChallenges = if existingCount >= maxChallengesPerKey && oldestChallengeExpiry >= 0
             then fold (\acc c ->
               if not acc.removed && c.pubkey == pubkey && c.expiresAt == oldestChallengeExpiry
@@ -623,7 +623,7 @@ serve = \req -> case req of
             then do c <- cappedChallenges.items; where c.expiresAt > t; yield c
             else cappedChallenges.items
           let globalOldestExpiry = if count withoutExpired >= maxChallenges
-            then fold (\acc c -> if acc == -1 || c.expiresAt < acc then c.expiresAt else acc) -1 withoutExpired
+            then fold (\acc c -> if acc == -1 || c.expiresAt < acc then c.expiresAt else acc) (-1) withoutExpired
             else -1
           let globalCapped = if globalOldestExpiry >= 0
             then (fold (\acc c ->
@@ -663,19 +663,19 @@ serve = \req -> case req of
           then False {}
           else verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
       set *challenges = if sigValid
-        then (case matched of
+        then case matched of
           Just {value: _} -> do
             c <- challenges
             where not (c.pubkey == pubkey && c.challenge == challenge)
             yield c
-          Nothing {} -> challenges)
+          Nothing {} -> challenges
         else challenges
       let existingForKey = do
         s <- sessions
         where s.pubkey == pubkey
         where s.expiresAt > t
         yield s
-      let oldestExpiry = fold (\acc s -> if acc == -1 || s.expiresAt < acc then s.expiresAt else acc) -1 existingForKey
+      let oldestExpiry = fold (\acc s -> if acc == -1 || s.expiresAt < acc then s.expiresAt else acc) (-1) existingForKey
       let cappedFold = fold (\acc s ->
           if not acc.removed && s.pubkey == pubkey && s.expiresAt == oldestExpiry
             then {removed: True {}, sessions: acc.sessions}
@@ -685,7 +685,7 @@ serve = \req -> case req of
         else sessions
       let activeSessionsCapped = do s <- sessionsCapped; where s.expiresAt > t; yield s
       let globalOldestSessionExpiry = if count activeSessionsCapped >= maxSessions
-        then fold (\acc s -> if acc == -1 || s.expiresAt < acc then s.expiresAt else acc) -1 activeSessionsCapped
+        then fold (\acc s -> if acc == -1 || s.expiresAt < acc then s.expiresAt else acc) (-1) activeSessionsCapped
         else -1
       let globalSessionsCapped = if globalOldestSessionExpiry >= 0
         then (fold (\acc s ->
@@ -700,7 +700,7 @@ serve = \req -> case req of
             p <- presence
             where not (p.pubkey == pubkey && p.server == serverHostN)
             yield p
-      let oldestPresenceExp = fold (\acc p -> if acc == -1 || p.expiresAt < acc then p.expiresAt else acc) -1 presenceWithout
+      let oldestPresenceExp = fold (\acc p -> if acc == -1 || p.expiresAt < acc then p.expiresAt else acc) (-1) presenceWithout
       let presenceEvicted = if count presenceWithout >= maxPresenceEntries && oldestPresenceExp >= 0
         then (fold (\acc p ->
           if not acc.removed && p.expiresAt == oldestPresenceExp
