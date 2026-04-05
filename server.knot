@@ -267,6 +267,16 @@ containsLocalhostSuffix = \s ->
   else if take 10 s == ".localhost" && (drop 10 s == "" || take 1 (drop 10 s) == ":") then True {}
   else containsLocalhostSuffix (drop 1 s)
 
+containsLocalSuffix = \s ->
+  if s == "" then False {}
+  else if take 6 s == ".local" && (drop 6 s == "" || take 1 (drop 6 s) == ":") then True {}
+  else containsLocalSuffix (drop 1 s)
+
+containsInternalSuffix = \s ->
+  if s == "" then False {}
+  else if take 9 s == ".internal" && (drop 9 s == "" || take 1 (drop 9 s) == ":") then True {}
+  else containsInternalSuffix (drop 1 s)
+
 isBadServerName = \s ->
   let sn = toLower (stripTrailingDot s)
   sn == ""
@@ -276,6 +286,9 @@ isBadServerName = \s ->
   || sn == "localhost" || take 10 sn == "localhost:"
   || sn == "localhost.localdomain" || take 22 sn == "localhost.localdomain:"
   || containsLocalhostSuffix sn
+  || containsLocalSuffix sn
+  || containsInternalSuffix sn
+  || sn == "metadata" || take 9 sn == "metadata:"
   || take 4 sn == "127." || take 3 sn == "10."
   || take 8 sn == "192.168." || take 7 sn == "169.254."
   || take 2 sn == "0." || take 1 sn == "["
@@ -365,8 +378,8 @@ evictOldestAckedIds = \items n ->
     in diff items toEvict
 
 safeCompareLoop = \s1 s2 n result ->
-  if n <= 0
-    then result + (if s1 == "" then 0 else 1) + (if s2 == "" then 0 else 1)
+  if n <= 0 && s1 == "" && s2 == ""
+    then result
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
@@ -945,7 +958,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
-    let fromServer = normalizeServerName fromServer
+    let fromServer = if tooLong fromServer maxServerNameLen then fromServer else normalizeServerName fromServer
     let validRequest = authorized && cappedHops >= 1 && not (fromServer == "") && not (fromServer == serverHostN) && not (tooLong fromServer maxServerNameLen) && not (isBadServerName fromServer) && count events <= maxGossipEvents
     let onlineEntries = do
       e <- events
@@ -1191,7 +1204,7 @@ serve = \req -> case req of
     let fromKey = if isValidHex fromKey then normalizeHex fromKey else fromKey
     let encryptedBlob = if isValidHex encryptedBlob then normalizeHex encryptedBlob else encryptedBlob
     let messageId = if isValidHex messageId then normalizeHex messageId else messageId
-    let originServer = normalizeServerName originServer
+    let originServer = if tooLong originServer maxServerNameLen then originServer else normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == "") && not (originServer == serverHostN) && not (tooLong originServer maxServerNameLen) && not (isBadServerName originServer)
@@ -1233,8 +1246,8 @@ serve = \req -> case req of
     broadcastOfflineGossip t result.peerServers result.expiredLocal
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
-    let fromServer = normalizeServerName fromServer
-    let originServer = normalizeServerName originServer
+    let fromServer = if tooLong fromServer maxServerNameLen then fromServer else normalizeServerName fromServer
+    let originServer = if tooLong originServer maxServerNameLen then originServer else normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
     let dedupedIds = fold (\acc mid ->
@@ -1335,7 +1348,7 @@ backgroundPrune = do
       else yield {}) (\err ->
       println ("background prune: ack send failed: " ++ show err))) (\err ->
     println ("background prune: " ++ show err))
-  backgroundPrune
+  spawn backgroundPrune
 
 main = do
   println "Skrepka relay server starting on port 8080..."
