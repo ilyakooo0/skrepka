@@ -391,8 +391,8 @@ evictOldestAckedIds = \items n ->
     in diff items toEvict
 
 safeCompareLoop = \s1 s2 n result ->
-  if n <= 0 && s1 == "" && s2 == ""
-    then result
+  if n <= 0
+    then result + (if s1 == "" then 0 else 1) + (if s2 == "" then 0 else 1)
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
 safeCompare = \a b ->
@@ -407,7 +407,9 @@ sendToEach = \servers action ->
       let rest = do s <- servers; where not (s == server); yield s
       if server == ""
         then yield {}
-        else action server
+        else do
+          action server
+          sendToEach rest action
 
 pruneExpired = \t -> do
   challenges <- *challenges
