@@ -301,7 +301,7 @@ isBadServerName = \s ->
   || containsInternalSuffix sn
   || sn == "metadata" || take 9 sn == "metadata:"
   || take 4 sn == "127." || take 3 sn == "10."
-  || take 8 sn == "192.168." || take 7 sn == "169.254."
+  || take 8 sn == "192.168." || take 8 sn == "169.254."
   || take 2 sn == "0." || take 1 sn == "["
   || take 7 sn == "172.16." || take 7 sn == "172.17." || take 7 sn == "172.18." || take 7 sn == "172.19."
   || take 7 sn == "172.20." || take 7 sn == "172.21." || take 7 sn == "172.22." || take 7 sn == "172.23."
@@ -311,8 +311,8 @@ isBadServerName = \s ->
   || take 8 sn == "192.0.0."
   || take 8 sn == "192.0.2."
   || take 10 sn == "192.88.99."
-  || take 12 sn == "198.51.100."
-  || take 11 sn == "203.0.113."
+  || take 11 sn == "198.51.100."
+  || take 10 sn == "203.0.113."
   || take 2 sn == "::"
   || isCgnatRange sn
   || containsMultipleColons sn
@@ -529,9 +529,9 @@ retryForwardsForServer = \entries remaining ->
 
 retryPendingForwards : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Int, toKey: Text, toServer: Text}] -> IO {network} {}
 retryPendingForwards = \pending -> do
-  let servers = fold (\acc x ->
+  let servers = traverse (\x ->
     if count (do s <- acc; where s == x.toServer; yield s) > 0 then acc
-    else union acc [x.toServer]) [] pending
+    else union acc [x.toServer]) pending
   sendToEach servers (\server ->
     retryForwardsForServer (do x <- pending; where x.toServer == server; yield x) maxForwardRetriesPerServer)
   yield {}
