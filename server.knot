@@ -78,7 +78,7 @@ route AuthApi where
       = VerifyAuth
 
 route ClientApi where
-  GET {cursor: Int, timeout: Int} /poll headers {authorization: Text}
+  POST {cursor: Int, timeout: Int} /poll headers {authorization: Text}
     -> {events: [PollEvent], cursor: Int, authorized: Bool}
     = Poll
   /messages

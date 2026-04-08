@@ -83,7 +83,8 @@ module ApiClient =
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =
         async {
-            let request = new HttpRequestMessage(HttpMethod.Get, $"{serverUrl}/poll?cursor={cursor}&timeout=30")
+            let request = new HttpRequestMessage(HttpMethod.Post, $"{serverUrl}/poll")
+            request.Content <- new StringContent($"""{{"cursor":{cursor},"timeout":30000}}""", Encoding.UTF8, "application/json")
             request.Headers.Add("Authorization", $"Bearer {token}")
 
             let! response = pollClient.SendAsync(request) |> Async.AwaitTask
