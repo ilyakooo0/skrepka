@@ -318,7 +318,7 @@ isBadServerName = \s ->
   || containsMultipleColons sn
   || hasOctalOctet sn
   || hasHexPrefix sn
-  || (isDigitChar (take 1 sn) && isAllDigitsUntilColonOrEnd sn)
+  || (isDigitChar (take 1 sn) && isAllDigitsOrDotsUntilColonOrEnd sn)
   || take 4 sn == "224." || take 4 sn == "225." || take 4 sn == "226." || take 4 sn == "227."
   || take 4 sn == "228." || take 4 sn == "229." || take 4 sn == "230." || take 4 sn == "231."
   || take 4 sn == "232." || take 4 sn == "233." || take 4 sn == "234." || take 4 sn == "235."
@@ -529,9 +529,9 @@ retryForwardsForServer = \entries remaining ->
 
 retryPendingForwards : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Int, toKey: Text, toServer: Text}] -> IO {network} {}
 retryPendingForwards = \pending -> do
-  let servers = traverse (\x ->
+  let servers = fold (\acc x ->
     if count (do s <- acc; where s == x.toServer; yield s) > 0 then acc
-    else union acc [x.toServer]) pending
+    else union acc [x.toServer]) [] pending
   sendToEach servers (\server ->
     retryForwardsForServer (do x <- pending; where x.toServer == server; yield x) maxForwardRetriesPerServer)
   yield {}
