@@ -297,7 +297,9 @@ isBadServerName = \s ->
   || sn == "localhost" || take 10 sn == "localhost:"
   || sn == "localhost.localdomain" || take 22 sn == "localhost.localdomain:"
   || containsLocalhostSuffix sn
+  || sn == "local" || take 6 sn == "local:"
   || containsLocalSuffix sn
+  || sn == "internal" || take 9 sn == "internal:"
   || containsInternalSuffix sn
   || sn == "metadata" || take 9 sn == "metadata:"
   || take 4 sn == "127." || take 3 sn == "10."
@@ -483,7 +485,7 @@ sendBatchedGossipToServer = \server allEvents ->
         Err _ -> yield {}
       sendBatchedGossipToServer server rest
 
-sendBatchedGossip : [Text] -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Int, ttl: Int}] -> IO {} {}
+sendBatchedGossip : [Text] -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Int, ttl: Int}] -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents ->
   if count allEvents == 0
     then yield {}
@@ -841,8 +843,12 @@ serve = \req -> case req of
              else "queued"
       forwards <- *forwards
       let forwardsAtCapacity = count forwards >= maxForwardsEntries
-      set *forwards = if shouldInsert && not forwardsAtCapacity && count remoteServers > 0 && not (federationSecret == "")
-        then union forwards (do s <- remoteServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
+      let forwardSlots = maxForwardsEntries - count forwards
+      let forwardServers = fold (\acc s ->
+        if count acc >= forwardSlots then acc
+        else union acc [s]) [] remoteServers
+      set *forwards = if shouldInsert && not forwardsAtCapacity && count forwardServers > 0 && not (federationSecret == "")
+        then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
         else forwards
       yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
     let finalStatus = if result.status == "federated" && (federationSecret == "" || result.forwardsAtCapacity) then "queued" else result.status
@@ -860,7 +866,8 @@ serve = \req -> case req of
                 x <- forwards
                 where not (x.messageId == msgId && x.toServer == server)
                 yield x
-            Err _ -> yield {})
+            Err _ -> yield {}
+          )
         else yield {}
       if result.forwardsAtCapacity && count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (result.status == "rejected")
         then println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
