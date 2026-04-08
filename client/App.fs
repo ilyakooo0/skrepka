@@ -47,8 +47,9 @@ module App =
           NewPubkey: string
           NewNickname: string
           Error: string option
-          PollCursor: int64
-          LastSendStatus: string }
+          PollCursor: uint64
+          LastSendStatus: string
+          Events: list<JsonElement> }
 
     // ── Msg ──
 
@@ -68,7 +69,7 @@ module App =
         | SetNewNickname of string
         | DoSaveContact
         | DoDeleteContact of string
-        | PollResult of (string * string * int64 * string) list * string * int64
+        | PollResult of (string * string * uint64 * string) list * string * uint64 * list<JsonElement>
         | DoPoll
         | CopyPubKey
         | DismissError
@@ -86,7 +87,7 @@ module App =
             pubKeyHex: string *
             recipPubHex: string *
             text: string
-        | CmdPoll of url: string * token: string * privKey: byte[] * cursor: int64
+        | CmdPoll of url: string * token: string * privKey: byte[] * cursor: uint64
         | CmdCopyToClipboard of string
 
     // ── Helpers ──
@@ -115,8 +116,9 @@ module App =
           NewPubkey = ""
           NewNickname = ""
           Error = None
-          PollCursor = 0L
-          LastSendStatus = "" },
+          PollCursor = 0UL
+          LastSendStatus = ""
+          Events = [] },
         []
 
     // ── Update ──
@@ -174,7 +176,7 @@ module App =
 
         | Sent(_, status) -> { model with LastSendStatus = status }, []
 
-        | PollResult(incoming, status, newCursor) ->
+        | PollResult(incoming, status, newCursor, events) ->
             let model' =
                 incoming
                 |> List.fold
@@ -199,7 +201,7 @@ module App =
                             { m with
                                 Contacts = contacts
                                 Messages = m.Messages |> Map.add fromPk (msgs @ [ newMsg ]) })
-                    { model with PollStatus = status; PollCursor = newCursor }
+                    { model with PollStatus = status; PollCursor = newCursor; Events = model.Events @ events }
 
             match model'.Conn with
             | Online token -> model', [ CmdPoll(model'.ServerUrl, token, model'.PrivKey.Value, model'.PollCursor) ]
@@ -309,14 +311,13 @@ module App =
                     for (evtId, evtType, payload) in events do
                         if evtType = "message" then
                             try
-                                let doc = JsonDocument.Parse(payload)
-                                let blobHex = doc.RootElement.GetProperty("encryptedBlob").GetString()
-                                let tsEl = doc.RootElement.GetProperty("timestamp")
+                                let blobHex = payload.GetProperty("encryptedBlob").GetString()
+                                let tsEl = payload.GetProperty("timestamp")
                                 let ts =
                                     if tsEl.ValueKind = JsonValueKind.String then
-                                        Int64.Parse(tsEl.GetString())
+                                        UInt64.Parse(tsEl.GetString())
                                     else
-                                        tsEl.GetInt64()
+                                        tsEl.GetUInt64()
                                 let blob = Crypto.fromHex blobHex
 
                                 match Crypto.decrypt privKey blob with
@@ -344,15 +345,15 @@ module App =
                         $"[{now}] evts:{events.Length} msgs:{messages.Count} errs:{errors.Count}"
                         + (if errors.Count > 0 then $" [{errors.[0]}]" else "")
 
-                    return PollResult(Seq.toList messages, status, newCursor)
+                    return PollResult(Seq.toList messages, status, newCursor, events |> List.map (fun (_, _, x) -> x))
                 with
                 | :? System.Threading.Tasks.TaskCanceledException ->
                     // Normal timeout from long poll — just retry
-                    return PollResult([], "polling...", cursor)
+                    return PollResult([], "polling...", cursor, [])
                 | ex ->
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
                     do! Async.Sleep 3000
-                    return PollResult([], $"[{now}] poll error: {ex.Message}", cursor)
+                    return PollResult([], $"[{now}] poll error: {ex.Message}", cursor, [])
             })
 
         | CmdCopyToClipboard text ->
@@ -449,6 +450,10 @@ module App =
 
                     Label($"poll: {model.PollStatus}")
                         .font(size = 10.)
+                        .textColor(Colors.DimGray)
+                    
+                    Label($"Events: {model.Events}")
+                        .font(10)
                         .textColor(Colors.DimGray)
 
                     if contactNames <> "" then

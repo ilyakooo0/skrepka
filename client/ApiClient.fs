@@ -78,10 +78,10 @@ module ApiClient =
 
     let private pollClient =
         let c = new HttpClient()
-        c.Timeout <- System.Threading.Timeout.InfiniteTimeSpan
+        c.Timeout <- TimeSpan.FromSeconds(120.)
         c
 
-    let poll (serverUrl: string) (token: string) (cursor: int64) =
+    let poll (serverUrl: string) (token: string) (cursor: uint64) =
         async {
             let request = new HttpRequestMessage(HttpMethod.Post, $"{serverUrl}/poll")
             request.Content <- new StringContent($"""{{"cursor":{cursor},"timeout":30000}}""", Encoding.UTF8, "application/json")
@@ -91,29 +91,16 @@ module ApiClient =
             let! text = response.Content.ReadAsStringAsync() |> Async.AwaitTask
             let doc = JsonDocument.Parse(text)
             let root = expectObject doc "/poll"
-            let cursor = root.GetProperty("cursor").GetInt64()
+            let cursor = root.GetProperty("cursor").GetUInt64
 
-            // Knot runtime wraps relations as [[record1, record2, ...]]
-            let eventsOuter = root.GetProperty("events")
-
-            let eventsInner =
-                if eventsOuter.GetArrayLength() > 0
-                   && eventsOuter.[0].ValueKind = JsonValueKind.Array then
-                    eventsOuter.[0]
-                else
-                    eventsOuter
+            let events= root.GetProperty("events")
 
             let events =
-                [ for e in eventsInner.EnumerateArray() do
+                [ for e in events.EnumerateArray() do
                       if e.ValueKind = JsonValueKind.Object then
                           let id = e.GetProperty("id").GetString()
                           let evtType = e.GetProperty("eventType").GetString()
-                          let payloadEl = e.GetProperty("payload")
-                          let payload =
-                              if payloadEl.ValueKind = JsonValueKind.String then
-                                  payloadEl.GetString()
-                              else
-                                  payloadEl.GetRawText()
+                          let payload = e.GetProperty("payload")
                           yield (id, evtType, payload) ]
 
             return (events, cursor)
