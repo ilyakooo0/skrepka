@@ -475,10 +475,12 @@ sendBatchedGossipToServer = \server allEvents ->
         if count acc >= maxGossipEvents then acc
         else union acc [e]) [] allEvents
       let rest = diff allEvents batch
-      fetch (federationScheme ++ server) (RecvGossip {
+      batchResult <- fetch (federationScheme ++ server) (RecvGossip {
         authorization: "Bearer " ++ federationSecret,
         events: batch, hopsRemaining: 2, fromServer: serverHostN})
-      sendBatchedGossipToServer server rest
+      case batchResult of
+        Ok _ -> sendBatchedGossipToServer server rest
+        Err _ -> yield {}
 
 sendBatchedGossip : [Text] -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Int, ttl: Int}] -> IO {} {}
 sendBatchedGossip = \peerServers allEvents ->
@@ -843,16 +845,18 @@ serve = \req -> case req of
     let finalStatus = if result.status == "federated" && (federationSecret == "" || result.forwardsAtCapacity) then "queued" else result.status
     if count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (result.status == "rejected") && not (federationSecret == "")
       then sendToEach result.remoteServers (\server -> do
-        fetch (federationScheme ++ server) (ForwardMessage {
+        fwdResult <- fetch (federationScheme ++ server) (ForwardMessage {
           toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
           timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
           authorization: "Bearer " ++ federationSecret})
-        atomic do
-          forwards <- *forwards
-          set *forwards = do
-            x <- forwards
-            where not (x.messageId == msgId && x.toServer == server)
-            yield x)
+        case fwdResult of
+          Ok _ -> atomic do
+            forwards <- *forwards
+            set *forwards = do
+              x <- forwards
+              where not (x.messageId == msgId && x.toServer == server)
+              yield x
+          Err _ -> yield {})
       else yield {}
     if result.forwardsAtCapacity && count result.remoteServers > 0 && not (result.status == "unauthorized") && not (result.status == "invalid") && not (result.status == "rejected")
       then println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
@@ -1046,14 +1050,13 @@ serve = \req -> case req of
     gossipResult <- atomic do
       pr <- maybePrune t
       presence <- *presence
-      let fromServerTrusted = count (do p <- presence; where p.server == fromServer; where p.expiresAt > t; yield p) > 0
       let trustedDeduped = do
         e <- deduped
-        where e.server == fromServer || fromServerTrusted || count (do p <- presence; where p.server == e.server; where p.expiresAt > t; yield p) > 0
+        where e.server == fromServer || count (do p <- presence; where p.server == e.server; where p.expiresAt > t; yield p) > 0
         yield e
       let trustedOffline = do
         e <- offlineEntries
-        where e.server == fromServer || fromServerTrusted || count (do p <- presence; where p.server == e.server; where p.expiresAt > t; yield p) > 0
+        where e.server == fromServer || count (do p <- presence; where p.server == e.server; where p.expiresAt > t; yield p) > 0
         yield e
       let appliedOnline = do
         e <- trustedDeduped
@@ -1356,10 +1359,11 @@ backgroundPrune = do
       where not (a.originServer == serverHostN)
       yield a
     yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
+  fork backgroundPrune
   broadcastOfflineGossip t result.peerServers result.expiredLocal
   if not (federationSecret == "") && count result.pendingForwards > 0
     then retryPendingForwards result.pendingForwards
-    else yield {} 
+    else yield {}
   if not (federationSecret == "") && count result.pendingAcks > 0
     then do
       let ackOriginServers = fold (\acc a ->
@@ -1367,7 +1371,6 @@ backgroundPrune = do
         else union acc [a.originServer]) [] result.pendingAcks
       sendAcksAndClean result.pendingAcks ackOriginServers
     else yield {}
-  fork backgroundPrune
 
 main = do
   println "Skrepka relay server starting on port 8080..."
