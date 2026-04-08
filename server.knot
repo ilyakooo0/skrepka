@@ -1032,6 +1032,7 @@ serve = \req -> case req of
       e <- onlineEntries
       where count (do
         o <- offlineEntries
+        where o.server == fromServer
         where o.pubkey == e.pubkey
         where o.server == e.server
         where o.timestamp > e.timestamp
@@ -1205,6 +1206,7 @@ serve = \req -> case req of
       where e.timestamp + (clampTtl e.ttl) * 1000 > t
       where not (e.eventType == "online" && count (do
         o <- offlineEntries
+        where o.server == fromServer
         where o.pubkey == normalizeHex e.pubkey
         where o.server == normalizeServerName e.server
         where o.timestamp > e.timestamp
