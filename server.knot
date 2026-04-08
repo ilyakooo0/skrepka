@@ -560,10 +560,9 @@ sendAcksAndClean = \pendingAcks servers ->
             Ok _ -> 
               atomic do
                 ackedIds <- *ackedIds
-                let ackMsgIds = do a <- serverAcks; yield a.messageId
                 set *ackedIds = do
                   a <- ackedIds
-                  where not (a.originServer == server && count (do mid <- ackMsgIds; where mid == a.messageId; yield mid) > 0)
+                  where not (a.originServer == server && count (do sa <- serverAcks; where sa.messageId == a.messageId; where sa.toKey == a.toKey; yield sa) > 0)
                   yield a
             Err _ -> yield {}
           sendAcksAndClean pendingAcks rest
@@ -950,15 +949,19 @@ serve = \req -> case req of
                     messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
                     originServer: server, fromServer: serverHostN})
                   case result of
-                    Err _ ->  atomic do
-                      ackedIds <- *ackedIds
-                      let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
-                      let combined = union ackedIds reinsert
-                      let excess = count combined - maxAckedIds
-                      let afterEviction = if excess <= 0 then combined
-                        else evictOldestAckedIds combined excess
-                      set *ackedIds = afterEviction
-                      yield {}
+                    Err _ -> do
+                      dropped <- atomic do
+                        ackedIds <- *ackedIds
+                        let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
+                        let combined = union ackedIds reinsert
+                        let excess = count combined - maxAckedIds
+                        let afterEviction = if excess <= 0 then combined
+                          else evictOldestAckedIds combined excess
+                        set *ackedIds = afterEviction
+                        yield excess
+                      if dropped > 0
+                        then println ("ackMessages: ackedIds at capacity (" ++ show maxAckedIds ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server)
+                        else yield {}
                     _ -> yield {}
                   )
             else yield {}
@@ -1068,7 +1071,7 @@ serve = \req -> case req of
         yield e
       let trustedOffline = do
         e <- offlineEntries
-        where e.server == fromServer || count (do p <- presence; where p.server == e.server; where p.expiresAt > t; yield p) > 0
+        where e.server == fromServer
         yield e
       let appliedOnline = do
         e <- trustedDeduped
