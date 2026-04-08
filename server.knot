@@ -559,7 +559,8 @@ sendAcksAndClean = \pendingAcks servers ->
                     a <- ackedIds
                     where not (a.originServer == server && count (do sa <- serverAcks; where sa.messageId == a.messageId; where sa.toKey == a.toKey; yield sa) > 0)
                     yield a
-              Err _ -> yield {})
+              Err _ -> yield {}
+            )
           sendAcksAndClean pendingAcks rest
 
 pollOnce = \token cursor -> do
