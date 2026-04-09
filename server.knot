@@ -56,21 +56,21 @@ type Timestamp = Int<Ms>
 -- Persisted State
 -- ============================================
 
-*challenges : [{pubkey: Text, challenge: Text, expiresAt: Int}]
+*challenges : [{pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp}]
 
-*sessions : [{token: Text, pubkey: Text, expiresAt: Int}]
+*sessions : [{token: Text, pubkey: PubkeyHex, expiresAt: Timestamp}]
 
-*messages : [{messageId: Text, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Timestamp, originServer: Text, receivedAt: Int}]
+*messages : [{messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, receivedAt: Timestamp}]
 
-*presence : [{pubkey: Text, server: Text, expiresAt: Int, timestamp: Timestamp}]
+*presence : [{pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp}]
 
-*seqCounter : Int
+*seqCounter : Timestamp
 
-*forwards : [{messageId: Text, toServer: Text, createdAt: Int, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Timestamp}]
+*forwards : [{messageId: MessageIdHex, toServer: Text, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}]
 
-*ackedIds : [{messageId: Text, toKey: Text, ackedAt: Int, originServer: Text}]
+*ackedIds : [{messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: Text}]
 
-*lastPrunedAt : Int
+*lastPrunedAt : Timestamp
 
 -- ============================================
 -- Routes
@@ -108,7 +108,7 @@ route FederationApi where
     POST {toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex} /forward headers {authorization: Text}
       -> {ok: Bool}
       = ForwardMessage
-    POST {messageIds: [Text], originServer: Text, fromServer: ServerName} /ack headers {authorization: Text}
+    POST {messageIds: [MessageIdHex], originServer: ServerName, fromServer: ServerName} /ack headers {authorization: Text}
       -> {ok: Bool}
       = FederationAck
 
@@ -345,13 +345,7 @@ lookupSession = \sessions token t ->
       else acc) Nothing {} sessions
 
 extractToken = \authHeader ->
-  if (take 1 authHeader == "B" || take 1 authHeader == "b")
-    && (take 1 (drop 1 authHeader) == "e" || take 1 (drop 1 authHeader) == "E")
-    && (take 1 (drop 2 authHeader) == "a" || take 1 (drop 2 authHeader) == "A")
-    && (take 1 (drop 3 authHeader) == "r" || take 1 (drop 3 authHeader) == "R")
-    && (take 1 (drop 4 authHeader) == "e" || take 1 (drop 4 authHeader) == "E")
-    && (take 1 (drop 5 authHeader) == "r" || take 1 (drop 5 authHeader) == "R")
-    && take 1 (drop 6 authHeader) == " "
+  if toLower (take 7 authHeader) == "bearer "
     && not (tooLong (drop 7 authHeader) maxTokenLen)
     then drop 7 authHeader
     else ""
@@ -405,6 +399,21 @@ safeCompareLoop = \s1 s2 n result ->
 safeCompare = \a b ->
   safeCompareLoop a b maxTokenLen 0 + (if a == "" then 1 else 0) + (if b == "" then 1 else 0) == 0
 
+evictOneOldest = \items getKey ->
+  let oldest = fold (\acc x -> let k = getKey x in if acc == -1 || k < acc then k else acc) (-1) items in
+  if oldest == -1 then items
+  else (fold (\acc x ->
+    if not acc.removed && getKey x == oldest
+      then {removed: True {}, items: acc.items}
+      else {removed: acc.removed, items: union acc.items [x]}) {removed: False {}, items: []} items).items
+
+collectPeerServers = \items getServer ->
+  fold (\acc item ->
+    let s = getServer item in
+    if s == serverHostN then acc
+    else if count (do a <- acc; where a == s; yield a) > 0 then acc
+    else union acc [s]) [] items
+
 sendToEach : [Text] -> (Text -> (a {})) -> a {}
 sendToEach = \servers action ->
   if count servers == 0
@@ -428,10 +437,7 @@ pruneExpired = \t -> do
     where s.expiresAt > t
     yield s
   presenceBefore <- *presence
-  let peerServersBefore = fold (\acc p ->
-    if p.server == serverHostN then acc
-    else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
-    else union acc [p.server]) [] presenceBefore
+  let peerServersBefore = collectPeerServers presenceBefore (\p -> p.server)
   let presenceAfter = do
     p <- presenceBefore
     where p.expiresAt > t
@@ -534,9 +540,7 @@ retryForwardsForServer = \entries remaining ->
 
 retryPendingForwards : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Timestamp, toKey: Text, toServer: Text}] -> IO {network} {}
 retryPendingForwards = \pending -> do
-  let servers = fold (\acc x ->
-    if count (do s <- acc; where s == x.toServer; yield s) > 0 then acc
-    else union acc [x.toServer]) [] pending
+  let servers = collectPeerServers pending (\x -> x.toServer)
   sendToEach servers (\server ->
     retryForwardsForServer (do x <- pending; where x.toServer == server; yield x) maxForwardRetriesPerServer)
   yield {}
@@ -567,16 +571,33 @@ sendBatchedAcksToServer = \serverAcks server ->
 
 sendAcksAndClean : [{messageId: Text, toKey: Text, originServer: Text, | a}] -> [Text] -> IO {network} {}
 sendAcksAndClean = \pendingAcks servers ->
-  if count servers == 0
-    then yield {}
-    else do
-      let server = fold (\acc s -> if acc == "" then s else acc) "" servers
-      let rest = do s <- servers; where not (s == server); yield s
-      if server == ""
-        then yield {}
-        else do
-          fork (sendBatchedAcksToServer (do a <- pendingAcks; where a.originServer == server; yield a) server)
-          sendAcksAndClean pendingAcks rest
+  sendToEach servers (\server ->
+    sendBatchedAcksToServer (do a <- pendingAcks; where a.originServer == server; yield a) server)
+
+pruneAndRetry = \t -> do
+  result <- atomic do
+    set *lastPrunedAt = t
+    pr <- pruneExpired t
+    forwards <- *forwards
+    let pendingForwards = do
+      f <- forwards
+      yield {toServer: f.toServer, toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, messageId: f.messageId}
+    ackedIds <- *ackedIds
+    let pendingAcks = do
+      a <- ackedIds
+      where not (a.originServer == "")
+      where not (a.originServer == serverHostN)
+      yield a
+    yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
+  broadcastOfflineGossip t result.peerServers result.expiredLocal
+  if not (federationSecret == "") && count result.pendingForwards > 0
+    then retryPendingForwards result.pendingForwards
+    else yield {}
+  if not (federationSecret == "") && count result.pendingAcks > 0
+    then do
+      let ackOriginServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
+      sendAcksAndClean result.pendingAcks ackOriginServers
+    else yield {}
 
 pollOnce : Text -> Int -> IO {clock} {authorized: Bool, cursor: Int, events: [PollEvent]}
 pollOnce = \token cursor -> do
@@ -655,24 +676,16 @@ serve = \req -> case req of
       pr <- maybePrune t
       challenges <- *challenges
       let existingCount = count (do c <- challenges; where c.pubkey == pubkey; where c.expiresAt > t; yield c)
-      let oldestChallengeExpiry = fold (\acc c2 -> if c2.pubkey == pubkey && c2.expiresAt > t && (acc == -1 || c2.expiresAt < acc) then c2.expiresAt else acc) (-1) challenges
-      let cappedChallenges = if existingCount >= maxChallengesPerKey && oldestChallengeExpiry >= 0
-        then fold (\acc c ->
-          if not acc.removed && c.pubkey == pubkey && c.expiresAt == oldestChallengeExpiry
-            then {removed: True {}, items: acc.items}
-            else {removed: acc.removed, items: union acc.items [c]}) {removed: False {}, items: []} challenges
-        else {removed: False {}, items: challenges}
-      let withoutExpired = if count cappedChallenges.items >= maxChallenges
-        then do c <- cappedChallenges.items; where c.expiresAt > t; yield c
-        else cappedChallenges.items
-      let globalOldestExpiry = if count withoutExpired >= maxChallenges
-        then fold (\acc c -> if acc == -1 || c.expiresAt < acc then c.expiresAt else acc) (-1) withoutExpired
-        else -1
-      let globalCapped = if globalOldestExpiry >= 0
-        then (fold (\acc c ->
-          if not acc.removed && c.expiresAt == globalOldestExpiry
-            then {removed: True {}, items: acc.items}
-            else {removed: acc.removed, items: union acc.items [c]}) {removed: False {}, items: []} withoutExpired).items
+      let forKey = do c <- challenges; where c.pubkey == pubkey; yield c
+      let others = do c <- challenges; where not (c.pubkey == pubkey); yield c
+      let challengesCapped = if existingCount >= maxChallengesPerKey
+        then union others (evictOneOldest forKey (\c -> c.expiresAt))
+        else challenges
+      let withoutExpired = if count challengesCapped >= maxChallenges
+        then do c <- challengesCapped; where c.expiresAt > t; yield c
+        else challengesCapped
+      let globalCapped = if count withoutExpired >= maxChallenges
+        then evictOneOldest withoutExpired (\c -> c.expiresAt)
         else withoutExpired
       set *challenges = union
         globalCapped
@@ -708,28 +721,15 @@ serve = \req -> case req of
             yield c
           Nothing {} -> challenges
         else challenges
-      let existingForKey = do
-        s <- sessions
-        where s.pubkey == pubkey
-        where s.expiresAt > t
-        yield s
-      let oldestExpiry = fold (\acc s -> if acc == -1 || s.expiresAt < acc then s.expiresAt else acc) (-1) existingForKey
-      let cappedFold = fold (\acc s ->
-          if not acc.removed && s.pubkey == pubkey && s.expiresAt == oldestExpiry
-            then {removed: True {}, sessions: acc.sessions}
-            else {removed: acc.removed, sessions: union acc.sessions [s]}) {removed: False {}, sessions: []} sessions
-      let sessionsCapped = if count existingForKey >= maxSessionsPerKey && oldestExpiry >= 0
-        then cappedFold.sessions
+      let existingForKey = do s <- sessions; where s.pubkey == pubkey; where s.expiresAt > t; yield s
+      let forKey = do s <- sessions; where s.pubkey == pubkey; yield s
+      let others = do s <- sessions; where not (s.pubkey == pubkey); yield s
+      let sessionsCapped = if count existingForKey >= maxSessionsPerKey
+        then union others (evictOneOldest forKey (\s -> s.expiresAt))
         else sessions
       let activeSessionsCapped = do s <- sessionsCapped; where s.expiresAt > t; yield s
-      let globalOldestSessionExpiry = if count activeSessionsCapped >= maxSessions
-        then fold (\acc s -> if acc == -1 || s.expiresAt < acc then s.expiresAt else acc) (-1) activeSessionsCapped
-        else -1
-      let globalSessionsCapped = if globalOldestSessionExpiry >= 0
-        then (fold (\acc s ->
-          if not acc.removed && s.expiresAt == globalOldestSessionExpiry
-            then {removed: True {}, items: acc.items}
-            else {removed: acc.removed, items: union acc.items [s]}) {removed: False {}, items: []} activeSessionsCapped).items
+      let globalSessionsCapped = if count activeSessionsCapped >= maxSessions
+        then evictOneOldest activeSessionsCapped (\s -> s.expiresAt)
         else activeSessionsCapped
       set *sessions = if sigValid
         then union globalSessionsCapped [{token: token, pubkey: pubkey, expiresAt: expiry}]
@@ -738,22 +738,15 @@ serve = \req -> case req of
             p <- presence
             where not (p.pubkey == pubkey && p.server == serverHostN)
             yield p
-      let oldestPresenceExp = fold (\acc p -> if acc == -1 || p.expiresAt < acc then p.expiresAt else acc) (-1) presenceWithout
-      let presenceEvicted = if count presenceWithout >= maxPresenceEntries && oldestPresenceExp >= 0
-        then (fold (\acc p ->
-          if not acc.removed && p.expiresAt == oldestPresenceExp
-            then {removed: True {}, items: acc.items}
-            else {removed: acc.removed, items: union acc.items [p]}) {removed: False {}, items: []} presenceWithout).items
+      let presenceEvicted = if count presenceWithout >= maxPresenceEntries
+        then evictOneOldest presenceWithout (\p -> p.expiresAt)
         else presenceWithout
       let updatedPresence = if sigValid
         then union presenceEvicted [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]
         else presence
       set *presence = updatedPresence
       let peerServers = if sigValid && not (federationSecret == "")
-        then fold (\acc p ->
-          if p.server == serverHostN then acc
-          else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
-          else union acc [p.server]) [] updatedPresence
+        then collectPeerServers updatedPresence (\p -> p.server)
         else []
       yield {sigValid: sigValid, peerServers: peerServers, expiredLocal: pr.expiredLocal, offlinePeers: pr.peerServers}
     fork (do
@@ -921,9 +914,7 @@ serve = \req -> case req of
       where not (m.originServer == "")
       where not (m.originServer == serverHostN)
       yield m
-    let originServers = fold (\acc m ->
-      if count (do a <- acc; where a == m.originServer; yield a) > 0 then acc
-      else union acc [m.originServer]) [] fedMessages
+    let originServers = collectPeerServers fedMessages (\m -> m.originServer)
     fork (do
       if result.ok && count originServers > 0 && not (federationSecret == "")
         then do
@@ -940,9 +931,7 @@ serve = \req -> case req of
             yield a
           if count evictedToRetry > 0 && not (federationSecret == "")
             then do
-              let evictedOriginServers = fold (\acc a ->
-                if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
-                else union acc [a.originServer]) [] evictedToRetry
+              let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
               sendToEach evictedOriginServers (\server -> do
                   result <- fetch (federationScheme ++ server) (FederationAck {
                     authorization: "Bearer " ++ federationSecret,
@@ -1189,10 +1178,7 @@ serve = \req -> case req of
         then if withinCapacity then afterOffline else afterReclaim
         else presence
       set *presence = finalPresence
-      let gossipPeerServers = fold (\acc p ->
-        if p.server == serverHostN then acc
-        else if count (do a <- acc; where a == p.server; yield a) > 0 then acc
-        else union acc [p.server]) [] finalPresence
+      let gossipPeerServers = collectPeerServers finalPresence (\p -> p.server)
       yield {appliedKeys: (if withinCapacity then union appliedOnline appliedOffline else union appliedOnlineUpdates appliedOffline), expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, gossipPeerServers: gossipPeerServers, withinCapacity: withinCapacity}
     let validEvents = do
       e <- events
@@ -1295,16 +1281,14 @@ serve = \req -> case req of
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     let fromServer = normalizeServerName fromServer
-    let originServer = if tooLong originServer maxServerNameLen then originServer else normalizeServerName originServer
+    let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
     let dedupedIds = fold (\acc mid ->
-        if mid == "" then acc
-        else if count acc >= maxMessageIds then acc
-        else if tooLong mid maxMessageIdLen then acc
-        else if not (isValidHex mid) then acc
-        else if count (do a <- acc; where a == normalizeHex mid; yield a) > 0 then acc
-        else union acc [normalizeHex mid]) [] messageIds
+        let nmid = normalizeHex mid in
+        if count acc >= maxMessageIds then acc
+        else if count (do a <- acc; where a == nmid; yield a) > 0 then acc
+        else union acc [nmid]) [] messageIds
     let validAckFields = authorized && originServer == serverHostN && not (fromServer == serverHostN)
     pruneResult <- atomic do
       pr <- maybePrune t
@@ -1328,32 +1312,7 @@ serve = \req -> case req of
     let authorized = verifyMaintenanceAuth authorization
     if authorized
       then do
-        result <- atomic do
-          set *lastPrunedAt = t
-          pr <- pruneExpired t
-          forwards <- *forwards
-          let pendingForwards = do
-            f <- forwards
-            yield {toServer: f.toServer, toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, messageId: f.messageId}
-          ackedIds <- *ackedIds
-          let pendingAcks = do
-            a <- ackedIds
-            where not (a.originServer == "")
-            where not (a.originServer == serverHostN)
-            yield a
-          yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
-        fork (do
-          broadcastOfflineGossip t result.peerServers result.expiredLocal
-          if not (federationSecret == "") && count result.pendingForwards > 0
-            then retryPendingForwards result.pendingForwards
-            else yield {}
-          if not (federationSecret == "") && count result.pendingAcks > 0
-            then do
-              let ackOriginServers = fold (\acc a ->
-                if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
-                else union acc [a.originServer]) [] result.pendingAcks
-              sendAcksAndClean result.pendingAcks ackOriginServers
-            else yield {})
+        fork (pruneAndRetry t)
         yield (respond {ok: True {}})
       else yield (respond {ok: False {}})
 
@@ -1364,31 +1323,7 @@ serve = \req -> case req of
 backgroundPrune = do
   sleep 30000
   t <- now
-  result <- atomic do
-    set *lastPrunedAt = t
-    pr <- pruneExpired t
-    forwards <- *forwards
-    let pendingForwards = do
-      f <- forwards
-      yield {toServer: f.toServer, toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, messageId: f.messageId}
-    ackedIds <- *ackedIds
-    let pendingAcks = do
-      a <- ackedIds
-      where not (a.originServer == "")
-      where not (a.originServer == serverHostN)
-      yield a
-    yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
-  broadcastOfflineGossip t result.peerServers result.expiredLocal
-  if not (federationSecret == "") && count result.pendingForwards > 0
-    then retryPendingForwards result.pendingForwards
-    else yield {}
-  if not (federationSecret == "") && count result.pendingAcks > 0
-    then do
-      let ackOriginServers = fold (\acc a ->
-        if count (do s <- acc; where s == a.originServer; yield s) > 0 then acc
-        else union acc [a.originServer]) [] result.pendingAcks
-      sendAcksAndClean result.pendingAcks ackOriginServers
-    else yield {}
+  pruneAndRetry t
   fork backgroundPrune
 
 main = do
