@@ -33,14 +33,14 @@ module App =
         | AddContact
         | Settings
 
-    type ConnState =
-        | Offline
-        | Connecting
-        | Online of token: string
-
     type Identity = { PrivKey: byte[]; PubKeyHex: string }
 
     type Session = { Url: string; Token: string; Identity: Identity }
+
+    type ConnState =
+        | Offline
+        | Connecting
+        | Online of Session
 
     // ── Model ──
 
@@ -72,7 +72,7 @@ module App =
         | DoDisconnect
         | SetCompose of string
         | DoSend
-        | Sent of recipient: string * status: string
+        | Sent of status: string
         | SetNewPubkey of string
         | SetNewNickname of string
         | DoSaveContact
@@ -87,7 +87,7 @@ module App =
     type CmdMsg =
         | CmdGenIdentity
         | CmdConnect of url: string * identity: Identity
-        | CmdSend of session: Session * recipientHex: string * text: string
+        | CmdSend of session: Session * recipientHex: string * text: string * messageId: string
         | CmdPoll of session: Session * cursor: uint64
         | CmdCopyToClipboard of string
 
@@ -119,8 +119,8 @@ module App =
         model.Identity |> Option.map _.PubKeyHex |> Option.defaultValue ""
 
     let private trySession model =
-        match model.Identity, model.Conn with
-        | Some id, Online token -> Some { Url = model.ServerUrl; Token = token; Identity = id }
+        match model.Conn with
+        | Online session -> Some session
         | _ -> None
 
     // ── Init ──
@@ -164,7 +164,7 @@ module App =
             match model.Identity with
             | Some id ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
-                { model with Conn = Online token; Page = Conversations; Error = None },
+                { model with Conn = Online session; Page = Conversations; Error = None },
                 [ CmdPoll(session, model.PollCursor) ]
             | None ->
                 { model with Error = Some "No identity generated" }, []
@@ -179,8 +179,9 @@ module App =
             match model.Page, trySession model with
             | Chat pk, Some session when model.ComposeText <> "" ->
                 let text = model.ComposeText
+                let id = Guid.NewGuid().ToString()
                 let outMsg =
-                    { Id = Guid.NewGuid().ToString()
+                    { Id = id
                       Body = text
                       Timestamp = DateTimeOffset.UtcNow
                       IsOutgoing = true }
@@ -189,10 +190,10 @@ module App =
                 { model with
                     ComposeText = ""
                     Messages = model.Messages |> Map.add pk (msgs @ [ outMsg ]) },
-                [ CmdSend(session, pk, text) ]
+                [ CmdSend(session, pk, text, id) ]
             | _ -> model, []
 
-        | Sent(_, status) -> { model with LastSendStatus = status }, []
+        | Sent status -> { model with LastSendStatus = status }, []
 
         | PollResult(incoming, status, newCursor) ->
             let model' =
@@ -312,21 +313,20 @@ module App =
                     return AuthErr ex.Message
             })
 
-        | CmdSend(session, recipientHex, text) ->
+        | CmdSend(session, recipientHex, text, messageId) ->
             asyncCmd (async {
                 try
                     let pubKey = session.Identity.PrivKey.[32..63]
                     let recipPub = Crypto.fromHex recipientHex
-                    let id = Guid.NewGuid().ToString()
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
                     let payload =
-                        $"""{{ "type": "text", "id": "{id}", "timestamp": {ts}, "body": {JsonSerializer.Serialize(text)} }}"""
+                        $"""{{ "type": "text", "id": "{messageId}", "timestamp": {ts}, "body": {JsonSerializer.Serialize(text)} }}"""
 
                     let blob = Crypto.encrypt session.Identity.PrivKey pubKey recipPub payload
                     let blobHex = Crypto.toHex blob
                     let! (status, msgId) = ApiClient.sendMessage session.Url session.Token recipientHex blobHex ts
-                    return Sent(recipientHex, $"{status}:{msgId}")
+                    return Sent $"{status}:{msgId}"
                 with ex ->
                     return DismissError  // TODO: show send errors properly
             })
@@ -335,29 +335,26 @@ module App =
             asyncCmd (async {
                 try
                     let! (events, newCursor) = ApiClient.poll session.Url session.Token cursor
-                    let messages = ResizeArray()
-                    let ackIds = ResizeArray()
-                    let errors = ResizeArray()
+                    let messages, ackIds, errors =
+                        events
+                        |> List.fold (fun (msgs, acks, errs) (evtId, evtType, payload) ->
+                            if evtType <> "message" then (msgs, acks, errs)
+                            else
+                                match decryptEvent session.Identity.PrivKey payload with
+                                | Ok msg -> (msg :: msgs, evtId :: acks, errs)
+                                | Error err -> (msgs, acks, err :: errs))
+                            ([], [], [])
 
-                    for (evtId, evtType, payload) in events do
-                        if evtType = "message" then
-                            match decryptEvent session.Identity.PrivKey payload with
-                            | Ok msg ->
-                                messages.Add(msg)
-                                ackIds.Add(evtId)
-                            | Error err ->
-                                errors.Add(err)
-
-                    if ackIds.Count > 0 then
-                        do! ApiClient.ackMessages session.Url session.Token (Seq.toList ackIds)
+                    if not ackIds.IsEmpty then
+                        do! ApiClient.ackMessages session.Url session.Token ackIds
 
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
 
                     let status =
-                        $"[{now}] evts:{events.Length} msgs:{messages.Count} errs:{errors.Count}"
-                        + (if errors.Count > 0 then $" [{errors.[0]}]" else "")
+                        $"[{now}] evts:{events.Length} msgs:{messages.Length} errs:{errors.Length}"
+                        + (match errors with err :: _ -> $" [{err}]" | [] -> "")
 
-                    return PollResult(Seq.toList messages, status, newCursor)
+                    return PollResult(List.rev messages, status, newCursor)
                 with
                 | :? TimeoutException ->
                     return PollResult([], "polling...", cursor)
@@ -411,12 +408,14 @@ module App =
 
                     Entry(model.ServerUrl, SetServerUrl)
 
-                    if model.Error.IsSome then
-                        Label(model.Error.Value)
+                    match model.Error with
+                    | Some err ->
+                        Label(err)
                             .textColor(Colors.Red)
                             .font(size = 12.)
 
                         Button("Dismiss", DismissError)
+                    | None -> ()
 
                     match model.Conn with
                     | Offline -> Button("Connect", DoConnect)
@@ -504,10 +503,12 @@ module App =
                         .centerTextHorizontal()
                 }
 
-                if model.Error.IsSome then
-                    Label(model.Error.Value)
+                match model.Error with
+                | Some err ->
+                    Label(err)
                         .textColor(Colors.Red)
                         .font(size = 11.)
+                | None -> ()
 
                 Label($"[{msgs.Length} message(s), compose: \"{model.ComposeText}\", send: \"{model.LastSendStatus}\"]")
                     .textColor(Colors.Gray)
