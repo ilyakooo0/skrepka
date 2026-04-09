@@ -29,7 +29,7 @@ module App =
     type Page =
         | Setup
         | Conversations
-        | Chat of string
+        | Chat of pubkey: string
         | AddContact
         | Settings
 
@@ -38,12 +38,15 @@ module App =
         | Connecting
         | Online of token: string
 
+    type Identity = { PrivKey: byte[]; PubKeyHex: string }
+
+    type Session = { Url: string; Token: string; Identity: Identity }
+
     // ── Model ──
 
     type Model =
         { Page: Page
-          PrivKey: byte[] option
-          PubKeyHex: string
+          Identity: Identity option
           ServerUrl: string
           Conn: ConnState
           Contacts: Contact list
@@ -61,7 +64,7 @@ module App =
     type Msg =
         | Nav of Page
         | GenIdentity
-        | IdentityReady of byte[] * byte[]
+        | IdentityReady of Identity
         | SetServerUrl of string
         | DoConnect
         | AuthOk of string
@@ -69,12 +72,12 @@ module App =
         | DoDisconnect
         | SetCompose of string
         | DoSend
-        | Sent of string * string
+        | Sent of recipient: string * status: string
         | SetNewPubkey of string
         | SetNewNickname of string
         | DoSaveContact
         | DoDeleteContact of string
-        | PollResult of IncomingMessage list * string * uint64
+        | PollResult of messages: IncomingMessage list * status: string * cursor: uint64
         | DoPoll
         | CopyPubKey
         | DismissError
@@ -83,9 +86,9 @@ module App =
 
     type CmdMsg =
         | CmdGenIdentity
-        | CmdConnect of url: string * pubHex: string * privKey: byte[]
-        | CmdSend of url: string * token: string * recipientHex: string * privKey: byte[] * text: string
-        | CmdPoll of url: string * token: string * privKey: byte[] * cursor: uint64
+        | CmdConnect of url: string * identity: Identity
+        | CmdSend of session: Session * recipientHex: string * text: string
+        | CmdPoll of session: Session * cursor: uint64
         | CmdCopyToClipboard of string
 
     // ── Helpers ──
@@ -112,12 +115,19 @@ module App =
         else
             contacts @ [ contact ]
 
+    let private pubKeyHex model =
+        model.Identity |> Option.map _.PubKeyHex |> Option.defaultValue ""
+
+    let private trySession model =
+        match model.Identity, model.Conn with
+        | Some id, Online token -> Some { Url = model.ServerUrl; Token = token; Identity = id }
+        | _ -> None
+
     // ── Init ──
 
     let init () =
         { Page = Setup
-          PrivKey = None
-          PubKeyHex = ""
+          Identity = None
           ServerUrl = "http://localhost:8080"
           Conn = Offline
           PollStatus = ""
@@ -139,26 +149,23 @@ module App =
 
         | GenIdentity -> model, [ CmdGenIdentity ]
 
-        | IdentityReady(priv, pub) ->
-            { model with
-                PrivKey = Some priv
-                PubKeyHex = Crypto.toHex pub
-                Page = Settings },
-            []
+        | IdentityReady identity ->
+            { model with Identity = Some identity; Page = Settings }, []
 
         | SetServerUrl url -> { model with ServerUrl = url }, []
 
         | DoConnect ->
-            match model.PrivKey with
-            | Some priv ->
-                { model with Conn = Connecting }, [ CmdConnect(model.ServerUrl, model.PubKeyHex, priv) ]
+            match model.Identity with
+            | Some id ->
+                { model with Conn = Connecting }, [ CmdConnect(model.ServerUrl, id) ]
             | None -> { model with Error = Some "No identity generated" }, []
 
         | AuthOk token ->
-            match model.PrivKey with
-            | Some priv ->
+            match model.Identity with
+            | Some id ->
+                let session = { Url = model.ServerUrl; Token = token; Identity = id }
                 { model with Conn = Online token; Page = Conversations; Error = None },
-                [ CmdPoll(model.ServerUrl, token, priv, model.PollCursor) ]
+                [ CmdPoll(session, model.PollCursor) ]
             | None ->
                 { model with Error = Some "No identity generated" }, []
 
@@ -169,8 +176,8 @@ module App =
         | SetCompose text -> { model with ComposeText = text }, []
 
         | DoSend ->
-            match model.Page, model.Conn, model.PrivKey with
-            | Chat pk, Online token, Some priv when model.ComposeText <> "" ->
+            match model.Page, trySession model with
+            | Chat pk, Some session when model.ComposeText <> "" ->
                 let text = model.ComposeText
                 let outMsg =
                     { Id = Guid.NewGuid().ToString()
@@ -182,7 +189,7 @@ module App =
                 { model with
                     ComposeText = ""
                     Messages = model.Messages |> Map.add pk (msgs @ [ outMsg ]) },
-                [ CmdSend(model.ServerUrl, token, pk, priv, text) ]
+                [ CmdSend(session, pk, text) ]
             | _ -> model, []
 
         | Sent(_, status) -> { model with LastSendStatus = status }, []
@@ -208,14 +215,14 @@ module App =
                                 Messages = m.Messages |> Map.add msg.FromPubkey (msgs @ [ chatMsg ]) })
                     { model with PollStatus = status; PollCursor = newCursor }
 
-            match model'.Conn, model'.PrivKey with
-            | Online token, Some priv -> model', [ CmdPoll(model'.ServerUrl, token, priv, model'.PollCursor) ]
-            | _ -> model', []
+            match trySession model' with
+            | Some session -> model', [ CmdPoll(session, model'.PollCursor) ]
+            | None -> model', []
 
         | DoPoll ->
-            match model.Conn, model.PrivKey with
-            | Online token, Some priv -> model, [ CmdPoll(model.ServerUrl, token, priv, model.PollCursor) ]
-            | _ -> model, []
+            match trySession model with
+            | Some session -> model, [ CmdPoll(session, model.PollCursor) ]
+            | None -> model, []
 
         | SetNewPubkey pk -> { model with NewPubkey = pk }, []
         | SetNewNickname nn -> { model with NewNickname = nn }, []
@@ -240,7 +247,10 @@ module App =
                 Contacts = model.Contacts |> List.filter (fun c -> c.Pubkey <> pk) },
             []
 
-        | CopyPubKey -> model, [ CmdCopyToClipboard model.PubKeyHex ]
+        | CopyPubKey ->
+            match model.Identity with
+            | Some id -> model, [ CmdCopyToClipboard id.PubKeyHex ]
+            | None -> model, []
 
         | DismissError -> { model with Error = None }, []
 
@@ -255,20 +265,44 @@ module App =
                 }))
             |> ignore)
 
+    let private decryptEvent (privKey: byte[]) (payload: JsonElement) =
+        try
+            let blobHex = payload.GetProperty("encryptedBlob").GetString()
+            let tsEl = payload.GetProperty("timestamp")
+            let ts =
+                if tsEl.ValueKind = JsonValueKind.String then Int64.Parse(tsEl.GetString())
+                else tsEl.GetInt64()
+            let blob = Crypto.fromHex blobHex
+
+            match Crypto.decrypt privKey blob with
+            | Some(plaintext, senderHex) ->
+                let ptDoc = JsonDocument.Parse(plaintext)
+                let ptRoot = ptDoc.RootElement
+
+                if ptRoot.GetProperty("type").GetString() = "text" then
+                    let msgId = ptRoot.GetProperty("id").GetString()
+                    let body = ptRoot.GetProperty("body").GetString()
+                    Ok { FromPubkey = senderHex; Body = body; Timestamp = ts; MessageId = msgId }
+                else
+                    Error "unknown type"
+            | None -> Error "decrypt failed"
+        with ex ->
+            Error $"parse: {ex.Message}"
+
     let mapCmd cmdMsg =
         match cmdMsg with
         | CmdGenIdentity ->
             asyncCmd (async {
                 let priv, pub = Crypto.generateIdentity ()
-                return IdentityReady(priv, pub)
+                return IdentityReady { PrivKey = priv; PubKeyHex = Crypto.toHex pub }
             })
 
-        | CmdConnect(url, pubHex, privKey) ->
+        | CmdConnect(url, identity) ->
             asyncCmd (async {
                 try
-                    let! challenge = ApiClient.requestChallenge url pubHex
-                    let sigHex = Crypto.signChallenge privKey challenge
-                    let! (token, _) = ApiClient.verify url pubHex challenge sigHex
+                    let! challenge = ApiClient.requestChallenge url identity.PubKeyHex
+                    let sigHex = Crypto.signChallenge identity.PrivKey challenge
+                    let! (token, _) = ApiClient.verify url identity.PubKeyHex challenge sigHex
 
                     if String.IsNullOrEmpty(token) then
                         return AuthErr "Authentication rejected by server"
@@ -278,10 +312,10 @@ module App =
                     return AuthErr ex.Message
             })
 
-        | CmdSend(url, token, recipientHex, privKey, text) ->
+        | CmdSend(session, recipientHex, text) ->
             asyncCmd (async {
                 try
-                    let pubKey = privKey.[32..63]
+                    let pubKey = session.Identity.PrivKey.[32..63]
                     let recipPub = Crypto.fromHex recipientHex
                     let id = Guid.NewGuid().ToString()
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
@@ -289,52 +323,33 @@ module App =
                     let payload =
                         $"""{{ "type": "text", "id": "{id}", "timestamp": {ts}, "body": {JsonSerializer.Serialize(text)} }}"""
 
-                    let blob = Crypto.encrypt privKey pubKey recipPub payload
+                    let blob = Crypto.encrypt session.Identity.PrivKey pubKey recipPub payload
                     let blobHex = Crypto.toHex blob
-                    let! (status, msgId) = ApiClient.sendMessage url token recipientHex blobHex ts
+                    let! (status, msgId) = ApiClient.sendMessage session.Url session.Token recipientHex blobHex ts
                     return Sent(recipientHex, $"{status}:{msgId}")
                 with ex ->
                     return DismissError  // TODO: show send errors properly
             })
 
-        | CmdPoll(url, token, privKey, cursor) ->
+        | CmdPoll(session, cursor) ->
             asyncCmd (async {
                 try
-                    let! (events, newCursor) = ApiClient.poll url token cursor
+                    let! (events, newCursor) = ApiClient.poll session.Url session.Token cursor
                     let messages = ResizeArray()
                     let ackIds = ResizeArray()
                     let errors = ResizeArray()
 
                     for (evtId, evtType, payload) in events do
                         if evtType = "message" then
-                            try
-                                let blobHex = payload.GetProperty("encryptedBlob").GetString()
-                                let tsEl = payload.GetProperty("timestamp")
-                                let ts =
-                                    if tsEl.ValueKind = JsonValueKind.String then
-                                        Int64.Parse(tsEl.GetString())
-                                    else
-                                        tsEl.GetInt64()
-                                let blob = Crypto.fromHex blobHex
-
-                                match Crypto.decrypt privKey blob with
-                                | Some(plaintext, senderHex) ->
-                                    let ptDoc = JsonDocument.Parse(plaintext)
-                                    let ptRoot = ptDoc.RootElement
-
-                                    if ptRoot.GetProperty("type").GetString() = "text" then
-                                        let msgId = ptRoot.GetProperty("id").GetString()
-                                        let body = ptRoot.GetProperty("body").GetString()
-                                        messages.Add({ FromPubkey = senderHex; Body = body; Timestamp = ts; MessageId = msgId })
-
-                                    ackIds.Add(evtId)
-                                | None ->
-                                    errors.Add("decrypt failed")
-                            with ex ->
-                                errors.Add($"parse: {ex.Message}")
+                            match decryptEvent session.Identity.PrivKey payload with
+                            | Ok msg ->
+                                messages.Add(msg)
+                                ackIds.Add(evtId)
+                            | Error err ->
+                                errors.Add(err)
 
                     if ackIds.Count > 0 then
-                        do! ApiClient.ackMessages url token (Seq.toList ackIds)
+                        do! ApiClient.ackMessages session.Url session.Token (Seq.toList ackIds)
 
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
 
@@ -387,7 +402,7 @@ module App =
 
                     Label("Your Public Key:")
 
-                    Label(model.PubKeyHex)
+                    Label(pubKeyHex model)
                         .font(size = 9.)
 
                     Button("Copy Public Key", CopyPubKey)
