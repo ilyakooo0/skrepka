@@ -130,7 +130,7 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 -- ============================================
 
 any = \xs pred -> count (do x <- xs; where pred x; yield x) > 0
-none = \xs pred -> count (do x <- xs; where pred x; yield x) == 0
+none = \xs pred -> not (any xs pred)
 isJust = \m -> case m of
   Nothing {} -> False {}
   _ -> True {}
@@ -463,13 +463,15 @@ collectPeerServers = \items getServer ->
 
 samePubkeyServer = \a b -> a.pubkey == b.pubkey && a.server == b.server
 
-mergeByPubkeyServer = \initial items ->
+mergeByKey = \sameKey initial items ->
   fold (\acc e ->
-    if any acc (\a -> samePubkeyServer a e && a.expiresAt >= e.expiresAt)
+    if any acc (\a -> sameKey a e && a.expiresAt >= e.expiresAt)
       then acc
       else union
-        (do a <- acc; where not (samePubkeyServer a e); yield a)
+        (do a <- acc; where not (sameKey a e); yield a)
         [e]) initial items
+
+mergeByPubkeyServer = mergeByKey samePubkeyServer
 
 removeOffline = \presenceSet offlineOnlyKeys trustedOffline t ->
   diff presenceSet (do
@@ -582,11 +584,9 @@ sendBatchedGossip = \peerServers allEvents ->
       sendToEach peerServers (\server -> sendBatchedGossipToServer server allEvents)
 
 broadcastOfflineGossip = \t peerServers expiredLocal -> do
-  let expiredEntries = fold (\acc p ->
-    if any acc (\a -> a.pubkey == p.pubkey && a.expiresAt >= p.expiresAt) then acc
-    else union
-      (do a <- acc; where not (a.pubkey == p.pubkey); yield a)
-      [{pubkey: p.pubkey, ttl: (let rawTtl = (p.expiresAt - p.timestamp) / 1000 in clampTtl (if rawTtl < offlineGossipMinTtl then offlineGossipMinTtl else rawTtl)), expiresAt: p.expiresAt}]) [] expiredLocal
+  let expiredEntries = mergeByKey (\a b -> a.pubkey == b.pubkey) [] (do
+    p <- expiredLocal
+    yield {pubkey: p.pubkey, ttl: (let rawTtl = (p.expiresAt - p.timestamp) / 1000 in clampTtl (if rawTtl < offlineGossipMinTtl then offlineGossipMinTtl else rawTtl)), expiresAt: p.expiresAt})
   if federationEnabled && count expiredEntries > 0 && count peerServers > 0
     then do
       let gossipEvents = do
@@ -863,23 +863,21 @@ serve = \req -> case req of
           where p.expiresAt > t
           yield p.server
         else []
+      forwards <- *forwards
+      let forwardsAtCapacity = count forwards >= maxForwardsEntries
       let status = if not authorized then "unauthorized"
         else if not shouldInsert then "rejected"
         else if localOnline then "delivered"
-        else if count remoteServers > 0 then "federated"
+        else if count remoteServers > 0 && federationEnabled && not forwardsAtCapacity then "federated"
         else "queued"
-      forwards <- *forwards
-      let forwardsAtCapacity = count forwards >= maxForwardsEntries
       let forwardSlots = maxForwardsEntries - count forwards
       let forwardServers = takeN remoteServers forwardSlots
       set *forwards = if shouldInsert && not forwardsAtCapacity && count forwardServers > 0 && federationEnabled
         then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
         else forwards
-      yield {status: status, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
-    let finalStatus = if result.status == "federated" && (not federationEnabled || result.forwardsAtCapacity) then "queued" else result.status
-    let actionable = not (result.status == "unauthorized") && not (result.status == "rejected")
+      yield {status: status, shouldInsert: shouldInsert, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
     fork (do
-      if count result.remoteServers > 0 && actionable && federationEnabled
+      if count result.remoteServers > 0 && result.shouldInsert && federationEnabled
         then sendToEach result.remoteServers (\server -> do
           fwdResult <- fetch (federationScheme ++ server) (ForwardMessage {
             toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
@@ -890,11 +888,11 @@ serve = \req -> case req of
             Err _ -> yield {}
           )
         else yield {}
-      if result.forwardsAtCapacity && count result.remoteServers > 0 && actionable
+      if result.forwardsAtCapacity && count result.remoteServers > 0 && result.shouldInsert
         then println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
         else yield {}
       broadcastOfflineGossip t result.peerServers result.expiredLocal)
-    yield (respond {status: finalStatus, messageId: (if result.status == "unauthorized" then "" else if result.status == "rejected" then "" else msgId)})
+    yield (respond {status: result.status, messageId: if result.shouldInsert then msgId else ""})
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -1159,11 +1157,10 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let dedupedIds = dedupMessageIds messageIds
-    let validAckFields = authorized && originServer == serverHostN && not (fromServer == serverHostN)
+    let validAck = authorized && originServer == serverHostN && not (fromServer == serverHostN)
     pruneResult <- atomic do
       pr <- maybePrune t
       forwards <- *forwards
-      let validAck = validAckFields
       let forwardsToRemove = do
         f <- forwards
         mid <- dedupedIds
@@ -1173,9 +1170,9 @@ serve = \req -> case req of
       set *forwards = if validAck
         then diff forwards forwardsToRemove
         else forwards
-      yield {peerServers: pr.peerServers, expiredLocal: pr.expiredLocal, validAck: validAck}
+      yield {peerServers: pr.peerServers, expiredLocal: pr.expiredLocal}
     forkBroadcastOffline t pruneResult
-    yield (respond {ok: pruneResult.validAck})
+    yield (respond {ok: validAck})
 
   Prune {authorization, respond} -> do
     t <- now
