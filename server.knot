@@ -58,23 +58,30 @@ type OptionalServerName = Text where \s -> s == "" || (not (tooLong s maxServerN
 
 type Timestamp = Int<Ms>
 
+type Challenge = {pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp}
+type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp}
+type Message = {messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: OptionalServerName, receivedAt: Timestamp}
+type PresenceEntry = {pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp}
+type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
+type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
+
 -- ============================================
 -- Persisted State
 -- ============================================
 
-*challenges : [{pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp}]
+*challenges : [Challenge]
 
-*sessions : [{token: Text, pubkey: PubkeyHex, expiresAt: Timestamp}]
+*sessions : [Session]
 
-*messages : [{messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: OptionalServerName, receivedAt: Timestamp}]
+*messages : [Message]
 
-*presence : [{pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp}]
+*presence : [PresenceEntry]
 
 *seqCounter : Timestamp
 
-*forwards : [{messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}]
+*forwards : [ForwardEntry]
 
-*ackedIds : [{messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}]
+*ackedIds : [AckedEntry]
 
 *lastPrunedAt : Timestamp
 
@@ -156,16 +163,12 @@ intTo3Hex = \n ->
   let b2 = r0 - b1 * 256 in
   byteToHex b0 ++ byteToHex b1 ++ byteToHex b2
 
-genToken = do
-  a <- randomInt 16777216
-  b <- randomInt 16777216
-  c <- randomInt 16777216
-  d <- randomInt 16777216
-  e <- randomInt 16777216
-  f <- randomInt 16777216
-  g <- randomInt 16777216
-  h <- randomInt 16777216
-  yield (intTo3Hex a ++ intTo3Hex b ++ intTo3Hex c ++ intTo3Hex d ++ intTo3Hex e ++ intTo3Hex f ++ intTo3Hex g ++ intTo3Hex h)
+genTokenN = \n -> if n <= 0 then yield "" else do
+  chunk <- randomInt 16777216
+  rest <- genTokenN (n - 1)
+  yield (intTo3Hex chunk ++ rest)
+
+genToken = genTokenN 8
 
 tooLong = \s maxLen -> not (drop maxLen s == "")
 
@@ -572,7 +575,7 @@ maybePrune = \t -> do
       set *lastPrunedAt = t
       pruneExpired t
 
-sendBatchedGossipToServer : Text -> [{eventType: GossipEventType, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int<S>}] -> IO {network} {}
+sendBatchedGossipToServer : Text -> [GossipEvent] -> IO {network} {}
 sendBatchedGossipToServer = \server allEvents ->
   if count allEvents == 0
     then yield {}
@@ -587,7 +590,7 @@ sendBatchedGossipToServer = \server allEvents ->
         Err _ -> yield {}
       sendBatchedGossipToServer server rest
 
-sendBatchedGossip : [Text] -> [{eventType: GossipEventType, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int<S>}] -> IO {network} {}
+sendBatchedGossip : [Text] -> [GossipEvent] -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents ->
   if count allEvents == 0
     then yield {}
@@ -780,12 +783,10 @@ serve = \req -> case req of
         Nothing {} -> False {}
         _ -> verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
       set *challenges = if sigValid
-        then case matched of
-          Just {value: _} -> do
-            c <- challenges
-            where not (c.pubkey == pubkey && c.challenge == challenge)
-            yield c
-          Nothing {} -> challenges
+        then do
+          c <- challenges
+          where not (c.pubkey == pubkey && c.challenge == challenge)
+          yield c
         else challenges
       let sessionsCapped = capPerKey sessions (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t
       let activeSessionsCapped = do s <- sessionsCapped; where s.expiresAt > t; yield s
@@ -917,9 +918,7 @@ serve = \req -> case req of
           where m.messageId == mid
           where m.toKey == s.pubkey
           yield m
-      set *messages = case session of
-        Nothing {} -> messages
-        Just {value: _} -> diff messages ackedMessages
+      set *messages = diff messages ackedMessages
       let ackedFederated = do
         m <- ackedMessages
         where isFederatedOrigin m.originServer
@@ -1153,7 +1152,7 @@ serve = \req -> case req of
         else messages
       yield {peerServers: pr.peerServers, expiredLocal: pr.expiredLocal, inserted: shouldInsert, alreadyExists: exists}
     forkBroadcastOffline t result
-    yield (respond {ok: result.inserted || (authorized && validOrigin && result.alreadyExists)})
+    yield (respond {ok: result.inserted || result.alreadyExists})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     let fromServer = normalizeServerName fromServer

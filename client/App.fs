@@ -4,6 +4,7 @@ open System
 open System.Text.Json
 open Fabulous
 open Fabulous.Maui
+open System.Collections.Generic
 open Microsoft.Maui.Graphics
 
 open type Fabulous.Maui.View
@@ -81,6 +82,7 @@ module App =
         | DoPoll
         | CopyPubKey
         | DismissError
+        | StateLoaded of identity: (byte[] * string) option * data: Store.DataDto option
 
     // ── CmdMsg ──
 
@@ -90,6 +92,9 @@ module App =
         | CmdSend of session: Session * recipientHex: string * text: string * messageId: string
         | CmdPoll of session: Session * cursor: uint64
         | CmdCopyToClipboard of string
+        | CmdLoadState
+        | CmdSaveIdentity of privKey: byte[] * pubKeyHex: string
+        | CmdSaveData of contacts: Contact list * messages: Map<string, ChatMessage list> * serverUrl: string * cursor: uint64
 
     // ── Helpers ──
 
@@ -123,6 +128,9 @@ module App =
         | Online session -> Some session
         | _ -> None
 
+    let private saveCmd model =
+        [ CmdSaveData(model.Contacts, model.Messages, model.ServerUrl, model.PollCursor) ]
+
     // ── Init ──
 
     let init () =
@@ -139,7 +147,7 @@ module App =
           Error = None
           PollCursor = 0UL
           LastSendStatus = "" },
-        []
+        [ CmdLoadState ]
 
     // ── Update ──
 
@@ -150,7 +158,8 @@ module App =
         | GenIdentity -> model, [ CmdGenIdentity ]
 
         | IdentityReady identity ->
-            { model with Identity = Some identity; Page = Settings }, []
+            { model with Identity = Some identity; Page = Settings },
+            [ CmdSaveIdentity(identity.PrivKey, identity.PubKeyHex) ]
 
         | SetServerUrl url -> { model with ServerUrl = url }, []
 
@@ -187,10 +196,12 @@ module App =
                       IsOutgoing = true }
                 let msgs = messagesFor pk model.Messages
 
-                { model with
-                    ComposeText = ""
-                    Messages = model.Messages |> Map.add pk (msgs @ [ outMsg ]) },
-                [ CmdSend(session, pk, text, id) ]
+                let model' =
+                    { model with
+                        ComposeText = ""
+                        Messages = model.Messages |> Map.add pk (msgs @ [ outMsg ]) }
+
+                model', CmdSend(session, pk, text, id) :: saveCmd model'
             | _ -> model, []
 
         | Sent status -> { model with LastSendStatus = status }, []
@@ -216,9 +227,12 @@ module App =
                                 Messages = m.Messages |> Map.add msg.FromPubkey (msgs @ [ chatMsg ]) })
                     { model with PollStatus = status; PollCursor = newCursor }
 
-            match trySession model' with
-            | Some session -> model', [ CmdPoll(session, model'.PollCursor) ]
-            | None -> model', []
+            let cmds =
+                match trySession model' with
+                | Some session -> [ CmdPoll(session, model'.PollCursor) ]
+                | None -> []
+
+            model', cmds @ (if not incoming.IsEmpty then saveCmd model' else [])
 
         | DoPoll ->
             match trySession model with
@@ -234,19 +248,23 @@ module App =
                     { Pubkey = model.NewPubkey
                       Nickname = model.NewNickname }
 
-                { model with
-                    Contacts = model.Contacts |> upsertContact contact
-                    NewPubkey = ""
-                    NewNickname = ""
-                    Page = Conversations },
-                []
+                let model' =
+                    { model with
+                        Contacts = model.Contacts |> upsertContact contact
+                        NewPubkey = ""
+                        NewNickname = ""
+                        Page = Conversations }
+
+                model', saveCmd model'
             else
                 model, []
 
         | DoDeleteContact pk ->
-            { model with
-                Contacts = model.Contacts |> List.filter (fun c -> c.Pubkey <> pk) },
-            []
+            let model' =
+                { model with
+                    Contacts = model.Contacts |> List.filter (fun c -> c.Pubkey <> pk) }
+
+            model', saveCmd model'
 
         | CopyPubKey ->
             match model.Identity with
@@ -254,6 +272,56 @@ module App =
             | None -> model, []
 
         | DismissError -> { model with Error = None }, []
+
+        | StateLoaded(identityOpt, dataOpt) ->
+            match identityOpt with
+            | None -> model, []
+            | Some(privKey, pubKeyHex) ->
+                let identity = { PrivKey = privKey; PubKeyHex = pubKeyHex }
+
+                let model' =
+                    match dataOpt with
+                    | Some data ->
+                        let contacts =
+                            data.Contacts
+                            |> Array.toList
+                            |> List.map (fun c ->
+                                { Pubkey = c.Pubkey; Nickname = c.Nickname }: Contact)
+
+                        let messages =
+                            data.Messages
+                            |> Seq.fold
+                                (fun acc (KeyValue(pk, dtos)) ->
+                                    let msgs =
+                                        dtos
+                                        |> Array.toList
+                                        |> List.map (fun m ->
+                                            { Id = m.Id
+                                              Body = m.Body
+                                              Timestamp = DateTimeOffset.FromUnixTimeSeconds m.TimestampUnix
+                                              IsOutgoing = m.IsOutgoing })
+
+                                    acc |> Map.add pk msgs)
+                                Map.empty
+
+                        { model with
+                            Identity = Some identity
+                            Contacts = contacts
+                            Messages = messages
+                            ServerUrl =
+                                if data.ServerUrl <> "" then data.ServerUrl
+                                else model.ServerUrl
+                            PollCursor = data.PollCursor
+                            Page = Conversations
+                            Conn = Connecting }
+
+                    | None ->
+                        { model with
+                            Identity = Some identity
+                            Page = Settings
+                            Conn = Connecting }
+
+                model', [ CmdConnect(model'.ServerUrl, identity) ]
 
     // ── mapCmd ──
 
@@ -368,6 +436,44 @@ module App =
             Cmd.ofEffect (fun _ ->
                 Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(text)
                 |> ignore)
+
+        | CmdLoadState ->
+            asyncCmd (async {
+                let! identity = Store.loadIdentity ()
+                let data = Store.loadData ()
+                return StateLoaded(identity, data)
+            })
+
+        | CmdSaveIdentity(privKey, pubKeyHex) ->
+            Cmd.ofEffect (fun _ -> Store.saveIdentity privKey pubKeyHex |> ignore)
+
+        | CmdSaveData(contacts, messages, serverUrl, cursor) ->
+            Cmd.ofEffect (fun _ ->
+                let contactDtos =
+                    contacts
+                    |> List.map (fun c ->
+                        { Store.ContactDto.Pubkey = c.Pubkey
+                          Store.ContactDto.Nickname = c.Nickname })
+                    |> Array.ofList
+
+                let messageDtos = Dictionary<string, Store.MessageDto array>()
+
+                messages
+                |> Map.iter (fun pk msgs ->
+                    messageDtos[pk] <-
+                        msgs
+                        |> List.map (fun m ->
+                            { Store.MessageDto.Id = m.Id
+                              Store.MessageDto.Body = m.Body
+                              Store.MessageDto.TimestampUnix = m.Timestamp.ToUnixTimeSeconds()
+                              Store.MessageDto.IsOutgoing = m.IsOutgoing })
+                        |> Array.ofList)
+
+                Store.saveData
+                    { Contacts = contactDtos
+                      Messages = messageDtos
+                      ServerUrl = serverUrl
+                      PollCursor = cursor })
 
     // ── View ──
 
