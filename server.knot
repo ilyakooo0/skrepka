@@ -541,7 +541,31 @@ retryPendingForwards = \pending -> do
     retryForwardsForServer (do x <- pending; where x.toServer == server; yield x) maxForwardRetriesPerServer)
   yield {}
 
-sendAcksAndClean : [{messageId: Text, originServer: Text, | a}] -> [Text] -> IO {network} {}
+sendBatchedAcksToServer : [{messageId: Text, toKey: Text, originServer: Text, | a}] -> Text -> IO {network} {}
+sendBatchedAcksToServer = \serverAcks server ->
+  if count serverAcks == 0
+    then yield {}
+    else do
+      let batch = fold (\acc a ->
+        if count acc >= maxMessageIds then acc
+        else union acc [a]) [] serverAcks
+      let rest = diff serverAcks batch
+      result <- fetch (federationScheme ++ server) (FederationAck {
+        authorization: "Bearer " ++ federationSecret,
+        messageIds: (do a <- batch; yield a.messageId),
+        originServer: server, fromServer: serverHostN})
+      case result of
+        Ok _ ->
+          atomic do
+            ackedIds <- *ackedIds
+            set *ackedIds = do
+              a <- ackedIds
+              where not (a.originServer == server && count (do sa <- batch; where sa.messageId == a.messageId; where sa.toKey == a.toKey; yield sa) > 0)
+              yield a
+        Err _ -> yield {}
+      sendBatchedAcksToServer rest server
+
+sendAcksAndClean : [{messageId: Text, toKey: Text, originServer: Text, | a}] -> [Text] -> IO {network} {}
 sendAcksAndClean = \pendingAcks servers ->
   if count servers == 0
     then yield {}
@@ -551,22 +575,7 @@ sendAcksAndClean = \pendingAcks servers ->
       if server == ""
         then yield {}
         else do
-          fork (do
-            let serverAcks = do a <- pendingAcks; where a.originServer == server; yield a
-            result <- fetch (federationScheme ++ server) (FederationAck {
-              authorization: "Bearer " ++ federationSecret,
-              messageIds: (do a <- serverAcks; yield a.messageId),
-              originServer: server, fromServer: serverHostN})
-            case result of
-              Ok _ ->
-                atomic do
-                  ackedIds <- *ackedIds
-                  set *ackedIds = do
-                    a <- ackedIds
-                    where not (a.originServer == server && count (do sa <- serverAcks; where sa.messageId == a.messageId; where sa.toKey == a.toKey; yield sa) > 0)
-                    yield a
-              Err _ -> yield {}
-            )
+          fork (sendBatchedAcksToServer (do a <- pendingAcks; where a.originServer == server; yield a) server)
           sendAcksAndClean pendingAcks rest
 
 pollOnce : Text -> Int -> IO {clock} {authorized: Bool, cursor: Int, events: [PollEvent]}
