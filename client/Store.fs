@@ -49,7 +49,7 @@ module Store =
                 return
                     Some
                         { Crypto.Identity.PrivKey = Convert.FromBase64String privKeyB64
-                          PubKeyHex = pubKeyHex }
+                          Crypto.Identity.PubKeyHex = pubKeyHex }
         }
 
     let saveIdentity (identity: Crypto.Identity) =
