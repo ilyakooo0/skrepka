@@ -488,6 +488,17 @@ countMessagesFor = \messages toKey t ->
     where m.receivedAt >= t - messageMaxAge
     yield m)
 
+&pendingAcks = do
+  ackedIds <- *ackedIds
+  yield (do a <- ackedIds; where isFederatedOrigin a.originServer; yield a)
+
+&knownMessageKeys = do
+  messages <- *messages
+  ackedIds <- *ackedIds
+  yield (union
+    (do m <- messages; yield {messageId: m.messageId, toKey: m.toKey})
+    (do a <- ackedIds; yield {messageId: a.messageId, toKey: a.toKey}))
+
 validGossipEvents : [GossipEvent] -> Bool -> Timestamp -> GossipEventType -> [{pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}]
 validGossipEvents = \events validRequest t eventType ->
   do
@@ -668,11 +679,7 @@ pruneAndRetry = \t -> do
     let pendingForwards = do
       f <- forwards
       yield {toServer: f.toServer, toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, messageId: f.messageId}
-    ackedIds <- *ackedIds
-    let pendingAcks = do
-      a <- ackedIds
-      where isFederatedOrigin a.originServer
-      yield a
+    pendingAcks <- &pendingAcks
     yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
   broadcastOfflineGossip t result.peerServers result.expiredLocal
   if federationEnabled && count result.pendingForwards > 0
@@ -1134,12 +1141,9 @@ serve = \req -> case req of
       let seqTs = nextSeqTs t seqCounter
       let recipientMsgCount = if not (authorized && validOrigin) then 0
         else countMessagesFor messages toKey t
-      let existsInMessages = if not (authorized && validOrigin) then False {}
-        else any messages (\m -> m.messageId == messageId && m.toKey == toKey)
-      ackedIds <- *ackedIds
-      let existsInAcked = if not (authorized && validOrigin) then False {}
-        else any ackedIds (\a -> a.messageId == messageId && a.toKey == toKey)
-      let exists = existsInMessages || existsInAcked
+      knownKeys <- &knownMessageKeys
+      let exists = if not (authorized && validOrigin) then False {}
+        else any knownKeys (\k -> k.messageId == messageId && k.toKey == toKey)
       let shouldInsert = authorized && validOrigin && not exists && recipientMsgCount < maxMessagesPerRecipient
       set *seqCounter = if shouldInsert then seqTs else seqCounter
       set *messages = if shouldInsert
