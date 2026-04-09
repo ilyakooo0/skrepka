@@ -64,6 +64,8 @@ type Message = {messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, e
 type PresenceEntry = {pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp}
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
+type AuthResult = {authorized: Bool, pubkey: Text}
+type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [Text]}
 
 -- ============================================
 -- Persisted State
@@ -138,11 +140,9 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 
 any = \xs pred -> count (do x <- xs; where pred x; yield x) > 0
 none = \xs pred -> not (any xs pred)
-isJust = \m -> case m of
-  Nothing {} -> False {}
-  _ -> True {}
-
-firstOf = \items -> fold (\acc s -> if acc == "" then s else acc) "" items
+headOf = \items -> fold (\acc x -> case acc of
+  Nothing {} -> Just {value: x}
+  _ -> acc) Nothing {} items
 
 msToS : Int<Ms> -> Int<S>
 msToS  = \x ->  x / 1000
@@ -355,18 +355,15 @@ isBadServerName = \s ->
   || (isDigitChar (take 1 sn) && isAllDigitsOrDotsUntilColonOrEnd sn)
   || isHighOctetPrefix sn
 
-lookupSession = \sessions token t ->
+authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
+authenticateSession = \sessions token t ->
   fold (\acc s ->
-    let matches = safeCompare s.token token in
-    if matches && s.expiresAt > t
-      then case acc of
-        Nothing {} -> Just {value: s}
-        _ -> acc
-      else acc) Nothing {} sessions
-
-sessionPubkey = \session -> case session of
-  Nothing {} -> ""
-  Just {value: s} -> s.pubkey
+    if acc.authorized then acc
+    else
+      let matches = safeCompare s.token token in
+      if matches && s.expiresAt > t
+        then {authorized: True {}, pubkey: s.pubkey}
+        else acc) {authorized: False {}, pubkey: ""} sessions
 
 extractToken = \authHeader ->
   if toLower (take 7 authHeader) == "bearer "
@@ -521,16 +518,12 @@ validGossipEvents = \events validRequest t eventType ->
 
 sendToEach : [Text] -> (Text -> (a {})) -> a {}
 sendToEach = \servers action ->
-  if count servers == 0
-    then yield {}
-    else do
-      let server = firstOf servers
+  case headOf servers of
+    Nothing {} -> yield {}
+    Just {value: server} -> do
       let rest = do s <- servers; where not (s == server); yield s
-      if server == ""
-        then yield {}
-        else do
-          fork (action server)
-          sendToEach rest action
+      fork (action server)
+      sendToEach rest action
 
 pruneExpired = \t -> do
   set *challenges = do
@@ -621,24 +614,22 @@ removeForward = \mid srv -> atomic do
 
 retryForwardsForServer : [{encryptedBlob: BlobHex, fromKey: PubkeyHex, messageId: MessageIdHex, timestamp: Timestamp, toKey: PubkeyHex, toServer: ServerName}] -> Int -> IO {network} {}
 retryForwardsForServer = \entries remaining ->
-  if count entries == 0 || remaining <= 0
+  if remaining <= 0
     then yield {}
-    else do
-      let f = fold (\acc x -> if acc.messageId == "" then x else acc) {messageId: "", toServer: "", toKey: "", fromKey: "", encryptedBlob: "", timestamp: 0} entries
-      let rest = do x <- entries; where not (x.messageId == f.messageId); yield x
-      if f.messageId == ""
-        then yield {}
-        else do
-          result <- fetch (federationScheme ++ f.toServer) (ForwardMessage {
-            toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob,
-            timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
-            authorization: "Bearer " ++ federationSecret})
-          case result of
-            Ok _ -> do
-              removeForward f.messageId f.toServer
-              yield {}
-            Err _ -> yield {}
-          retryForwardsForServer rest (remaining - 1)
+    else case headOf entries of
+      Nothing {} -> yield {}
+      Just {value: f} -> do
+        let rest = do x <- entries; where not (x.messageId == f.messageId); yield x
+        result <- fetch (federationScheme ++ f.toServer) (ForwardMessage {
+          toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob,
+          timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
+          authorization: "Bearer " ++ federationSecret})
+        case result of
+          Ok _ -> do
+            removeForward f.messageId f.toServer
+            yield {}
+          Err _ -> yield {}
+        retryForwardsForServer rest (remaining - 1)
 
 retryPendingForwards : [{encryptedBlob: BlobHex, fromKey: PubkeyHex, messageId: MessageIdHex, timestamp: Timestamp, toKey: PubkeyHex, toServer: ServerName}] -> IO {network} {}
 retryPendingForwards = \pending -> do
@@ -701,19 +692,17 @@ pollOnce = \token cursor -> do
     sessions <- *sessions
     messages <- *messages
     seqCounter <- *seqCounter
-    let session = lookupSession sessions token t
+    let auth = authenticateSession sessions token t
     let cursorCeil = if seqCounter > t then seqCounter else t
     let clampedCursor = if cursor < 0 then 0 else if cursor > cursorCeil then cursorCeil else cursor
-    let matchingMsgs = case session of
-      Nothing {} -> []
-      Just {value: s} -> do
+    let matchingMsgs = if not auth.authorized then []
+      else do
         m <- messages
-        where m.toKey == s.pubkey
+        where m.toKey == auth.pubkey
         where m.receivedAt >= t - messageMaxAge
         where m.receivedAt > clampedCursor
         yield m
     let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
-    let authorized = isJust session
     let evts = do
       m <- limitedMsgs
       yield {id: m.messageId, eventType: "message",
@@ -721,10 +710,8 @@ pollOnce = \token cursor -> do
                         encryptedBlob: m.encryptedBlob,
                         timestamp: m.timestamp}}
     let lastReceivedAt = fold (\acc m -> if m.receivedAt > acc then m.receivedAt else acc) clampedCursor limitedMsgs
-    let newCursor = case session of
-      Nothing {} -> -1
-      _ -> lastReceivedAt
-    yield {events: evts, cursor: newCursor, authorized: authorized}
+    let newCursor = if not auth.authorized then -1 else lastReceivedAt
+    yield {events: evts, cursor: newCursor, authorized: auth.authorized}
 
 pollLoop : Text -> Int -> Int -> IO {clock} {authorized: Bool, cursor: Int, events: [PollEvent]}
 pollLoop = \token cursor deadline -> do
@@ -849,9 +836,9 @@ serve = \req -> case req of
       sessions <- *sessions
       messages <- *messages
       presence <- *presence
-      let session = lookupSession sessions (extractToken authorization) t
-      let fromKey = sessionPubkey session
-      let authorized = isJust session
+      let auth = authenticateSession sessions (extractToken authorization) t
+      let fromKey = auth.pubkey
+      let authorized = auth.authorized
       seqCounter <- *seqCounter
       let seqTs = nextSeqTs t seqCounter
       let recipientMsgCount = countMessagesFor messages to t
@@ -909,14 +896,13 @@ serve = \req -> case req of
       pr <- maybePrune t
       sessions <- *sessions
       messages <- *messages
-      let session = lookupSession sessions (extractToken authorization) t
-      let ackedMessages = case session of
-        Nothing {} -> []
-        Just {value: s} -> do
+      let auth = authenticateSession sessions (extractToken authorization) t
+      let ackedMessages = if not auth.authorized then []
+        else do
           m <- messages
           mid <- dedupedIds
           where m.messageId == mid
-          where m.toKey == s.pubkey
+          where m.toKey == auth.pubkey
           yield m
       set *messages = diff messages ackedMessages
       let ackedFederated = do
@@ -931,7 +917,7 @@ serve = \req -> case req of
       let evictedEntries = if excessCount <= 0 then []
         else diff combinedAckedIds afterEviction
       set *ackedIds = afterEviction
-      let ok = isJust session
+      let ok = auth.authorized
       yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, evictedEntries: evictedEntries}
     let fedMessages = do
       m <- result.ackedMessages
@@ -988,21 +974,20 @@ serve = \req -> case req of
       pr <- maybePrune t
       sessions <- *sessions
       presence <- *presence
-      let session = lookupSession sessions (extractToken authorization) t
-      let authorized = isJust session
+      let auth = authenticateSession sessions (extractToken authorization) t
+      let authorized = auth.authorized
       let valid = do
         p <- presence
         where p.pubkey == pubkey
         where p.expiresAt > t
         yield p
-      let foundServer = case session of
-        Nothing {} -> ""
-        Just {value: _} ->
-          if count valid == 0
-            then ""
-            else if any valid (\p -> p.server == serverHostN)
-              then serverHostN
-              else (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
+      let foundServer = if not authorized
+        then ""
+        else if count valid == 0
+          then ""
+          else if any valid (\p -> p.server == serverHostN)
+            then serverHostN
+            else (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
       yield {foundServer: foundServer, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     forkBroadcastOffline t result
     yield (respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized})
@@ -1018,7 +1003,7 @@ serve = \req -> case req of
     let filteredOnline = do
       e <- onlineEntries
       where none offlineEntries (\o -> o.server == fromServer && samePubkeyServer o e && o.timestamp > e.timestamp)
-      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.expiresAt, timestamp: e.timestamp, ttl: e.ttl}
+      yield e
     let affectedKeys = union
       (do
         e <- onlineEntries

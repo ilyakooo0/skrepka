@@ -8,6 +8,8 @@ open System.Threading.Tasks
 
 module ApiClient =
 
+    type PollEvent = { Id: string; EventType: string; Payload: JsonElement }
+
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
     let private awaitTask (t: Task<'T>) : Async<'T> =
@@ -109,10 +111,10 @@ module ApiClient =
             let events =
                 [ for e in events.EnumerateArray() do
                       if e.ValueKind = JsonValueKind.Object then
-                          let id = e.GetProperty("id").GetString()
-                          let evtType = e.GetProperty("eventType").GetString()
-                          let payload = e.GetProperty("payload")
-                          yield (id, evtType, payload) ]
+                          yield
+                              { Id = e.GetProperty("id").GetString()
+                                EventType = e.GetProperty("eventType").GetString()
+                                Payload = e.GetProperty("payload") } ]
 
             return (events, cursor)
         }
@@ -123,6 +125,5 @@ module ApiClient =
                 messageIds |> List.map (fun id -> $"\"{id}\"") |> String.concat ", "
 
             let body = $"""{{ "messageIds": [{idsJson}] }}"""
-            let! _ = postJson $"{serverUrl}/messages/ack" body (Some token)
-            return ()
+            do! postJson $"{serverUrl}/messages/ack" body (Some token) |> Async.Ignore
         }

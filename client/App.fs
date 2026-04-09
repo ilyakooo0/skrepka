@@ -34,7 +34,7 @@ module App =
         | AddContact
         | Settings
 
-    type Identity = { PrivKey: byte[]; PubKeyHex: string }
+    type Identity = Crypto.Identity
 
     type Session = { Url: string; Token: string; Identity: Identity }
 
@@ -82,7 +82,7 @@ module App =
         | DoPoll
         | CopyPubKey
         | DismissError
-        | StateLoaded of identity: (byte[] * string) option * data: Store.DataDto option
+        | StateLoaded of Identity option * Store.DataDto option
 
     // ── CmdMsg ──
 
@@ -93,7 +93,7 @@ module App =
         | CmdPoll of session: Session * cursor: uint64
         | CmdCopyToClipboard of string
         | CmdLoadState
-        | CmdSaveIdentity of privKey: byte[] * pubKeyHex: string
+        | CmdSaveIdentity of Identity
         | CmdSaveData of contacts: Contact list * messages: Map<string, ChatMessage list> * serverUrl: string * cursor: uint64
 
     // ── Helpers ──
@@ -159,7 +159,7 @@ module App =
 
         | IdentityReady identity ->
             { model with Identity = Some identity; Page = Settings },
-            [ CmdSaveIdentity(identity.PrivKey, identity.PubKeyHex) ]
+            [ CmdSaveIdentity identity ]
 
         | SetServerUrl url -> { model with ServerUrl = url }, []
 
@@ -276,9 +276,7 @@ module App =
         | StateLoaded(identityOpt, dataOpt) ->
             match identityOpt with
             | None -> model, []
-            | Some(privKey, pubKeyHex) ->
-                let identity = { PrivKey = privKey; PubKeyHex = pubKeyHex }
-
+            | Some identity ->
                 let model' =
                     match dataOpt with
                     | Some data ->
@@ -361,10 +359,7 @@ module App =
     let mapCmd cmdMsg =
         match cmdMsg with
         | CmdGenIdentity ->
-            asyncCmd (async {
-                let priv, pub = Crypto.generateIdentity ()
-                return IdentityReady { PrivKey = priv; PubKeyHex = Crypto.toHex pub }
-            })
+            asyncCmd (async { return IdentityReady(Crypto.generateIdentity ()) })
 
         | CmdConnect(url, identity) ->
             asyncCmd (async {
@@ -384,7 +379,7 @@ module App =
         | CmdSend(session, recipientHex, text, messageId) ->
             asyncCmd (async {
                 try
-                    let pubKey = session.Identity.PrivKey.[32..63]
+                    let pubKey = Crypto.fromHex session.Identity.PubKeyHex
                     let recipPub = Crypto.fromHex recipientHex
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
@@ -405,11 +400,11 @@ module App =
                     let! (events, newCursor) = ApiClient.poll session.Url session.Token cursor
                     let messages, ackIds, errors =
                         events
-                        |> List.fold (fun (msgs, acks, errs) (evtId, evtType, payload) ->
-                            if evtType <> "message" then (msgs, acks, errs)
+                        |> List.fold (fun (msgs, acks, errs) evt ->
+                            if evt.EventType <> "message" then (msgs, acks, errs)
                             else
-                                match decryptEvent session.Identity.PrivKey payload with
-                                | Ok msg -> (msg :: msgs, evtId :: acks, errs)
+                                match decryptEvent session.Identity.PrivKey evt.Payload with
+                                | Ok msg -> (msg :: msgs, evt.Id :: acks, errs)
                                 | Error err -> (msgs, acks, err :: errs))
                             ([], [], [])
 
@@ -444,8 +439,8 @@ module App =
                 return StateLoaded(identity, data)
             })
 
-        | CmdSaveIdentity(privKey, pubKeyHex) ->
-            Cmd.ofEffect (fun _ -> Store.saveIdentity privKey pubKeyHex |> ignore)
+        | CmdSaveIdentity identity ->
+            Cmd.ofEffect (fun _ -> Store.saveIdentity identity |> ignore)
 
         | CmdSaveData(contacts, messages, serverUrl, cursor) ->
             Cmd.ofEffect (fun _ ->

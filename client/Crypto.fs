@@ -7,15 +7,17 @@ open Sodium
 
 module Crypto =
 
+    type Identity = { PrivKey: byte[]; PubKeyHex: string }
+
     let toHex (bytes: byte[]) : string =
         Convert.ToHexString(bytes).ToLowerInvariant()
 
     let fromHex (hex: string) : byte[] =
         Convert.FromHexString(hex)
 
-    let generateIdentity () : byte[] * byte[] =
+    let generateIdentity () : Identity =
         let kp = PublicKeyAuth.GenerateKeyPair()
-        (kp.PrivateKey, kp.PublicKey)
+        { PrivKey = kp.PrivateKey; PubKeyHex = toHex kp.PublicKey }
 
     let signChallenge (privKey: byte[]) (challenge: string) : string =
         let message = Encoding.UTF8.GetBytes(challenge)

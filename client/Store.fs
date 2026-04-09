@@ -46,13 +46,16 @@ module Store =
             if isNull privKeyB64 || isNull pubKeyHex then
                 return None
             else
-                return Some(Convert.FromBase64String privKeyB64, pubKeyHex)
+                return
+                    Some
+                        { Crypto.Identity.PrivKey = Convert.FromBase64String privKeyB64
+                          PubKeyHex = pubKeyHex }
         }
 
-    let saveIdentity (privKey: byte[]) (pubKeyHex: string) =
+    let saveIdentity (identity: Crypto.Identity) =
         task {
-            do! SecureStorage.Default.SetAsync("identity_privkey", Convert.ToBase64String privKey)
-            do! SecureStorage.Default.SetAsync("identity_pubkey", pubKeyHex)
+            do! SecureStorage.Default.SetAsync("identity_privkey", Convert.ToBase64String identity.PrivKey)
+            do! SecureStorage.Default.SetAsync("identity_pubkey", identity.PubKeyHex)
         }
 
     let loadData () =
@@ -64,21 +67,9 @@ module Store =
                 let dto = JsonSerializer.Deserialize<DataDto>(json, jsonOpts)
 
                 Some
-                    { Contacts =
-                        if Object.ReferenceEquals(dto.Contacts, null) then
-                            [||]
-                        else
-                            dto.Contacts
-                      Messages =
-                        if Object.ReferenceEquals(dto.Messages, null) then
-                            Dictionary()
-                        else
-                            dto.Messages
-                      ServerUrl =
-                        if Object.ReferenceEquals(dto.ServerUrl, null) then
-                            ""
-                        else
-                            dto.ServerUrl
+                    { Contacts = if isNull dto.Contacts then [||] else dto.Contacts
+                      Messages = if isNull dto.Messages then Dictionary() else dto.Messages
+                      ServerUrl = if isNull dto.ServerUrl then "" else dto.ServerUrl
                       PollCursor = dto.PollCursor }
             with _ ->
                 None
