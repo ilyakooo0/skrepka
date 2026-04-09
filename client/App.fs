@@ -43,6 +43,15 @@ module App =
         | Connecting
         | Online of Session
 
+    type PollResultData =
+        { Messages: IncomingMessage list
+          Status: string
+          Cursor: uint64 }
+
+    type LoadedState =
+        { Identity: Identity option
+          Data: Store.DataDto option }
+
     // ── Model ──
 
     type Model =
@@ -78,11 +87,11 @@ module App =
         | SetNewNickname of string
         | DoSaveContact
         | DoDeleteContact of string
-        | PollResult of messages: IncomingMessage list * status: string * cursor: uint64
+        | PollResult of PollResultData
         | DoPoll
         | CopyPubKey
         | DismissError
-        | StateLoaded of Identity option * Store.DataDto option
+        | StateLoaded of LoadedState
 
     // ── CmdMsg ──
 
@@ -109,6 +118,9 @@ module App =
 
     let private messagesFor (pk: string) (messages: Map<string, ChatMessage list>) =
         messages |> Map.tryFind pk |> Option.defaultValue []
+
+    let private appendMessage (pk: string) (msg: ChatMessage) (messages: Map<string, ChatMessage list>) =
+        messages |> Map.add pk (messagesFor pk messages @ [ msg ])
 
     let private addContactIfNew (contact: Contact) (contacts: Contact list) =
         if contacts |> List.exists (fun c -> c.Pubkey = contact.Pubkey) then contacts
@@ -194,26 +206,23 @@ module App =
                       Body = text
                       Timestamp = DateTimeOffset.UtcNow
                       IsOutgoing = true }
-                let msgs = messagesFor pk model.Messages
 
                 let model' =
                     { model with
                         ComposeText = ""
-                        Messages = model.Messages |> Map.add pk (msgs @ [ outMsg ]) }
+                        Messages = model.Messages |> appendMessage pk outMsg }
 
                 model', CmdSend(session, pk, text, id) :: saveCmd model'
             | _ -> model, []
 
         | Sent status -> { model with LastSendStatus = status }, []
 
-        | PollResult(incoming, status, newCursor) ->
+        | PollResult { Messages = incoming; Status = status; Cursor = newCursor } ->
             let model' =
                 incoming
                 |> List.fold
                     (fun m msg ->
-                        let msgs = messagesFor msg.FromPubkey m.Messages
-
-                        if msgs |> List.exists (fun x -> x.Id = msg.MessageId) then
+                        if messagesFor msg.FromPubkey m.Messages |> List.exists (fun x -> x.Id = msg.MessageId) then
                             m
                         else
                             let chatMsg =
@@ -224,7 +233,7 @@ module App =
 
                             { m with
                                 Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.FromPubkey; Nickname = truncKey msg.FromPubkey }
-                                Messages = m.Messages |> Map.add msg.FromPubkey (msgs @ [ chatMsg ]) })
+                                Messages = m.Messages |> appendMessage msg.FromPubkey chatMsg })
                     { model with PollStatus = status; PollCursor = newCursor }
 
             let cmds =
@@ -273,10 +282,12 @@ module App =
 
         | DismissError -> { model with Error = None }, []
 
-        | StateLoaded(identityOpt, dataOpt) ->
+        | StateLoaded { Identity = identityOpt; Data = dataOpt } ->
             match identityOpt with
             | None -> model, []
             | Some identity ->
+                let model' = { model with Identity = Some identity; Conn = Connecting }
+
                 let model' =
                     match dataOpt with
                     | Some data ->
@@ -302,22 +313,14 @@ module App =
                                     acc |> Map.add pk msgs)
                                 Map.empty
 
-                        { model with
-                            Identity = Some identity
+                        { model' with
                             Contacts = contacts
                             Messages = messages
-                            ServerUrl =
-                                if data.ServerUrl <> "" then data.ServerUrl
-                                else model.ServerUrl
+                            ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
                             PollCursor = data.PollCursor
-                            Page = Conversations
-                            Conn = Connecting }
+                            Page = Conversations }
 
-                    | None ->
-                        { model with
-                            Identity = Some identity
-                            Page = Settings
-                            Conn = Connecting }
+                    | None -> { model' with Page = Settings }
 
                 model', [ CmdConnect(model'.ServerUrl, identity) ]
 
@@ -366,12 +369,12 @@ module App =
                 try
                     let! challenge = ApiClient.requestChallenge url identity.PubKeyHex
                     let sigHex = Crypto.signChallenge identity.PrivKey challenge
-                    let! (token, _) = ApiClient.verify url identity.PubKeyHex challenge sigHex
+                    let! result = ApiClient.verify url identity.PubKeyHex challenge sigHex
 
-                    if String.IsNullOrEmpty(token) then
+                    if String.IsNullOrEmpty(result.Token) then
                         return AuthErr "Authentication rejected by server"
                     else
-                        return AuthOk token
+                        return AuthOk result.Token
                 with ex ->
                     return AuthErr ex.Message
             })
@@ -379,17 +382,16 @@ module App =
         | CmdSend(session, recipientHex, text, messageId) ->
             asyncCmd (async {
                 try
-                    let pubKey = Crypto.fromHex session.Identity.PubKeyHex
                     let recipPub = Crypto.fromHex recipientHex
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
                     let payload =
                         $"""{{ "type": "text", "id": "{messageId}", "timestamp": {ts}, "body": {JsonSerializer.Serialize(text)} }}"""
 
-                    let blob = Crypto.encrypt session.Identity.PrivKey pubKey recipPub payload
+                    let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob
-                    let! (status, msgId) = ApiClient.sendMessage session.Url session.Token recipientHex blobHex ts
-                    return Sent $"{status}:{msgId}"
+                    let! result = ApiClient.sendMessage session.Url session.Token recipientHex blobHex ts
+                    return Sent $"{result.Status}:{result.MessageId}"
                 with ex ->
                     return DismissError  // TODO: show send errors properly
             })
@@ -397,15 +399,13 @@ module App =
         | CmdPoll(session, cursor) ->
             asyncCmd (async {
                 try
-                    let! (events, newCursor) = ApiClient.poll session.Url session.Token cursor
+                    let! response = ApiClient.poll session.Url session.Token cursor
                     let messages, ackIds, errors =
-                        events
+                        response.Events
                         |> List.fold (fun (msgs, acks, errs) evt ->
-                            if evt.EventType <> "message" then (msgs, acks, errs)
-                            else
-                                match decryptEvent session.Identity.PrivKey evt.Payload with
-                                | Ok msg -> (msg :: msgs, evt.Id :: acks, errs)
-                                | Error err -> (msgs, acks, err :: errs))
+                            match decryptEvent session.Identity.PrivKey evt.Payload with
+                            | Ok msg -> (msg :: msgs, evt.Id :: acks, errs)
+                            | Error err -> (msgs, acks, err :: errs))
                             ([], [], [])
 
                     if not ackIds.IsEmpty then
@@ -414,17 +414,17 @@ module App =
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
 
                     let status =
-                        $"[{now}] evts:{events.Length} msgs:{messages.Length} errs:{errors.Length}"
+                        $"[{now}] evts:{response.Events.Length} msgs:{messages.Length} errs:{errors.Length}"
                         + (match errors with err :: _ -> $" [{err}]" | [] -> "")
 
-                    return PollResult(List.rev messages, status, newCursor)
+                    return PollResult { Messages = List.rev messages; Status = status; Cursor = response.Cursor }
                 with
                 | :? TimeoutException ->
-                    return PollResult([], "polling...", cursor)
+                    return PollResult { Messages = []; Status = "polling..."; Cursor = cursor }
                 | ex ->
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
                     do! Async.Sleep 3000
-                    return PollResult([], $"[{now}] poll error: {ex.Message}", cursor)
+                    return PollResult { Messages = []; Status = $"[{now}] poll error: {ex.Message}"; Cursor = cursor }
             })
 
         | CmdCopyToClipboard text ->
@@ -436,7 +436,7 @@ module App =
             asyncCmd (async {
                 let! identity = Store.loadIdentity ()
                 let data = Store.loadData ()
-                return StateLoaded(identity, data)
+                return StateLoaded { Identity = identity; Data = data }
             })
 
         | CmdSaveIdentity identity ->

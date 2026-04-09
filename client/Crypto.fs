@@ -23,7 +23,8 @@ module Crypto =
         let message = Encoding.UTF8.GetBytes(challenge)
         PublicKeyAuth.SignDetached(message, privKey) |> toHex
 
-    let encrypt (senderPrivKey: byte[]) (senderPubKey: byte[]) (recipientEd25519Pub: byte[]) (plaintext: string) : byte[] =
+    let encrypt (senderPrivKey: byte[]) (recipientEd25519Pub: byte[]) (plaintext: string) : byte[] =
+        let senderPubKey = senderPrivKey.[32..63]
         let ephKp = PublicKeyBox.GenerateKeyPair()
         let recipientX25519Pub =
             PublicKeyAuth.ConvertEd25519PublicKeyToCurve25519PublicKey(recipientEd25519Pub)

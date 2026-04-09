@@ -8,7 +8,11 @@ open System.Threading.Tasks
 
 module ApiClient =
 
-    type PollEvent = { Id: string; EventType: string; Payload: JsonElement }
+    type PollEvent = { Id: string; Payload: JsonElement }
+
+    type AuthResult = { Token: string; ExpiresAt: int64 }
+    type SendResult = { Status: string; MessageId: string }
+    type PollResponse = { Events: PollEvent list; Cursor: uint64 }
 
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
@@ -72,9 +76,9 @@ module ApiClient =
 
             let! doc = postJson $"{serverUrl}/auth/verify" body None
             let root = expectObject doc "/auth/verify"
-            let token = root.GetProperty("token").GetString()
-            let expiresAt = root.GetProperty("expiresAt").GetInt64()
-            return (token, expiresAt)
+            return
+                { Token = root.GetProperty("token").GetString()
+                  ExpiresAt = root.GetProperty("expiresAt").GetInt64() }
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
@@ -84,9 +88,9 @@ module ApiClient =
 
             let! doc = postJson $"{serverUrl}/messages" body (Some token)
             let root = expectObject doc "/messages"
-            let status = root.GetProperty("status").GetString()
-            let msgId = root.GetProperty("messageId").GetString()
-            return (status, msgId)
+            return
+                { Status = root.GetProperty("status").GetString()
+                  MessageId = root.GetProperty("messageId").GetString() }
         }
 
     let private pollClient =
@@ -110,13 +114,13 @@ module ApiClient =
 
             let events =
                 [ for e in events.EnumerateArray() do
-                      if e.ValueKind = JsonValueKind.Object then
+                      if e.ValueKind = JsonValueKind.Object
+                         && e.GetProperty("eventType").GetString() = "message" then
                           yield
                               { Id = e.GetProperty("id").GetString()
-                                EventType = e.GetProperty("eventType").GetString()
                                 Payload = e.GetProperty("payload") } ]
 
-            return (events, cursor)
+            return { Events = events; Cursor = cursor }
         }
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
