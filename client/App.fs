@@ -20,6 +20,12 @@ module App =
           Timestamp: DateTimeOffset
           IsOutgoing: bool }
 
+    type IncomingMessage =
+        { FromPubkey: string
+          Body: string
+          Timestamp: int64
+          MessageId: string }
+
     type Page =
         | Setup
         | Conversations
@@ -68,7 +74,7 @@ module App =
         | SetNewNickname of string
         | DoSaveContact
         | DoDeleteContact of string
-        | PollResult of (string * string * int64 * string) list * string * uint64
+        | PollResult of IncomingMessage list * string * uint64
         | DoPoll
         | CopyPubKey
         | DismissError
@@ -78,14 +84,7 @@ module App =
     type CmdMsg =
         | CmdGenIdentity
         | CmdConnect of url: string * pubHex: string * privKey: byte[]
-        | CmdSend of
-            url: string *
-            token: string *
-            toHex: string *
-            privKey: byte[] *
-            pubKeyHex: string *
-            recipPubHex: string *
-            text: string
+        | CmdSend of url: string * token: string * recipientHex: string * privKey: byte[] * text: string
         | CmdPoll of url: string * token: string * privKey: byte[] * cursor: uint64
         | CmdCopyToClipboard of string
 
@@ -99,6 +98,19 @@ module App =
         |> List.tryFind (fun c -> c.Pubkey = pk)
         |> Option.map _.Nickname
         |> Option.defaultValue (truncKey pk)
+
+    let private messagesFor (pk: string) (messages: Map<string, ChatMessage list>) =
+        messages |> Map.tryFind pk |> Option.defaultValue []
+
+    let private addContactIfNew (contact: Contact) (contacts: Contact list) =
+        if contacts |> List.exists (fun c -> c.Pubkey = contact.Pubkey) then contacts
+        else contacts @ [ contact ]
+
+    let private upsertContact (contact: Contact) (contacts: Contact list) =
+        if contacts |> List.exists (fun c -> c.Pubkey = contact.Pubkey) then
+            contacts |> List.map (fun c -> if c.Pubkey = contact.Pubkey then contact else c)
+        else
+            contacts @ [ contact ]
 
     // ── Init ──
 
@@ -143,11 +155,12 @@ module App =
             | None -> { model with Error = Some "No identity generated" }, []
 
         | AuthOk token ->
-            { model with
-                Conn = Online token
-                Page = Conversations
-                Error = None },
-            [ CmdPoll(model.ServerUrl, token, model.PrivKey.Value, model.PollCursor) ]
+            match model.PrivKey with
+            | Some priv ->
+                { model with Conn = Online token; Page = Conversations; Error = None },
+                [ CmdPoll(model.ServerUrl, token, priv, model.PollCursor) ]
+            | None ->
+                { model with Error = Some "No identity generated" }, []
 
         | AuthErr err -> { model with Conn = Offline; Error = Some err }, []
 
@@ -164,12 +177,12 @@ module App =
                       Body = text
                       Timestamp = DateTimeOffset.UtcNow
                       IsOutgoing = true }
-                let msgs = model.Messages |> Map.tryFind pk |> Option.defaultValue []
+                let msgs = messagesFor pk model.Messages
 
                 { model with
                     ComposeText = ""
                     Messages = model.Messages |> Map.add pk (msgs @ [ outMsg ]) },
-                [ CmdSend(model.ServerUrl, token, pk, priv, model.PubKeyHex, pk, text) ]
+                [ CmdSend(model.ServerUrl, token, pk, priv, text) ]
             | _ -> model, []
 
         | Sent(_, status) -> { model with LastSendStatus = status }, []
@@ -178,31 +191,25 @@ module App =
             let model' =
                 incoming
                 |> List.fold
-                    (fun m (fromPk, body, ts, id) ->
-                        let msgs = m.Messages |> Map.tryFind fromPk |> Option.defaultValue []
+                    (fun m msg ->
+                        let msgs = messagesFor msg.FromPubkey m.Messages
 
-                        if msgs |> List.exists (fun msg -> msg.Id = id) then
+                        if msgs |> List.exists (fun x -> x.Id = msg.MessageId) then
                             m
                         else
-                            let newMsg =
-                                { Id = id
-                                  Body = body
-                                  Timestamp = DateTimeOffset.FromUnixTimeSeconds(ts)
+                            let chatMsg =
+                                { Id = msg.MessageId
+                                  Body = msg.Body
+                                  Timestamp = DateTimeOffset.FromUnixTimeSeconds(msg.Timestamp)
                                   IsOutgoing = false }
 
-                            let contacts =
-                                if m.Contacts |> List.exists (fun c -> c.Pubkey = fromPk) then
-                                    m.Contacts
-                                else
-                                    m.Contacts @ [ { Pubkey = fromPk; Nickname = truncKey fromPk } ]
-
                             { m with
-                                Contacts = contacts
-                                Messages = m.Messages |> Map.add fromPk (msgs @ [ newMsg ]) })
+                                Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.FromPubkey; Nickname = truncKey msg.FromPubkey }
+                                Messages = m.Messages |> Map.add msg.FromPubkey (msgs @ [ chatMsg ]) })
                     { model with PollStatus = status; PollCursor = newCursor }
 
-            match model'.Conn with
-            | Online token -> model', [ CmdPoll(model'.ServerUrl, token, model'.PrivKey.Value, model'.PollCursor) ]
+            match model'.Conn, model'.PrivKey with
+            | Online token, Some priv -> model', [ CmdPoll(model'.ServerUrl, token, priv, model'.PollCursor) ]
             | _ -> model', []
 
         | DoPoll ->
@@ -219,16 +226,8 @@ module App =
                     { Pubkey = model.NewPubkey
                       Nickname = model.NewNickname }
 
-                let contacts =
-                    if model.Contacts |> List.exists (fun c -> c.Pubkey = model.NewPubkey) then
-                        model.Contacts
-                        |> List.map (fun c ->
-                            if c.Pubkey = model.NewPubkey then contact else c)
-                    else
-                        model.Contacts @ [ contact ]
-
                 { model with
-                    Contacts = contacts
+                    Contacts = model.Contacts |> upsertContact contact
                     NewPubkey = ""
                     NewNickname = ""
                     Page = Conversations },
@@ -279,11 +278,11 @@ module App =
                     return AuthErr ex.Message
             })
 
-        | CmdSend(url, token, toHex, privKey, pubKeyHex, recipPubHex, text) ->
+        | CmdSend(url, token, recipientHex, privKey, text) ->
             asyncCmd (async {
                 try
-                    let pubKey = Crypto.fromHex pubKeyHex
-                    let recipPub = Crypto.fromHex recipPubHex
+                    let pubKey = privKey.[32..63]
+                    let recipPub = Crypto.fromHex recipientHex
                     let id = Guid.NewGuid().ToString()
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
@@ -292,8 +291,8 @@ module App =
 
                     let blob = Crypto.encrypt privKey pubKey recipPub payload
                     let blobHex = Crypto.toHex blob
-                    let! (status, msgId) = ApiClient.sendMessage url token toHex blobHex ts
-                    return Sent(toHex, $"{status}:{msgId}")
+                    let! (status, msgId) = ApiClient.sendMessage url token recipientHex blobHex ts
+                    return Sent(recipientHex, $"{status}:{msgId}")
                 with ex ->
                     return DismissError  // TODO: show send errors properly
             })
@@ -326,7 +325,7 @@ module App =
                                     if ptRoot.GetProperty("type").GetString() = "text" then
                                         let msgId = ptRoot.GetProperty("id").GetString()
                                         let body = ptRoot.GetProperty("body").GetString()
-                                        messages.Add((senderHex, body, ts, msgId))
+                                        messages.Add({ FromPubkey = senderHex; Body = body; Timestamp = ts; MessageId = msgId })
 
                                     ackIds.Add(evtId)
                                 | None ->
@@ -478,7 +477,7 @@ module App =
 
     let private viewChat model pk =
         let name = contactName model.Contacts pk
-        let msgs = model.Messages |> Map.tryFind pk |> Option.defaultValue []
+        let msgs = messagesFor pk model.Messages
 
         ContentPage(
             (VStack(spacing = 8.) {

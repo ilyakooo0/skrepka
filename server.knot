@@ -41,7 +41,7 @@ federationEnabled = not (federationSecret == "")
 -- Types
 -- ============================================
 
-type PollEvent = {id: Text, eventType: Text, payload: {encryptedBlob: Text, fromKey: Text, timestamp: Timestamp, toKey: Text}}
+type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
 type GossipEventType = Text where \s -> s == "online" || s == "offline"
 
@@ -379,6 +379,12 @@ clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresen
 
 clampTimestamp = \timestamp t -> if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
 
+nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
+
+isFederatedOrigin = \originServer -> not (originServer == "") && not (originServer == serverHostN)
+
+takeN = \items n -> fold (\acc e -> if count acc >= n then acc else union acc [e]) [] items
+
 dedupMessageIds = \messageIds ->
   fold (\acc mid ->
     let nmid = normalizeHex mid in
@@ -544,14 +550,12 @@ maybePrune = \t -> do
       set *lastPrunedAt = t
       pruneExpired t
 
-sendBatchedGossipToServer : Text -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int}] -> IO {network} {}
+sendBatchedGossipToServer : Text -> [{eventType: GossipEventType, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int<S>}] -> IO {network} {}
 sendBatchedGossipToServer = \server allEvents ->
   if count allEvents == 0
     then yield {}
     else do
-      let batch = fold (\acc e ->
-        if count acc >= maxGossipEvents then acc
-        else union acc [e]) [] allEvents
+      let batch = takeN allEvents maxGossipEvents
       let rest = diff allEvents batch
       batchResult <- fetch (federationScheme ++ server) (RecvGossip {
         authorization: "Bearer " ++ federationSecret,
@@ -561,7 +565,7 @@ sendBatchedGossipToServer = \server allEvents ->
         Err _ -> yield {}
       sendBatchedGossipToServer server rest
 
-sendBatchedGossip : [Text] -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int}] -> IO {network} {}
+sendBatchedGossip : [Text] -> [{eventType: GossipEventType, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int<S>}] -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents ->
   if count allEvents == 0
     then yield {}
@@ -582,7 +586,7 @@ broadcastOfflineGossip = \t peerServers expiredLocal -> do
       sendBatchedGossip peerServers gossipEvents
     else yield {}
 
-retryForwardsForServer : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Timestamp, toKey: Text, toServer: Text}] -> Int -> IO {network} {}
+retryForwardsForServer : [{encryptedBlob: BlobHex, fromKey: PubkeyHex, messageId: MessageIdHex, timestamp: Timestamp, toKey: PubkeyHex, toServer: ServerName}] -> Int -> IO {network} {}
 retryForwardsForServer = \entries remaining ->
   if count entries == 0 || remaining <= 0
     then yield {}
@@ -608,21 +612,19 @@ retryForwardsForServer = \entries remaining ->
             Err _ -> yield {}
           retryForwardsForServer rest (remaining - 1)
 
-retryPendingForwards : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Timestamp, toKey: Text, toServer: Text}] -> IO {network} {}
+retryPendingForwards : [{encryptedBlob: BlobHex, fromKey: PubkeyHex, messageId: MessageIdHex, timestamp: Timestamp, toKey: PubkeyHex, toServer: ServerName}] -> IO {network} {}
 retryPendingForwards = \pending -> do
   let servers = collectPeerServers pending (\x -> x.toServer)
   sendToEach servers (\server ->
     retryForwardsForServer (do x <- pending; where x.toServer == server; yield x) maxForwardRetriesPerServer)
   yield {}
 
-sendBatchedAcksToServer : [{messageId: Text, toKey: Text, originServer: Text, | a}] -> Text -> IO {network} {}
+sendBatchedAcksToServer : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: Text, | a}] -> Text -> IO {network} {}
 sendBatchedAcksToServer = \serverAcks server ->
   if count serverAcks == 0
     then yield {}
     else do
-      let batch = fold (\acc a ->
-        if count acc >= maxMessageIds then acc
-        else union acc [a]) [] serverAcks
+      let batch = takeN serverAcks maxMessageIds
       let rest = diff serverAcks batch
       result <- fetch (federationScheme ++ server) (FederationAck {
         authorization: "Bearer " ++ federationSecret,
@@ -639,7 +641,7 @@ sendBatchedAcksToServer = \serverAcks server ->
         Err _ -> yield {}
       sendBatchedAcksToServer rest server
 
-sendAcksAndClean : [{messageId: Text, toKey: Text, originServer: Text, | a}] -> [Text] -> IO {network} {}
+sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: Text, | a}] -> [Text] -> IO {network} {}
 sendAcksAndClean = \pendingAcks servers ->
   sendToEach servers (\server ->
     sendBatchedAcksToServer (do a <- pendingAcks; where a.originServer == server; yield a) server)
@@ -655,8 +657,7 @@ pruneAndRetry = \t -> do
     ackedIds <- *ackedIds
     let pendingAcks = do
       a <- ackedIds
-      where not (a.originServer == "")
-      where not (a.originServer == serverHostN)
+      where isFederatedOrigin a.originServer
       yield a
     yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
   broadcastOfflineGossip t result.peerServers result.expiredLocal
@@ -832,7 +833,7 @@ serve = \req -> case req of
         Just {value: s} -> s.pubkey
       let authorized = isJust session
       seqCounter <- *seqCounter
-      let seqTs = if t > seqCounter then t else seqCounter + 1
+      let seqTs = nextSeqTs t seqCounter
       let recipientMsgCount = countMessagesFor messages to t
       let shouldInsert = authorized && recipientMsgCount < maxMessagesPerRecipient
       set *seqCounter = if shouldInsert then seqTs else seqCounter
@@ -858,9 +859,7 @@ serve = \req -> case req of
       forwards <- *forwards
       let forwardsAtCapacity = count forwards >= maxForwardsEntries
       let forwardSlots = maxForwardsEntries - count forwards
-      let forwardServers = fold (\acc s ->
-        if count acc >= forwardSlots then acc
-        else union acc [s]) [] remoteServers
+      let forwardServers = takeN remoteServers forwardSlots
       set *forwards = if shouldInsert && not forwardsAtCapacity && count forwardServers > 0 && federationEnabled
         then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
         else forwards
@@ -910,8 +909,7 @@ serve = \req -> case req of
         Just {value: _} -> diff messages ackedMessages
       let ackedFederated = do
         m <- ackedMessages
-        where not (m.originServer == "")
-        where not (m.originServer == serverHostN)
+        where isFederatedOrigin m.originServer
         yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
       ackedIds <- *ackedIds
       let combinedAckedIds = union ackedIds ackedFederated
@@ -925,8 +923,7 @@ serve = \req -> case req of
       yield {ok: ok, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, evictedEntries: evictedEntries}
     let fedMessages = do
       m <- result.ackedMessages
-      where not (m.originServer == "")
-      where not (m.originServer == serverHostN)
+      where isFederatedOrigin m.originServer
       yield m
     let originServers = collectPeerServers fedMessages (\m -> m.originServer)
     fork (do
@@ -1063,9 +1060,7 @@ serve = \req -> case req of
           where none updatesOnlyAfterOffline (\p -> samePubkeyServer p e)
           yield e
       let reclaimedEntries = if withinCapacity then []
-        else fold (\acc e ->
-          if count acc >= reclaimCapacity then acc
-          else union acc [e]) [] newEntries
+        else takeN newEntries reclaimCapacity
       let afterReclaim = if withinCapacity then afterOffline
         else union updatesOnlyAfterOffline reclaimedEntries
       let appliedOnlineUpdates = if withinCapacity then appliedOnline
@@ -1130,7 +1125,7 @@ serve = \req -> case req of
       pr <- maybePrune t
       messages <- *messages
       seqCounter <- *seqCounter
-      let seqTs = if t > seqCounter then t else seqCounter + 1
+      let seqTs = nextSeqTs t seqCounter
       let recipientMsgCount = if not (authorized && validOrigin) then 0
         else countMessagesFor messages toKey t
       let existsInMessages = if not (authorized && validOrigin) then False {}
