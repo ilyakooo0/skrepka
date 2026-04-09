@@ -68,6 +68,7 @@ type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: T
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = {authorized: Bool, pubkey: Text}
 type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [Text]}
+type ForwardInfo = {messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, toServer: ServerName}
 
 -- ============================================
 -- Persisted State
@@ -140,7 +141,7 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 -- Helpers
 -- ============================================
 
-any = \xs pred -> count (do x <- xs; where pred x; yield x) > 0
+any = \xs pred -> fold (\acc x -> if acc then acc else pred x) (False {}) xs
 none = \xs pred -> not (any xs pred)
 headOf = \items -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
@@ -374,7 +375,7 @@ extractToken = \authHeader ->
     else ""
 
 verifySecret = \token secret ->
-  safeCompare token (if secret == "" then "x" else secret) && not (secret == "")
+  not (secret == "") && safeCompare token secret
 
 verifyFederationAuth = \authorization ->
   verifySecret (extractToken authorization) federationSecret
@@ -609,7 +610,7 @@ removeForward = \mid srv -> atomic do
     where not (x.messageId == mid && x.toServer == srv)
     yield x
 
-retryForwardsForServer : [{encryptedBlob: BlobHex, fromKey: PubkeyHex, messageId: MessageIdHex, timestamp: Timestamp, toKey: PubkeyHex, toServer: ServerName}] -> Int -> IO {network} {}
+retryForwardsForServer : [ForwardInfo] -> Int -> IO {network} {}
 retryForwardsForServer = \entries remaining ->
   if remaining <= 0
     then yield {}
@@ -628,7 +629,7 @@ retryForwardsForServer = \entries remaining ->
           Err _ -> yield {}
         retryForwardsForServer rest (remaining - 1)
 
-retryPendingForwards : [{encryptedBlob: BlobHex, fromKey: PubkeyHex, messageId: MessageIdHex, timestamp: Timestamp, toKey: PubkeyHex, toServer: ServerName}] -> IO {network} {}
+retryPendingForwards : [ForwardInfo] -> IO {network} {}
 retryPendingForwards = \pending -> do
   let servers = collectPeerServers pending (\x -> x.toServer)
   sendToEach servers (\server ->
@@ -975,13 +976,11 @@ serve = \req -> case req of
         where p.pubkey == pubkey
         where p.expiresAt > t
         yield p
-      let foundServer = if not authorized
+      let foundServer = if not authorized || count valid == 0
         then ""
-        else if count valid == 0
-          then ""
-          else if any valid (\p -> p.server == serverHostN)
-            then serverHostN
-            else (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
+        else if any valid (\p -> p.server == serverHostN)
+          then serverHostN
+          else (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
       yield {foundServer: foundServer, authorized: authorized, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     forkBroadcastOffline t result
     yield (respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized})
@@ -1108,7 +1107,7 @@ serve = \req -> case req of
     let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
-    let validOrigin = not (originServer == serverHostN)
+    let validOrigin = isFederatedOrigin originServer
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       pr <- maybePrune t
@@ -1127,9 +1126,9 @@ serve = \req -> case req of
           [{messageId: messageId, toKey: toKey, fromKey: fromKey,
             encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
         else messages
-      yield {peerServers: pr.peerServers, expiredLocal: pr.expiredLocal, inserted: shouldInsert, alreadyExists: exists}
+      yield {peerServers: pr.peerServers, expiredLocal: pr.expiredLocal, ok: shouldInsert || exists}
     forkBroadcastOffline t result
-    yield (respond {ok: result.inserted || result.alreadyExists})
+    yield (respond {ok: result.ok})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     let fromServer = normalizeServerName fromServer
@@ -1157,11 +1156,8 @@ serve = \req -> case req of
   Prune {authorization, respond} -> do
     t <- now
     let authorized = verifyMaintenanceAuth authorization
-    if authorized
-      then do
-        fork (pruneAndRetry t)
-        yield (respond {ok: True {}})
-      else yield (respond {ok: False {}})
+    if authorized then fork (pruneAndRetry t) else yield {}
+    yield (respond {ok: authorized})
 
 -- ============================================
 -- Entry Point
