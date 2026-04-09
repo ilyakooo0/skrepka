@@ -49,6 +49,7 @@ type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen)
 type SignatureHex = Text where \s -> isValidHex s && not (tooLong s maxSignatureLen)
 type MessageIdHex = Text where \s -> isValidHex s && not (tooLong s maxMessageIdLen)
 type ServerName = Text where \s -> not (tooLong s maxServerNameLen) && not (isBadServerName s)
+type OptionalServerName = Text where \s -> s == "" || (not (tooLong s maxServerNameLen) && not (isBadServerName s))
 
 type Timestamp = Int<Ms>
 
@@ -60,15 +61,15 @@ type Timestamp = Int<Ms>
 
 *sessions : [{token: Text, pubkey: PubkeyHex, expiresAt: Timestamp}]
 
-*messages : [{messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, receivedAt: Timestamp}]
+*messages : [{messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: OptionalServerName, receivedAt: Timestamp}]
 
 *presence : [{pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp}]
 
 *seqCounter : Timestamp
 
-*forwards : [{messageId: MessageIdHex, toServer: Text, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}]
+*forwards : [{messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}]
 
-*ackedIds : [{messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: Text}]
+*ackedIds : [{messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}]
 
 *lastPrunedAt : Timestamp
 
@@ -278,20 +279,14 @@ normalizeServerName = \s -> toLower (stripTrailingDot s)
 
 serverHostN = normalizeServerName serverHost
 
-containsLocalhostSuffix = \s ->
+containsSuffix = \suffix suffixLen s ->
   if s == "" then False {}
-  else if take 10 s == ".localhost" && (drop 10 s == "" || take 1 (drop 10 s) == ":") then True {}
-  else containsLocalhostSuffix (drop 1 s)
+  else if take suffixLen s == suffix && (drop suffixLen s == "" || take 1 (drop suffixLen s) == ":") then True {}
+  else containsSuffix suffix suffixLen (drop 1 s)
 
-containsLocalSuffix = \s ->
-  if s == "" then False {}
-  else if take 6 s == ".local" && (drop 6 s == "" || take 1 (drop 6 s) == ":") then True {}
-  else containsLocalSuffix (drop 1 s)
-
-containsInternalSuffix = \s ->
-  if s == "" then False {}
-  else if take 9 s == ".internal" && (drop 9 s == "" || take 1 (drop 9 s) == ":") then True {}
-  else containsInternalSuffix (drop 1 s)
+containsLocalhostSuffix = \s -> containsSuffix ".localhost" 10 s
+containsLocalSuffix = \s -> containsSuffix ".local" 6 s
+containsInternalSuffix = \s -> containsSuffix ".internal" 9 s
 
 isBadServerName = \s ->
   let sn = toLower (stripTrailingDot s) in
@@ -368,28 +363,39 @@ verifyMaintenanceAuth = \authorization ->
 
 clampTtl = \ttl -> if ttl < 1 then 1 else if ttl > maxPresenceTtl then maxPresenceTtl else ttl
 
+clampTimestamp = \timestamp t -> if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
+
+dedupMessageIds = \messageIds ->
+  fold (\acc mid ->
+    let nmid = normalizeHex mid in
+    if count acc >= maxMessageIds then acc
+    else if count (do a <- acc; where a == nmid; yield a) > 0 then acc
+    else union acc [nmid]) [] messageIds
+
+boundedSmallest = \items n getKey ->
+  (fold (\acc a ->
+    let k = getKey a in
+    if acc.size < n
+      then
+        let newHeap = union acc.heap [a] in
+        let newSize = count newHeap in
+        if newSize > acc.size
+          then {size: newSize, heap: newHeap, heapMax: if k > acc.heapMax then k else acc.heapMax}
+          else acc
+      else if k < acc.heapMax
+        then
+          let removed = fold (\r x ->
+            if not r.done && getKey x == acc.heapMax
+              then {done: True {}, items: r.items}
+              else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
+          let newHeap = union removed.items [a] in
+          let newMax = fold (\best x -> if getKey x > best then getKey x else best) (-1) newHeap in
+          {size: acc.size, heap: newHeap, heapMax: newMax}
+        else acc) {size: 0, heap: [], heapMax: -1} items).heap
+
 evictOldestAckedIds = \items n ->
   if n <= 0 then items
-  else
-    let toEvict = (fold (\acc a ->
-      if acc.size < n
-        then
-          let newHeap = union acc.heap [a] in
-          let newSize = count newHeap in
-          if newSize > acc.size
-            then {size: newSize, heap: newHeap, heapMax: if a.ackedAt > acc.heapMax then a.ackedAt else acc.heapMax}
-            else acc
-        else if a.ackedAt < acc.heapMax
-          then
-            let removed = fold (\r x ->
-              if not r.done && x.ackedAt == acc.heapMax
-                then {done: True {}, items: r.items}
-                else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
-            let newHeap = union removed.items [a] in
-            let newMax = fold (\best x -> if x.ackedAt > best then x.ackedAt else best) (-1) newHeap in
-            {size: acc.size, heap: newHeap, heapMax: newMax}
-          else acc) {size: 0, heap: [], heapMax: -1} items).heap
-    in diff items toEvict
+  else diff items (boundedSmallest items n (\a -> a.ackedAt))
 
 safeCompareLoop = \s1 s2 n result ->
   if n <= 0 && s1 == "" && s2 == ""
@@ -413,6 +419,22 @@ collectPeerServers = \items getServer ->
     if s == serverHostN then acc
     else if count (do a <- acc; where a == s; yield a) > 0 then acc
     else union acc [s]) [] items
+
+validGossipEvents = \events validRequest t eventType ->
+  do
+    e <- events
+    where validRequest
+    where e.eventType == eventType
+    where not (e.server == "")
+    where not (e.pubkey == "")
+    where not (tooLong e.pubkey maxPubkeyLen)
+    where not (tooLong e.server maxServerNameLen)
+    where not (isBadServerName e.server)
+    where isValidHex e.pubkey
+    where not (normalizeServerName e.server == serverHostN)
+    where e.timestamp <= t + clockSkewTolerance
+    where e.timestamp + (clampTtl e.ttl) * 1000 > t
+    yield {pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp, ttl: clampTtl e.ttl}
 
 sendToEach : [Text] -> (Text -> (a {})) -> a {}
 sendToEach = \servers action ->
@@ -617,24 +639,7 @@ pollOnce = \token cursor -> do
         where m.receivedAt >= t - messageMaxAge
         where m.receivedAt > clampedCursor
         yield m
-    let limitedMsgs = (fold (\acc m ->
-      if acc.size < maxPollEvents
-        then
-          let newHeap = union acc.heap [m] in
-          let newSize = count newHeap in
-          if newSize > acc.size
-            then {size: newSize, heap: newHeap, heapMax: if m.receivedAt > acc.heapMax then m.receivedAt else acc.heapMax}
-            else acc
-        else if m.receivedAt < acc.heapMax
-          then
-            let removed = fold (\r x ->
-              if not r.done && x.receivedAt == acc.heapMax
-                then {done: True {}, items: r.items}
-                else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
-            let newHeap = union removed.items [m] in
-            let newMax = fold (\best x -> if x.receivedAt > best then x.receivedAt else best) (-1) newHeap in
-            {size: acc.size, heap: newHeap, heapMax: newMax}
-          else acc) {size: 0, heap: [], heapMax: -1} matchingMsgs).heap
+    let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
     let authorized = case session of
       Nothing {} -> False {}
       _ -> True {}
@@ -785,13 +790,19 @@ serve = \req -> case req of
     let encryptedBlob = normalizeHex encryptedBlob
     t <- now
     msgId <- genToken
-    let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
+    let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       pr <- maybePrune t
       sessions <- *sessions
       messages <- *messages
       presence <- *presence
       let session = lookupSession sessions (extractToken authorization) t
+      let fromKey = case session of
+        Nothing {} -> ""
+        Just {value: s} -> s.pubkey
+      let authorized = case session of
+        Nothing {} -> False {}
+        _ -> True {}
       seqCounter <- *seqCounter
       let seqTs = if t > seqCounter then t else seqCounter + 1
       let recipientMsgCount = count (do
@@ -799,42 +810,32 @@ serve = \req -> case req of
         where m.toKey == to
         where m.receivedAt >= t - messageMaxAge
         yield m)
-      let shouldInsert = case session of
-        Nothing {} -> False {}
-        Just {value: _} -> recipientMsgCount < maxMessagesPerRecipient
+      let shouldInsert = authorized && recipientMsgCount < maxMessagesPerRecipient
       set *seqCounter = if shouldInsert then seqTs else seqCounter
-      set *messages = case session of
-        Nothing {} -> messages
-        Just {value: s} -> if recipientMsgCount < maxMessagesPerRecipient
-          then union messages
-            [{messageId: msgId, toKey: to, fromKey: s.pubkey,
-              encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
-          else messages
-      let localOnline = case session of
-        Nothing {} -> False {}
-        Just {value: _} -> count (do
-          p <- presence
-          where p.pubkey == to
-          where p.server == serverHostN
-          where p.expiresAt > t
-          yield p) > 0
-      let remoteServers = case session of
-        Nothing {} -> []
-        Just {value: _} -> do
+      set *messages = if shouldInsert
+        then union messages
+          [{messageId: msgId, toKey: to, fromKey: fromKey,
+            encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
+        else messages
+      let localOnline = authorized && count (do
+        p <- presence
+        where p.pubkey == to
+        where p.server == serverHostN
+        where p.expiresAt > t
+        yield p) > 0
+      let remoteServers = if authorized
+        then do
           p <- presence
           where p.pubkey == to
           where not (p.server == serverHostN)
           where p.expiresAt > t
           yield p.server
-      let fromKey = case session of
-        Nothing {} -> ""
-        Just {value: s} -> s.pubkey
-      let status = case session of
-        Nothing {} -> "unauthorized"
-        _ -> if recipientMsgCount >= maxMessagesPerRecipient then "rejected"
-             else if localOnline then "delivered"
-             else if count remoteServers > 0 then "federated"
-             else "queued"
+        else []
+      let status = if not authorized then "unauthorized"
+        else if not shouldInsert then "rejected"
+        else if localOnline then "delivered"
+        else if count remoteServers > 0 then "federated"
+        else "queued"
       forwards <- *forwards
       let forwardsAtCapacity = count forwards >= maxForwardsEntries
       let forwardSlots = maxForwardsEntries - count forwards
@@ -871,11 +872,7 @@ serve = \req -> case req of
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
-    let dedupedIds = fold (\acc mid ->
-        let nmid = normalizeHex mid in
-        if count acc >= maxMessageIds then acc
-        else if count (do a <- acc; where a == nmid; yield a) > 0 then acc
-        else union acc [nmid]) [] messageIds
+    let dedupedIds = dedupMessageIds messageIds
     result <- atomic do
       pr <- maybePrune t
       sessions <- *sessions
@@ -992,34 +989,8 @@ serve = \req -> case req of
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
     let fromServer = normalizeServerName fromServer
     let validRequest = authorized && cappedHops >= 1 && not (fromServer == serverHostN) && count events <= maxGossipEvents
-    let onlineEntries = do
-      e <- events
-      where validRequest
-      where e.eventType == "online"
-      where not (e.server == "")
-      where not (e.pubkey == "")
-      where not (tooLong e.pubkey maxPubkeyLen)
-      where not (tooLong e.server maxServerNameLen)
-      where not (isBadServerName e.server)
-      where isValidHex e.pubkey
-      where not (normalizeServerName e.server == serverHostN)
-      where e.timestamp <= t + clockSkewTolerance
-      where e.timestamp + (clampTtl e.ttl) * 1000 > t
-      yield {pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp}
-    let offlineEntries = do
-      e <- events
-      where validRequest
-      where e.eventType == "offline"
-      where not (e.server == "")
-      where not (e.pubkey == "")
-      where not (tooLong e.pubkey maxPubkeyLen)
-      where not (tooLong e.server maxServerNameLen)
-      where not (isBadServerName e.server)
-      where isValidHex e.pubkey
-      where not (normalizeServerName e.server == serverHostN)
-      where e.timestamp <= t + clockSkewTolerance
-      where t - e.timestamp < (clampTtl e.ttl) * 1000
-      yield {pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, timestamp: e.timestamp}
+    let onlineEntries = validGossipEvents events validRequest t "online"
+    let offlineEntries = validGossipEvents events validRequest t "offline"
     let filteredOnline = do
       e <- onlineEntries
       where count (do
@@ -1029,7 +1000,7 @@ serve = \req -> case req of
         where o.server == e.server
         where o.timestamp > e.timestamp
         yield o) == 0
-      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.expiresAt, timestamp: e.timestamp}
+      yield {pubkey: e.pubkey, server: e.server, expiresAt: e.expiresAt, timestamp: e.timestamp, ttl: e.ttl}
     let affectedKeys = union
       (do
         e <- onlineEntries
@@ -1180,37 +1151,21 @@ serve = \req -> case req of
       set *presence = finalPresence
       let gossipPeerServers = collectPeerServers finalPresence (\p -> p.server)
       yield {appliedKeys: (if withinCapacity then union appliedOnline appliedOffline else union appliedOnlineUpdates appliedOffline), expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, gossipPeerServers: gossipPeerServers, withinCapacity: withinCapacity}
-    let validEvents = do
-      e <- events
-      where validRequest
-      where e.eventType == "online" || e.eventType == "offline"
-      where not (e.server == "")
-      where not (e.pubkey == "")
-      where not (tooLong e.pubkey maxPubkeyLen)
-      where not (tooLong e.server maxServerNameLen)
-      where not (isBadServerName e.server)
-      where isValidHex e.pubkey
-      where not (normalizeServerName e.server == serverHostN)
-      where e.timestamp <= t + clockSkewTolerance
-      where e.timestamp + (clampTtl e.ttl) * 1000 > t
-      where not (e.eventType == "online" && count (do
-        o <- offlineEntries
-        where o.server == fromServer
-        where o.pubkey == normalizeHex e.pubkey
-        where o.server == normalizeServerName e.server
-        where o.timestamp > e.timestamp
-        yield o) > 0)
-      where not (e.eventType == "offline" && count (do
+    let filteredOffline = do
+      e <- offlineEntries
+      where count (do
         o <- onlineEntries
-        where o.pubkey == normalizeHex e.pubkey
-        where o.server == normalizeServerName e.server
+        where o.pubkey == e.pubkey
+        where o.server == e.server
         where o.timestamp > e.timestamp
-        yield o) > 0)
+        yield o) == 0
       yield e
     let effectiveEvents = do
-      e <- validEvents
-      where count (do a <- gossipResult.appliedKeys; where a.pubkey == normalizeHex e.pubkey; where a.server == normalizeServerName e.server; yield a) > 0
-      yield {eventType: e.eventType, pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, timestamp: e.timestamp, ttl: clampTtl e.ttl}
+      e <- union
+        (do e <- filteredOnline; yield {eventType: "online", pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl})
+        (do e <- filteredOffline; yield {eventType: "offline", pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl})
+      where count (do a <- gossipResult.appliedKeys; where a.pubkey == e.pubkey; where a.server == e.server; yield a) > 0
+      yield e
     if not gossipResult.withinCapacity
       then println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer)
       else yield {}
@@ -1242,7 +1197,7 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = not (originServer == serverHostN)
-    let clampedTs = if timestamp > t then t else if timestamp < t - messageMaxAge then t - messageMaxAge else timestamp
+    let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       pr <- maybePrune t
       messages <- *messages
@@ -1284,11 +1239,7 @@ serve = \req -> case req of
     let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
-    let dedupedIds = fold (\acc mid ->
-        let nmid = normalizeHex mid in
-        if count acc >= maxMessageIds then acc
-        else if count (do a <- acc; where a == nmid; yield a) > 0 then acc
-        else union acc [nmid]) [] messageIds
+    let dedupedIds = dedupMessageIds messageIds
     let validAckFields = authorized && originServer == serverHostN && not (fromServer == serverHostN)
     pruneResult <- atomic do
       pr <- maybePrune t
