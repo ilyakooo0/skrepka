@@ -40,15 +40,17 @@ maxForwardRetriesPerServer = 100
 -- Types
 -- ============================================
 
-type PollEvent = {id: Text, eventType: Text, payload: {encryptedBlob: Text, fromKey: Text, timestamp: Int, toKey: Text}}
+type PollEvent = {id: Text, eventType: Text, payload: {encryptedBlob: Text, fromKey: Text, timestamp: Timestamp, toKey: Text}}
 
-type GossipEvent = {eventType: Text, pubkey: Text, server: Text, timestamp: Int, ttl: Int}
+type GossipEvent = {eventType: Text, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int<S>}
 
 type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen)
 type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen)
 type SignatureHex = Text where \s -> isValidHex s && not (tooLong s maxSignatureLen)
 type MessageIdHex = Text where \s -> isValidHex s && not (tooLong s maxMessageIdLen)
 type ServerName = Text where \s -> not (tooLong s maxServerNameLen) && not (isBadServerName s)
+
+type Timestamp = Int<Ms>
 
 -- ============================================
 -- Persisted State
@@ -58,13 +60,13 @@ type ServerName = Text where \s -> not (tooLong s maxServerNameLen) && not (isBa
 
 *sessions : [{token: Text, pubkey: Text, expiresAt: Int}]
 
-*messages : [{messageId: Text, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int, originServer: Text, receivedAt: Int}]
+*messages : [{messageId: Text, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Timestamp, originServer: Text, receivedAt: Int}]
 
-*presence : [{pubkey: Text, server: Text, expiresAt: Int, timestamp: Int}]
+*presence : [{pubkey: Text, server: Text, expiresAt: Int, timestamp: Timestamp}]
 
 *seqCounter : Int
 
-*forwards : [{messageId: Text, toServer: Text, createdAt: Int, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Int}]
+*forwards : [{messageId: Text, toServer: Text, createdAt: Int, toKey: Text, fromKey: Text, encryptedBlob: Text, timestamp: Timestamp}]
 
 *ackedIds : [{messageId: Text, toKey: Text, ackedAt: Int, originServer: Text}]
 
@@ -88,7 +90,7 @@ route ClientApi where
     -> {events: [PollEvent], cursor: Int, authorized: Bool}
     = Poll
   /messages
-    POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Int} / headers {authorization: Text}
+    POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp} / headers {authorization: Text}
       -> {status: Text, messageId: Text}
       = SendMessage
     POST {messageIds: [MessageIdHex]} /ack headers {authorization: Text}
@@ -103,7 +105,7 @@ route FederationApi where
     POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName} /gossip headers {authorization: Text}
       -> {ok: Bool}
       = RecvGossip
-    POST {toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Int, originServer: ServerName, messageId: MessageIdHex} /forward headers {authorization: Text}
+    POST {toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex} /forward headers {authorization: Text}
       -> {ok: Bool}
       = ForwardMessage
     POST {messageIds: [Text], originServer: Text, fromServer: ServerName} /ack headers {authorization: Text}
@@ -120,6 +122,9 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 -- ============================================
 -- Helpers
 -- ============================================
+
+msToS : Int<Ms> -> Int<S>
+msToS  = \x ->  x / 1000
 
 hexDigit = \n ->
   let n = if n < 0 then 0 else if n > 15 then 15 else n in
@@ -414,14 +419,12 @@ sendToEach = \servers action ->
           sendToEach rest action
 
 pruneExpired = \t -> do
-  challenges <- *challenges
   set *challenges = do
-    c <- challenges
+    c <- *challenges
     where c.expiresAt > t
     yield c
-  sessions <- *sessions
   set *sessions = do
-    s <- sessions
+    s <- *sessions
     where s.expiresAt > t
     yield s
   presenceBefore <- *presence
@@ -434,19 +437,16 @@ pruneExpired = \t -> do
     where p.expiresAt > t
     yield p
   set *presence = presenceAfter
-  messages <- *messages
   set *messages = do
-    m <- messages
+    m <- *messages
     where m.receivedAt >= t - messageMaxAge
     yield m
-  forwards <- *forwards
   set *forwards = do
-    f <- forwards
+    f <- *forwards
     where f.createdAt >= t - messageMaxAge
     yield f
-  ackedIds <- *ackedIds
   set *ackedIds = do
-    a <- ackedIds
+    a <- *ackedIds
     where a.ackedAt >= t - messageMaxAge
     yield a
   yield {expiredLocal: (do
@@ -468,7 +468,7 @@ maybePrune = \t -> do
       set *lastPrunedAt = t
       pruneExpired t
 
-sendBatchedGossipToServer : Text -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Int, ttl: Int}] -> IO {network} {}
+sendBatchedGossipToServer : Text -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int}] -> IO {network} {}
 sendBatchedGossipToServer = \server allEvents ->
   if count allEvents == 0
     then yield {}
@@ -485,7 +485,7 @@ sendBatchedGossipToServer = \server allEvents ->
         Err _ -> yield {}
       sendBatchedGossipToServer server rest
 
-sendBatchedGossip : [Text] -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Int, ttl: Int}] -> IO {network} {}
+sendBatchedGossip : [Text] -> [{eventType: Text, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int}] -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents ->
   if count allEvents == 0
     then yield {}
@@ -506,7 +506,7 @@ broadcastOfflineGossip = \t peerServers expiredLocal -> do
       sendBatchedGossip peerServers gossipEvents
     else yield {}
 
-retryForwardsForServer : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Int, toKey: Text, toServer: Text}] -> Int -> IO {network} {}
+retryForwardsForServer : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Timestamp, toKey: Text, toServer: Text}] -> Int -> IO {network} {}
 retryForwardsForServer = \entries remaining ->
   if count entries == 0 || remaining <= 0
     then yield {}
@@ -532,7 +532,7 @@ retryForwardsForServer = \entries remaining ->
             Err _ -> yield {}
           retryForwardsForServer rest (remaining - 1)
 
-retryPendingForwards : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Int, toKey: Text, toServer: Text}] -> IO {network} {}
+retryPendingForwards : [{encryptedBlob: Text, fromKey: Text, messageId: Text, timestamp: Timestamp, toKey: Text, toServer: Text}] -> IO {network} {}
 retryPendingForwards = \pending -> do
   let servers = fold (\acc x ->
     if count (do s <- acc; where s == x.toServer; yield s) > 0 then acc
@@ -636,7 +636,7 @@ pollLoop = \token cursor deadline -> do
   if result.authorized && count result.events == 0 && t < deadline
     then do
       let remaining = deadline - t
-      let sleepMs = if remaining > 500 then 500 else remaining
+      let sleepMs  = if remaining > 500 then 500<Ms> else remaining
       sleep sleepMs
       pollLoop token cursor deadline
     else yield result

@@ -48,8 +48,7 @@ module App =
           NewNickname: string
           Error: string option
           PollCursor: uint64
-          LastSendStatus: string
-          Events: list<JsonElement> }
+          LastSendStatus: string }
 
     // ── Msg ──
 
@@ -69,7 +68,7 @@ module App =
         | SetNewNickname of string
         | DoSaveContact
         | DoDeleteContact of string
-        | PollResult of (string * string * uint64 * string) list * string * uint64 * list<JsonElement>
+        | PollResult of (string * string * int64 * string) list * string * uint64
         | DoPoll
         | CopyPubKey
         | DismissError
@@ -117,8 +116,7 @@ module App =
           NewNickname = ""
           Error = None
           PollCursor = 0UL
-          LastSendStatus = ""
-          Events = [] },
+          LastSendStatus = "" },
         []
 
     // ── Update ──
@@ -176,7 +174,7 @@ module App =
 
         | Sent(_, status) -> { model with LastSendStatus = status }, []
 
-        | PollResult(incoming, status, newCursor, events) ->
+        | PollResult(incoming, status, newCursor) ->
             let model' =
                 incoming
                 |> List.fold
@@ -201,7 +199,7 @@ module App =
                             { m with
                                 Contacts = contacts
                                 Messages = m.Messages |> Map.add fromPk (msgs @ [ newMsg ]) })
-                    { model with PollStatus = status; PollCursor = newCursor; Events = model.Events @ events }
+                    { model with PollStatus = status; PollCursor = newCursor }
 
             match model'.Conn with
             | Online token -> model', [ CmdPoll(model'.ServerUrl, token, model'.PrivKey.Value, model'.PollCursor) ]
@@ -315,9 +313,9 @@ module App =
                                 let tsEl = payload.GetProperty("timestamp")
                                 let ts =
                                     if tsEl.ValueKind = JsonValueKind.String then
-                                        UInt64.Parse(tsEl.GetString())
+                                        Int64.Parse(tsEl.GetString())
                                     else
-                                        tsEl.GetUInt64()
+                                        tsEl.GetInt64()
                                 let blob = Crypto.fromHex blobHex
 
                                 match Crypto.decrypt privKey blob with
@@ -345,15 +343,14 @@ module App =
                         $"[{now}] evts:{events.Length} msgs:{messages.Count} errs:{errors.Count}"
                         + (if errors.Count > 0 then $" [{errors.[0]}]" else "")
 
-                    return PollResult(Seq.toList messages, status, newCursor, events |> List.map (fun (_, _, x) -> x))
+                    return PollResult(Seq.toList messages, status, newCursor)
                 with
-                | :? System.Threading.Tasks.TaskCanceledException ->
-                    // Normal timeout from long poll — just retry
-                    return PollResult([], "polling...", cursor, [])
+                | :? TimeoutException ->
+                    return PollResult([], "polling...", cursor)
                 | ex ->
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
                     do! Async.Sleep 3000
-                    return PollResult([], $"[{now}] poll error: {ex.Message}", cursor, [])
+                    return PollResult([], $"[{now}] poll error: {ex.Message}", cursor)
             })
 
         | CmdCopyToClipboard text ->
@@ -450,10 +447,6 @@ module App =
 
                     Label($"poll: {model.PollStatus}")
                         .font(size = 10.)
-                        .textColor(Colors.DimGray)
-                    
-                    Label($"Events: {model.Events}")
-                        .font(10)
                         .textColor(Colors.DimGray)
 
                     if contactNames <> "" then

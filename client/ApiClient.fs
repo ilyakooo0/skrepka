@@ -4,8 +4,19 @@ open System
 open System.Net.Http
 open System.Text
 open System.Text.Json
+open System.Threading.Tasks
 
 module ApiClient =
+
+    /// Awaits a Task without converting TaskCanceledException to F# async
+    /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
+    let private awaitTask (t: Task<'T>) : Async<'T> =
+        Async.FromContinuations(fun (ok, err, _cancel) ->
+            t.ContinueWith(fun (t: Task<'T>) ->
+                if t.IsFaulted then err t.Exception.InnerException
+                elif t.IsCanceled then err (TimeoutException("Request timed out"))
+                else ok t.Result)
+            |> ignore)
 
     let private client =
         let c = new HttpClient()
@@ -87,13 +98,13 @@ module ApiClient =
             request.Content <- new StringContent($"""{{"cursor":{cursor},"timeout":30000}}""", Encoding.UTF8, "application/json")
             request.Headers.Add("Authorization", $"Bearer {token}")
 
-            let! response = pollClient.SendAsync(request) |> Async.AwaitTask
-            let! text = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+            let! response = pollClient.SendAsync(request) |> awaitTask
+            let! text = response.Content.ReadAsStringAsync() |> awaitTask
             let doc = JsonDocument.Parse(text)
             let root = expectObject doc "/poll"
-            let cursor = root.GetProperty("cursor").GetUInt64
+            let cursor = root.GetProperty("cursor").GetUInt64()
 
-            let events= root.GetProperty("events")
+            let events = root.GetProperty("events")
 
             let events =
                 [ for e in events.EnumerateArray() do
