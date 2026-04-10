@@ -12,8 +12,10 @@ module ApiClient =
     [<CLIMutable>]
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
 
+    type EventType = Message | UnknownEvent of string
+
     [<CLIMutable>]
-    type PollEvent = { Id: string; EventType: string; Payload: EventPayload }
+    type PollEvent = { Id: string; EventType: EventType; Payload: EventPayload }
 
     type MessageStatus = Delivered | Federated | Queued | Rejected | Unauthorized
 
@@ -58,9 +60,22 @@ module ApiClient =
                 | Rejected -> "rejected"
                 | Unauthorized -> "unauthorized")
 
+    type private EventTypeConverter() =
+        inherit JsonConverter<EventType>()
+        override _.Read(reader, _, _) =
+            match reader.GetString() with
+            | "message" -> Message
+            | s -> UnknownEvent s
+        override _.Write(writer, value, _) =
+            writer.WriteStringValue(
+                match value with
+                | Message -> "message"
+                | UnknownEvent s -> s)
+
     let private jsonOpts =
         let opts = JsonSerializerOptions(PropertyNameCaseInsensitive = true, NumberHandling = JsonNumberHandling.AllowReadingFromString)
         opts.Converters.Add(MessageStatusConverter())
+        opts.Converters.Add(EventTypeConverter())
         opts
 
     let private client =
@@ -114,7 +129,7 @@ module ApiClient =
         let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
         async {
             let! response = postJson<PollResponse> pollClient $"{serverUrl}/poll" body (Some token)
-            return { response with Events = response.Events |> Array.filter (fun e -> e.EventType = "message") }
+            return { response with Events = response.Events |> Array.filter (fun e -> e.EventType = Message) }
         }
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =

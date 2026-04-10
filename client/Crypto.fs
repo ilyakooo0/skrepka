@@ -15,6 +15,10 @@ module Crypto =
     let fromHex (hex: string) : byte[] =
         Convert.FromHexString(hex)
 
+    let tryFromHex (hex: string) : byte[] option =
+        try Some(Convert.FromHexString(hex))
+        with :? FormatException -> None
+
     let generateIdentity () : Identity =
         let kp = PublicKeyAuth.GenerateKeyPair()
         { PrivKey = kp.PrivateKey; PubKeyHex = toHex kp.PublicKey }

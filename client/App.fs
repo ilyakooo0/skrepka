@@ -17,11 +17,30 @@ module App =
 
     // ── Domain Types ──
 
+    type private EnvelopeType = Text | UnknownEnvelope of string
+
+    type private EnvelopeTypeConverter() =
+        inherit JsonConverter<EnvelopeType>()
+        override _.Read(reader, _, _) =
+            match reader.GetString() with
+            | "text" -> Text
+            | s -> UnknownEnvelope s
+        override _.Write(writer, value, _) =
+            writer.WriteStringValue(
+                match value with
+                | Text -> "text"
+                | UnknownEnvelope s -> s)
+
     [<CLIMutable>]
     type private TextEnvelope =
-        { [<JsonPropertyName("type")>] Type: string
+        { [<JsonPropertyName("type")>] Type: EnvelopeType
           [<JsonPropertyName("id")>] Id: string
           [<JsonPropertyName("body")>] Body: string }
+
+    let private envelopeJsonOpts =
+        let opts = JsonSerializerOptions()
+        opts.Converters.Add(EnvelopeTypeConverter())
+        opts
 
     type Page =
         | Setup
@@ -230,22 +249,17 @@ module App =
         | DoSaveContact ->
             match model.Page with
             | AddContact(pk, nn) when pk <> "" && nn <> "" ->
-                let pubkeyHex =
-                    if pk.Contains("-") then
-                        match Phonemic.fromOb pk with
-                        | Some bytes -> Crypto.toHex bytes
-                        | None -> pk
-                    else
-                        pk
+                match Phonemic.fromOb pk |> Option.orElseWith (fun () -> Crypto.tryFromHex pk) with
+                | Some bytes when bytes.Length = 32 ->
+                    let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = nn }
 
-                let contact: Contact = { Pubkey = pubkeyHex; Nickname = nn }
+                    let model' =
+                        { model with
+                            Contacts = model.Contacts |> upsertContact contact
+                            Page = Conversations }
 
-                let model' =
-                    { model with
-                        Contacts = model.Contacts |> upsertContact contact
-                        Page = Conversations }
-
-                model', [ saveCmdMsg model' ]
+                    model', [ saveCmdMsg model' ]
+                | _ -> { model with Error = Some "Invalid public key" }, []
             | _ -> model, []
 
         | CopyPubKey ->
@@ -287,16 +301,16 @@ module App =
 
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
-                let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext)
+                let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext, envelopeJsonOpts)
 
                 match envelope.Type with
-                | "text" ->
+                | Text ->
                     Ok(senderHex,
                        { Id = envelope.Id
                          Body = envelope.Body
                          Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
                          IsOutgoing = false })
-                | t -> Error $"unknown type: {t}"
+                | UnknownEnvelope t -> Error $"unknown envelope type: {t}"
             | None -> Error "decrypt failed"
         with ex ->
             Error $"parse: {ex.Message}"
@@ -321,7 +335,7 @@ module App =
                     try
                         let recipPub = Crypto.fromHex recipientHex
                         let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                        let payload = JsonSerializer.Serialize({ Type = "text"; Id = messageId; Body = text }: TextEnvelope)
+                        let payload = JsonSerializer.Serialize<TextEnvelope>({ Type = Text; Id = messageId; Body = text }, envelopeJsonOpts)
                         let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                         let! status = sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
 

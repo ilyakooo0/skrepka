@@ -85,7 +85,7 @@ module Store =
 
                 { Contacts = contacts
                   Messages = messages
-                  ServerUrl = if String.IsNullOrEmpty settings.ServerUrl then None else Some settings.ServerUrl
+                  ServerUrl = settings.ServerUrl |> Option.ofObj |> Option.filter ((<>) "")
                   PollCursor = settings.PollCursor })
         with _ ->
             None

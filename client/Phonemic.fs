@@ -101,9 +101,9 @@ module Phonemic =
         else
             let pairs = s.Split('-') |> Array.filter (fun p -> p <> "")
 
-            let results =
+            let decoded =
                 pairs
-                |> Array.map (fun sp ->
+                |> Array.choose (fun sp ->
                     if sp.Length = 6 then
                         match Map.tryFind sp.[0..2] prefixMap, Map.tryFind sp.[3..5] suffixMap with
                         | Some hi, Some lo -> Some(hi, lo)
@@ -111,11 +111,7 @@ module Phonemic =
                     else
                         None)
 
-            if results |> Array.forall Option.isSome then
-                results
-                |> Array.collect (fun r ->
-                    let hi, lo = r.Value
-                    [| hi; lo |])
-                |> Some
+            if decoded.Length = pairs.Length then
+                decoded |> Array.collect (fun (hi, lo) -> [| hi; lo |]) |> Some
             else
                 None
