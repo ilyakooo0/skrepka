@@ -70,17 +70,25 @@ module ApiClient =
 
             let! response = httpClient.SendAsync(request) |> awaitTask
             let! text = response.Content.ReadAsStringAsync() |> awaitTask
-            use doc = JsonDocument.Parse(text)
+            let doc = JsonDocument.Parse(text)
 
             match doc.RootElement.TryGetProperty("error") with
-            | true, err -> return failwith $"{url}: {err.GetString()}"
-            | _ -> return text
+            | true, err ->
+                doc.Dispose()
+                return failwith $"{url}: {err.GetString()}"
+            | _ -> return doc
+        }
+
+    let private post httpClient url body token =
+        async {
+            use! _doc = sendRequest httpClient url body token
+            return ()
         }
 
     let private postJson<'T> httpClient url body token =
         async {
-            let! text = sendRequest httpClient url body token
-            return JsonSerializer.Deserialize<'T>(text, jsonOpts)
+            use! doc = sendRequest httpClient url body token
+            return doc.RootElement.Deserialize<'T>(jsonOpts)
         }
 
     let authenticate (serverUrl: string) (identity: Crypto.Identity) =
@@ -112,5 +120,5 @@ module ApiClient =
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
         async {
             let body = JsonSerializer.Serialize({| messageIds = messageIds |})
-            do! sendRequest client $"{serverUrl}/messages/ack" body (Some token) |> Async.Ignore
+            do! post client $"{serverUrl}/messages/ack" body (Some token)
         }

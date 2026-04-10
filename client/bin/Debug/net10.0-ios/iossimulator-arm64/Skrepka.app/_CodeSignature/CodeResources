@@ -26,11 +26,7 @@
 		</data>
 		<key>Info.plist</key>
 		<data>
-		ssir7S2kJ96ERvRbt4MyKxnB/Bg=
-		</data>
-		<key>MauiInfo.plist</key>
-		<data>
-		iEtuUGCV6JM3gxS/pO33swhmpp8=
+		m96ofwll7AgsnmJ6k8Mhg6rEh+k=
 		</data>
 		<key>MauiSplash.storyboardc/01J-lp-oVM-view-Ze5-6b-2t3.nib</key>
 		<data>
@@ -162,11 +158,11 @@
 		</data>
 		<key>Skrepka.dll</key>
 		<data>
-		Fx5eEqogOKsTrWA3kWp16d3fSyU=
+		m/JtNDTwXk9X/g1/AaE5Vwl4W2M=
 		</data>
 		<key>Skrepka.pdb</key>
 		<data>
-		HqhmdetfGb7BH5l9fuwhGdebTOE=
+		73CrYxr59vU0P2RRGGZKrbhrupU=
 		</data>
 		<key>Sodium.Core.dll</key>
 		<data>
@@ -1154,13 +1150,6 @@
 			qpZJG5sHLu7WLZdd3Hp9GLV8v5gqy7cr5m0iSkYjBXc=
 			</data>
 		</dict>
-		<key>MauiInfo.plist</key>
-		<dict>
-			<key>hash2</key>
-			<data>
-			tx0KXqEC+DvcCGyogQTEQWHcCWJYYqH24NtPwhpQEjo=
-			</data>
-		</dict>
 		<key>MauiSplash.storyboardc/01J-lp-oVM-view-Ze5-6b-2t3.nib</key>
 		<dict>
 			<key>hash2</key>
@@ -1382,14 +1371,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			FjsECHINikzgAyKIKVfKchjBJ13FDPE/H9z1BXBRz0w=
+			ZF4F2VwuJgNcoxdnMOVcFjYX5wbJbSBws4JgwK9hrXc=
 			</data>
 		</dict>
 		<key>Skrepka.pdb</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			3GjYcjVCL6cSFSxxBQY9gaQpUEE77fX5bueUq6AVhZQ=
+			V7wCsBDqyaA4e02MG2zYiouDtDEgDU3uuJzwQbBfAgY=
 			</data>
 		</dict>
 		<key>Sodium.Core.dll</key>

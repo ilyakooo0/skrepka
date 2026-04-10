@@ -10,7 +10,7 @@ open System.Reflection
 [<assembly: System.Reflection.AssemblyCompanyAttribute("Skrepka")>]
 [<assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")>]
 [<assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")>]
-[<assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0+f11ecd2201e52dce49ef2d913500531961808e00")>]
+[<assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0+76838374041f6fc059855075419f13397f59e5a7")>]
 [<assembly: System.Reflection.AssemblyProductAttribute("Skrepka")>]
 [<assembly: System.Reflection.AssemblyTitleAttribute("Skrepka")>]
 [<assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")>]

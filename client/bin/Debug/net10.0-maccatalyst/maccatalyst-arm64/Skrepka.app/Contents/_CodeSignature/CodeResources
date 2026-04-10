@@ -12,10 +12,6 @@
 		<data>
 		c3wF+z6XtMjJ+O5rJymqsoYbzDg=
 		</data>
-		<key>Resources/MauiInfo.plist</key>
-		<data>
-		iEtuUGCV6JM3gxS/pO33swhmpp8=
-		</data>
 		<key>Resources/MonoTouchDebugConfiguration.txt</key>
 		<data>
 		oowkf1sL6T19nanXUObgmuayWqM=
@@ -43,6 +39,10 @@
 		<key>Resources/dotnet_bot@3x.png</key>
 		<data>
 		0MNKQFxkmotyH6NbFxiImCoXedE=
+		</data>
+		<key>Resources/xml/microsoft_maui_essentials_fileprovider_file_paths.xml</key>
+		<data>
+		0ZugOR08oYUyn+ivNzk266eEOoY=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -240,14 +240,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			E9mXMT9TM9+PN5lZdr8hd7Pjdh/b/nQ62LyZ9LZgVuw=
+			XU+yAt7vNt9BpnKXVtjK7OrVVcCx0NV5yVFk70jDuKA=
 			</data>
 		</dict>
 		<key>MonoBundle/Skrepka.pdb</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			zrk8Hm3qBzSS6q+50oo9lwNm5bRrdg7ggTxpygT5xx4=
+			1rsqlbs6EGxpr47/dseRdpvX9mqCbc9lJ7fOrIUjaqs=
 			</data>
 		</dict>
 		<key>MonoBundle/Sodium.Core.dll</key>
@@ -1783,13 +1783,6 @@
 			HfYxSjf/+d0hBTO933j7O0S+icn+eoL8QQEDzydpDZM=
 			</data>
 		</dict>
-		<key>Resources/MauiInfo.plist</key>
-		<dict>
-			<key>hash2</key>
-			<data>
-			tx0KXqEC+DvcCGyogQTEQWHcCWJYYqH24NtPwhpQEjo=
-			</data>
-		</dict>
 		<key>Resources/MonoTouchDebugConfiguration.txt</key>
 		<dict>
 			<key>hash2</key>
@@ -1837,6 +1830,13 @@
 			<key>hash2</key>
 			<data>
 			/SFENCPPsp1Yo7TyezWGBYqhyOLp2UYMcmcjN7dKg2I=
+			</data>
+		</dict>
+		<key>Resources/xml/microsoft_maui_essentials_fileprovider_file_paths.xml</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			W4mBx+OWozujR6fIlOuqppzspq5DXmkX1Oo5zBuPD6Q=
 			</data>
 		</dict>
 	</dict>

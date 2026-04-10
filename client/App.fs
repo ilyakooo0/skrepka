@@ -5,25 +5,19 @@ open System.Text.Json
 open System.Text.Json.Serialization
 open Fabulous
 open Fabulous.Maui
-open System.Collections.Generic
 open Microsoft.Maui.Graphics
 
 open type Fabulous.Maui.View
 
 module App =
 
+    open Store
+    open Crypto
+
     // ── Domain Types ──
 
-    type Contact = Store.Contact
-
-    type ChatMessage =
-        { Id: string
-          Body: string
-          Timestamp: DateTimeOffset
-          IsOutgoing: bool }
-
     [<CLIMutable>]
-    type TextEnvelope =
+    type private TextEnvelope =
         { [<JsonPropertyName("type")>] Type: string
           [<JsonPropertyName("id")>] Id: string
           [<JsonPropertyName("timestamp")>] Timestamp: int64
@@ -35,8 +29,6 @@ module App =
         | Chat of pubkey: string
         | AddContact
         | Settings
-
-    type Identity = Crypto.Identity
 
     type Session = { Url: string; Token: string; Identity: Identity }
 
@@ -82,7 +74,7 @@ module App =
         | PollResult of messages: (string * ChatMessage) list * status: string * cursor: uint64
         | CopyPubKey
         | DismissError
-        | StateLoaded of Identity * Store.DataDto option
+        | StateLoaded of Identity * Data option
 
     // ── CmdMsg ──
 
@@ -94,7 +86,7 @@ module App =
         | CmdCopyToClipboard of string
         | CmdLoadState
         | CmdSaveIdentity of Identity
-        | CmdSaveData of contacts: Contact list * messages: Map<string, ChatMessage list> * serverUrl: string * cursor: uint64
+        | CmdSaveData of Data
 
     // ── Helpers ──
 
@@ -132,7 +124,7 @@ module App =
         | _ -> None
 
     let private saveCmd model =
-        [ CmdSaveData(model.Contacts, model.Messages, model.ServerUrl, model.PollCursor) ]
+        [ CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = model.ServerUrl; PollCursor = model.PollCursor } ]
 
     // ── Init ──
 
@@ -260,22 +252,9 @@ module App =
             let model' =
                 match dataOpt with
                 | Some data ->
-                    let messages =
-                        data.Messages
-                        |> Seq.map (fun (KeyValue(pk, dtos)) ->
-                            pk,
-                            dtos
-                            |> Array.toList
-                            |> List.map (fun m ->
-                                { Id = m.Id
-                                  Body = m.Body
-                                  Timestamp = DateTimeOffset.FromUnixTimeSeconds m.TimestampUnix
-                                  IsOutgoing = m.IsOutgoing }))
-                        |> Map.ofSeq
-
                     { model' with
-                        Contacts = data.Contacts |> Array.toList
-                        Messages = messages
+                        Contacts = data.Contacts
+                        Messages = data.Messages
                         ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
                         PollCursor = data.PollCursor
                         Page = Conversations }
@@ -396,26 +375,8 @@ module App =
         | CmdSaveIdentity identity ->
             Cmd.ofEffect (fun _ -> Store.saveIdentity identity |> ignore)
 
-        | CmdSaveData(contacts, messages, serverUrl, cursor) ->
-            Cmd.ofEffect (fun _ ->
-                let messageDtos = Dictionary<string, Store.MessageDto array>()
-
-                messages
-                |> Map.iter (fun pk msgs ->
-                    messageDtos[pk] <-
-                        msgs
-                        |> List.map (fun m ->
-                            { Store.MessageDto.Id = m.Id
-                              Store.MessageDto.Body = m.Body
-                              Store.MessageDto.TimestampUnix = m.Timestamp.ToUnixTimeSeconds()
-                              Store.MessageDto.IsOutgoing = m.IsOutgoing })
-                        |> Array.ofList)
-
-                Store.saveData
-                    { Contacts = contacts |> Array.ofList
-                      Messages = messageDtos
-                      ServerUrl = serverUrl
-                      PollCursor = cursor })
+        | CmdSaveData data ->
+            Cmd.ofEffect (fun _ -> Store.saveData data)
 
     // ── View ──
 
