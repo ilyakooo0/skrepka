@@ -54,7 +54,7 @@ type PollEvent = {id: MessageIdHex, eventType: PollEventType, payload: {encrypte
 
 type GossipEventType = Text where \s -> s == "online" || s == "offline"
 
-type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: Text, timestamp: Timestamp, ttl: Int<S>}
+type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
 type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
@@ -64,8 +64,8 @@ type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) &
 type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen) && s == normalizeHex s
 type SignatureHex = Text where \s -> isValidHex s && not (tooLong s maxSignatureLen) && s == normalizeHex s
 type MessageIdHex = Text where \s -> isValidHex s && not (tooLong s maxMessageIdLen) && s == normalizeHex s
-type ServerName = Text where \s -> not (tooLong s maxServerNameLen) && not (isBadServerName s) && s == normalizeServerName s
-type OptionalServerName = Text where \s -> s == "" || (not (tooLong s maxServerNameLen) && not (isBadServerName s) && s == normalizeServerName s)
+type ServerName = Text where \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
+type OptionalServerName = Text where \s -> s == "" || (not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s))
 
 type Timestamp = Int<Ms>
 
@@ -224,8 +224,6 @@ isCgnatRange = \s ->
     then True {}
   else False {}
 
-containsColon = \s -> contains ":" s
-
 containsMultipleColons = \s -> count (do c <- chars s; where c == ":"; yield c) > 1
 
 hasOctalOctet = \s ->
@@ -298,8 +296,7 @@ isHighOctetPrefix = \sn ->
 matchesHostname = \sn name nameLen ->
   take nameLen sn == name && (drop nameLen sn == "" || take 1 (drop nameLen sn) == ":")
 
-isBadServerName = \s ->
-  let sn = toLower (stripTrailingDot s) in
+isBadServerName = \sn ->
   sn == ""
   || take 1 sn == "."
   || take 1 sn == ":"
@@ -449,15 +446,15 @@ collectPeerServers = \items getServer ->
 
 samePubkeyServer = \a b -> a.pubkey == b.pubkey && a.server == b.server
 
-mergeByKey = \sameKey initial items ->
+mergeByKey = \sameKey getFreshness initial items ->
   fold (\acc e ->
-    if any acc (\a -> sameKey a e && a.expiresAt >= e.expiresAt)
+    if any acc (\a -> sameKey a e && getFreshness a >= getFreshness e)
       then acc
       else union
         (do a <- acc; where not (sameKey a e); yield a)
         [e]) initial items
 
-mergeByPubkeyServer = mergeByKey samePubkeyServer
+mergeByPubkeyServer = mergeByKey samePubkeyServer (\x -> x.expiresAt)
 
 removeOffline = \presenceSet offlineOnlyKeys trustedOffline t ->
   diff presenceSet (do
@@ -476,13 +473,11 @@ countMessagesFor = \messages toKey t ->
 validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
 validGossipEvents = \events t -> do
   e <- events
-  where not (tooLong e.server maxServerNameLen) && not (isBadServerName e.server)
-  let server = normalizeServerName e.server
-  where server != serverHostN && e.timestamp <= t + clockSkewTolerance
+  where e.server != serverHostN && e.timestamp <= t + clockSkewTolerance
   let ttl = clampTtl e.ttl
   let expiresAt = e.timestamp + ttl * 1000
   where expiresAt > t
-  yield {eventType: e.eventType, pubkey: e.pubkey, server: server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
+  yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
 
 sendToEach : [ServerName] -> (ServerName -> (a {})) -> a {}
 sendToEach = \servers action ->
@@ -556,12 +551,10 @@ sendBatchedGossip = \peerServers allEvents hops ->
 
 broadcastOfflineGossip = \t peerServers expiredLocal ->
   when (federationEnabled && count peerServers > 0 && count expiredLocal > 0) (do
-    let gossipEvents = do
-      e <- mergeByKey (\a b -> a.pubkey == b.pubkey) [] (do
-        p <- expiredLocal
-        let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
-        yield {pubkey: p.pubkey, ttl: ttl, expiresAt: p.expiresAt})
-      yield {eventType: "offline", pubkey: e.pubkey, server: serverHostN, timestamp: e.expiresAt, ttl: e.ttl}
+    let gossipEvents = mergeByKey (\a b -> a.pubkey == b.pubkey) (\x -> x.timestamp) [] (do
+      p <- expiredLocal
+      let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
+      yield {eventType: "offline", pubkey: p.pubkey, server: serverHostN, timestamp: p.expiresAt, ttl: ttl})
     sendBatchedGossip peerServers gossipEvents 2)
 
 forkBroadcastOffline = \t result ->
