@@ -912,12 +912,11 @@ serve = \req -> case req of
             p <- presence
             where p.pubkey == pubkey && p.expiresAt > t
             yield p
-          let localPresent = any valid (\p -> p.server == serverHostN)
-          let bestRemote = (fold (\acc p ->
-            if p.server != serverHostN && p.expiresAt > acc.best
-              then {server: p.server, best: p.expiresAt}
-              else acc) {server: "", best: 0} valid).server
-          let foundServer = if localPresent then serverHostN else bestRemote
+          let foundServer = (fold (\acc p ->
+            if acc.local then acc
+            else if p.server == serverHostN then {server: serverHostN, best: 0, local: True {}}
+            else if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt, local: False {}}
+            else acc) {server: "", best: 0, local: False {}} valid).server
           yield {pr: pr, authorized: True {}, foundServer: foundServer}
     forkBroadcastOffline t result.pr
     yield (respond {online: result.foundServer != "", server: result.foundServer, authorized: result.authorized})
@@ -958,7 +957,7 @@ serve = \req -> case req of
           let merged = mergeByPubkeyServer presence trustedDeduped
           let offlineOnlyKeys = do
             e <- allValidEntries
-            where none trustedDeduped (\d -> samePubkeyServer d e)
+            where e.server == fromServer && none trustedDeduped (\d -> samePubkeyServer d e)
             yield e
           let afterOffline = removeOffline merged offlineOnlyKeys trustedOffline t
           let appliedOffline = do p <- diff merged afterOffline; yield {pubkey: p.pubkey, server: p.server}
@@ -979,8 +978,7 @@ serve = \req -> case req of
               where s != fromServer
               yield s
             in sendBatchedGossip targets effectiveEvents (cappedHops - 1))
-          let pr = gossipResult.pr
-          broadcastOfflineGossip t pr.peerServers pr.expiredLocal)
+          broadcastOfflineGossip t gossipResult.pr.peerServers gossipResult.pr.expiredLocal)
         yield (respond {ok: True {}})
 
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do

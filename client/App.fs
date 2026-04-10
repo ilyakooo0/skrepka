@@ -17,9 +17,9 @@ module App =
 
     // ── Domain Types ──
 
+    [<JsonConverter(typeof<EnvelopeTypeConverter>)>]
     type private EnvelopeType = Text | UnknownEnvelope of string
-
-    type private EnvelopeTypeConverter() =
+    and private EnvelopeTypeConverter() =
         inherit JsonConverter<EnvelopeType>()
         override _.Read(reader, _, _) =
             match reader.GetString() with
@@ -37,11 +37,6 @@ module App =
           [<JsonPropertyName("id")>] Id: string
           [<JsonPropertyName("body")>] Body: string }
 
-    let private envelopeJsonOpts =
-        let opts = JsonSerializerOptions()
-        opts.Converters.Add(EnvelopeTypeConverter())
-        opts
-
     type Page =
         | Setup
         | Conversations
@@ -54,7 +49,7 @@ module App =
     type ConnStatus =
         | Offline
         | Connecting
-        | Online of token: string
+        | Online of Session
 
     type AuthState =
         | NoIdentity
@@ -166,7 +161,7 @@ module App =
 
     let private trySession model =
         match model.Auth with
-        | Identified(id, Online token) -> Some { Url = model.ServerUrl; Token = token; Identity = id }
+        | Identified(_, Online session) -> Some session
         | _ -> None
 
     let private setConn status model =
@@ -225,7 +220,7 @@ module App =
             match model.Auth with
             | Identified(id, Connecting) ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
-                { model with Auth = Identified(id, Online token); Page = Conversations; Error = None },
+                { model with Auth = Identified(id, Online session); Page = Conversations; Error = None },
                 [ CmdPoll(session, model.PollCursor) ]
             | _ -> model, []
 
