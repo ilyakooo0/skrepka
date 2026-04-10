@@ -21,7 +21,7 @@ module Store =
     type Data =
         { Contacts: Contact list
           Messages: Map<string, ChatMessage list>
-          ServerUrl: string
+          ServerUrl: string option
           PollCursor: int64 }
 
     [<CLIMutable>]
@@ -53,24 +53,18 @@ module Store =
                 SecureStorage.Default.GetAsync("identity_privkey")
                 |> Async.AwaitTask
 
-            let! pubKeyHex =
-                SecureStorage.Default.GetAsync("identity_pubkey")
-                |> Async.AwaitTask
-
             return
-                Option.map2
-                    (fun pk pub ->
-                        { Crypto.Identity.PrivKey = Convert.FromBase64String pk
-                          Crypto.Identity.PubKeyHex = pub })
-                    (Option.ofObj privKeyB64)
-                    (Option.ofObj pubKeyHex)
+                privKeyB64
+                |> Option.ofObj
+                |> Option.map (fun b64 ->
+                    let privKey = Convert.FromBase64String b64
+                    { Crypto.Identity.PrivKey = privKey
+                      Crypto.Identity.PubKeyHex = Crypto.toHex privKey.[32..63] })
         }
 
     let saveIdentity (identity: Crypto.Identity) =
-        async {
-            do! SecureStorage.Default.SetAsync("identity_privkey", Convert.ToBase64String identity.PrivKey) |> Async.AwaitTask
-            do! SecureStorage.Default.SetAsync("identity_pubkey", identity.PubKeyHex) |> Async.AwaitTask
-        }
+        SecureStorage.Default.SetAsync("identity_privkey", Convert.ToBase64String identity.PrivKey)
+        |> Async.AwaitTask
 
     let loadData () : Data option =
         try
@@ -91,7 +85,7 @@ module Store =
 
                 { Contacts = contacts
                   Messages = messages
-                  ServerUrl = settings.ServerUrl
+                  ServerUrl = if String.IsNullOrEmpty settings.ServerUrl then None else Some settings.ServerUrl
                   PollCursor = settings.PollCursor })
         with _ ->
             None
@@ -113,7 +107,7 @@ module Store =
 
             settings.Upsert
                 { Id = "settings"
-                  ServerUrl = data.ServerUrl
+                  ServerUrl = data.ServerUrl |> Option.defaultValue ""
                   PollCursor = data.PollCursor }
             |> ignore
         with _ ->

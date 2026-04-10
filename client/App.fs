@@ -21,7 +21,6 @@ module App =
     type private TextEnvelope =
         { [<JsonPropertyName("type")>] Type: string
           [<JsonPropertyName("id")>] Id: string
-          [<JsonPropertyName("timestamp")>] Timestamp: int64
           [<JsonPropertyName("body")>] Body: string }
 
     type Page =
@@ -134,7 +133,7 @@ module App =
         | NoIdentity -> model
 
     let private saveCmdMsg model =
-        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = model.ServerUrl; PollCursor = model.PollCursor }
+        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = Some model.ServerUrl; PollCursor = model.PollCursor }
 
     // ── Init ──
 
@@ -246,7 +245,7 @@ module App =
                         Auth = Identified(identity, Connecting)
                         Contacts = data.Contacts
                         Messages = data.Messages
-                        ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
+                        ServerUrl = data.ServerUrl |> Option.defaultValue model.ServerUrl
                         PollCursor = data.PollCursor
                         Page = Conversations }
                 model', [ CmdConnect(model'.ServerUrl, identity) ]
@@ -303,10 +302,7 @@ module App =
                     try
                         let recipPub = Crypto.fromHex recipientHex
                         let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-
-                        let payload =
-                            JsonSerializer.Serialize({ Type = "text"; Id = messageId; Timestamp = ts; Body = text }: TextEnvelope)
-
+                        let payload = JsonSerializer.Serialize({ Type = "text"; Id = messageId; Body = text }: TextEnvelope)
                         let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                         let! status = sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
 
@@ -477,9 +473,8 @@ module App =
 
                     for c in model.Contacts do
                         let preview =
-                            model.Messages
-                            |> Map.tryFind c.Pubkey
-                            |> Option.bind List.tryLast
+                            messagesFor c.Pubkey model.Messages
+                            |> List.tryLast
                             |> Option.map (fun m -> truncate 40 m.Body)
                             |> Option.defaultValue ""
 

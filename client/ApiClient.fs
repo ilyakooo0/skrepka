@@ -18,7 +18,7 @@ module ApiClient =
     type MessageStatus = Delivered | Federated | Queued | Rejected | Unauthorized
 
     [<CLIMutable>]
-    type private SendResult = { Status: MessageStatus; MessageId: string }
+    type private SendResult = { Status: MessageStatus }
 
     [<CLIMutable>]
     type PollResponse = { Cursor: int64; Events: PollEvent array }
