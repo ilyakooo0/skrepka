@@ -49,7 +49,7 @@ type GossipEventType = Text where \s -> s == "online" || s == "offline"
 
 type GossipEvent = {eventType: GossipEventType, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int<S>}
 
-type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
+type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
 type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || s == "delivered" || s == "federated" || s == "queued"
 
@@ -145,6 +145,7 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 
 any = \xs pred -> fold (\acc x -> if acc then acc else pred x) (False {}) xs
 none = \xs pred -> not (any xs pred)
+when = \cond action -> if cond then action else yield {}
 headOf = \items -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
   _ -> acc) Nothing {} items
@@ -583,13 +584,11 @@ broadcastOfflineGossip = \t peerServers expiredLocal -> do
   let expiredEntries = mergeByKey (\a b -> a.pubkey == b.pubkey) [] (do
     p <- expiredLocal
     yield {pubkey: p.pubkey, ttl: (let rawTtl = (p.expiresAt - p.timestamp) / 1000 in if rawTtl < offlineGossipMinTtl then offlineGossipMinTtl else if rawTtl > maxPresenceTtl then maxPresenceTtl else rawTtl), expiresAt: p.expiresAt})
-  if federationEnabled && count expiredEntries > 0 && count peerServers > 0
-    then do
-      let gossipEvents = do
-        e <- expiredEntries
-        yield {eventType: "offline", pubkey: e.pubkey, server: serverHostN, timestamp: e.expiresAt, ttl: e.ttl}
-      sendBatchedGossip peerServers gossipEvents
-    else yield {}
+  when (federationEnabled && count expiredEntries > 0 && count peerServers > 0) (do
+    let gossipEvents = do
+      e <- expiredEntries
+      yield {eventType: "offline", pubkey: e.pubkey, server: serverHostN, timestamp: e.expiresAt, ttl: e.ttl}
+    sendBatchedGossip peerServers gossipEvents)
 
 forkBroadcastOffline = \t result ->
   fork (broadcastOfflineGossip t result.peerServers result.expiredLocal)
@@ -658,14 +657,11 @@ pruneAndRetry = \t -> do
     let pendingAcks = do a <- ackedIds; where isFederatedOrigin a.originServer; yield a
     yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: forwards, pendingAcks: pendingAcks}
   broadcastOfflineGossip t result.peerServers result.expiredLocal
-  if federationEnabled && count result.pendingForwards > 0
-    then retryPendingForwards result.pendingForwards
-    else yield {}
-  if federationEnabled && count result.pendingAcks > 0
-    then do
-      let ackOriginServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
-      sendAcksAndClean result.pendingAcks ackOriginServers
-    else yield {}
+  when (federationEnabled && count result.pendingForwards > 0)
+    (retryPendingForwards result.pendingForwards)
+  when (federationEnabled && count result.pendingAcks > 0) (do
+    let ackOriginServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
+    sendAcksAndClean result.pendingAcks ackOriginServers)
 
 pollOnce : Text -> Int -> IO {clock} {authorized: Bool, cursor: Int, events: [PollEvent]}
 pollOnce = \token cursor -> do
@@ -751,40 +747,35 @@ serve = \req -> case req of
       let sigValid = case matched of
         Nothing {} -> False {}
         _ -> verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
-      set *challenges = if sigValid
-        then do
-          c <- challenges
-          where not (c.pubkey == pubkey && c.challenge == challenge)
-          yield c
-        else challenges
-      let sessionsCapped = capPerKey sessions (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t
-      let activeSessionsCapped = do s <- sessionsCapped; where s.expiresAt > t; yield s
-      let globalSessionsCapped = capGlobal activeSessionsCapped maxSessions (\s -> s.expiresAt)
-      set *sessions = if sigValid
-        then union globalSessionsCapped [{token: token, pubkey: pubkey, expiresAt: expiry}]
-        else sessions
-      let presenceWithout = do
-            p <- presence
-            where not (p.pubkey == pubkey && p.server == serverHostN)
-            yield p
-      let presenceEvicted = capGlobal presenceWithout maxPresenceEntries (\p -> p.expiresAt)
-      let updatedPresence = if sigValid
-        then union presenceEvicted [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]
-        else presence
-      set *presence = updatedPresence
-      let peerServers = if sigValid && federationEnabled
-        then collectPeerServers updatedPresence (\p -> p.server)
-        else []
-      yield {sigValid: sigValid, peerServers: peerServers, expiredLocal: pr.expiredLocal, offlinePeers: pr.peerServers}
+      if not sigValid
+        then yield {sigValid: False {}, peerServers: [], expiredLocal: pr.expiredLocal, offlinePeers: pr.peerServers}
+        else do
+          set *challenges = do
+            c <- challenges
+            where not (c.pubkey == pubkey && c.challenge == challenge)
+            yield c
+          let sessionsCapped = capPerKey sessions (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t
+          let activeSessionsCapped = do s <- sessionsCapped; where s.expiresAt > t; yield s
+          let globalSessionsCapped = capGlobal activeSessionsCapped maxSessions (\s -> s.expiresAt)
+          set *sessions = union globalSessionsCapped [{token: token, pubkey: pubkey, expiresAt: expiry}]
+          let presenceWithout = do
+                p <- presence
+                where not (p.pubkey == pubkey && p.server == serverHostN)
+                yield p
+          let presenceEvicted = capGlobal presenceWithout maxPresenceEntries (\p -> p.expiresAt)
+          let updatedPresence = union presenceEvicted [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]
+          set *presence = updatedPresence
+          let peerServers = if federationEnabled
+            then collectPeerServers updatedPresence (\p -> p.server)
+            else []
+          yield {sigValid: True {}, peerServers: peerServers, expiredLocal: pr.expiredLocal, offlinePeers: pr.peerServers}
     fork (do
-      if result.sigValid && federationEnabled
-        then sendToEach result.peerServers (\server -> do
+      when (result.sigValid && federationEnabled)
+        (sendToEach result.peerServers (\server -> do
           _ <- fetch (federationScheme ++ server) (RecvGossip {
             authorization: "Bearer " ++ federationSecret,
             events: [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHostN})
-          yield {}
-          )
-        else yield {}
+          yield {}))
       broadcastOfflineGossip t result.offlinePeers (do
         p <- result.expiredLocal
         where not (result.sigValid && p.pubkey == pubkey)
@@ -846,20 +837,17 @@ serve = \req -> case req of
             else forwards
           yield {status: status, shouldInsert: shouldInsert, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
     fork (do
-      if count result.remoteServers > 0 && result.shouldInsert && federationEnabled
-        then sendToEach result.remoteServers (\server -> do
+      when (count result.remoteServers > 0 && result.shouldInsert && federationEnabled)
+        (sendToEach result.remoteServers (\server -> do
           fwdResult <- fetch (federationScheme ++ server) (ForwardMessage {
             toKey: to, fromKey: result.fromKey, encryptedBlob: encryptedBlob,
             timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
             authorization: "Bearer " ++ federationSecret})
           case fwdResult of
             Ok _ -> removeForward msgId server
-            Err _ -> yield {}
-          )
-        else yield {}
-      if result.forwardsAtCapacity && count result.remoteServers > 0 && result.shouldInsert
-        then println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
-        else yield {}
+            Err _ -> yield {}))
+      when (result.forwardsAtCapacity && count result.remoteServers > 0 && result.shouldInsert)
+        (println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking"))
       broadcastOfflineGossip t result.peerServers result.expiredLocal)
     yield (respond {status: result.status, messageId: if result.shouldInsert then msgId else ""})
 
@@ -897,41 +885,34 @@ serve = \req -> case req of
           yield {ok: True {}, pendingAcks: ackedFederated, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, evictedEntries: evictedEntries}
     let originServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
     fork (do
-      if result.ok
-        then do
-          if count originServers > 0 && federationEnabled
-            then sendAcksAndClean result.pendingAcks originServers
-            else yield {}
-          let evictedToRetry = do
-            a <- result.evictedEntries
-            where none result.pendingAcks (\a2 -> a2.messageId == a.messageId && a2.toKey == a.toKey)
-            yield a
-          if count evictedToRetry > 0 && federationEnabled
-            then do
-              let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
-              sendToEach evictedOriginServers (\server -> do
-                  fetchResult <- fetch (federationScheme ++ server) (FederationAck {
-                    authorization: "Bearer " ++ federationSecret,
-                    messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
-                    originServer: server, fromServer: serverHostN})
-                  case fetchResult of
-                    Err _ -> do
-                      dropped <- atomic do
-                        ackedIds <- *ackedIds
-                        let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
-                        let combined = union ackedIds reinsert
-                        let excess = count combined - maxAckedIds
-                        let afterEviction = if excess <= 0 then combined
-                          else evictOldestAckedIds combined excess
-                        set *ackedIds = afterEviction
-                        yield excess
-                      if dropped > 0
-                        then println ("ackMessages: ackedIds at capacity (" ++ show maxAckedIds ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server)
-                        else yield {}
-                    _ -> yield {}
-                  )
-            else yield {}
-        else yield {}
+      when result.ok (do
+        when (count originServers > 0 && federationEnabled)
+          (sendAcksAndClean result.pendingAcks originServers)
+        let evictedToRetry = do
+          a <- result.evictedEntries
+          where none result.pendingAcks (\a2 -> a2.messageId == a.messageId && a2.toKey == a.toKey)
+          yield a
+        when (count evictedToRetry > 0 && federationEnabled) (do
+          let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
+          sendToEach evictedOriginServers (\server -> do
+            fetchResult <- fetch (federationScheme ++ server) (FederationAck {
+              authorization: "Bearer " ++ federationSecret,
+              messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
+              originServer: server, fromServer: serverHostN})
+            case fetchResult of
+              Err _ -> do
+                dropped <- atomic do
+                  ackedIds <- *ackedIds
+                  let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
+                  let combined = union ackedIds reinsert
+                  let excess = count combined - maxAckedIds
+                  let afterEviction = if excess <= 0 then combined
+                    else evictOldestAckedIds combined excess
+                  set *ackedIds = afterEviction
+                  yield excess
+                when (dropped > 0)
+                  (println ("ackMessages: ackedIds at capacity (" ++ show maxAckedIds ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server))
+              _ -> yield {})))
       broadcastOfflineGossip t result.peerServers result.expiredLocal)
     yield (respond {ok: result.ok})
 
@@ -973,7 +954,7 @@ serve = \req -> case req of
       where none offlineEntries (\o -> o.server == fromServer && samePubkeyServer o e && o.timestamp > e.timestamp)
       yield e
     let affectedKeys = do
-      e <- union onlineEntries offlineEntries
+      e <- allValidEntries
       yield {pubkey: e.pubkey, server: e.server}
     let deduped = mergeByPubkeyServer [] filteredOnline
     gossipResult <- atomic do
@@ -1027,23 +1008,19 @@ serve = \req -> case req of
       e <- union filteredOnline filteredOffline
       where any gossipResult.appliedKeys (\a -> samePubkeyServer a e)
       yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl}
-    if not gossipResult.withinCapacity
-      then println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer)
-      else yield {}
+    when (not gossipResult.withinCapacity)
+      (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer))
     fork (do
-      if validRequest && cappedHops > 1 && federationEnabled && count effectiveEvents > 0
-        then do
-          let targets = do
-            s <- gossipResult.gossipPeerServers
-            where not (s == fromServer)
-            yield s
-          sendToEach targets (\server -> do
-            _ <- fetch (federationScheme ++ server) (RecvGossip {
-              authorization: "Bearer " ++ federationSecret,
-              events: effectiveEvents, hopsRemaining: cappedHops - 1, fromServer: serverHostN})
-            yield {}
-            )
-        else yield {}
+      when (validRequest && cappedHops > 1 && federationEnabled && count effectiveEvents > 0) (do
+        let targets = do
+          s <- gossipResult.gossipPeerServers
+          where not (s == fromServer)
+          yield s
+        sendToEach targets (\server -> do
+          _ <- fetch (federationScheme ++ server) (RecvGossip {
+            authorization: "Bearer " ++ federationSecret,
+            events: effectiveEvents, hopsRemaining: cappedHops - 1, fromServer: serverHostN})
+          yield {}))
       broadcastOfflineGossip t gossipResult.peerServers gossipResult.expiredLocal)
     yield (respond {ok: validRequest})
 
@@ -1063,10 +1040,11 @@ serve = \req -> case req of
       seqCounter <- *seqCounter
       let seqTs = nextSeqTs t seqCounter
       ackedIds <- *ackedIds
-      let exists = authorized && validOrigin
+      let valid = authorized && validOrigin
+      let alreadyExists = valid
         && (any messages (\m -> m.messageId == messageId && m.toKey == toKey)
           || any ackedIds (\a -> a.messageId == messageId && a.toKey == toKey))
-      let shouldInsert = authorized && validOrigin && not exists
+      let shouldInsert = valid && not alreadyExists
         && countMessagesFor messages toKey t < maxMessagesPerRecipient
       set *seqCounter = if shouldInsert then seqTs else seqCounter
       set *messages = if shouldInsert
@@ -1074,7 +1052,7 @@ serve = \req -> case req of
           [{messageId: messageId, toKey: toKey, fromKey: fromKey,
             encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
         else messages
-      yield {peerServers: pr.peerServers, expiredLocal: pr.expiredLocal, ok: shouldInsert || exists}
+      yield {peerServers: pr.peerServers, expiredLocal: pr.expiredLocal, ok: shouldInsert || alreadyExists}
     forkBroadcastOffline t result
     yield (respond {ok: result.ok})
 
@@ -1104,7 +1082,7 @@ serve = \req -> case req of
   Prune {authorization, respond} -> do
     t <- now
     let authorized = verifyMaintenanceAuth authorization
-    if authorized then fork (pruneAndRetry t) else yield {}
+    when authorized (fork (pruneAndRetry t))
     yield (respond {ok: authorized})
 
 -- ============================================

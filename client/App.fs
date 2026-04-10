@@ -50,8 +50,8 @@ module App =
           Cursor: uint64 }
 
     type LoadedState =
-        { Identity: Identity option
-          Data: Store.DataDto option }
+        | NoIdentity
+        | Loaded of identity: Identity * data: Store.DataDto option
 
     // ── Model ──
 
@@ -262,8 +262,8 @@ module App =
 
         | DismissError -> { model with Error = None }, []
 
-        | StateLoaded { Identity = None } -> model, []
-        | StateLoaded { Identity = Some identity; Data = dataOpt } ->
+        | StateLoaded NoIdentity -> model, []
+        | StateLoaded(Loaded(identity, dataOpt)) ->
             let model' = { model with Identity = Some identity; Conn = Connecting identity }
 
             let model' =
@@ -333,12 +333,8 @@ module App =
                 try
                     let! challenge = ApiClient.requestChallenge url identity.PubKeyHex
                     let sigHex = Crypto.signChallenge identity.PrivKey challenge
-                    let! result = ApiClient.verify url identity.PubKeyHex challenge sigHex
-
-                    if String.IsNullOrEmpty(result.Token) then
-                        return AuthErr "Authentication rejected by server"
-                    else
-                        return AuthOk result.Token
+                    let! token = ApiClient.verify url identity.PubKeyHex challenge sigHex
+                    return AuthOk token
                 with ex ->
                     return AuthErr ex.Message
             })
@@ -399,8 +395,11 @@ module App =
         | CmdLoadState ->
             asyncCmd (async {
                 let! identity = Store.loadIdentity ()
-                let data = Store.loadData ()
-                return StateLoaded { Identity = identity; Data = data }
+                match identity with
+                | None -> return StateLoaded NoIdentity
+                | Some id ->
+                    let data = Store.loadData ()
+                    return StateLoaded(Loaded(id, data))
             })
 
         | CmdSaveIdentity identity ->

@@ -11,7 +11,6 @@ module ApiClient =
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
     type PollEvent = { Id: string; Payload: EventPayload }
 
-    type AuthResult = { Token: string; ExpiresAt: int64 }
     type SendResult = { Status: string; MessageId: string }
     type PollResponse = { Events: PollEvent list; Cursor: uint64 }
 
@@ -45,15 +44,6 @@ module ApiClient =
 
     let private postJson url body token = postJsonWith client url body token
 
-    let private getJson (url: string) (token: string) =
-        async {
-            let request = new HttpRequestMessage(HttpMethod.Get, url)
-            request.Headers.Add("Authorization", $"Bearer {token}")
-            let! response = client.SendAsync(request) |> awaitTask
-            let! text = response.Content.ReadAsStringAsync() |> awaitTask
-            return JsonDocument.Parse(text)
-        }
-
     let private expectObject (doc: JsonDocument) (endpoint: string) =
         let root = doc.RootElement
 
@@ -78,9 +68,9 @@ module ApiClient =
 
             let! doc = postJson $"{serverUrl}/auth/verify" body None
             let root = expectObject doc "/auth/verify"
-            return
-                { Token = root.GetProperty("token").GetString()
-                  ExpiresAt = root.GetProperty("expiresAt").GetInt64() }
+            let token = root.GetProperty("token").GetString()
+            if String.IsNullOrEmpty(token) then failwith "Authentication rejected by server"
+            return token
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
