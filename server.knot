@@ -48,9 +48,7 @@ federationEnabled = federationSecret != ""
 -- Types
 -- ============================================
 
-type PollEventType = Text where \s -> s == "message"
-
-type PollEvent = {id: MessageIdHex, eventType: PollEventType, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
+type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
 type GossipEventType = Text where \s -> s == "online" || s == "offline"
 
@@ -58,26 +56,29 @@ type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: Serve
 
 type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
-type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || s == "delivered" || s == "federated" || s == "queued"
+isDeliveryStatus = \s -> s == "delivered" || s == "federated" || s == "queued"
+type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || isDeliveryStatus s
 
 type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) && s == normalizeHex s
 type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen) && s == normalizeHex s
 type SignatureHex = Text where \s -> isValidHex s && not (tooLong s maxSignatureLen) && s == normalizeHex s
 type MessageIdHex = Text where \s -> isValidHex s && not (tooLong s maxMessageIdLen) && s == normalizeHex s
-type ServerName = Text where \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
-type OptionalServerName = Text where \s -> s == "" || (not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s))
+isValidServerName = \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
+type ServerName = Text where isValidServerName
+type OptionalServerName = Text where \s -> s == "" || isValidServerName s
+type AnyServerName = Text where \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s
 
 type Timestamp = Int<Ms>
 
 type Challenge = {pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp}
 type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp}
 type Message = {messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: OptionalServerName, receivedAt: Timestamp}
-type PresenceEntry = {pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp}
+type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Timestamp, timestamp: Timestamp}
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [ServerName]}
-type DeliveryStatus = Text where \s -> s == "delivered" || s == "federated" || s == "queued"
+type DeliveryStatus = Text where isDeliveryStatus
 type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: DeliveryStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
 
 
@@ -265,14 +266,16 @@ normalizeServerName = \s -> toLower (stripTrailingDot s)
 
 serverHostN = normalizeServerName serverHost
 
-containsSuffix = \suffix suffixLen s ->
+containsSuffixN = \suffix suffixLen s ->
   if s == "" then False {}
   else if take suffixLen s == suffix && (drop suffixLen s == "" || take 1 (drop suffixLen s) == ":") then True {}
-  else containsSuffix suffix suffixLen (drop 1 s)
+  else containsSuffixN suffix suffixLen (drop 1 s)
 
-containsLocalhostSuffix = \s -> containsSuffix ".localhost" 10 s
-containsLocalSuffix = \s -> containsSuffix ".local" 6 s
-containsInternalSuffix = \s -> containsSuffix ".internal" 9 s
+containsSuffix = \suffix s -> containsSuffixN suffix (count (chars suffix)) s
+
+containsLocalhostSuffix = \s -> containsSuffix ".localhost" s
+containsLocalSuffix = \s -> containsSuffix ".local" s
+containsInternalSuffix = \s -> containsSuffix ".internal" s
 
 is172Private = \sn ->
   take 4 sn == "172."
@@ -463,6 +466,22 @@ removeOffline = \presenceSet offlineOnlyKeys trustedOffline t ->
     where samePubkeyServer p k && any trustedOffline (\o -> samePubkeyServer o k && (if o.timestamp > t then t else o.timestamp) > p.timestamp)
     yield p)
 
+capGossipPresence = \afterOffline appliedOnline trustedDeduped presence offlineOnlyKeys trustedOffline t ->
+  if count afterOffline <= maxPresenceEntries
+    then {finalPresence: afterOffline, appliedOnline: appliedOnline, withinCapacity: True {}}
+    else
+      let updatesOnly = do e <- trustedDeduped; where any presence (\p -> samePubkeyServer p e); yield e in
+      let updatesOnlyMerged = mergeByPubkeyServer presence updatesOnly in
+      let updatesOnlyAfterOffline = removeOffline updatesOnlyMerged offlineOnlyKeys trustedOffline t in
+      let reclaimSlots = maxPresenceEntries - count updatesOnlyAfterOffline in
+      let newEntries = do e <- trustedDeduped; where none presence (\p -> samePubkeyServer p e); yield e in
+      let reclaimedEntries = takeN newEntries reclaimSlots in
+      {finalPresence: union updatesOnlyAfterOffline reclaimedEntries,
+       appliedOnline: union
+        (do e <- updatesOnly; where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield {pubkey: e.pubkey, server: e.server})
+        (do e <- reclaimedEntries; yield {pubkey: e.pubkey, server: e.server}),
+       withinCapacity: False {}}
+
 countMessagesFor = \messages toKey t ->
   count (do
     m <- messages
@@ -617,7 +636,7 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
     a <- evictedEntries
     where none pendingAcks (\a2 -> a2.messageId == a.messageId && a2.toKey == a.toKey)
     yield a
-  in when (count evictedToRetry > 0) (do
+  in do
     let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
     sendToEach evictedOriginServers (\server -> do
       fetchResult <- fetch (federationScheme ++ server) (FederationAck {
@@ -637,7 +656,7 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
             yield excess
           when (dropped > 0)
             (println ("ackMessages: ackedIds at capacity (" ++ show maxAckedIds ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server))
-        _ -> yield {}))
+        _ -> yield {})
 
 pruneAndRetry = \t -> do
   result <- atomic do
@@ -649,11 +668,9 @@ pruneAndRetry = \t -> do
     yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: forwards, pendingAcks: pendingAcks}
   broadcastOfflineGossip t result.peerServers result.expiredLocal
   when federationEnabled (do
-    when (count result.pendingForwards > 0)
-      (retryPendingForwards result.pendingForwards)
-    when (count result.pendingAcks > 0) (do
-      let ackOriginServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
-      sendAcksAndClean result.pendingAcks ackOriginServers))
+    retryPendingForwards result.pendingForwards
+    let ackOriginServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
+    sendAcksAndClean result.pendingAcks ackOriginServers)
 
 pollOnce = \token cursor -> do
   t <- now
@@ -920,23 +937,10 @@ serve = \req -> case req of
             where any presence (\p -> samePubkeyServer p k && any trustedOffline (\o -> samePubkeyServer o k && (if o.timestamp > t then t else o.timestamp) > p.timestamp))
             yield {pubkey: k.pubkey, server: k.server}
           let afterOffline = removeOffline merged offlineOnlyKeys trustedOffline t
-          let withinCapacity = count afterOffline <= maxPresenceEntries
-          let capResult = if withinCapacity
-            then {finalPresence: afterOffline, appliedOnline: appliedOnline}
-            else
-              let updatesOnly = do e <- trustedDeduped; where any presence (\p -> samePubkeyServer p e); yield e in
-              let updatesOnlyMerged = mergeByPubkeyServer presence updatesOnly in
-              let updatesOnlyAfterOffline = removeOffline updatesOnlyMerged offlineOnlyKeys trustedOffline t in
-              let reclaimSlots = maxPresenceEntries - count updatesOnlyAfterOffline in
-              let newEntries = do e <- trustedDeduped; where none presence (\p -> samePubkeyServer p e); yield e in
-              let reclaimedEntries = takeN newEntries reclaimSlots in
-              {finalPresence: union updatesOnlyAfterOffline reclaimedEntries,
-               appliedOnline: union
-                (do e <- updatesOnly; where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield {pubkey: e.pubkey, server: e.server})
-                (do e <- reclaimedEntries; yield {pubkey: e.pubkey, server: e.server})}
+          let capResult = capGossipPresence afterOffline appliedOnline trustedDeduped presence offlineOnlyKeys trustedOffline t
           set *presence = capResult.finalPresence
           let gossipPeerServers = collectPeerServers capResult.finalPresence (\p -> p.server)
-          yield {appliedKeys: union capResult.appliedOnline appliedOffline, pr: pr, gossipPeerServers: gossipPeerServers, withinCapacity: withinCapacity}
+          yield {appliedKeys: union capResult.appliedOnline appliedOffline, pr: pr, gossipPeerServers: gossipPeerServers, withinCapacity: capResult.withinCapacity}
         let effectiveEvents = do
           e <- union filteredOnline filteredOffline
           where any gossipResult.appliedKeys (\a -> samePubkeyServer a e)

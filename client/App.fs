@@ -45,8 +45,8 @@ module App =
     type Page =
         | Setup
         | Conversations
-        | Chat of pubkey: string * compose: string
-        | AddContact of pubkey: string * nickname: string
+        | Chat of pubkey: string
+        | AddContact
         | Settings
 
     type Session = { Url: string; Token: string; Identity: Identity }
@@ -70,12 +70,18 @@ module App =
           PollStatus: string
           Messages: Map<string, ChatMessage list>
           Error: string option
-          PollCursor: int64 }
+          PollCursor: int64
+          Compose: string
+          ContactPubkey: string
+          ContactNickname: string }
 
     // ── Msg ──
 
     type Msg =
         | SetPage of Page
+        | SetCompose of string
+        | SetContactPubkey of string
+        | SetContactNickname of string
         | GenIdentity
         | IdentityReady of Identity
         | SetServerUrl of string
@@ -175,14 +181,25 @@ module App =
           Contacts = []
           Messages = Map.empty
           Error = None
-          PollCursor = 0L },
+          PollCursor = 0L
+          Compose = ""
+          ContactPubkey = ""
+          ContactNickname = "" },
         [ CmdLoadState ]
 
     // ── Update ──
 
     let update msg model =
         match msg with
+        | SetPage(Chat pk) ->
+            { model with Page = Chat pk; Compose = "" }, []
+        | SetPage AddContact ->
+            { model with Page = AddContact; ContactPubkey = ""; ContactNickname = "" }, []
         | SetPage page -> { model with Page = page }, []
+
+        | SetCompose text -> { model with Compose = text }, []
+        | SetContactPubkey pk -> { model with ContactPubkey = pk }, []
+        | SetContactNickname nn -> { model with ContactNickname = nn }, []
 
         | GenIdentity -> model, [ CmdGenIdentity ]
 
@@ -212,20 +229,21 @@ module App =
 
         | DoSend ->
             match model.Page, trySession model with
-            | Chat(pk, compose), Some session when compose <> "" ->
+            | Chat pk, Some session when model.Compose <> "" ->
+                let text = model.Compose
                 let id = Guid.NewGuid().ToString()
                 let outMsg =
                     { Id = id
-                      Body = compose
+                      Body = text
                       Timestamp = DateTimeOffset.UtcNow
                       IsOutgoing = true }
 
                 let model' =
                     { model with
-                        Page = Chat(pk, "")
+                        Compose = ""
                         Messages = model.Messages |> appendMessage pk outMsg }
 
-                model', [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
+                model', [ CmdSend(session, pk, text, id); saveCmdMsg model' ]
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
@@ -247,8 +265,9 @@ module App =
               if not incoming.IsEmpty then saveCmdMsg model' ]
 
         | DoSaveContact ->
+            let pk, nn = model.ContactPubkey, model.ContactNickname
             match model.Page with
-            | AddContact(pk, nn) when pk <> "" && nn <> "" ->
+            | AddContact when pk <> "" && nn <> "" ->
                 match Phonemic.fromOb pk |> Option.orElseWith (fun () -> Crypto.tryFromHex pk) with
                 | Some bytes when bytes.Length = 32 ->
                     let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = nn }
@@ -482,7 +501,7 @@ module App =
                         Label("Conversations")
                             .font(size = 24.)
 
-                        Button("+", SetPage(AddContact("", "")))
+                        Button("+", SetPage AddContact)
                         Button("Settings", SetPage Settings)
                     }
 
@@ -511,13 +530,13 @@ module App =
                             |> Option.map (fun m -> truncate 40 m.Body)
                             |> Option.defaultValue ""
 
-                        Button($"{c.Nickname}\n{preview}", SetPage(Chat(c.Pubkey, "")))
+                        Button($"{c.Nickname}\n{preview}", SetPage(Chat c.Pubkey))
                 })
                     .padding(20.)
             )
         )
 
-    let private viewChat model pk compose =
+    let private viewChat model pk =
         let name = contactName model.Contacts pk
         let msgs = messagesFor pk model.Messages
 
@@ -549,7 +568,7 @@ module App =
                     .font(size = 14.)
 
                 HStack(spacing = 8.) {
-                    Entry(compose, fun t -> SetPage(Chat(pk, t)))
+                    Entry(model.Compose, SetCompose)
                         .placeholder("Message...")
 
                     Button("Send", DoSend)
@@ -558,7 +577,7 @@ module App =
                 .padding(12.)
         )
 
-    let private viewAddContact pk nn =
+    let private viewAddContact model =
         ContentPage(
             (VStack(spacing = 16.) {
                 HStack(spacing = 8.) {
@@ -569,11 +588,11 @@ module App =
                 }
 
                 Label("Public Key:")
-                Entry(pk, fun t -> SetPage(AddContact(t, nn)))
+                Entry(model.ContactPubkey, SetContactPubkey)
                     .placeholder("sampel-palnet-...")
 
                 Label("Nickname:")
-                Entry(nn, fun t -> SetPage(AddContact(pk, t)))
+                Entry(model.ContactNickname, SetContactNickname)
 
                 Button("Save Contact", DoSaveContact)
                     .centerHorizontal()
@@ -587,8 +606,8 @@ module App =
             | Setup -> viewSetup ()
             | Settings -> viewSettings model
             | Conversations -> viewConversations model
-            | Chat(pk, compose) -> viewChat model pk compose
-            | AddContact(pk, nn) -> viewAddContact pk nn
+            | Chat pk -> viewChat model pk
+            | AddContact -> viewAddContact model
 
         Application() { Window(page) }
 
