@@ -69,10 +69,10 @@ type PresenceEntry = {pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, tim
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
-type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [Text]}
+type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [ServerName]}
 type PollResult = PollUnauthorized {} | PollAuthorized {events: [PollEvent], cursor: Timestamp}
-type VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [Text]}
-type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [Text], fromKey: PubkeyHex}
+type VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
+type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
 type AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 type LookupResult = LookupUnauthorized {} | LookupDone {foundServer: OptionalServerName}
 
@@ -370,6 +370,9 @@ authenticateSession = \sessions token t ->
   case headOf (do s <- sessions; where safeCompare s.token token && s.expiresAt > t; yield s) of
     Nothing {} -> Unauthorized {}
     Just {value: s} -> Authorized {pubkey: s.pubkey}
+
+authenticateRequest = \sessions authorization t ->
+  authenticateSession sessions (extractToken authorization) t
 
 extractToken = \authHeader ->
   let token = drop 7 authHeader in
@@ -771,11 +774,7 @@ serve = \req -> case req of
       case result.verify of
         VerifyOk {peerServers} ->
           when federationEnabled
-            (sendToEach peerServers (\server -> do
-              _ <- fetch (federationScheme ++ server) (RecvGossip {
-                authorization: "Bearer " ++ federationSecret,
-                events: [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHostN})
-              yield {}))
+            (sendBatchedGossip peerServers [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}] 2)
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers expiredLocal)
     yield (case result.verify of
@@ -797,14 +796,13 @@ serve = \req -> case req of
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     let to = normalizeHex to
     let encryptedBlob = normalizeHex encryptedBlob
-    let token = extractToken authorization
     t <- now
     msgId <- genToken
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       pr <- maybePrune t
       sessions <- *sessions
-      let auth = authenticateSession sessions token t
+      let auth = authenticateRequest sessions authorization t
       case auth of
         Unauthorized {} ->
           yield {pr: pr, send: SendUnauthorized {}}
@@ -853,13 +851,12 @@ serve = \req -> case req of
       SendDone {status} -> respond {status: status, messageId: msgId})
 
   AckMessages {messageIds, authorization, respond} -> do
-    let token = extractToken authorization
     t <- now
     let dedupedIds = dedupMessageIds messageIds
     result <- atomic do
       pr <- maybePrune t
       sessions <- *sessions
-      let auth = authenticateSession sessions token t
+      let auth = authenticateRequest sessions authorization t
       case auth of
         Unauthorized {} ->
           yield {pr: pr, ack: AckUnauthorized {}}
@@ -921,12 +918,11 @@ serve = \req -> case req of
 
   LookupPresence {pubkey, authorization, respond} -> do
     let pubkey = normalizeHex pubkey
-    let token = extractToken authorization
     t <- now
     result <- atomic do
       pr <- maybePrune t
       sessions <- *sessions
-      let auth = authenticateSession sessions token t
+      let auth = authenticateRequest sessions authorization t
       case auth of
         Unauthorized {} ->
           yield {pr: pr, lookup: LookupUnauthorized {}}

@@ -39,14 +39,6 @@ module ApiClient =
                 else ok t.Result)
             |> ignore)
 
-    type private FlexibleInt64Converter() =
-        inherit JsonConverter<int64>()
-        override _.Read(reader, _, _) =
-            match reader.TokenType with
-            | JsonTokenType.String -> Int64.Parse(reader.GetString())
-            | _ -> reader.GetInt64()
-        override _.Write(writer, value, _) = writer.WriteNumberValue(value)
-
     type private MessageStatusConverter() =
         inherit JsonConverter<MessageStatus>()
         override _.Read(reader, _, _) =
@@ -67,8 +59,7 @@ module ApiClient =
                 | Unauthorized -> "unauthorized")
 
     let private jsonOpts =
-        let opts = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
-        opts.Converters.Add(FlexibleInt64Converter())
+        let opts = JsonSerializerOptions(PropertyNameCaseInsensitive = true, NumberHandling = JsonNumberHandling.AllowReadingFromString)
         opts.Converters.Add(MessageStatusConverter())
         opts
 
@@ -84,34 +75,24 @@ module ApiClient =
 
     let private sendRequest (httpClient: HttpClient) (url: string) (body: string) (token: string option) =
         async {
-            let request = new HttpRequestMessage(HttpMethod.Post, url)
+            use request = new HttpRequestMessage(HttpMethod.Post, url)
             request.Content <- new StringContent(body, Encoding.UTF8, "application/json")
-
-            token
-            |> Option.iter (fun t -> request.Headers.Add("Authorization", $"Bearer {t}"))
-
-            let! response = httpClient.SendAsync(request) |> awaitTask
+            token |> Option.iter (fun t -> request.Headers.Add("Authorization", $"Bearer {t}"))
+            use! response = httpClient.SendAsync(request) |> awaitTask
             let! text = response.Content.ReadAsStringAsync() |> awaitTask
-            let doc = JsonDocument.Parse(text)
-
+            use doc = JsonDocument.Parse(text)
             match doc.RootElement.TryGetProperty("error") with
-            | true, err ->
-                let msg = err.GetString()
-                doc.Dispose()
-                return failwith $"{url}: {msg}"
-            | _ -> return doc
+            | true, err -> return failwith $"{url}: {err.GetString()}"
+            | _ -> return text
         }
 
     let private post httpClient url body token =
-        async {
-            use! _doc = sendRequest httpClient url body token
-            return ()
-        }
+        sendRequest httpClient url body token |> Async.Ignore
 
     let private postJson<'T> httpClient url body token =
         async {
-            use! doc = sendRequest httpClient url body token
-            return doc.RootElement.Deserialize<'T>(jsonOpts)
+            let! text = sendRequest httpClient url body token
+            return JsonSerializer.Deserialize<'T>(text, jsonOpts)
         }
 
     let authenticate (serverUrl: string) (identity: Crypto.Identity) =

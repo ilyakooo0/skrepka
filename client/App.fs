@@ -201,11 +201,11 @@ module App =
                 model', CmdSend(session, pk, compose, id) :: saveCmd model'
             | _ -> model, []
 
+        | Sent(Ok { Status = ApiClient.Delivered | ApiClient.Federated | ApiClient.Queued }) -> model, []
         | Sent(Ok { Status = ApiClient.Rejected }) ->
             { model with Error = Some "Message rejected by server" }, []
         | Sent(Ok { Status = ApiClient.Unauthorized }) ->
             { model with Error = Some "Not authorized to deliver message" }, []
-        | Sent(Ok _) -> model, []
         | Sent(Error err) -> { model with Error = Some $"Send failed: {err}" }, []
 
         | PollResult(incoming, status, newCursor) ->
@@ -493,8 +493,7 @@ module App =
                             model.Messages
                             |> Map.tryFind c.Pubkey
                             |> Option.bind List.tryLast
-                            |> Option.map _.Body
-                            |> Option.map (fun b -> if b.Length > 40 then b.[..39] + "..." else b)
+                            |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
                             |> Option.defaultValue ""
 
                         Button($"{c.Nickname}\n{preview}", Nav(Chat(c.Pubkey, "")))

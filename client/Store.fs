@@ -71,9 +71,9 @@ module Store =
             use db = openDb ()
             let settings = db.GetCollection<SettingsDoc>("settings").FindById(BsonValue "settings")
 
-            match box settings with
-            | null -> None
-            | _ ->
+            match settings |> Option.ofObj with
+            | None -> None
+            | Some settings ->
                 let contacts = db.GetCollection<Contact>("contacts").FindAll() |> Seq.toList
 
                 let messages =
