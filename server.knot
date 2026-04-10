@@ -49,6 +49,8 @@ type GossipEventType = Text where \s -> s == "online" || s == "offline"
 
 type GossipEvent = {eventType: GossipEventType, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int<S>}
 
+type ValidGossipEntry = {pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
+
 type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || s == "delivered" || s == "federated" || s == "queued"
 
 type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen)
@@ -68,7 +70,7 @@ type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: T
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = {authorized: Bool, pubkey: Text}
 type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [Text]}
-type ForwardInfo = {messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, toServer: ServerName}
+
 
 -- ============================================
 -- Persisted State
@@ -326,20 +328,23 @@ isHighOctetPrefix = \sn ->
     || (d2 == "4" && isDigitChar d3)
     || (d2 == "5" && (d3 == "0" || d3 == "1" || d3 == "2" || d3 == "3" || d3 == "4" || d3 == "5")))
 
+matchesHostname = \sn name nameLen ->
+  take nameLen sn == name && (drop nameLen sn == "" || take 1 (drop nameLen sn) == ":")
+
 isBadServerName = \s ->
   let sn = toLower (stripTrailingDot s) in
   sn == ""
   || take 1 sn == "."
   || take 1 sn == ":"
   || containsBadUrlChar sn
-  || sn == "localhost" || take 10 sn == "localhost:"
-  || sn == "localhost.localdomain" || take 22 sn == "localhost.localdomain:"
+  || matchesHostname sn "localhost" 9
+  || matchesHostname sn "localhost.localdomain" 21
   || containsLocalhostSuffix sn
-  || sn == "local" || take 6 sn == "local:"
+  || matchesHostname sn "local" 5
   || containsLocalSuffix sn
-  || sn == "internal" || take 9 sn == "internal:"
+  || matchesHostname sn "internal" 8
   || containsInternalSuffix sn
-  || sn == "metadata" || take 9 sn == "metadata:"
+  || matchesHostname sn "metadata" 8
   || take 4 sn == "127." || take 3 sn == "10."
   || take 8 sn == "192.168." || take 8 sn == "169.254."
   || take 2 sn == "0." || take 1 sn == "["
@@ -489,22 +494,12 @@ countMessagesFor = \messages toKey t ->
     where m.receivedAt >= t - messageMaxAge
     yield m)
 
-&pendingAcks = do
-  ackedIds <- *ackedIds
-  yield (do a <- ackedIds; where isFederatedOrigin a.originServer; yield a)
 
-&knownMessageKeys = do
-  messages <- *messages
-  ackedIds <- *ackedIds
-  yield (union
-    (do m <- messages; yield {messageId: m.messageId, toKey: m.toKey})
-    (do a <- ackedIds; yield {messageId: a.messageId, toKey: a.toKey}))
-
-validGossipEvents : [GossipEvent] -> Bool -> Timestamp -> GossipEventType -> [{pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}]
+validGossipEvents : [GossipEvent] -> Bool -> Timestamp -> GossipEventType -> [ValidGossipEntry]
 validGossipEvents = \events validRequest t eventType ->
-  do
+  if not validRequest then []
+  else do
     e <- events
-    where validRequest
     where e.eventType == eventType
     where not (e.server == "")
     where not (e.pubkey == "")
@@ -583,10 +578,7 @@ sendBatchedGossipToServer = \server allEvents ->
 
 sendBatchedGossip : [Text] -> [GossipEvent] -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents ->
-  if count allEvents == 0
-    then yield {}
-    else
-      sendToEach peerServers (\server -> sendBatchedGossipToServer server allEvents)
+  sendToEach peerServers (\server -> sendBatchedGossipToServer server allEvents)
 
 broadcastOfflineGossip = \t peerServers expiredLocal -> do
   let expiredEntries = mergeByKey (\a b -> a.pubkey == b.pubkey) [] (do
@@ -610,7 +602,7 @@ removeForward = \mid srv -> atomic do
     where not (x.messageId == mid && x.toServer == srv)
     yield x
 
-retryForwardsForServer : [ForwardInfo] -> Int -> IO {network} {}
+retryForwardsForServer : [ForwardEntry] -> Int -> IO {network} {}
 retryForwardsForServer = \entries remaining ->
   if remaining <= 0
     then yield {}
@@ -629,7 +621,7 @@ retryForwardsForServer = \entries remaining ->
           Err _ -> yield {}
         retryForwardsForServer rest (remaining - 1)
 
-retryPendingForwards : [ForwardInfo] -> IO {network} {}
+retryPendingForwards : [ForwardEntry] -> IO {network} {}
 retryPendingForwards = \pending -> do
   let servers = collectPeerServers pending (\x -> x.toServer)
   sendToEach servers (\server ->
@@ -668,10 +660,9 @@ pruneAndRetry = \t -> do
     set *lastPrunedAt = t
     pr <- pruneExpired t
     forwards <- *forwards
-    let pendingForwards = do
-      f <- forwards
-      yield {toServer: f.toServer, toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, messageId: f.messageId}
-    pendingAcks <- &pendingAcks
+    let pendingForwards = forwards
+    ackedIds <- *ackedIds
+    let pendingAcks = do a <- ackedIds; where isFederatedOrigin a.originServer; yield a
     yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
   broadcastOfflineGossip t result.peerServers result.expiredLocal
   if federationEnabled && count result.pendingForwards > 0
@@ -976,7 +967,7 @@ serve = \req -> case req of
         where p.pubkey == pubkey
         where p.expiresAt > t
         yield p
-      let foundServer = if not authorized || count valid == 0
+      let foundServer = if not authorized
         then ""
         else if any valid (\p -> p.server == serverHostN)
           then serverHostN
@@ -1114,12 +1105,12 @@ serve = \req -> case req of
       messages <- *messages
       seqCounter <- *seqCounter
       let seqTs = nextSeqTs t seqCounter
-      let recipientMsgCount = if not (authorized && validOrigin) then 0
-        else countMessagesFor messages toKey t
-      knownKeys <- &knownMessageKeys
-      let exists = if not (authorized && validOrigin) then False {}
-        else any knownKeys (\k -> k.messageId == messageId && k.toKey == toKey)
-      let shouldInsert = authorized && validOrigin && not exists && recipientMsgCount < maxMessagesPerRecipient
+      ackedIds <- *ackedIds
+      let exists = authorized && validOrigin
+        && (any messages (\m -> m.messageId == messageId && m.toKey == toKey)
+          || any ackedIds (\a -> a.messageId == messageId && a.toKey == toKey))
+      let shouldInsert = authorized && validOrigin && not exists
+        && countMessagesFor messages toKey t < maxMessagesPerRecipient
       set *seqCounter = if shouldInsert then seqTs else seqCounter
       set *messages = if shouldInsert
         then union messages

@@ -13,7 +13,7 @@ module App =
 
     // ── Domain Types ──
 
-    type Contact = { Pubkey: string; Nickname: string }
+    type Contact = Store.Contact
 
     type ChatMessage =
         { Id: string
@@ -40,7 +40,7 @@ module App =
 
     type ConnState =
         | Offline
-        | Connecting
+        | Connecting of Identity
         | Online of Session
 
     type PollResultData =
@@ -82,7 +82,7 @@ module App =
         | DoDisconnect
         | SetCompose of string
         | DoSend
-        | Sent of status: string
+        | Sent of ApiClient.SendResult
         | SetNewPubkey of string
         | SetNewNickname of string
         | DoSaveContact
@@ -178,17 +178,16 @@ module App =
         | DoConnect ->
             match model.Identity with
             | Some id ->
-                { model with Conn = Connecting }, [ CmdConnect(model.ServerUrl, id) ]
+                { model with Conn = Connecting id }, [ CmdConnect(model.ServerUrl, id) ]
             | None -> { model with Error = Some "No identity generated" }, []
 
         | AuthOk token ->
-            match model.Identity with
-            | Some id ->
+            match model.Conn with
+            | Connecting id ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
                 { model with Conn = Online session; Page = Conversations; Error = None },
                 [ CmdPoll(session, model.PollCursor) ]
-            | None ->
-                { model with Error = Some "No identity generated" }, []
+            | _ -> model, []
 
         | AuthErr err -> { model with Conn = Offline; Error = Some err }, []
 
@@ -215,7 +214,7 @@ module App =
                 model', CmdSend(session, pk, text, id) :: saveCmd model'
             | _ -> model, []
 
-        | Sent status -> { model with LastSendStatus = status }, []
+        | Sent result -> { model with LastSendStatus = $"{result.Status}:{result.MessageId}" }, []
 
         | PollResult { Messages = incoming; Status = status; Cursor = newCursor } ->
             let model' =
@@ -286,35 +285,26 @@ module App =
             match identityOpt with
             | None -> model, []
             | Some identity ->
-                let model' = { model with Identity = Some identity; Conn = Connecting }
+                let model' = { model with Identity = Some identity; Conn = Connecting identity }
 
                 let model' =
                     match dataOpt with
                     | Some data ->
-                        let contacts =
-                            data.Contacts
-                            |> Array.toList
-                            |> List.map (fun c ->
-                                { Pubkey = c.Pubkey; Nickname = c.Nickname }: Contact)
-
                         let messages =
                             data.Messages
-                            |> Seq.fold
-                                (fun acc (KeyValue(pk, dtos)) ->
-                                    let msgs =
-                                        dtos
-                                        |> Array.toList
-                                        |> List.map (fun m ->
-                                            { Id = m.Id
-                                              Body = m.Body
-                                              Timestamp = DateTimeOffset.FromUnixTimeSeconds m.TimestampUnix
-                                              IsOutgoing = m.IsOutgoing })
-
-                                    acc |> Map.add pk msgs)
-                                Map.empty
+                            |> Seq.map (fun (KeyValue(pk, dtos)) ->
+                                pk,
+                                dtos
+                                |> Array.toList
+                                |> List.map (fun m ->
+                                    { Id = m.Id
+                                      Body = m.Body
+                                      Timestamp = DateTimeOffset.FromUnixTimeSeconds m.TimestampUnix
+                                      IsOutgoing = m.IsOutgoing }))
+                            |> Map.ofSeq
 
                         { model' with
-                            Contacts = contacts
+                            Contacts = data.Contacts |> Array.toList
                             Messages = messages
                             ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
                             PollCursor = data.PollCursor
@@ -391,7 +381,7 @@ module App =
                     let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob
                     let! result = ApiClient.sendMessage session.Url session.Token recipientHex blobHex ts
-                    return Sent $"{result.Status}:{result.MessageId}"
+                    return Sent result
                 with ex ->
                     return DismissError  // TODO: show send errors properly
             })
@@ -444,13 +434,6 @@ module App =
 
         | CmdSaveData(contacts, messages, serverUrl, cursor) ->
             Cmd.ofEffect (fun _ ->
-                let contactDtos =
-                    contacts
-                    |> List.map (fun c ->
-                        { Store.ContactDto.Pubkey = c.Pubkey
-                          Store.ContactDto.Nickname = c.Nickname })
-                    |> Array.ofList
-
                 let messageDtos = Dictionary<string, Store.MessageDto array>()
 
                 messages
@@ -465,7 +448,7 @@ module App =
                         |> Array.ofList)
 
                 Store.saveData
-                    { Contacts = contactDtos
+                    { Contacts = contacts |> Array.ofList
                       Messages = messageDtos
                       ServerUrl = serverUrl
                       PollCursor = cursor })
@@ -520,7 +503,7 @@ module App =
 
                     match model.Conn with
                     | Offline -> Button("Connect", DoConnect)
-                    | Connecting -> Label("Connecting...").centerTextHorizontal()
+                    | Connecting _ -> Label("Connecting...").centerTextHorizontal()
                     | Online _ ->
                         Button("Disconnect", DoDisconnect)
                         Button("Go to Conversations", Nav Conversations)
@@ -533,7 +516,7 @@ module App =
         let connStr =
             match model.Conn with
             | Offline -> "OFFLINE"
-            | Connecting -> "CONNECTING"
+            | Connecting _ -> "CONNECTING"
             | Online _ -> "ONLINE"
 
         let contactNames =

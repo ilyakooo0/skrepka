@@ -9,7 +9,7 @@ open Microsoft.Maui.Storage
 module Store =
 
     [<CLIMutable>]
-    type ContactDto =
+    type Contact =
         { Pubkey: string
           Nickname: string }
 
@@ -22,7 +22,7 @@ module Store =
 
     [<CLIMutable>]
     type DataDto =
-        { Contacts: ContactDto array
+        { Contacts: Contact array
           Messages: Dictionary<string, MessageDto array>
           ServerUrl: string
           PollCursor: uint64 }
