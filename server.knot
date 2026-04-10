@@ -53,10 +53,10 @@ type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: 
 
 type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || s == "delivered" || s == "federated" || s == "queued"
 
-type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen)
-type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen)
-type SignatureHex = Text where \s -> isValidHex s && not (tooLong s maxSignatureLen)
-type MessageIdHex = Text where \s -> isValidHex s && not (tooLong s maxMessageIdLen)
+type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) && s == normalizeHex s
+type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen) && s == normalizeHex s
+type SignatureHex = Text where \s -> isValidHex s && not (tooLong s maxSignatureLen) && s == normalizeHex s
+type MessageIdHex = Text where \s -> isValidHex s && not (tooLong s maxMessageIdLen) && s == normalizeHex s
 type ServerName = Text where \s -> not (tooLong s maxServerNameLen) && not (isBadServerName s)
 type OptionalServerName = Text where \s -> s == "" || (not (tooLong s maxServerNameLen) && not (isBadServerName s))
 
@@ -70,10 +70,8 @@ type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: T
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [ServerName]}
-type PollResult = PollUnauthorized {} | PollAuthorized {events: [PollEvent], cursor: Timestamp}
 type DeliveryStatus = Text where \s -> s == "delivered" || s == "federated" || s == "queued"
 type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: DeliveryStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
-type AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 
 
 -- ============================================
@@ -370,8 +368,9 @@ authenticateSession = \sessions token t ->
     Nothing {} -> Unauthorized {}
     Just {value: s} -> Authorized {pubkey: s.pubkey}
 
-authenticateRequest = \sessions authorization t ->
-  authenticateSession sessions (extractToken authorization) t
+authenticateRequest = \authorization t -> do
+  sessions <- *sessions
+  yield (authenticateSession sessions (extractToken authorization) t)
 
 extractToken = \authHeader ->
   let token = drop 7 authHeader in
@@ -401,10 +400,9 @@ takeN = \items n -> (fold (\acc e -> if acc.n >= n then acc else {n: acc.n + 1, 
 
 dedupMessageIds = \messageIds ->
   fold (\acc mid ->
-    let nmid = normalizeHex mid in
     if count acc >= maxMessageIds then acc
-    else if any acc (\a -> a == nmid) then acc
-    else union acc [nmid]) [] messageIds
+    else if any acc (\a -> a == mid) then acc
+    else union acc [mid]) [] messageIds
 
 boundedSmallest = \items n getKey ->
   (fold (\acc a ->
@@ -703,7 +701,7 @@ pollOnce = \token cursor -> do
     let auth = authenticateSession sessions token t
     case auth of
       Unauthorized {} ->
-        yield PollUnauthorized {}
+        yield {events: [], cursor: -1, authorized: False {}}
       Authorized {pubkey} -> do
         seqCounter <- *seqCounter
         messages <- *messages
@@ -721,21 +719,16 @@ pollOnce = \token cursor -> do
                             encryptedBlob: m.encryptedBlob,
                             timestamp: m.timestamp}}
         let lastReceivedAt = fold (\acc m -> if m.receivedAt > acc then m.receivedAt else acc) clampedCursor limitedMsgs
-        yield PollAuthorized {events: evts, cursor: lastReceivedAt}
+        yield {events: evts, cursor: lastReceivedAt, authorized: True {}}
 
 pollLoop = \token cursor deadline -> do
   result <- pollOnce token cursor
   t <- now
-  case result of
-    PollUnauthorized {} -> yield result
-    PollAuthorized {events} ->
-      if count events == 0 && t < deadline
-        then do
-          let remaining = deadline - t
-          let sleepMs  = if remaining > 500 then 500<Ms> else remaining
-          sleep sleepMs
-          pollLoop token cursor deadline
-        else yield result
+  if result.authorized && count result.events == 0 && t < deadline
+    then do
+      sleep (clamp 1 500 (deadline - t))
+      pollLoop token cursor deadline
+    else yield result
 
 -- ============================================
 -- Request Handler
@@ -744,7 +737,6 @@ pollLoop = \token cursor deadline -> do
 serve = \req -> case req of
 
   ReqChallenge {pubkey, respond} -> do
-    let pubkey = normalizeHex pubkey
     challenge <- genToken
     t <- now
     pruneResult <- atomic do
@@ -759,7 +751,6 @@ serve = \req -> case req of
     yield (respond {challenge: challenge})
 
   VerifyAuth {pubkey, challenge, signature, respond} -> do
-    let pubkey = normalizeHex pubkey
     t <- now
     token <- genToken
     let expiry = t + sessionExpiry
@@ -809,20 +800,15 @@ serve = \req -> case req of
     result <- pollLoop token cursor deadline
     tAfterPoll <- now
     maybePruneAndBroadcast tAfterPoll
-    yield (case result of
-      PollUnauthorized {} -> respond {events: [], cursor: -1, authorized: False {}}
-      PollAuthorized {events, cursor: c} -> respond {events: events, cursor: c, authorized: True {}})
+    yield (respond result)
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
-    let to = normalizeHex to
-    let encryptedBlob = normalizeHex encryptedBlob
     t <- now
     msgId <- genToken
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       pr <- maybePrune t
-      sessions <- *sessions
-      let auth = authenticateRequest sessions authorization t
+      auth <- authenticateRequest authorization t
       case auth of
         Unauthorized {} ->
           yield {pr: pr, send: SendUnauthorized {}}
@@ -875,11 +861,10 @@ serve = \req -> case req of
     let dedupedIds = dedupMessageIds messageIds
     result <- atomic do
       pr <- maybePrune t
-      sessions <- *sessions
-      let auth = authenticateRequest sessions authorization t
+      auth <- authenticateRequest authorization t
       case auth of
         Unauthorized {} ->
-          yield {pr: pr, ack: AckUnauthorized {}}
+          yield {pr: pr, ok: False {}, pendingAcks: [], evictedEntries: []}
         Authorized {pubkey} -> do
           messages <- *messages
           let ackedMessages = do
@@ -896,27 +881,20 @@ serve = \req -> case req of
           let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
             if excessCount <= 0 then [] else boundedSmallest combinedAckedIds excessCount (\a -> a.ackedAt)
           set *ackedIds = diff combinedAckedIds evictedEntries
-          yield {pr: pr, ack: AckDone {pendingAcks: ackedFederated, evictedEntries: evictedEntries}}
+          yield {pr: pr, ok: True {}, pendingAcks: ackedFederated, evictedEntries: evictedEntries}
     fork (do
-      case result.ack of
-        AckDone {pendingAcks, evictedEntries} ->
-          when federationEnabled (do
-            let originServers = collectPeerServers pendingAcks (\a -> a.originServer)
-            sendAcksAndClean pendingAcks originServers
-            retryEvictedAcks evictedEntries pendingAcks)
-        _ -> yield {}
+      when (result.ok && federationEnabled) (do
+        let originServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
+        sendAcksAndClean result.pendingAcks originServers
+        retryEvictedAcks result.evictedEntries result.pendingAcks)
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
-    yield (case result.ack of
-      AckUnauthorized _ -> respond {ok: False {}}
-      AckDone _ -> respond {ok: True {}})
+    yield (respond {ok: result.ok})
 
   LookupPresence {pubkey, authorization, respond} -> do
-    let pubkey = normalizeHex pubkey
     t <- now
     result <- atomic do
       pr <- maybePrune t
-      sessions <- *sessions
-      let auth = authenticateRequest sessions authorization t
+      auth <- authenticateRequest authorization t
       case auth of
         Unauthorized {} ->
           yield {pr: pr, authorized: False {}, foundServer: ""}
@@ -933,9 +911,7 @@ serve = \req -> case req of
             else acc) {server: "", best: 0} valid).server
           yield {pr: pr, authorized: True {}, foundServer: foundServer}
     forkBroadcastOffline t result.pr
-    yield (if result.authorized
-      then respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: True {}}
-      else respond {online: False {}, server: "", authorized: False {}})
+    yield (respond {online: not (result.foundServer == ""), server: result.foundServer, authorized: result.authorized})
 
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
@@ -1019,10 +995,6 @@ serve = \req -> case req of
         yield (respond {ok: True {}})
 
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
-    let toKey = normalizeHex toKey
-    let fromKey = normalizeHex fromKey
-    let encryptedBlob = normalizeHex encryptedBlob
-    let messageId = normalizeHex messageId
     let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
