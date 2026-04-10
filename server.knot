@@ -495,8 +495,7 @@ removeOffline = \presenceSet offlineOnlyKeys trustedOffline t ->
   diff presenceSet (do
     p <- presenceSet
     k <- offlineOnlyKeys
-    where samePubkeyServer p k
-    where any trustedOffline (\o -> samePubkeyServer o k && (if o.timestamp > t then t else o.timestamp) > p.timestamp)
+    where samePubkeyServer p k && any trustedOffline (\o -> samePubkeyServer o k && (if o.timestamp > t then t else o.timestamp) > p.timestamp)
     yield p)
 
 countMessagesFor = \messages toKey t ->
@@ -509,11 +508,9 @@ countMessagesFor = \messages toKey t ->
 validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
 validGossipEvents = \events t -> do
   e <- events
-  where isValidHex e.pubkey && not (tooLong e.pubkey maxPubkeyLen)
-  where not (tooLong e.server maxServerNameLen) && not (isBadServerName e.server)
+  where isValidHex e.pubkey && not (tooLong e.pubkey maxPubkeyLen) && not (tooLong e.server maxServerNameLen) && not (isBadServerName e.server)
   let server = normalizeServerName e.server
-  where not (server == serverHostN)
-  where e.timestamp <= t + clockSkewTolerance
+  where not (server == serverHostN) && e.timestamp <= t + clockSkewTolerance
   let ttl = clampTtl e.ttl
   let expiresAt = e.timestamp + ttl * 1000
   where expiresAt > t
@@ -558,8 +555,7 @@ pruneExpired = \t -> do
     yield a
   yield {expiredLocal: (do
     p <- presenceBefore
-    where p.expiresAt <= t && p.server == serverHostN
-    where none presenceAfter (\q -> q.pubkey == p.pubkey && q.server == serverHostN)
+    where p.expiresAt <= t && p.server == serverHostN && none presenceAfter (\q -> q.pubkey == p.pubkey && q.server == serverHostN)
     yield p), peerServers: peerServersBefore}
 
 maybePrune = \t -> do
@@ -578,7 +574,7 @@ forEachBatch = \items batchSize process ->
     process batch
     forEachBatch rest batchSize process
 
-sendBatchedGossipToServer : Text -> [GossipEvent] -> Int -> IO {network} {}
+sendBatchedGossipToServer : ServerName -> [GossipEvent] -> Int -> IO {network} {}
 sendBatchedGossipToServer = \server allEvents hops ->
   forEachBatch allEvents maxGossipEvents (\batch -> do
     _ <- fetch (federationScheme ++ server) (RecvGossip {
@@ -586,7 +582,7 @@ sendBatchedGossipToServer = \server allEvents hops ->
       events: batch, hopsRemaining: hops, fromServer: serverHostN})
     yield {})
 
-sendBatchedGossip : [Text] -> [GossipEvent] -> Int -> IO {network} {}
+sendBatchedGossip : [ServerName] -> [GossipEvent] -> Int -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents hops ->
   sendToEach peerServers (\server -> sendBatchedGossipToServer server allEvents hops)
 
