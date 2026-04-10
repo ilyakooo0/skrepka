@@ -1,5 +1,7 @@
 namespace Skrepka
 
+open System
+
 module Phonemic =
 
     // Urbit @p syllable tables (256 prefixes, 256 suffixes)
@@ -94,12 +96,11 @@ module Phonemic =
         sb.ToString()
 
     let fromOb (s: string) : byte[] option =
-        let s = s.Trim('-')
+        let pairs = s.Split('-', StringSplitOptions.RemoveEmptyEntries)
 
-        if s = "" then
+        if pairs.Length = 0 then
             None
         else
-            let pairs = s.Split('-') |> Array.filter (fun p -> p <> "")
 
             let decoded =
                 pairs

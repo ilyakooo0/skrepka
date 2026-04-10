@@ -17,7 +17,7 @@ module ApiClient =
     [<CLIMutable>]
     type PollEvent = { Id: string; EventType: EventType; Payload: EventPayload }
 
-    type MessageStatus = Delivered | Federated | Queued | Rejected | Unauthorized
+    type MessageStatus = Delivered | Federated | Queued | Rejected | Unauthorized | UnknownStatus of string
 
     [<CLIMutable>]
     type private SendResult = { Status: MessageStatus }
@@ -50,7 +50,7 @@ module ApiClient =
             | "queued" -> Queued
             | "rejected" -> Rejected
             | "unauthorized" -> Unauthorized
-            | s -> failwith $"Unknown message status: {s}"
+            | s -> UnknownStatus s
         override _.Write(writer, value, _) =
             writer.WriteStringValue(
                 match value with
@@ -58,7 +58,8 @@ module ApiClient =
                 | Federated -> "federated"
                 | Queued -> "queued"
                 | Rejected -> "rejected"
-                | Unauthorized -> "unauthorized")
+                | Unauthorized -> "unauthorized"
+                | UnknownStatus s -> s)
 
     type private EventTypeConverter() =
         inherit JsonConverter<EventType>()

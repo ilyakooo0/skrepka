@@ -50,19 +50,33 @@ federationEnabled = federationSecret != ""
 
 type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
-type GossipEventType = Text where \s -> s == "online" || s == "offline"
+type GossipEventType = GossipOnline {} | GossipOffline {}
+
+impl ToJSON GossipEventType where
+  toJson et = toJson (case et of
+    GossipOnline {} -> "online"
+    GossipOffline {} -> "offline")
+
+impl FromJSON GossipEventType where
+  parseJson t =
+    let s : Text = parseJson t in
+    if s == "online" then GossipOnline {} else GossipOffline {}
+
+isGossipOnline = \et -> case et of GossipOnline {} -> True {}; _ -> False {}
+isGossipOffline = \et -> case et of GossipOffline {} -> True {}; _ -> False {}
 
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
 type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
-isDeliveryStatus = \s -> s == "delivered" || s == "federated" || s == "queued"
-type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || isDeliveryStatus s
+type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || s == "delivered" || s == "federated" || s == "queued"
 
 type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) && s == normalizeHex s
 type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen) && s == normalizeHex s
 type SignatureHex = Text where \s -> isValidHex s && not (tooLong s maxSignatureLen) && s == normalizeHex s
-type MessageIdHex = Text where \s -> isValidHex s && not (tooLong s maxMessageIdLen) && s == normalizeHex s
+isValidMessageId = \s -> isValidHex s && not (tooLong s maxMessageIdLen) && s == normalizeHex s
+type MessageIdHex = Text where isValidMessageId
+type OptionalMessageId = Text where \s -> s == "" || isValidMessageId s
 isValidServerName = \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
 type ServerName = Text where isValidServerName
 type OptionalServerName = Text where \s -> s == "" || isValidServerName s
@@ -78,7 +92,11 @@ type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: T
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [ServerName]}
-type DeliveryStatus = Text where isDeliveryStatus
+type DeliveryStatus = Delivered {} | Federated {} | Queued {}
+deliveryStatusText = \s -> case s of
+  Delivered {} -> "delivered"
+  Federated {} -> "federated"
+  Queued {} -> "queued"
 type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: DeliveryStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
 
 
@@ -121,13 +139,13 @@ route ClientApi where
     = Poll
   /messages
     POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp} / headers {authorization: Text}
-      -> {status: MessageStatus, messageId: Text}
+      -> {status: MessageStatus, messageId: OptionalMessageId}
       = SendMessage
     POST {messageIds: [MessageIdHex]} /ack headers {authorization: Text}
       -> {ok: Bool}
       = AckMessages
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text}
-    -> {online: Bool, server: Text, authorized: Bool}
+    -> {online: Bool, server: AnyServerName, authorized: Bool}
     = LookupPresence
 
 route FederationApi where
@@ -204,28 +222,25 @@ containsBadUrlChar = \s -> any (chars s) (\c -> not (isAllowedServerChar c))
 
 isCgnatRange = \s ->
   if take 4 s != "100." then False {}
-  else if (take 1 (drop 4 s) == "7" || take 1 (drop 4 s) == "8" || take 1 (drop 4 s) == "9")
-    && isDigitChar (take 1 (drop 5 s)) && take 1 (drop 6 s) == "."
+  else let d4 = take 1 (drop 4 s) in
+  let d5 = take 1 (drop 5 s) in
+  let d6 = take 1 (drop 6 s) in
+  let d7 = take 1 (drop 7 s) in
+  if contains d4 "789" && isDigitChar d5 && d6 == "."
     && isAllDigitsOrDotsUntilColonOrEnd (drop 7 s)
     then True {}
-  else if take 1 (drop 4 s) == "6"
-    && (take 1 (drop 5 s) == "4" || take 1 (drop 5 s) == "5" || take 1 (drop 5 s) == "6" || take 1 (drop 5 s) == "7" || take 1 (drop 5 s) == "8" || take 1 (drop 5 s) == "9")
-    && take 1 (drop 6 s) == "."
+  else if d4 == "6" && contains d5 "456789" && d6 == "."
     && isAllDigitsOrDotsUntilColonOrEnd (drop 7 s)
     then True {}
-  else if take 1 (drop 4 s) == "1" && (take 1 (drop 5 s) == "0" || take 1 (drop 5 s) == "1")
-    && isDigitChar (take 1 (drop 6 s)) && take 1 (drop 7 s) == "."
+  else if d4 == "1" && contains d5 "01" && isDigitChar d6 && d7 == "."
     && isAllDigitsOrDotsUntilColonOrEnd (drop 8 s)
     then True {}
-  else if take 1 (drop 4 s) == "1" && take 1 (drop 5 s) == "2"
-    && (take 1 (drop 6 s) == "0" || take 1 (drop 6 s) == "1" || take 1 (drop 6 s) == "2" || take 1 (drop 6 s) == "3"
-      || take 1 (drop 6 s) == "4" || take 1 (drop 6 s) == "5" || take 1 (drop 6 s) == "6" || take 1 (drop 6 s) == "7")
-    && take 1 (drop 7 s) == "."
+  else if d4 == "1" && d5 == "2" && contains d6 "01234567" && d7 == "."
     && isAllDigitsOrDotsUntilColonOrEnd (drop 8 s)
     then True {}
   else False {}
 
-containsMultipleColons = \s -> count (do c <- chars s; where c == ":"; yield c) > 1
+containsMultipleColons = \s -> fold (\n c -> if c == ":" then n + 1 else n) 0 (chars s) > 1
 
 hasOctalOctet = \s ->
   if take 1 s == "0" && isDigitChar (take 1 (drop 1 s)) && isAllDigitsOrDotsUntilColonOrEnd (drop 2 s) then True {}
@@ -273,30 +288,26 @@ containsSuffixN = \suffix suffixLen s ->
 
 containsSuffix = \suffix s -> containsSuffixN suffix (count (chars suffix)) s
 
-containsLocalhostSuffix = \s -> containsSuffix ".localhost" s
-containsLocalSuffix = \s -> containsSuffix ".local" s
-containsInternalSuffix = \s -> containsSuffix ".internal" s
-
 is172Private = \sn ->
   take 4 sn == "172."
   && let d1 = take 1 (drop 4 sn) in
   let d2 = take 1 (drop 5 sn) in
   take 1 (drop 6 sn) == "."
-  && ((d1 == "1" && (d2 == "6" || d2 == "7" || d2 == "8" || d2 == "9"))
+  && ((d1 == "1" && contains d2 "6789")
     || (d1 == "2" && isDigitChar d2)
-    || (d1 == "3" && (d2 == "0" || d2 == "1")))
+    || (d1 == "3" && contains d2 "01"))
 
 isHighOctetPrefix = \sn ->
   take 1 sn == "2"
   && let d2 = take 1 (drop 1 sn) in
   let d3 = take 1 (drop 2 sn) in
   take 1 (drop 3 sn) == "."
-  && ((d2 == "2" && (d3 == "4" || d3 == "5" || d3 == "6" || d3 == "7" || d3 == "8" || d3 == "9"))
-    || (d2 == "3" && isDigitChar d3)
-    || (d2 == "4" && isDigitChar d3)
-    || (d2 == "5" && (d3 == "0" || d3 == "1" || d3 == "2" || d3 == "3" || d3 == "4" || d3 == "5")))
+  && ((d2 == "2" && contains d3 "456789")
+    || (contains d2 "34" && isDigitChar d3)
+    || (d2 == "5" && contains d3 "012345"))
 
-matchesHostname = \sn name nameLen ->
+matchesHostname = \sn name ->
+  let nameLen = count (chars name) in
   take nameLen sn == name && (drop nameLen sn == "" || take 1 (drop nameLen sn) == ":")
 
 isBadServerName = \sn ->
@@ -304,14 +315,14 @@ isBadServerName = \sn ->
   || take 1 sn == "."
   || take 1 sn == ":"
   || containsBadUrlChar sn
-  || matchesHostname sn "localhost" 9
-  || matchesHostname sn "localhost.localdomain" 21
-  || containsLocalhostSuffix sn
-  || matchesHostname sn "local" 5
-  || containsLocalSuffix sn
-  || matchesHostname sn "internal" 8
-  || containsInternalSuffix sn
-  || matchesHostname sn "metadata" 8
+  || matchesHostname sn "localhost"
+  || matchesHostname sn "localhost.localdomain"
+  || containsSuffix ".localhost" sn
+  || matchesHostname sn "local"
+  || containsSuffix ".local" sn
+  || matchesHostname sn "internal"
+  || containsSuffix ".internal" sn
+  || matchesHostname sn "metadata"
   || take 4 sn == "127." || take 3 sn == "10."
   || take 8 sn == "192.168." || take 8 sn == "169.254."
   || take 2 sn == "0." || take 1 sn == "["
@@ -573,7 +584,7 @@ broadcastOfflineGossip = \t peerServers expiredLocal ->
     let gossipEvents = mergeByKey (\a b -> a.pubkey == b.pubkey) (\x -> x.timestamp) [] (do
       p <- expiredLocal
       let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
-      yield {eventType: "offline", pubkey: p.pubkey, server: serverHostN, timestamp: p.expiresAt, ttl: ttl})
+      yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: p.expiresAt, ttl: ttl})
     sendBatchedGossip peerServers gossipEvents 2)
 
 forkBroadcastOffline = \t result ->
@@ -764,7 +775,7 @@ serve = \req -> case req of
       else result.pr.expiredLocal
     fork (do
       when (result.verified && federationEnabled)
-        (sendBatchedGossip result.peerServers [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}] 2)
+        (sendBatchedGossip result.peerServers [{eventType: GossipOnline {}, pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}] 2)
       broadcastOfflineGossip t result.pr.peerServers expiredLocal)
     yield (if result.verified
       then respond {token: token, expiresAt: expiry}
@@ -808,9 +819,9 @@ serve = \req -> case req of
               forwards <- *forwards
               let forwardServers = takeN remoteServers (maxForwardsEntries - count forwards)
               let shouldForward = federationEnabled && count forwardServers > 0
-              let status = if localOnline then "delivered"
-                else if shouldForward then "federated"
-                else "queued"
+              let status = if localOnline then Delivered {}
+                else if shouldForward then Federated {}
+                else Queued {}
               set *forwards = if shouldForward
                 then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
                 else forwards
@@ -825,14 +836,15 @@ serve = \req -> case req of
                 timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
                 authorization: "Bearer " ++ federationSecret})
               whenOk fwdResult (removeForward msgId server))
-            when (status == "queued")
-              (println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")))
+            case status of
+              Queued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
+              _ -> yield {})
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
       SendUnauthorized _ -> respond {status: "unauthorized", messageId: ""}
       SendRejected _ -> respond {status: "rejected", messageId: ""}
-      SendDone {status} -> respond {status: status, messageId: msgId})
+      SendDone {status} -> respond {status: deliveryStatusText status, messageId: msgId})
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -901,8 +913,8 @@ serve = \req -> case req of
         yield (respond {ok: False {}})
       else do
         let allValidEntries = validGossipEvents events t
-        let onlineEntries = do e <- allValidEntries; where e.eventType == "online"; yield e
-        let offlineEntries = do e <- allValidEntries; where e.eventType == "offline"; yield e
+        let onlineEntries = do e <- allValidEntries; where isGossipOnline e.eventType; yield e
+        let offlineEntries = do e <- allValidEntries; where isGossipOffline e.eventType; yield e
         let filteredOnline = do
           e <- onlineEntries
           where none offlineEntries (\o -> o.server == fromServer && samePubkeyServer o e && o.timestamp > e.timestamp)

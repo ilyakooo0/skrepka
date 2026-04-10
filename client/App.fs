@@ -95,7 +95,7 @@ module App =
         | PollResult of messages: (string * ChatMessage) list * status: string * cursor: int64
         | CopyPubKey
         | DismissError
-        | StateLoaded of Identity * Data option
+        | StateLoaded of (Identity * Data option) option
 
     // ── CmdMsg ──
 
@@ -129,6 +129,10 @@ module App =
             $"{parts.[0]}-{parts.[1]}..{parts.[parts.Length - 2]}-{parts.[parts.Length - 1]}"
 
     let private truncKey (hex: string) = hexToOb hex |> truncOb
+
+    let private tryParsePubkey (input: string) =
+        (Phonemic.fromOb input |> Option.orElseWith (fun () -> Crypto.tryFromHex input))
+        |> Option.filter (fun bytes -> bytes.Length = 32)
 
     let private contactName (contacts: Contact list) (pk: string) =
         contacts
@@ -268,8 +272,8 @@ module App =
             let pk, nn = model.ContactPubkey, model.ContactNickname
             match model.Page with
             | AddContact when pk <> "" && nn <> "" ->
-                match Phonemic.fromOb pk |> Option.orElseWith (fun () -> Crypto.tryFromHex pk) with
-                | Some bytes when bytes.Length = 32 ->
+                match tryParsePubkey pk with
+                | Some bytes ->
                     let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = nn }
 
                     let model' =
@@ -289,20 +293,19 @@ module App =
 
         | DismissError -> { model with Error = None }, []
 
-        | StateLoaded(identity, dataOpt) ->
-            match dataOpt with
-            | Some data ->
-                let model' =
-                    { model with
-                        Auth = Identified(identity, Connecting)
-                        Contacts = data.Contacts
-                        Messages = data.Messages
-                        ServerUrl = data.ServerUrl |> Option.defaultValue model.ServerUrl
-                        PollCursor = data.PollCursor
-                        Page = Conversations }
-                model', [ CmdConnect(model'.ServerUrl, identity) ]
-            | None ->
-                { model with Auth = Identified(identity, Offline); Page = Settings }, []
+        | StateLoaded(Some(identity, Some data)) ->
+            let model' =
+                { model with
+                    Auth = Identified(identity, Connecting)
+                    Contacts = data.Contacts
+                    Messages = data.Messages
+                    ServerUrl = data.ServerUrl |> Option.defaultValue model.ServerUrl
+                    PollCursor = data.PollCursor
+                    Page = Conversations }
+            model', [ CmdConnect(model'.ServerUrl, identity) ]
+        | StateLoaded(Some(identity, None)) ->
+            { model with Auth = Identified(identity, Offline); Page = Settings }, []
+        | StateLoaded None -> model, []
 
     // ── mapCmd ──
 
@@ -362,6 +365,7 @@ module App =
                         | Delivered | Federated | Queued -> ()
                         | Rejected -> dispatch (SendFailed "Message rejected by server")
                         | Unauthorized -> dispatch (SendFailed "Not authorized to deliver message")
+                        | UnknownStatus s -> dispatch (SendFailed $"Unexpected status: {s}")
                     with ex ->
                         dispatch (SendFailed $"Send failed: {ex.Message}")
                 }
@@ -405,13 +409,11 @@ module App =
                 |> ignore)
 
         | CmdLoadState ->
-            Cmd.ofEffect (fun dispatch ->
-                async {
-                    match! Store.loadIdentity () with
-                    | Some id -> dispatch (StateLoaded(id, Store.loadData ()))
-                    | None -> ()
-                }
-                |> Async.Start)
+            asyncCmd (async {
+                match! Store.loadIdentity () with
+                | Some id -> return StateLoaded(Some(id, Store.loadData ()))
+                | None -> return StateLoaded None
+            })
 
         | CmdSaveIdentity identity ->
             Cmd.ofEffect (fun _ -> Store.saveIdentity identity |> Async.Start)
