@@ -77,9 +77,9 @@ module Store =
             use db = openDb ()
             let settings = db.GetCollection<SettingsDoc>("settings").FindById(BsonValue "settings")
 
-            match settings |> Option.ofObj with
-            | None -> None
-            | Some settings ->
+            settings
+            |> Option.ofObj
+            |> Option.map (fun settings ->
                 let contacts = db.GetCollection<Contact>("contacts").FindAll() |> Seq.toList
 
                 let messages =
@@ -89,11 +89,10 @@ module Store =
                         convId, docs |> Seq.map toChatMessage |> Seq.sortBy _.Timestamp |> Seq.toList)
                     |> Map.ofSeq
 
-                Some
-                    { Contacts = contacts
-                      Messages = messages
-                      ServerUrl = settings.ServerUrl
-                      PollCursor = settings.PollCursor }
+                { Contacts = contacts
+                  Messages = messages
+                  ServerUrl = settings.ServerUrl
+                  PollCursor = settings.PollCursor })
         with _ ->
             None
 

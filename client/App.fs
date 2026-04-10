@@ -57,7 +57,7 @@ module App =
     // ── Msg ──
 
     type Msg =
-        | Nav of Page
+        | SetPage of Page
         | GenIdentity
         | IdentityReady of Identity
         | SetServerUrl of string
@@ -65,11 +65,8 @@ module App =
         | AuthOk of string
         | AuthErr of string
         | DoDisconnect
-        | SetCompose of string
         | DoSend
-        | Sent of Result<unit, string>
-        | SetNewPubkey of string
-        | SetNewNickname of string
+        | SendFailed of string
         | DoSaveContact
         | PollResult of messages: (string * ChatMessage) list * status: string * cursor: int64
         | CopyPubKey
@@ -156,7 +153,7 @@ module App =
 
     let update msg model =
         match msg with
-        | Nav page -> { model with Page = page }, []
+        | SetPage page -> { model with Page = page }, []
 
         | GenIdentity -> model, [ CmdGenIdentity ]
 
@@ -184,11 +181,6 @@ module App =
 
         | DoDisconnect -> model |> setConn Offline, []
 
-        | SetCompose text ->
-            match model.Page with
-            | Chat(pk, _) -> { model with Page = Chat(pk, text) }, []
-            | _ -> model, []
-
         | DoSend ->
             match model.Page, trySession model with
             | Chat(pk, compose), Some session when compose <> "" ->
@@ -207,8 +199,7 @@ module App =
                 model', [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
             | _ -> model, []
 
-        | Sent(Ok()) -> model, []
-        | Sent(Error err) -> { model with Error = Some err }, []
+        | SendFailed err -> { model with Error = Some err }, []
 
         | PollResult(incoming, status, newCursor) ->
             let model' =
@@ -226,16 +217,6 @@ module App =
               | None -> ()
               if not incoming.IsEmpty then saveCmdMsg model' ]
 
-        | SetNewPubkey pk ->
-            match model.Page with
-            | AddContact(_, nn) -> { model with Page = AddContact(pk, nn) }, []
-            | _ -> model, []
-
-        | SetNewNickname nn ->
-            match model.Page with
-            | AddContact(pk, _) -> { model with Page = AddContact(pk, nn) }, []
-            | _ -> model, []
-
         | DoSaveContact ->
             match model.Page with
             | AddContact(pk, nn) when pk <> "" && nn <> "" ->
@@ -250,9 +231,10 @@ module App =
             | _ -> model, []
 
         | CopyPubKey ->
-            match model.Auth with
-            | Identified(id, _) -> model, [ CmdCopyToClipboard id.PubKeyHex ]
-            | NoIdentity -> model, []
+            model,
+            [ match model.Auth with
+              | Identified(id, _) -> CmdCopyToClipboard id.PubKeyHex
+              | NoIdentity -> () ]
 
         | DismissError -> { model with Error = None }, []
 
@@ -316,25 +298,26 @@ module App =
             })
 
         | CmdSend(session, recipientHex, text, messageId) ->
-            asyncCmd (async {
-                try
-                    let recipPub = Crypto.fromHex recipientHex
-                    let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            Cmd.ofEffect (fun dispatch ->
+                async {
+                    try
+                        let recipPub = Crypto.fromHex recipientHex
+                        let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
-                    let payload =
-                        JsonSerializer.Serialize({ Type = "text"; Id = messageId; Timestamp = ts; Body = text }: TextEnvelope)
+                        let payload =
+                            JsonSerializer.Serialize({ Type = "text"; Id = messageId; Timestamp = ts; Body = text }: TextEnvelope)
 
-                    let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
-                    let blobHex = Crypto.toHex blob
-                    let! status = sendMessage session.Url session.Token recipientHex blobHex ts
-                    return
+                        let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
+                        let! status = sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
+
                         match status with
-                        | Delivered | Federated | Queued -> Sent(Ok())
-                        | Rejected -> Sent(Error "Message rejected by server")
-                        | Unauthorized -> Sent(Error "Not authorized to deliver message")
-                with ex ->
-                    return Sent(Error $"Send failed: {ex.Message}")
-            })
+                        | Delivered | Federated | Queued -> ()
+                        | Rejected -> dispatch (SendFailed "Message rejected by server")
+                        | Unauthorized -> dispatch (SendFailed "Not authorized to deliver message")
+                    with ex ->
+                        dispatch (SendFailed $"Send failed: {ex.Message}")
+                }
+                |> Async.Start)
 
         | CmdPoll(session, cursor) ->
             asyncCmd (async {
@@ -441,7 +424,7 @@ module App =
                     | Identified(_, Connecting) -> Label("Connecting...").centerTextHorizontal()
                     | Identified(_, Online _) ->
                         Button("Disconnect", DoDisconnect)
-                        Button("Go to Conversations", Nav Conversations)
+                        Button("Go to Conversations", SetPage Conversations)
                     | NoIdentity -> ()
                 })
                     .padding(20.)
@@ -470,8 +453,8 @@ module App =
                         Label("Conversations")
                             .font(size = 24.)
 
-                        Button("+", Nav(AddContact("", "")))
-                        Button("Settings", Nav Settings)
+                        Button("+", SetPage(AddContact("", "")))
+                        Button("Settings", SetPage Settings)
                     }
 
                     Label($"conn:{connStr} contacts:{model.Contacts.Length} msgs:{totalMsgs}")
@@ -500,7 +483,7 @@ module App =
                             |> Option.map (fun m -> truncate 40 m.Body)
                             |> Option.defaultValue ""
 
-                        Button($"{c.Nickname}\n{preview}", Nav(Chat(c.Pubkey, "")))
+                        Button($"{c.Nickname}\n{preview}", SetPage(Chat(c.Pubkey, "")))
                 })
                     .padding(20.)
             )
@@ -513,7 +496,7 @@ module App =
         ContentPage(
             (VStack(spacing = 8.) {
                 HStack(spacing = 8.) {
-                    Button("< Back", Nav Conversations)
+                    Button("< Back", SetPage Conversations)
 
                     Label(name)
                         .font(size = 20.)
@@ -538,7 +521,7 @@ module App =
                     .font(size = 14.)
 
                 HStack(spacing = 8.) {
-                    Entry(compose, SetCompose)
+                    Entry(compose, fun t -> SetPage(Chat(pk, t)))
                         .placeholder("Message...")
 
                     Button("Send", DoSend)
@@ -551,17 +534,17 @@ module App =
         ContentPage(
             (VStack(spacing = 16.) {
                 HStack(spacing = 8.) {
-                    Button("< Back", Nav Conversations)
+                    Button("< Back", SetPage Conversations)
 
                     Label("Add Contact")
                         .font(size = 20.)
                 }
 
                 Label("Public Key (hex):")
-                Entry(pk, SetNewPubkey)
+                Entry(pk, fun t -> SetPage(AddContact(t, nn)))
 
                 Label("Nickname:")
-                Entry(nn, SetNewNickname)
+                Entry(nn, fun t -> SetPage(AddContact(pk, t)))
 
                 Button("Save Contact", DoSaveContact)
                     .centerHorizontal()
