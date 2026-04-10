@@ -99,7 +99,9 @@ module App =
         messages |> Map.tryFind pk |> Option.defaultValue []
 
     let private appendMessage (pk: string) (msg: ChatMessage) (messages: Map<string, ChatMessage list>) =
-        messages |> Map.add pk (messagesFor pk messages @ [ msg ])
+        let existing = messagesFor pk messages
+        if existing |> List.exists (fun m -> m.Id = msg.Id) then messages
+        else Map.add pk (existing @ [ msg ]) messages
 
     let private addContactIfNew (contact: Contact) (contacts: Contact list) =
         if contacts |> List.exists (fun c -> c.Pubkey = contact.Pubkey) then contacts
@@ -199,12 +201,9 @@ module App =
                 incoming
                 |> List.fold
                     (fun m (fromPubkey, chatMsg) ->
-                        if messagesFor fromPubkey m.Messages |> List.exists (fun x -> x.Id = chatMsg.Id) then
-                            m
-                        else
-                            { m with
-                                Contacts = m.Contacts |> addContactIfNew { Pubkey = fromPubkey; Nickname = truncKey fromPubkey }
-                                Messages = m.Messages |> appendMessage fromPubkey chatMsg })
+                        { m with
+                            Contacts = m.Contacts |> addContactIfNew { Pubkey = fromPubkey; Nickname = truncKey fromPubkey }
+                            Messages = m.Messages |> appendMessage fromPubkey chatMsg })
                     { model with PollStatus = status; PollCursor = newCursor }
 
             let cmds =
@@ -212,7 +211,7 @@ module App =
                 | Some session -> [ CmdPoll(session, model'.PollCursor) ]
                 | None -> []
 
-            model', cmds @ (if not incoming.IsEmpty then saveCmd model' else [])
+            model', cmds @ (if incoming.IsEmpty then [] else saveCmd model')
 
         | SetNewPubkey pk ->
             match model.Page with
@@ -245,19 +244,19 @@ module App =
         | DismissError -> { model with Error = None }, []
 
         | StateLoaded(identity, dataOpt) ->
-            let model' = { model with Identity = Some identity; Conn = Connecting }
-
             let model' =
                 match dataOpt with
                 | Some data ->
-                    { model' with
+                    { model with
+                        Identity = Some identity
+                        Conn = Connecting
                         Contacts = data.Contacts
                         Messages = data.Messages
                         ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
                         PollCursor = data.PollCursor
                         Page = Conversations }
-
-                | None -> { model' with Page = Settings }
+                | None ->
+                    { model with Identity = Some identity; Conn = Connecting; Page = Settings }
 
             model', [ CmdConnect(model'.ServerUrl, identity) ]
 
@@ -327,11 +326,12 @@ module App =
                 try
                     let! response = ApiClient.poll session.Url session.Token cursor
                     let messages, ackIds, errors =
-                        response.Events
-                        |> Array.fold (fun (msgs, acks, errs) evt ->
-                            match decryptEvent session.Identity.PrivKey evt.Payload with
-                            | Ok msg -> (msg :: msgs, evt.Id :: acks, errs)
-                            | Error err -> (msgs, acks, err :: errs))
+                        Array.foldBack
+                            (fun (evt: ApiClient.PollEvent) (msgs, acks, errs) ->
+                                match decryptEvent session.Identity.PrivKey evt.Payload with
+                                | Ok msg -> (msg :: msgs, evt.Id :: acks, errs)
+                                | Error err -> (msgs, acks, err :: errs))
+                            response.Events
                             ([], [], [])
 
                     if not ackIds.IsEmpty then
@@ -343,7 +343,7 @@ module App =
                         $"[{now}] evts:{response.Events.Length} msgs:{messages.Length} errs:{errors.Length}"
                         + (match errors with err :: _ -> $" [{err}]" | [] -> "")
 
-                    return PollResult(List.rev messages, status, response.Cursor)
+                    return PollResult(messages, status, response.Cursor)
                 with
                 | :? TimeoutException ->
                     return PollResult([], "polling...", cursor)

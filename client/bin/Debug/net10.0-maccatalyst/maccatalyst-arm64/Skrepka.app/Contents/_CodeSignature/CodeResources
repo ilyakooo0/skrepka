@@ -12,6 +12,10 @@
 		<data>
 		c3wF+z6XtMjJ+O5rJymqsoYbzDg=
 		</data>
+		<key>Resources/MauiInfo.plist</key>
+		<data>
+		iEtuUGCV6JM3gxS/pO33swhmpp8=
+		</data>
 		<key>Resources/MonoTouchDebugConfiguration.txt</key>
 		<data>
 		oowkf1sL6T19nanXUObgmuayWqM=
@@ -247,14 +251,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			Ll855YGoZZ4EHbGdnm7YJ2/UrFtklAGRlFW9NlLbdXI=
+			ACzMr65iZCRxNkmPNzA6fyn/yv2+20NTfHo+2J3hOVo=
 			</data>
 		</dict>
 		<key>MonoBundle/Skrepka.pdb</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			J4e+LdQyWbJGoueMWBhlFQg9tI6hYFwkIT6qA3pNgNU=
+			7pMDhAJJCLuEC9ASqtHFdvdW1xJFyw0foQ6ySH91mrU=
 			</data>
 		</dict>
 		<key>MonoBundle/Sodium.Core.dll</key>
@@ -1788,6 +1792,13 @@
 			<key>hash2</key>
 			<data>
 			HfYxSjf/+d0hBTO933j7O0S+icn+eoL8QQEDzydpDZM=
+			</data>
+		</dict>
+		<key>Resources/MauiInfo.plist</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			tx0KXqEC+DvcCGyogQTEQWHcCWJYYqH24NtPwhpQEjo=
 			</data>
 		</dict>
 		<key>Resources/MonoTouchDebugConfiguration.txt</key>
