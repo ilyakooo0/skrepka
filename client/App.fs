@@ -45,15 +45,6 @@ module App =
         | Connecting of Identity
         | Online of Session
 
-    type PollResultData =
-        { Messages: (string * ChatMessage) list
-          Status: string
-          Cursor: uint64 }
-
-    type LoadedState =
-        | NoIdentity
-        | Loaded of identity: Identity * data: Store.DataDto option
-
     // ── Model ──
 
     type Model =
@@ -88,10 +79,11 @@ module App =
         | SetNewPubkey of string
         | SetNewNickname of string
         | DoSaveContact
-        | PollResult of PollResultData
+        | PollResult of messages: (string * ChatMessage) list * status: string * cursor: uint64
         | CopyPubKey
         | DismissError
-        | StateLoaded of LoadedState
+        | NoIdentityFound
+        | StateLoaded of Identity * Store.DataDto option
 
     // ── CmdMsg ──
 
@@ -216,7 +208,7 @@ module App =
 
         | Sent result -> { model with LastSendStatus = $"{result.Status}:{result.MessageId}" }, []
 
-        | PollResult { Messages = incoming; Status = status; Cursor = newCursor } ->
+        | PollResult(incoming, status, newCursor) ->
             let model' =
                 incoming
                 |> List.fold
@@ -263,8 +255,8 @@ module App =
 
         | DismissError -> { model with Error = None }, []
 
-        | StateLoaded NoIdentity -> model, []
-        | StateLoaded(Loaded(identity, dataOpt)) ->
+        | NoIdentityFound -> model, []
+        | StateLoaded(identity, dataOpt) ->
             let model' = { model with Identity = Some identity; Conn = Connecting identity }
 
             let model' =
@@ -363,7 +355,7 @@ module App =
                     let! response = ApiClient.poll session.Url session.Token cursor
                     let messages, ackIds, errors =
                         response.Events
-                        |> List.fold (fun (msgs, acks, errs) evt ->
+                        |> Array.fold (fun (msgs, acks, errs) evt ->
                             match decryptEvent session.Identity.PrivKey evt.Payload with
                             | Ok msg -> (msg :: msgs, evt.Id :: acks, errs)
                             | Error err -> (msgs, acks, err :: errs))
@@ -378,14 +370,14 @@ module App =
                         $"[{now}] evts:{response.Events.Length} msgs:{messages.Length} errs:{errors.Length}"
                         + (match errors with err :: _ -> $" [{err}]" | [] -> "")
 
-                    return PollResult { Messages = List.rev messages; Status = status; Cursor = response.Cursor }
+                    return PollResult(List.rev messages, status, response.Cursor)
                 with
                 | :? TimeoutException ->
-                    return PollResult { Messages = []; Status = "polling..."; Cursor = cursor }
+                    return PollResult([], "polling...", cursor)
                 | ex ->
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
                     do! Async.Sleep 3000
-                    return PollResult { Messages = []; Status = $"[{now}] poll error: {ex.Message}"; Cursor = cursor }
+                    return PollResult([], $"[{now}] poll error: {ex.Message}", cursor)
             })
 
         | CmdCopyToClipboard text ->
@@ -397,10 +389,10 @@ module App =
             asyncCmd (async {
                 let! identity = Store.loadIdentity ()
                 match identity with
-                | None -> return StateLoaded NoIdentity
+                | None -> return NoIdentityFound
                 | Some id ->
                     let data = Store.loadData ()
-                    return StateLoaded(Loaded(id, data))
+                    return StateLoaded(id, data)
             })
 
         | CmdSaveIdentity identity ->

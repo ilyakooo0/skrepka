@@ -4,32 +4,28 @@ open System
 open System.Net.Http
 open System.Text
 open System.Text.Json
+open System.Text.Json.Serialization
 open System.Threading.Tasks
 
 module ApiClient =
 
+    [<CLIMutable>]
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
-    type PollEvent = { Id: string; Payload: EventPayload }
+
+    [<CLIMutable>]
+    type PollEvent = { Id: string; EventType: string; Payload: EventPayload }
 
     [<CLIMutable>]
     type SendResult = { Status: string; MessageId: string }
 
-    type PollResponse = { Events: PollEvent list; Cursor: uint64 }
+    [<CLIMutable>]
+    type PollResponse = { Cursor: uint64; Events: PollEvent array }
 
     [<CLIMutable>]
     type ChallengeResponse = { challenge: string }
 
     [<CLIMutable>]
     type VerifyResponse = { token: string }
-
-    [<CLIMutable>]
-    type PollPayloadDto = { encryptedBlob: string; timestamp: JsonElement }
-
-    [<CLIMutable>]
-    type PollEventDto = { id: string; eventType: string; payload: PollPayloadDto }
-
-    [<CLIMutable>]
-    type PollResponseDto = { cursor: uint64; events: PollEventDto array }
 
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
@@ -41,7 +37,18 @@ module ApiClient =
                 else ok t.Result)
             |> ignore)
 
-    let private jsonOpts = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+    type private FlexibleInt64Converter() =
+        inherit JsonConverter<int64>()
+        override _.Read(reader, _, _) =
+            match reader.TokenType with
+            | JsonTokenType.String -> Int64.Parse(reader.GetString())
+            | _ -> reader.GetInt64()
+        override _.Write(writer, value, _) = writer.WriteNumberValue(value)
+
+    let private jsonOpts =
+        let opts = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+        opts.Converters.Add(FlexibleInt64Converter())
+        opts
 
     let private client =
         let c = new HttpClient()
@@ -100,19 +107,10 @@ module ApiClient =
     let poll (serverUrl: string) (token: string) (cursor: uint64) =
         async {
             let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
-            let! response = postJson<PollResponseDto> pollClient $"{serverUrl}/poll" body (Some token)
-
-            let events =
-                [ for e in response.events do
-                      if e.eventType = "message" then
-                          let ts =
-                              if e.payload.timestamp.ValueKind = JsonValueKind.String
-                              then Int64.Parse(e.payload.timestamp.GetString())
-                              else e.payload.timestamp.GetInt64()
-                          { Id = e.id
-                            Payload = { EncryptedBlob = e.payload.encryptedBlob; Timestamp = ts } } ]
-
-            return { Events = events; Cursor = response.cursor }
+            let! response = postJson<PollResponse> pollClient $"{serverUrl}/poll" body (Some token)
+            return
+                { response with
+                    Events = response.Events |> Array.filter (fun e -> e.EventType = "message") }
         }
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
