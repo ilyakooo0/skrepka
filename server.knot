@@ -462,12 +462,13 @@ evictOneOldest = \items getKey ->
           else {removed: acc.removed, items: union acc.items [x]}) {removed: False {}, items: []} items).items
 
 capPerKey = \items matchKey maxPerKey getExpiry t ->
-  let activeCount = count (do x <- items; where matchKey x; where getExpiry x > t; yield x) in
-  if activeCount >= maxPerKey
-    then let forKey = do x <- items; where matchKey x; yield x in
-         let others = do x <- items; where not (matchKey x); yield x in
+  let active = do x <- items; where getExpiry x > t; yield x in
+  let activeForKeyCount = count (do x <- active; where matchKey x; yield x) in
+  if activeForKeyCount >= maxPerKey
+    then let forKey = do x <- active; where matchKey x; yield x in
+         let others = do x <- active; where not (matchKey x); yield x in
          union others (evictOneOldest forKey getExpiry)
-    else items
+    else active
 
 capGlobal = \items maxCount getKey ->
   if count items >= maxCount
@@ -735,8 +736,7 @@ serve = \req -> case req of
     pruneResult <- atomic do
       pr <- maybePrune t
       challenges <- *challenges
-      let challengesCapped = capPerKey challenges (\c -> c.pubkey == pubkey) maxChallengesPerKey (\c -> c.expiresAt) t
-      let activeChallenges = do c <- challengesCapped; where c.expiresAt > t; yield c
+      let activeChallenges = capPerKey challenges (\c -> c.pubkey == pubkey) maxChallengesPerKey (\c -> c.expiresAt) t
       let globalCapped = capGlobal activeChallenges maxChallenges (\c -> c.expiresAt)
       set *challenges = union
         globalCapped
@@ -771,9 +771,8 @@ serve = \req -> case req of
             c <- challenges
             where not (c.pubkey == pubkey && c.challenge == challenge)
             yield c
-          let sessionsCapped = capPerKey sessions (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t
-          let activeSessionsCapped = do s <- sessionsCapped; where s.expiresAt > t; yield s
-          let globalSessionsCapped = capGlobal activeSessionsCapped maxSessions (\s -> s.expiresAt)
+          let activeSessions = capPerKey sessions (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t
+          let globalSessionsCapped = capGlobal activeSessions maxSessions (\s -> s.expiresAt)
           set *sessions = union globalSessionsCapped [{token: token, pubkey: pubkey, expiresAt: expiry}]
           let presenceWithout = do
                 p <- presence
@@ -845,10 +844,11 @@ serve = \req -> case req of
               let remoteServers = do p <- toPresence; where not (p.server == serverHostN); yield p.server
               forwards <- *forwards
               let forwardServers = takeN remoteServers (maxForwardsEntries - count forwards)
+              let shouldForward = federationEnabled && count forwardServers > 0
               let status = if localOnline then "delivered"
-                else if federationEnabled && count forwardServers > 0 then "federated"
+                else if shouldForward then "federated"
                 else "queued"
-              set *forwards = if federationEnabled && count forwardServers > 0
+              set *forwards = if shouldForward
                 then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
                 else forwards
               yield {pr: pr, send: SendDone {status: status, remoteServers: remoteServers, fromKey: fromKey}}
@@ -866,7 +866,8 @@ serve = \req -> case req of
                 Err _ -> yield {}))
           when (status == "queued" && count remoteServers > 0 && federationEnabled)
             (println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking"))
-        _ -> yield {}
+        SendUnauthorized {} -> yield {}
+        SendRejected {} -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
       SendUnauthorized _ -> respond {status: "unauthorized", messageId: ""}
@@ -936,7 +937,7 @@ serve = \req -> case req of
                   when (dropped > 0)
                     (println ("ackMessages: ackedIds at capacity (" ++ show maxAckedIds ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server))
                 _ -> yield {}))
-        _ -> yield {}
+        AckUnauthorized {} -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.ack of
       AckUnauthorized _ -> respond {ok: False {}}
@@ -1063,15 +1064,12 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = isFederatedOrigin originServer
-    if not (authorized && validOrigin)
-      then do
-        pruneResult <- atomic do maybePrune t
-        forkBroadcastOffline t pruneResult
-        yield (respond {ok: False {}})
-      else do
-        let clampedTs = clampTimestamp timestamp t
-        result <- atomic do
-          pr <- maybePrune t
+    let clampedTs = clampTimestamp timestamp t
+    result <- atomic do
+      pr <- maybePrune t
+      if not (authorized && validOrigin)
+        then yield {pr: pr, ok: False {}}
+        else do
           messages <- *messages
           ackedIds <- *ackedIds
           if any messages (\m -> m.messageId == messageId && m.toKey == toKey)
@@ -1087,8 +1085,8 @@ serve = \req -> case req of
                   [{messageId: messageId, toKey: toKey, fromKey: fromKey,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
                 yield {pr: pr, ok: True {}}
-        forkBroadcastOffline t result.pr
-        yield (respond {ok: result.ok})
+    forkBroadcastOffline t result.pr
+    yield (respond {ok: result.ok})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     let fromServer = normalizeServerName fromServer
