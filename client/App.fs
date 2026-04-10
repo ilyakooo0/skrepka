@@ -95,14 +95,15 @@ module App =
     let private hexToOb (hex: string) =
         Crypto.fromHex hex |> Phonemic.toOb
 
-    let private truncKey (hex: string) =
-        let ob = hexToOb hex
-        match ob.IndexOf('-') with
-        | -1 -> ob
-        | i ->
-            match ob.IndexOf('-', i + 1) with
-            | -1 -> ob
-            | j -> ob.[..j - 1]
+    let private truncOb (ob: string) =
+        let parts = ob.Split('-')
+
+        if parts.Length <= 4 then
+            ob
+        else
+            $"{parts.[0]}-{parts.[1]}..{parts.[parts.Length - 2]}-{parts.[parts.Length - 1]}"
+
+    let private truncKey (hex: string) = hexToOb hex |> truncOb
 
     let private contactName (contacts: Contact list) (pk: string) =
         contacts
@@ -415,8 +416,8 @@ module App =
 
                     Label("Your Public Key:")
 
-                    Label(hexToOb (pubKeyHex model))
-                        .font(size = 11.)
+                    Label(truncOb (hexToOb (pubKeyHex model)))
+                        .font(size = 14.)
 
                     Button("Copy Public Key", CopyPubKey)
 
