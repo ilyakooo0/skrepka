@@ -19,7 +19,7 @@ module ApiClient =
     type SendResult = { Status: string; MessageId: string }
 
     [<CLIMutable>]
-    type PollResponse = { Cursor: uint64; Events: PollEvent array }
+    type PollResponse = { Cursor: int64; Events: PollEvent array }
 
     [<CLIMutable>]
     type private ChallengeResponse = { challenge: string }
@@ -108,7 +108,7 @@ module ApiClient =
             return! postJson<SendResult> client $"{serverUrl}/messages" body (Some token)
         }
 
-    let poll (serverUrl: string) (token: string) (cursor: uint64) =
+    let poll (serverUrl: string) (token: string) (cursor: int64) =
         async {
             let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
             let! response = postJson<PollResponse> pollClient $"{serverUrl}/poll" body (Some token)

@@ -72,7 +72,7 @@ type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [Text]}
 type PollResult = PollUnauthorized {} | PollAuthorized {events: [PollEvent], cursor: Timestamp}
 type VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [Text]}
-type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: Text, remoteServers: [Text], fromKey: PubkeyHex}
+type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [Text], fromKey: PubkeyHex}
 type AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 type LookupResult = LookupUnauthorized {} | LookupDone {foundServer: Text}
 
@@ -368,13 +368,9 @@ isBadServerName = \s ->
 
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
-  fold (\acc s ->
-    case acc of
-      Authorized _ -> acc
-      Unauthorized {} ->
-        if safeCompare s.token token && s.expiresAt > t
-          then Authorized {pubkey: s.pubkey}
-          else acc) Unauthorized {} sessions
+  case headOf (do s <- sessions; where safeCompare s.token token && s.expiresAt > t; yield s) of
+    Nothing {} -> Unauthorized {}
+    Just {value: s} -> Authorized {pubkey: s.pubkey}
 
 extractToken = \authHeader ->
   if toLower (take 7 authHeader) == "bearer "
@@ -463,10 +459,9 @@ evictOneOldest = \items getKey ->
 
 capPerKey = \items matchKey maxPerKey getExpiry t ->
   let active = do x <- items; where getExpiry x > t; yield x in
-  let activeForKeyCount = count (do x <- active; where matchKey x; yield x) in
-  if activeForKeyCount >= maxPerKey
-    then let forKey = do x <- active; where matchKey x; yield x in
-         let others = do x <- active; where not (matchKey x); yield x in
+  let forKey = do x <- active; where matchKey x; yield x in
+  if count forKey >= maxPerKey
+    then let others = do x <- active; where not (matchKey x); yield x in
          union others (evictOneOldest forKey getExpiry)
     else active
 
@@ -630,9 +625,7 @@ retryForwardsForServer = \entries remaining ->
           timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
           authorization: "Bearer " ++ federationSecret})
         case result of
-          Ok _ -> do
-            removeForward f.messageId f.toServer
-            yield {}
+          Ok _ -> removeForward f.messageId f.toServer
           Err _ -> yield {}
         retryForwardsForServer rest (remaining - 1)
 
@@ -755,15 +748,8 @@ serve = \req -> case req of
       challenges <- *challenges
       sessions <- *sessions
       presence <- *presence
-      let matched = single (do
-        c <- challenges
-        where c.pubkey == pubkey
-        where c.challenge == challenge
-        where c.expiresAt > t
-        yield c)
-      let sigValid = case matched of
-        Nothing {} -> False {}
-        _ -> verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
+      let hasMatch = any challenges (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t)
+      let sigValid = if hasMatch then verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature) else False {}
       if not sigValid
         then yield {pr: pr, verify: VerifyFailed {}}
         else do
@@ -854,18 +840,18 @@ serve = \req -> case req of
               yield {pr: pr, send: SendDone {status: status, remoteServers: remoteServers, fromKey: fromKey}}
     fork (do
       case result.send of
-        SendDone {status, remoteServers, fromKey} -> do
-          when (count remoteServers > 0 && federationEnabled)
-            (sendToEach remoteServers (\server -> do
+        SendDone {status, remoteServers, fromKey} ->
+          when (count remoteServers > 0 && federationEnabled) (do
+            sendToEach remoteServers (\server -> do
               fwdResult <- fetch (federationScheme ++ server) (ForwardMessage {
                 toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob,
                 timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
                 authorization: "Bearer " ++ federationSecret})
               case fwdResult of
                 Ok _ -> removeForward msgId server
-                Err _ -> yield {}))
-          when (status == "queued" && count remoteServers > 0 && federationEnabled)
-            (println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking"))
+                Err _ -> yield {})
+            when (status == "queued")
+              (println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")))
         SendUnauthorized {} -> yield {}
         SendRejected {} -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)

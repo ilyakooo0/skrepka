@@ -22,7 +22,7 @@ module Store =
         { Contacts: Contact list
           Messages: Map<string, ChatMessage list>
           ServerUrl: string
-          PollCursor: uint64 }
+          PollCursor: int64 }
 
     [<CLIMutable>]
     type private MessageDoc =
@@ -61,9 +61,9 @@ module Store =
         }
 
     let saveIdentity (identity: Crypto.Identity) =
-        task {
-            do! SecureStorage.Default.SetAsync("identity_privkey", Convert.ToBase64String identity.PrivKey)
-            do! SecureStorage.Default.SetAsync("identity_pubkey", identity.PubKeyHex)
+        async {
+            do! SecureStorage.Default.SetAsync("identity_privkey", Convert.ToBase64String identity.PrivKey) |> Async.AwaitTask
+            do! SecureStorage.Default.SetAsync("identity_pubkey", identity.PubKeyHex) |> Async.AwaitTask
         }
 
     let loadData () : Data option =
@@ -95,7 +95,7 @@ module Store =
                     { Contacts = contacts
                       Messages = messages
                       ServerUrl = settings.ServerUrl
-                      PollCursor = uint64 settings.PollCursor }
+                      PollCursor = settings.PollCursor }
         with _ ->
             None
 
@@ -123,7 +123,7 @@ module Store =
             settings.Upsert
                 { Id = "settings"
                   ServerUrl = data.ServerUrl
-                  PollCursor = int64 data.PollCursor }
+                  PollCursor = data.PollCursor }
             |> ignore
         with _ ->
             ()
