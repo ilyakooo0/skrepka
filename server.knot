@@ -48,15 +48,7 @@ federationEnabled = federationSecret != ""
 -- Types
 -- ============================================
 
-type PollEventType = PollMessage {}
-
-impl ToJSON PollEventType where
-  toJson _ = toJson "message"
-
-impl FromJSON PollEventType where
-  parseJson _ = PollMessage {}
-
-type PollEvent = {id: MessageIdHex, eventType: PollEventType, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
+type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
 type GossipEventType = GossipOnline {} | GossipOffline {}
 
@@ -68,7 +60,9 @@ impl ToJSON GossipEventType where
 impl FromJSON GossipEventType where
   parseJson t =
     let s : Text = parseJson t in
-    if s == "online" then GossipOnline {} else GossipOffline {}
+    if s == "online" then GossipOnline {}
+    else if s == "offline" then GossipOffline {}
+    else GossipOffline {}
 
 isGossipOnline = \et -> case et of GossipOnline {} -> True {}; _ -> False {}
 
@@ -93,6 +87,7 @@ impl FromJSON MessageStatus where
     else if s == "rejected" then MsRejected {}
     else if s == "delivered" then MsDelivered {}
     else if s == "federated" then MsFederated {}
+    else if s == "queued" then MsQueued {}
     else MsQueued {}
 
 type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) && s == normalizeHex s
@@ -488,20 +483,20 @@ mergeByKey = \sameKey getFreshness initial items ->
 
 mergeByPubkeyServer = mergeByKey samePubkeyServer (\x -> x.expiresAt)
 
-removeOffline = \presenceSet offlineOnlyKeys trustedOffline t ->
+removeOffline = \presenceSet trustedOffline t ->
   diff presenceSet (do
     p <- presenceSet
-    k <- offlineOnlyKeys
-    where samePubkeyServer p k && any trustedOffline (\o -> samePubkeyServer o k && (if o.timestamp > t then t else o.timestamp) > p.timestamp)
+    o <- trustedOffline
+    where samePubkeyServer p o && (if o.timestamp > t then t else o.timestamp) > p.timestamp
     yield p)
 
-capGossipPresence = \afterOffline appliedOnline trustedDeduped presence offlineOnlyKeys trustedOffline t ->
+capGossipPresence = \afterOffline appliedOnline trustedDeduped presence trustedOffline t ->
   if count afterOffline <= maxPresenceEntries
     then {finalPresence: afterOffline, appliedOnline: appliedOnline, withinCapacity: True {}}
     else
       let updatesOnly = do e <- trustedDeduped; where any presence (\p -> samePubkeyServer p e); yield e in
       let updatesOnlyMerged = mergeByPubkeyServer presence updatesOnly in
-      let updatesOnlyAfterOffline = removeOffline updatesOnlyMerged offlineOnlyKeys trustedOffline t in
+      let updatesOnlyAfterOffline = removeOffline updatesOnlyMerged trustedOffline t in
       let reclaimSlots = maxPresenceEntries - count updatesOnlyAfterOffline in
       let newEntries = do e <- trustedDeduped; where none presence (\p -> samePubkeyServer p e); yield e in
       let reclaimedEntries = takeN newEntries reclaimSlots in
@@ -512,10 +507,7 @@ capGossipPresence = \afterOffline appliedOnline trustedDeduped presence offlineO
        withinCapacity: False {}}
 
 countMessagesFor = \messages toKey t ->
-  count (do
-    m <- messages
-    where m.toKey == toKey && m.receivedAt >= t - messageMaxAge
-    yield m)
+  fold (\n m -> if m.toKey == toKey && m.receivedAt >= t - messageMaxAge then n + 1 else n) 0 messages
 
 
 validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
@@ -577,13 +569,18 @@ maybePrune = \t -> do
       set *lastPrunedAt = t
       pruneExpired t
 
+splitAtN = \items n ->
+  fold (\acc e ->
+    if acc.n < n then {n: acc.n + 1, batch: union acc.batch [e], rest: acc.rest}
+    else {n: acc.n, batch: acc.batch, rest: union acc.rest [e]})
+    {n: 0, batch: [], rest: []} items
+
 forEachBatch = \items batchSize process ->
   if count items == 0 then yield {}
   else do
-    let batch = takeN items batchSize
-    let rest = diff items batch
-    process batch
-    forEachBatch rest batchSize process
+    let split = splitAtN items batchSize
+    process split.batch
+    forEachBatch split.rest batchSize process
 
 sendBatchedGossipToServer : ServerName -> [GossipEvent] -> Int -> IO {network} {}
 sendBatchedGossipToServer = \server allEvents hops ->
@@ -721,7 +718,7 @@ pollOnce = \token cursor -> do
         let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
         let evts = do
           m <- limitedMsgs
-          yield {id: m.messageId, eventType: PollMessage {},
+          yield {id: m.messageId, eventType: "message",
                  payload: {toKey: m.toKey, fromKey: m.fromKey,
                             encryptedBlob: m.encryptedBlob,
                             timestamp: m.timestamp}}
@@ -931,7 +928,7 @@ serve = \req -> case req of
       else do
         let allValidEntries = validGossipEvents events t
         let onlineEntries = do e <- allValidEntries; where isGossipOnline e.eventType; yield e
-        let offlineEntries = diff allValidEntries onlineEntries
+        let offlineEntries = do e <- allValidEntries; where not (isGossipOnline e.eventType); yield e
         let trustedOffline = do e <- offlineEntries; where e.server == fromServer; yield e
         let filteredOnline = do
           e <- onlineEntries
@@ -954,13 +951,9 @@ serve = \req -> case req of
             where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt)
             yield {pubkey: e.pubkey, server: e.server}
           let merged = mergeByPubkeyServer presence trustedDeduped
-          let offlineOnlyKeys = do
-            e <- allValidEntries
-            where e.server == fromServer && none trustedDeduped (\d -> samePubkeyServer d e)
-            yield e
-          let afterOffline = removeOffline merged offlineOnlyKeys trustedOffline t
+          let afterOffline = removeOffline merged trustedOffline t
           let appliedOffline = do p <- diff merged afterOffline; yield {pubkey: p.pubkey, server: p.server}
-          let capResult = capGossipPresence afterOffline appliedOnline trustedDeduped presence offlineOnlyKeys trustedOffline t
+          let capResult = capGossipPresence afterOffline appliedOnline trustedDeduped presence trustedOffline t
           set *presence = capResult.finalPresence
           let gossipPeerServers = collectPeerServers capResult.finalPresence (\p -> p.server)
           yield {appliedKeys: union capResult.appliedOnline appliedOffline, pr: pr, gossipPeerServers: gossipPeerServers, withinCapacity: capResult.withinCapacity}

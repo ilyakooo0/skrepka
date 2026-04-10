@@ -40,8 +40,8 @@ module App =
     type Page =
         | Setup
         | Conversations
-        | Chat of pubkey: string
-        | AddContact
+        | Chat of pubkey: string * compose: string
+        | AddContact of pubkey: string * nickname: string
         | Settings
 
     type Session = { Url: string; Token: string; Identity: Identity }
@@ -55,6 +55,14 @@ module App =
         | NoIdentity
         | Identified of identity: Identity * conn: ConnStatus
 
+    type IncomingMessage = { SenderPubkey: string; Message: ChatMessage }
+
+    type PollStatus =
+        | Idle
+        | Polling
+        | Received of events: int * messages: int * errors: int * firstError: string option
+        | PollError of string
+
     // ── Model ──
 
     type Model =
@@ -62,13 +70,10 @@ module App =
           Auth: AuthState
           ServerUrl: string
           Contacts: Contact list
-          PollStatus: string
+          PollStatus: PollStatus
           Messages: Map<string, ChatMessage list>
           Error: string option
-          PollCursor: int64
-          Compose: string
-          ContactPubkey: string
-          ContactNickname: string }
+          PollCursor: int64 }
 
     // ── Msg ──
 
@@ -92,7 +97,7 @@ module App =
         | DoSend
         | SendFailed of string
         | DoSaveContact
-        | PollResult of messages: (string * ChatMessage) list * status: string * cursor: int64
+        | PollResult of messages: IncomingMessage list * status: PollStatus * cursor: int64
         | CopyPubKey
         | DismissError
         | StateLoaded of StateLoadResult
@@ -110,12 +115,6 @@ module App =
         | CmdSaveData of Data
 
     // ── Helpers ──
-
-    let private nowStr () =
-        DateTimeOffset.UtcNow.ToString("HH:mm:ss")
-
-    let private truncate maxLen (s: string) =
-        if s.Length > maxLen then s.[..maxLen - 1] + "..." else s
 
     let private hexToOb (hex: string) =
         Crypto.fromHex hex |> Phonemic.toOb
@@ -178,29 +177,35 @@ module App =
         { Page = Setup
           Auth = NoIdentity
           ServerUrl = "http://localhost:8080"
-          PollStatus = ""
+          PollStatus = Idle
           Contacts = []
           Messages = Map.empty
           Error = None
-          PollCursor = 0L
-          Compose = ""
-          ContactPubkey = ""
-          ContactNickname = "" },
+          PollCursor = 0L },
         [ CmdLoadState ]
 
     // ── Update ──
 
     let update msg model =
         match msg with
-        | SetPage(Chat pk) ->
-            { model with Page = Chat pk; Compose = "" }, []
-        | SetPage AddContact ->
-            { model with Page = AddContact; ContactPubkey = ""; ContactNickname = "" }, []
+        | SetPage(Chat(pk, _)) ->
+            { model with Page = Chat(pk, "") }, []
+        | SetPage(AddContact _) ->
+            { model with Page = AddContact("", "") }, []
         | SetPage page -> { model with Page = page }, []
 
-        | SetCompose text -> { model with Compose = text }, []
-        | SetContactPubkey pk -> { model with ContactPubkey = pk }, []
-        | SetContactNickname nn -> { model with ContactNickname = nn }, []
+        | SetCompose text ->
+            match model.Page with
+            | Chat(pk, _) -> { model with Page = Chat(pk, text) }, []
+            | _ -> model, []
+        | SetContactPubkey pk ->
+            match model.Page with
+            | AddContact(_, nn) -> { model with Page = AddContact(pk, nn) }, []
+            | _ -> model, []
+        | SetContactNickname nn ->
+            match model.Page with
+            | AddContact(pk, _) -> { model with Page = AddContact(pk, nn) }, []
+            | _ -> model, []
 
         | GenIdentity -> model, [ CmdGenIdentity ]
 
@@ -230,21 +235,20 @@ module App =
 
         | DoSend ->
             match model.Page, trySession model with
-            | Chat pk, Some session when model.Compose <> "" ->
-                let text = model.Compose
+            | Chat(pk, compose), Some session when compose <> "" ->
                 let id = Guid.NewGuid().ToString()
                 let outMsg =
                     { Id = id
-                      Body = text
+                      Body = compose
                       Timestamp = DateTimeOffset.UtcNow
                       IsOutgoing = true }
 
                 let model' =
                     { model with
-                        Compose = ""
+                        Page = Chat(pk, "")
                         Messages = model.Messages |> appendMessage pk outMsg }
 
-                model', [ CmdSend(session, pk, text, id); saveCmdMsg model' ]
+                model', [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
@@ -253,10 +257,10 @@ module App =
             let model' =
                 incoming
                 |> List.fold
-                    (fun (m: Model) (fromPubkey, chatMsg) ->
+                    (fun (m: Model) msg ->
                         { m with
-                            Contacts = m.Contacts |> addContactIfNew { Pubkey = fromPubkey; Nickname = truncKey fromPubkey }
-                            Messages = m.Messages |> appendMessage fromPubkey chatMsg })
+                            Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.SenderPubkey; Nickname = truncKey msg.SenderPubkey }
+                            Messages = m.Messages |> appendMessage msg.SenderPubkey msg.Message })
                     { model with PollStatus = status; PollCursor = newCursor }
 
             model',
@@ -266,9 +270,8 @@ module App =
               if not incoming.IsEmpty then saveCmdMsg model' ]
 
         | DoSaveContact ->
-            let pk, nn = model.ContactPubkey, model.ContactNickname
             match model.Page with
-            | AddContact when pk <> "" && nn <> "" ->
+            | AddContact(pk, nn) when pk <> "" && nn <> "" ->
                 match tryParsePubkey pk with
                 | Some bytes ->
                     let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = nn }
@@ -323,11 +326,12 @@ module App =
 
                 match envelope.Type with
                 | Text ->
-                    Ok(senderHex,
-                       { Id = envelope.Id
-                         Body = envelope.Body
-                         Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
-                         IsOutgoing = false })
+                    Ok { SenderPubkey = senderHex
+                         Message =
+                             { Id = envelope.Id
+                               Body = envelope.Body
+                               Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
+                               IsOutgoing = false } }
                 | UnknownEnvelope t -> Error $"unknown envelope type: {t}"
             | None -> Error "decrypt failed"
         with ex ->
@@ -388,20 +392,14 @@ module App =
                     if not ackIds.IsEmpty then
                         do! ackMessages session.Url session.Token ackIds
 
-                    let now = nowStr ()
-
-                    let status =
-                        $"[{now}] evts:{response.Events.Length} msgs:{messages.Length} errs:{errors.Length}"
-                        + (match errors with err :: _ -> $" [{err}]" | [] -> "")
-
+                    let status = Received(response.Events.Length, messages.Length, errors.Length, List.tryHead errors)
                     return PollResult(messages, status, response.Cursor)
                 with
                 | :? TimeoutException ->
-                    return PollResult([], "polling...", cursor)
+                    return PollResult([], Polling, cursor)
                 | ex ->
-                    let now = nowStr ()
                     do! Async.Sleep 3000
-                    return PollResult([], $"[{now}] poll error: {ex.Message}", cursor)
+                    return PollResult([], PollError ex.Message, cursor)
             })
 
         | CmdCopyToClipboard text ->
@@ -427,6 +425,14 @@ module App =
             Cmd.ofEffect (fun _ -> Store.saveData data)
 
     // ── View ──
+
+    let private formatPollStatus = function
+        | Idle -> ""
+        | Polling -> "polling..."
+        | Received(evts, msgs, errs, firstErr) ->
+            $"evts:{evts} msgs:{msgs} errs:{errs}"
+            + (match firstErr with Some e -> $" [{e}]" | None -> "")
+        | PollError msg -> $"poll error: {msg}"
 
     let private viewSetup () =
         ContentPage(
@@ -495,14 +501,6 @@ module App =
             | Identified(_, Connecting) -> "CONNECTING"
             | Identified(_, Online _) -> "ONLINE"
 
-        let contactNames =
-            model.Contacts
-            |> List.map _.Nickname
-            |> String.concat ", "
-
-        let totalMsgs =
-            model.Messages |> Map.values |> Seq.sumBy List.length
-
         ContentPage(
             ScrollView(
                 (VStack(spacing = 8.) {
@@ -510,22 +508,19 @@ module App =
                         Label("Conversations")
                             .font(size = 24.)
 
-                        Button("+", SetPage AddContact)
+                        Button("+", SetPage(AddContact("", "")))
                         Button("Settings", SetPage Settings)
                     }
 
-                    Label($"conn:{connStr} contacts:{model.Contacts.Length} msgs:{totalMsgs}")
+                    Label($"{connStr} | {formatPollStatus model.PollStatus}")
                         .font(size = 10.)
                         .textColor(Colors.DimGray)
 
-                    Label($"poll: {model.PollStatus}")
-                        .font(size = 10.)
-                        .textColor(Colors.DimGray)
-
-                    if contactNames <> "" then
-                        Label($"names: {contactNames}")
-                            .font(size = 10.)
-                            .textColor(Colors.DimGray)
+                    match model.Error with
+                    | Some err ->
+                        Label(err).textColor(Colors.Red).font(size = 12.)
+                        Button("Dismiss", DismissError)
+                    | None -> ()
 
                     if model.Contacts.IsEmpty then
                         Label("No contacts yet. Tap + to add one.")
@@ -536,16 +531,16 @@ module App =
                         let preview =
                             messagesFor c.Pubkey model.Messages
                             |> List.tryLast
-                            |> Option.map (fun m -> truncate 40 m.Body)
+                            |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
                             |> Option.defaultValue ""
 
-                        Button($"{c.Nickname}\n{preview}", SetPage(Chat c.Pubkey))
+                        Button($"{c.Nickname}\n{preview}", SetPage(Chat(c.Pubkey, "")))
                 })
                     .padding(20.)
             )
         )
 
-    let private viewChat model pk =
+    let private viewChat model pk compose =
         let name = contactName model.Contacts pk
         let msgs = messagesFor pk model.Messages
 
@@ -563,7 +558,9 @@ module App =
                 | Some err ->
                     Label(err)
                         .textColor(Colors.Red)
-                        .font(size = 11.)
+                        .font(size = 12.)
+
+                    Button("Dismiss", DismissError)
                 | None -> ()
 
                 if msgs.IsEmpty then
@@ -577,7 +574,7 @@ module App =
                             .font(size = 14.)
 
                 HStack(spacing = 8.) {
-                    Entry(model.Compose, SetCompose)
+                    Entry(compose, SetCompose)
                         .placeholder("Message...")
 
                     Button("Send", DoSend)
@@ -586,7 +583,7 @@ module App =
                 .padding(12.)
         )
 
-    let private viewAddContact model =
+    let private viewAddContact model pubkey nickname =
         ContentPage(
             (VStack(spacing = 16.) {
                 HStack(spacing = 8.) {
@@ -596,12 +593,18 @@ module App =
                         .font(size = 20.)
                 }
 
+                match model.Error with
+                | Some err ->
+                    Label(err).textColor(Colors.Red).font(size = 12.)
+                    Button("Dismiss", DismissError)
+                | None -> ()
+
                 Label("Public Key:")
-                Entry(model.ContactPubkey, SetContactPubkey)
+                Entry(pubkey, SetContactPubkey)
                     .placeholder("sampel-palnet-...")
 
                 Label("Nickname:")
-                Entry(model.ContactNickname, SetContactNickname)
+                Entry(nickname, SetContactNickname)
 
                 Button("Save Contact", DoSaveContact)
                     .centerHorizontal()
@@ -615,8 +618,8 @@ module App =
             | Setup -> viewSetup ()
             | Settings -> viewSettings model
             | Conversations -> viewConversations model
-            | Chat pk -> viewChat model pk
-            | AddContact -> viewAddContact model
+            | Chat(pk, compose) -> viewChat model pk compose
+            | AddContact(pubkey, nickname) -> viewAddContact model pubkey nickname
 
         Application() { Window(page) }
 
