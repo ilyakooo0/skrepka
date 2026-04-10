@@ -30,7 +30,7 @@ module ApiClient =
         c.Timeout <- TimeSpan.FromSeconds(60.)
         c
 
-    let private postJson (url: string) (body: string) (token: string option) =
+    let private postJsonWith (httpClient: HttpClient) (url: string) (body: string) (token: string option) =
         async {
             let request = new HttpRequestMessage(HttpMethod.Post, url)
             request.Content <- new StringContent(body, Encoding.UTF8, "application/json")
@@ -38,10 +38,12 @@ module ApiClient =
             token
             |> Option.iter (fun t -> request.Headers.Add("Authorization", $"Bearer {t}"))
 
-            let! response = client.SendAsync(request) |> awaitTask
+            let! response = httpClient.SendAsync(request) |> awaitTask
             let! text = response.Content.ReadAsStringAsync() |> awaitTask
             return JsonDocument.Parse(text)
         }
+
+    let private postJson url body token = postJsonWith client url body token
 
     let private getJson (url: string) (token: string) =
         async {
@@ -99,13 +101,8 @@ module ApiClient =
 
     let poll (serverUrl: string) (token: string) (cursor: uint64) =
         async {
-            let request = new HttpRequestMessage(HttpMethod.Post, $"{serverUrl}/poll")
-            request.Content <- new StringContent(JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |}), Encoding.UTF8, "application/json")
-            request.Headers.Add("Authorization", $"Bearer {token}")
-
-            let! response = pollClient.SendAsync(request) |> awaitTask
-            let! text = response.Content.ReadAsStringAsync() |> awaitTask
-            let doc = JsonDocument.Parse(text)
+            let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
+            let! doc = postJsonWith pollClient $"{serverUrl}/poll" body (Some token)
             let root = expectObject doc "/poll"
             let cursor = root.GetProperty("cursor").GetUInt64()
 

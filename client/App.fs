@@ -21,12 +21,6 @@ module App =
           Timestamp: DateTimeOffset
           IsOutgoing: bool }
 
-    type IncomingMessage =
-        { FromPubkey: string
-          Body: string
-          Timestamp: int64
-          MessageId: string }
-
     [<CLIMutable>]
     type TextEnvelope =
         { ``type``: string
@@ -47,11 +41,11 @@ module App =
 
     type ConnState =
         | Offline
-        | Connecting
+        | Connecting of Identity
         | Online of Session
 
     type PollResultData =
-        { Messages: IncomingMessage list
+        { Messages: (string * ChatMessage) list
           Status: string
           Cursor: uint64 }
 
@@ -183,12 +177,12 @@ module App =
         | DoConnect ->
             match model.Identity with
             | Some id ->
-                { model with Conn = Connecting }, [ CmdConnect(model.ServerUrl, id) ]
+                { model with Conn = Connecting id }, [ CmdConnect(model.ServerUrl, id) ]
             | None -> { model with Error = Some "No identity generated" }, []
 
         | AuthOk token ->
-            match model.Conn, model.Identity with
-            | Connecting, Some id ->
+            match model.Conn with
+            | Connecting id ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
                 { model with Conn = Online session; Page = Conversations; Error = None },
                 [ CmdPoll(session, model.PollCursor) ]
@@ -225,19 +219,13 @@ module App =
             let model' =
                 incoming
                 |> List.fold
-                    (fun m msg ->
-                        if messagesFor msg.FromPubkey m.Messages |> List.exists (fun x -> x.Id = msg.MessageId) then
+                    (fun m (fromPubkey, chatMsg) ->
+                        if messagesFor fromPubkey m.Messages |> List.exists (fun x -> x.Id = chatMsg.Id) then
                             m
                         else
-                            let chatMsg =
-                                { Id = msg.MessageId
-                                  Body = msg.Body
-                                  Timestamp = DateTimeOffset.FromUnixTimeSeconds(msg.Timestamp)
-                                  IsOutgoing = false }
-
                             { m with
-                                Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.FromPubkey; Nickname = truncKey msg.FromPubkey }
-                                Messages = m.Messages |> appendMessage msg.FromPubkey chatMsg })
+                                Contacts = m.Contacts |> addContactIfNew { Pubkey = fromPubkey; Nickname = truncKey fromPubkey }
+                                Messages = m.Messages |> appendMessage fromPubkey chatMsg })
                     { model with PollStatus = status; PollCursor = newCursor }
 
             let cmds =
@@ -276,7 +264,7 @@ module App =
 
         | StateLoaded { Identity = None } -> model, []
         | StateLoaded { Identity = Some identity; Data = dataOpt } ->
-            let model' = { model with Identity = Some identity; Conn = Connecting }
+            let model' = { model with Identity = Some identity; Conn = Connecting identity }
 
             let model' =
                 match dataOpt with
@@ -324,10 +312,11 @@ module App =
                 let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext)
 
                 if envelope.``type`` = "text" then
-                    Ok { FromPubkey = senderHex
+                    Ok(senderHex,
+                       { Id = envelope.id
                          Body = envelope.body
-                         Timestamp = payload.Timestamp
-                         MessageId = envelope.id }
+                         Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
+                         IsOutgoing = false })
                 else
                     Error "unknown type"
             | None -> Error "decrypt failed"
@@ -488,7 +477,7 @@ module App =
 
                     match model.Conn with
                     | Offline -> Button("Connect", DoConnect)
-                    | Connecting -> Label("Connecting...").centerTextHorizontal()
+                    | Connecting _ -> Label("Connecting...").centerTextHorizontal()
                     | Online _ ->
                         Button("Disconnect", DoDisconnect)
                         Button("Go to Conversations", Nav Conversations)
@@ -501,7 +490,7 @@ module App =
         let connStr =
             match model.Conn with
             | Offline -> "OFFLINE"
-            | Connecting -> "CONNECTING"
+            | Connecting _ -> "CONNECTING"
             | Online _ -> "ONLINE"
 
         let contactNames =
