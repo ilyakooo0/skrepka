@@ -136,6 +136,7 @@ module App =
     let private truncKey (hex: string) = hexToOb hex |> truncOb
 
     let private tryParsePubkey (input: string) =
+        let input = input.Trim()
         (Phonemic.fromOb input |> Option.orElseWith (fun () -> Crypto.tryFromHex input))
         |> Option.filter (fun bytes -> bytes.Length = 32)
 
@@ -375,14 +376,16 @@ module App =
             asyncCmd (async {
                 try
                     let! response = poll session.Url session.Token cursor
-                    let messages, ackIds, errors =
+                    let ackIds = response.Events |> Array.map _.Id |> Array.toList
+
+                    let messages, errors =
                         Array.foldBack
-                            (fun (evt: PollEvent) (msgs, acks, errs) ->
+                            (fun (evt: PollEvent) (msgs, errs) ->
                                 match decryptEvent session.Identity.PrivKey evt.Payload with
-                                | Ok msg -> (msg :: msgs, evt.Id :: acks, errs)
-                                | Error err -> (msgs, acks, err :: errs))
+                                | Ok msg -> (msg :: msgs, errs)
+                                | Error err -> (msgs, err :: errs))
                             response.Events
-                            ([], [], [])
+                            ([], [])
 
                     if not ackIds.IsEmpty then
                         do! ackMessages session.Url session.Token ackIds
@@ -565,15 +568,15 @@ module App =
                         .font(size = 11.)
                 | None -> ()
 
-                let allMessages =
-                    msgs
-                    |> List.map (fun m ->
-                        if m.IsOutgoing then $"You: {m.Body}" else m.Body)
-                    |> String.concat "\n"
-
-                Label(if allMessages = "" then "No messages yet" else allMessages)
-                    .padding(8.)
-                    .font(size = 14.)
+                if msgs.IsEmpty then
+                    Label("No messages yet")
+                        .padding(8.)
+                        .font(size = 14.)
+                else
+                    for m in msgs do
+                        Label(if m.IsOutgoing then $"You: {m.Body}" else m.Body)
+                            .padding(8.)
+                            .font(size = 14.)
 
                 HStack(spacing = 8.) {
                     Entry(model.Compose, SetCompose)

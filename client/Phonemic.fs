@@ -82,18 +82,10 @@ module Phonemic =
         suffixes |> Array.mapi (fun i s -> s, byte i) |> Map.ofArray
 
     let toOb (bytes: byte[]) : string =
-        let sb = System.Text.StringBuilder()
-
-        for i in 0..2 .. bytes.Length - 1 do
-            let pair = i / 2
-
-            if pair > 0 then
-                sb.Append('-') |> ignore
-
-            sb.Append(prefixes.[int bytes.[i]]).Append(suffixes.[int bytes.[i + 1]])
-            |> ignore
-
-        sb.ToString()
+        bytes
+        |> Array.chunkBySize 2
+        |> Array.map (fun pair -> $"{prefixes.[int pair.[0]]}{suffixes.[int pair.[1]]}")
+        |> String.concat "-"
 
     let fromOb (s: string) : byte[] option =
         let pairs = s.Split('-', StringSplitOptions.RemoveEmptyEntries)

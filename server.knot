@@ -48,7 +48,15 @@ federationEnabled = federationSecret != ""
 -- Types
 -- ============================================
 
-type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
+type PollEventType = PollMessage {}
+
+impl ToJSON PollEventType where
+  toJson _ = toJson "message"
+
+impl FromJSON PollEventType where
+  parseJson _ = PollMessage {}
+
+type PollEvent = {id: MessageIdHex, eventType: PollEventType, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
 type GossipEventType = GossipOnline {} | GossipOffline {}
 
@@ -63,7 +71,6 @@ impl FromJSON GossipEventType where
     if s == "online" then GossipOnline {} else GossipOffline {}
 
 isGossipOnline = \et -> case et of GossipOnline {} -> True {}; _ -> False {}
-isGossipOffline = \et -> case et of GossipOffline {} -> True {}; _ -> False {}
 
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
@@ -715,7 +722,7 @@ pollOnce = \token cursor -> do
         let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
         let evts = do
           m <- limitedMsgs
-          yield {id: m.messageId, eventType: "message",
+          yield {id: m.messageId, eventType: PollMessage {},
                  payload: {toKey: m.toKey, fromKey: m.fromKey,
                             encryptedBlob: m.encryptedBlob,
                             timestamp: m.timestamp}}
@@ -906,11 +913,12 @@ serve = \req -> case req of
             p <- presence
             where p.pubkey == pubkey && p.expiresAt > t
             yield p
-          let foundServer = (fold (\acc p ->
-            if acc.server == serverHostN then acc
-            else if p.server == serverHostN then {server: serverHostN, best: p.expiresAt}
-            else if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt}
-            else acc) {server: "", best: 0} valid).server
+          let localPresent = any valid (\p -> p.server == serverHostN)
+          let bestRemote = (fold (\acc p ->
+            if p.server != serverHostN && p.expiresAt > acc.best
+              then {server: p.server, best: p.expiresAt}
+              else acc) {server: "", best: 0} valid).server
+          let foundServer = if localPresent then serverHostN else bestRemote
           yield {pr: pr, authorized: True {}, foundServer: foundServer}
     forkBroadcastOffline t result.pr
     yield (respond {online: result.foundServer != "", server: result.foundServer, authorized: result.authorized})
@@ -926,7 +934,7 @@ serve = \req -> case req of
       else do
         let allValidEntries = validGossipEvents events t
         let onlineEntries = do e <- allValidEntries; where isGossipOnline e.eventType; yield e
-        let offlineEntries = do e <- allValidEntries; where isGossipOffline e.eventType; yield e
+        let offlineEntries = do e <- allValidEntries; where not (isGossipOnline e.eventType); yield e
         let filteredOnline = do
           e <- onlineEntries
           where none offlineEntries (\o -> o.server == fromServer && samePubkeyServer o e && o.timestamp > e.timestamp)
@@ -936,8 +944,8 @@ serve = \req -> case req of
           where none onlineEntries (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
           yield e
         let trustedOffline = do
-          e <- offlineEntries
-          where e.server == fromServer
+          e <- allValidEntries
+          where not (isGossipOnline e.eventType) && e.server == fromServer
           yield e
         let deduped = mergeByPubkeyServer [] filteredOnline
         gossipResult <- atomic do
