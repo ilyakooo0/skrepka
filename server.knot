@@ -499,16 +499,16 @@ validGossipEvents : [GossipEvent] -> Timestamp -> GossipEventType -> [ValidGossi
 validGossipEvents = \events t eventType -> do
   e <- events
   where e.eventType == eventType
-  where not (e.server == "")
-  where not (e.pubkey == "")
   where not (tooLong e.pubkey maxPubkeyLen)
   where not (tooLong e.server maxServerNameLen)
   where not (isBadServerName e.server)
   where isValidHex e.pubkey
-  where not (normalizeServerName e.server == serverHostN)
+  let server = normalizeServerName e.server
+  where not (server == serverHostN)
   where e.timestamp <= t + clockSkewTolerance
-  where e.timestamp + (clampTtl e.ttl) * 1000 > t
-  yield {eventType: eventType, pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp, ttl: clampTtl e.ttl}
+  let ttl = clampTtl e.ttl
+  where e.timestamp + ttl * 1000 > t
+  yield {eventType: eventType, pubkey: normalizeHex e.pubkey, server: server, expiresAt: e.timestamp + ttl * 1000, timestamp: e.timestamp, ttl: ttl}
 
 sendToEach : [Text] -> (Text -> (a {})) -> a {}
 sendToEach = \servers action ->
@@ -581,7 +581,7 @@ sendBatchedGossip = \peerServers allEvents ->
 broadcastOfflineGossip = \t peerServers expiredLocal -> do
   let expiredEntries = mergeByKey (\a b -> a.pubkey == b.pubkey) [] (do
     p <- expiredLocal
-    yield {pubkey: p.pubkey, ttl: (let rawTtl = (p.expiresAt - p.timestamp) / 1000 in clampTtl (if rawTtl < offlineGossipMinTtl then offlineGossipMinTtl else rawTtl)), expiresAt: p.expiresAt})
+    yield {pubkey: p.pubkey, ttl: (let rawTtl = (p.expiresAt - p.timestamp) / 1000 in if rawTtl < offlineGossipMinTtl then offlineGossipMinTtl else if rawTtl > maxPresenceTtl then maxPresenceTtl else rawTtl), expiresAt: p.expiresAt})
   if federationEnabled && count expiredEntries > 0 && count peerServers > 0
     then do
       let gossipEvents = do
@@ -725,10 +725,8 @@ serve = \req -> case req of
       pr <- maybePrune t
       challenges <- *challenges
       let challengesCapped = capPerKey challenges (\c -> c.pubkey == pubkey) maxChallengesPerKey (\c -> c.expiresAt) t
-      let withoutExpired = if count challengesCapped >= maxChallenges
-        then do c <- challengesCapped; where c.expiresAt > t; yield c
-        else challengesCapped
-      let globalCapped = capGlobal withoutExpired maxChallenges (\c -> c.expiresAt)
+      let activeChallenges = do c <- challengesCapped; where c.expiresAt > t; yield c
+      let globalCapped = capGlobal activeChallenges maxChallenges (\c -> c.expiresAt)
       set *challenges = union
         globalCapped
         [{pubkey: pubkey, challenge: challenge, expiresAt: t + challengeExpiry}]
@@ -825,8 +823,7 @@ serve = \req -> case req of
       let authorized = auth.authorized
       seqCounter <- *seqCounter
       let seqTs = nextSeqTs t seqCounter
-      let recipientMsgCount = countMessagesFor messages to t
-      let shouldInsert = authorized && recipientMsgCount < maxMessagesPerRecipient
+      let shouldInsert = authorized && countMessagesFor messages to t < maxMessagesPerRecipient
       set *seqCounter = if shouldInsert then seqTs else seqCounter
       set *messages = if shouldInsert
         then union messages
@@ -1003,15 +1000,9 @@ serve = \req -> case req of
         yield {pubkey: k.pubkey, server: k.server}
       let afterOffline = removeOffline merged offlineOnlyKeys trustedOffline t
       let withinCapacity = count afterOffline <= maxPresenceEntries
+      let updatesOnly = do e <- trustedDeduped; where any presence (\p -> samePubkeyServer p e); yield e
       let updatesOnlyMerged = if withinCapacity then afterOffline
-        else fold (\acc e ->
-          if any acc (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt)
-            then acc
-            else if any presence (\p -> samePubkeyServer p e)
-              then union
-                (do p <- acc; where not (samePubkeyServer p e); yield p)
-                [e]
-              else acc) presence trustedDeduped
+        else mergeByPubkeyServer presence updatesOnly
       let updatesOnlyAfterOffline = if withinCapacity then afterOffline
         else removeOffline updatesOnlyMerged offlineOnlyKeys trustedOffline t
       let reclaimCapacity = if withinCapacity then 0 else maxPresenceEntries - count updatesOnlyAfterOffline
@@ -1028,8 +1019,7 @@ serve = \req -> case req of
       let appliedOnlineUpdates = if withinCapacity then appliedOnline
         else union
           (do
-            e <- trustedDeduped
-            where any presence (\p -> samePubkeyServer p e)
+            e <- updatesOnly
             where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt)
             yield {pubkey: e.pubkey, server: e.server})
           (do
