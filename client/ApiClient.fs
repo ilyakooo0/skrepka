@@ -38,8 +38,8 @@ module ApiClient =
             token
             |> Option.iter (fun t -> request.Headers.Add("Authorization", $"Bearer {t}"))
 
-            let! response = client.SendAsync(request) |> Async.AwaitTask
-            let! text = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+            let! response = client.SendAsync(request) |> awaitTask
+            let! text = response.Content.ReadAsStringAsync() |> awaitTask
             return JsonDocument.Parse(text)
         }
 
@@ -47,8 +47,8 @@ module ApiClient =
         async {
             let request = new HttpRequestMessage(HttpMethod.Get, url)
             request.Headers.Add("Authorization", $"Bearer {token}")
-            let! response = client.SendAsync(request) |> Async.AwaitTask
-            let! text = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+            let! response = client.SendAsync(request) |> awaitTask
+            let! text = response.Content.ReadAsStringAsync() |> awaitTask
             return JsonDocument.Parse(text)
         }
 

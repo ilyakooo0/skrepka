@@ -27,6 +27,13 @@ module App =
           Timestamp: int64
           MessageId: string }
 
+    [<CLIMutable>]
+    type TextEnvelope =
+        { ``type``: string
+          id: string
+          timestamp: int64
+          body: string }
+
     type Page =
         | Setup
         | Conversations
@@ -86,9 +93,7 @@ module App =
         | SetNewPubkey of string
         | SetNewNickname of string
         | DoSaveContact
-        | DoDeleteContact of string
         | PollResult of PollResultData
-        | DoPoll
         | CopyPubKey
         | DismissError
         | StateLoaded of LoadedState
@@ -242,11 +247,6 @@ module App =
 
             model', cmds @ (if not incoming.IsEmpty then saveCmd model' else [])
 
-        | DoPoll ->
-            match trySession model with
-            | Some session -> model, [ CmdPoll(session, model.PollCursor) ]
-            | None -> model, []
-
         | SetNewPubkey pk -> { model with NewPubkey = pk }, []
         | SetNewNickname nn -> { model with NewNickname = nn }, []
 
@@ -266,13 +266,6 @@ module App =
                 model', saveCmd model'
             else
                 model, []
-
-        | DoDeleteContact pk ->
-            let model' =
-                { model with
-                    Contacts = model.Contacts |> List.filter (fun c -> c.Pubkey <> pk) }
-
-            model', saveCmd model'
 
         | CopyPubKey ->
             match model.Identity with
@@ -316,12 +309,11 @@ module App =
 
     let private asyncCmd (op: Async<Msg>) : Cmd<Msg> =
         Cmd.ofEffect (fun dispatch ->
-            System.Threading.Tasks.Task.Run(Func<System.Threading.Tasks.Task>(fun () ->
-                task {
-                    let! msg = Async.StartAsTask op
-                    dispatch msg
-                }))
-            |> ignore)
+            async {
+                let! msg = op
+                dispatch msg
+            }
+            |> Async.Start)
 
     let private decryptEvent (privKey: byte[]) (payload: ApiClient.EventPayload) =
         try
@@ -329,13 +321,13 @@ module App =
 
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
-                let pt = JsonDocument.Parse(plaintext).RootElement
+                let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext)
 
-                if pt.GetProperty("type").GetString() = "text" then
+                if envelope.``type`` = "text" then
                     Ok { FromPubkey = senderHex
-                         Body = pt.GetProperty("body").GetString()
+                         Body = envelope.body
                          Timestamp = payload.Timestamp
-                         MessageId = pt.GetProperty("id").GetString() }
+                         MessageId = envelope.id }
                 else
                     Error "unknown type"
             | None -> Error "decrypt failed"
@@ -369,7 +361,7 @@ module App =
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
                     let payload =
-                        JsonSerializer.Serialize({| ``type`` = "text"; id = messageId; timestamp = ts; body = text |})
+                        JsonSerializer.Serialize({ ``type`` = "text"; id = messageId; timestamp = ts; body = text }: TextEnvelope)
 
                     let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob
