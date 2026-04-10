@@ -40,7 +40,7 @@ module App =
 
     type ConnState =
         | Offline
-        | Connecting of Identity
+        | Connecting
         | Online of Session
 
     type PollResultData =
@@ -178,12 +178,12 @@ module App =
         | DoConnect ->
             match model.Identity with
             | Some id ->
-                { model with Conn = Connecting id }, [ CmdConnect(model.ServerUrl, id) ]
+                { model with Conn = Connecting }, [ CmdConnect(model.ServerUrl, id) ]
             | None -> { model with Error = Some "No identity generated" }, []
 
         | AuthOk token ->
-            match model.Conn with
-            | Connecting id ->
+            match model.Conn, model.Identity with
+            | Connecting, Some id ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
                 { model with Conn = Online session; Page = Conversations; Error = None },
                 [ CmdPoll(session, model.PollCursor) ]
@@ -252,7 +252,7 @@ module App =
 
         | DoSaveContact ->
             if model.NewPubkey <> "" && model.NewNickname <> "" then
-                let contact =
+                let contact: Contact =
                     { Pubkey = model.NewPubkey
                       Nickname = model.NewNickname }
 
@@ -281,38 +281,36 @@ module App =
 
         | DismissError -> { model with Error = None }, []
 
-        | StateLoaded { Identity = identityOpt; Data = dataOpt } ->
-            match identityOpt with
-            | None -> model, []
-            | Some identity ->
-                let model' = { model with Identity = Some identity; Conn = Connecting identity }
+        | StateLoaded { Identity = None } -> model, []
+        | StateLoaded { Identity = Some identity; Data = dataOpt } ->
+            let model' = { model with Identity = Some identity; Conn = Connecting }
 
-                let model' =
-                    match dataOpt with
-                    | Some data ->
-                        let messages =
-                            data.Messages
-                            |> Seq.map (fun (KeyValue(pk, dtos)) ->
-                                pk,
-                                dtos
-                                |> Array.toList
-                                |> List.map (fun m ->
-                                    { Id = m.Id
-                                      Body = m.Body
-                                      Timestamp = DateTimeOffset.FromUnixTimeSeconds m.TimestampUnix
-                                      IsOutgoing = m.IsOutgoing }))
-                            |> Map.ofSeq
+            let model' =
+                match dataOpt with
+                | Some data ->
+                    let messages =
+                        data.Messages
+                        |> Seq.map (fun (KeyValue(pk, dtos)) ->
+                            pk,
+                            dtos
+                            |> Array.toList
+                            |> List.map (fun m ->
+                                { Id = m.Id
+                                  Body = m.Body
+                                  Timestamp = DateTimeOffset.FromUnixTimeSeconds m.TimestampUnix
+                                  IsOutgoing = m.IsOutgoing }))
+                        |> Map.ofSeq
 
-                        { model' with
-                            Contacts = data.Contacts |> Array.toList
-                            Messages = messages
-                            ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
-                            PollCursor = data.PollCursor
-                            Page = Conversations }
+                    { model' with
+                        Contacts = data.Contacts |> Array.toList
+                        Messages = messages
+                        ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
+                        PollCursor = data.PollCursor
+                        Page = Conversations }
 
-                    | None -> { model' with Page = Settings }
+                | None -> { model' with Page = Settings }
 
-                model', [ CmdConnect(model'.ServerUrl, identity) ]
+            model', [ CmdConnect(model'.ServerUrl, identity) ]
 
     // ── mapCmd ──
 
@@ -325,24 +323,19 @@ module App =
                 }))
             |> ignore)
 
-    let private decryptEvent (privKey: byte[]) (payload: JsonElement) =
+    let private decryptEvent (privKey: byte[]) (payload: ApiClient.EventPayload) =
         try
-            let blobHex = payload.GetProperty("encryptedBlob").GetString()
-            let tsEl = payload.GetProperty("timestamp")
-            let ts =
-                if tsEl.ValueKind = JsonValueKind.String then Int64.Parse(tsEl.GetString())
-                else tsEl.GetInt64()
-            let blob = Crypto.fromHex blobHex
+            let blob = Crypto.fromHex payload.EncryptedBlob
 
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
-                let ptDoc = JsonDocument.Parse(plaintext)
-                let ptRoot = ptDoc.RootElement
+                let pt = JsonDocument.Parse(plaintext).RootElement
 
-                if ptRoot.GetProperty("type").GetString() = "text" then
-                    let msgId = ptRoot.GetProperty("id").GetString()
-                    let body = ptRoot.GetProperty("body").GetString()
-                    Ok { FromPubkey = senderHex; Body = body; Timestamp = ts; MessageId = msgId }
+                if pt.GetProperty("type").GetString() = "text" then
+                    Ok { FromPubkey = senderHex
+                         Body = pt.GetProperty("body").GetString()
+                         Timestamp = payload.Timestamp
+                         MessageId = pt.GetProperty("id").GetString() }
                 else
                     Error "unknown type"
             | None -> Error "decrypt failed"
@@ -376,7 +369,7 @@ module App =
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
                     let payload =
-                        $"""{{ "type": "text", "id": "{messageId}", "timestamp": {ts}, "body": {JsonSerializer.Serialize(text)} }}"""
+                        JsonSerializer.Serialize({| ``type`` = "text"; id = messageId; timestamp = ts; body = text |})
 
                     let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob
@@ -503,7 +496,7 @@ module App =
 
                     match model.Conn with
                     | Offline -> Button("Connect", DoConnect)
-                    | Connecting _ -> Label("Connecting...").centerTextHorizontal()
+                    | Connecting -> Label("Connecting...").centerTextHorizontal()
                     | Online _ ->
                         Button("Disconnect", DoDisconnect)
                         Button("Go to Conversations", Nav Conversations)
@@ -516,7 +509,7 @@ module App =
         let connStr =
             match model.Conn with
             | Offline -> "OFFLINE"
-            | Connecting _ -> "CONNECTING"
+            | Connecting -> "CONNECTING"
             | Online _ -> "ONLINE"
 
         let contactNames =

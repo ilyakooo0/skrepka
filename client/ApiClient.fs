@@ -8,7 +8,8 @@ open System.Threading.Tasks
 
 module ApiClient =
 
-    type PollEvent = { Id: string; Payload: JsonElement }
+    type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
+    type PollEvent = { Id: string; Payload: EventPayload }
 
     type AuthResult = { Token: string; ExpiresAt: int64 }
     type SendResult = { Status: string; MessageId: string }
@@ -63,7 +64,7 @@ module ApiClient =
 
     let requestChallenge (serverUrl: string) (pubkeyHex: string) =
         async {
-            let body = $"""{{ "pubkey": "{pubkeyHex}" }}"""
+            let body = JsonSerializer.Serialize({| pubkey = pubkeyHex |})
             let! doc = postJson $"{serverUrl}/auth/challenge" body None
             let root = expectObject doc "/auth/challenge"
             return root.GetProperty("challenge").GetString()
@@ -71,8 +72,7 @@ module ApiClient =
 
     let verify (serverUrl: string) (pubkeyHex: string) (challenge: string) (signatureHex: string) =
         async {
-            let body =
-                $"""{{ "pubkey": "{pubkeyHex}", "challenge": "{challenge}", "signature": "{signatureHex}" }}"""
+            let body = JsonSerializer.Serialize({| pubkey = pubkeyHex; challenge = challenge; signature = signatureHex |})
 
             let! doc = postJson $"{serverUrl}/auth/verify" body None
             let root = expectObject doc "/auth/verify"
@@ -83,8 +83,7 @@ module ApiClient =
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
         async {
-            let body =
-                $"""{{ "to": "{toHex}", "encryptedBlob": "{blobHex}", "timestamp": {timestamp} }}"""
+            let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
 
             let! doc = postJson $"{serverUrl}/messages" body (Some token)
             let root = expectObject doc "/messages"
@@ -101,7 +100,7 @@ module ApiClient =
     let poll (serverUrl: string) (token: string) (cursor: uint64) =
         async {
             let request = new HttpRequestMessage(HttpMethod.Post, $"{serverUrl}/poll")
-            request.Content <- new StringContent($"""{{"cursor":{cursor},"timeout":30000}}""", Encoding.UTF8, "application/json")
+            request.Content <- new StringContent(JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |}), Encoding.UTF8, "application/json")
             request.Headers.Add("Authorization", $"Bearer {token}")
 
             let! response = pollClient.SendAsync(request) |> awaitTask
@@ -116,18 +115,19 @@ module ApiClient =
                 [ for e in events.EnumerateArray() do
                       if e.ValueKind = JsonValueKind.Object
                          && e.GetProperty("eventType").GetString() = "message" then
+                          let p = e.GetProperty("payload")
+                          let ts = p.GetProperty("timestamp")
                           yield
                               { Id = e.GetProperty("id").GetString()
-                                Payload = e.GetProperty("payload") } ]
+                                Payload =
+                                    { EncryptedBlob = p.GetProperty("encryptedBlob").GetString()
+                                      Timestamp = if ts.ValueKind = JsonValueKind.String then Int64.Parse(ts.GetString()) else ts.GetInt64() } } ]
 
             return { Events = events; Cursor = cursor }
         }
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
         async {
-            let idsJson =
-                messageIds |> List.map (fun id -> $"\"{id}\"") |> String.concat ", "
-
-            let body = $"""{{ "messageIds": [{idsJson}] }}"""
+            let body = JsonSerializer.Serialize({| messageIds = messageIds |})
             do! postJson $"{serverUrl}/messages/ack" body (Some token) |> Async.Ignore
         }
