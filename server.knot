@@ -438,12 +438,16 @@ safeCompare = \a b ->
   safeCompareLoop a b maxTokenLen 0 + (if a == "" then 1 else 0) + (if b == "" then 1 else 0) == 0
 
 evictOneOldest = \items getKey ->
-  let oldest = fold (\acc x -> let k = getKey x in if acc == -1 || k < acc then k else acc) (-1) items in
-  if oldest == -1 then items
-  else (fold (\acc x ->
-    if not acc.removed && getKey x == oldest
-      then {removed: True {}, items: acc.items}
-      else {removed: acc.removed, items: union acc.items [x]}) {removed: False {}, items: []} items).items
+  let oldest = fold (\acc x -> let k = getKey x in case acc of
+    Nothing {} -> Just {value: k}
+    Just {value: v} -> if k < v then Just {value: k} else acc) Nothing {} items in
+  case oldest of
+    Nothing {} -> items
+    Just {value: oldestKey} ->
+      (fold (\acc x ->
+        if not acc.removed && getKey x == oldestKey
+          then {removed: True {}, items: acc.items}
+          else {removed: acc.removed, items: union acc.items [x]}) {removed: False {}, items: []} items).items
 
 capPerKey = \items matchKey maxPerKey getExpiry t ->
   let activeCount = count (do x <- items; where matchKey x; where getExpiry x > t; yield x) in
@@ -655,9 +659,8 @@ pruneAndRetry = \t -> do
     forwards <- *forwards
     ackedIds <- *ackedIds
     let pendingAcks = do a <- ackedIds; where isFederatedOrigin a.originServer; yield a
-    yield {pr: pr, pendingForwards: forwards, pendingAcks: pendingAcks}
-  let pr = result.pr
-  broadcastOfflineGossip t pr.peerServers pr.expiredLocal
+    yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: forwards, pendingAcks: pendingAcks}
+  broadcastOfflineGossip t result.peerServers result.expiredLocal
   when (federationEnabled && count result.pendingForwards > 0)
     (retryPendingForwards result.pendingForwards)
   when (federationEnabled && count result.pendingAcks > 0) (do
@@ -1054,12 +1057,15 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = isFederatedOrigin originServer
-    let clampedTs = clampTimestamp timestamp t
-    result <- atomic do
-      pr <- maybePrune t
-      if not (authorized && validOrigin)
-        then yield {pr: pr, ok: False {}}
-        else do
+    if not (authorized && validOrigin)
+      then do
+        pruneResult <- atomic do maybePrune t
+        forkBroadcastOffline t pruneResult
+        yield (respond {ok: False {}})
+      else do
+        let clampedTs = clampTimestamp timestamp t
+        result <- atomic do
+          pr <- maybePrune t
           messages <- *messages
           ackedIds <- *ackedIds
           if any messages (\m -> m.messageId == messageId && m.toKey == toKey)
@@ -1075,8 +1081,8 @@ serve = \req -> case req of
                   [{messageId: messageId, toKey: toKey, fromKey: fromKey,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
                 yield {pr: pr, ok: True {}}
-    forkBroadcastOffline t result.pr
-    yield (respond {ok: result.ok})
+        forkBroadcastOffline t result.pr
+        yield (respond {ok: result.ok})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     let fromServer = normalizeServerName fromServer
@@ -1087,16 +1093,12 @@ serve = \req -> case req of
     let validAck = authorized && originServer == serverHostN && not (fromServer == serverHostN)
     pruneResult <- atomic do
       pr <- maybePrune t
-      forwards <- *forwards
-      let forwardsToRemove = do
-        f <- forwards
-        mid <- dedupedIds
-        where f.messageId == mid
-        where f.toServer == fromServer
-        yield f
-      set *forwards = if validAck
-        then diff forwards forwardsToRemove
-        else forwards
+      when validAck (do
+        forwards <- *forwards
+        set *forwards = do
+          f <- forwards
+          where not (f.toServer == fromServer && any dedupedIds (\mid -> f.messageId == mid))
+          yield f)
       yield pr
     forkBroadcastOffline t pruneResult
     yield (respond {ok: validAck})
