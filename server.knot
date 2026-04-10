@@ -506,10 +506,8 @@ countMessagesFor = \messages toKey t ->
 validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
 validGossipEvents = \events t -> do
   e <- events
-  where not (tooLong e.pubkey maxPubkeyLen)
-  where not (tooLong e.server maxServerNameLen)
-  where not (isBadServerName e.server)
-  where isValidHex e.pubkey
+  where isValidHex e.pubkey && not (tooLong e.pubkey maxPubkeyLen)
+  where not (tooLong e.server maxServerNameLen) && not (isBadServerName e.server)
   let server = normalizeServerName e.server
   where not (server == serverHostN)
   where e.timestamp <= t + clockSkewTolerance
@@ -590,12 +588,12 @@ sendBatchedGossip : [Text] -> [GossipEvent] -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents ->
   sendToEach peerServers (\server -> sendBatchedGossipToServer server allEvents)
 
-broadcastOfflineGossip = \t peerServers expiredLocal -> do
-  let expiredEntries = mergeByKey (\a b -> a.pubkey == b.pubkey) [] (do
-    p <- expiredLocal
-    let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
-    yield {pubkey: p.pubkey, ttl: ttl, expiresAt: p.expiresAt})
-  when (federationEnabled && count expiredEntries > 0 && count peerServers > 0) (do
+broadcastOfflineGossip = \t peerServers expiredLocal ->
+  when (federationEnabled && count peerServers > 0 && count expiredLocal > 0) (do
+    let expiredEntries = mergeByKey (\a b -> a.pubkey == b.pubkey) [] (do
+      p <- expiredLocal
+      let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
+      yield {pubkey: p.pubkey, ttl: ttl, expiresAt: p.expiresAt})
     let gossipEvents = do
       e <- expiredEntries
       yield {eventType: "offline", pubkey: e.pubkey, server: serverHostN, timestamp: e.expiresAt, ttl: e.ttl}
@@ -767,20 +765,18 @@ serve = \req -> case req of
             then collectPeerServers updatedPresence (\p -> p.server)
             else []
           yield {pr: pr, verify: VerifyOk {peerServers: peerServers}}
-    fork (do
-      case result.verify of
-        VerifyOk {peerServers} ->
-          when federationEnabled
-            (sendToEach peerServers (\server -> do
-              _ <- fetch (federationScheme ++ server) (RecvGossip {
-                authorization: "Bearer " ++ federationSecret,
-                events: [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHostN})
-              yield {}))
-        _ -> yield {}
-      let expiredLocal = case result.verify of
-        VerifyOk _ -> do p <- result.pr.expiredLocal; where not (p.pubkey == pubkey); yield p
-        _ -> result.pr.expiredLocal
-      broadcastOfflineGossip t result.pr.peerServers expiredLocal)
+    fork (case result.verify of
+      VerifyOk {peerServers} -> do
+        when federationEnabled
+          (sendToEach peerServers (\server -> do
+            _ <- fetch (federationScheme ++ server) (RecvGossip {
+              authorization: "Bearer " ++ federationSecret,
+              events: [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHostN})
+            yield {}))
+        broadcastOfflineGossip t result.pr.peerServers
+          (do p <- result.pr.expiredLocal; where not (p.pubkey == pubkey); yield p)
+      _ ->
+        broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.verify of
       VerifyFailed _ -> respond {token: "", expiresAt: 0}
       VerifyOk _ -> respond {token: token, expiresAt: expiry})
@@ -800,13 +796,14 @@ serve = \req -> case req of
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     let to = normalizeHex to
     let encryptedBlob = normalizeHex encryptedBlob
+    let token = extractToken authorization
     t <- now
     msgId <- genToken
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       pr <- maybePrune t
       sessions <- *sessions
-      let auth = authenticateSession sessions (extractToken authorization) t
+      let auth = authenticateSession sessions token t
       case auth of
         Unauthorized {} ->
           yield {pr: pr, send: SendUnauthorized {}}
@@ -855,12 +852,13 @@ serve = \req -> case req of
       SendDone {status} -> respond {status: status, messageId: msgId})
 
   AckMessages {messageIds, authorization, respond} -> do
+    let token = extractToken authorization
     t <- now
     let dedupedIds = dedupMessageIds messageIds
     result <- atomic do
       pr <- maybePrune t
       sessions <- *sessions
-      let auth = authenticateSession sessions (extractToken authorization) t
+      let auth = authenticateSession sessions token t
       case auth of
         Unauthorized {} ->
           yield {pr: pr, ack: AckUnauthorized {}}
@@ -888,35 +886,36 @@ serve = \req -> case req of
           yield {pr: pr, ack: AckDone {pendingAcks: ackedFederated, evictedEntries: evictedEntries}}
     fork (do
       case result.ack of
-        AckDone {pendingAcks, evictedEntries} -> do
-          let originServers = collectPeerServers pendingAcks (\a -> a.originServer)
-          when (count originServers > 0 && federationEnabled)
-            (sendAcksAndClean pendingAcks originServers)
-          let evictedToRetry = do
-            a <- evictedEntries
-            where none pendingAcks (\a2 -> a2.messageId == a.messageId && a2.toKey == a.toKey)
-            yield a
-          when (count evictedToRetry > 0 && federationEnabled) (do
-            let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
-            sendToEach evictedOriginServers (\server -> do
-              fetchResult <- fetch (federationScheme ++ server) (FederationAck {
-                authorization: "Bearer " ++ federationSecret,
-                messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
-                originServer: server, fromServer: serverHostN})
-              case fetchResult of
-                Err _ -> do
-                  dropped <- atomic do
-                    ackedIds <- *ackedIds
-                    let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
-                    let combined = union ackedIds reinsert
-                    let excess = count combined - maxAckedIds
-                    let afterEviction = if excess <= 0 then combined
-                      else evictOldestAckedIds combined excess
-                    set *ackedIds = afterEviction
-                    yield excess
-                  when (dropped > 0)
-                    (println ("ackMessages: ackedIds at capacity (" ++ show maxAckedIds ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server))
-                _ -> yield {}))
+        AckDone {pendingAcks, evictedEntries} ->
+          when federationEnabled (do
+            let originServers = collectPeerServers pendingAcks (\a -> a.originServer)
+            when (count originServers > 0)
+              (sendAcksAndClean pendingAcks originServers)
+            let evictedToRetry = do
+              a <- evictedEntries
+              where none pendingAcks (\a2 -> a2.messageId == a.messageId && a2.toKey == a.toKey)
+              yield a
+            when (count evictedToRetry > 0) (do
+              let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
+              sendToEach evictedOriginServers (\server -> do
+                fetchResult <- fetch (federationScheme ++ server) (FederationAck {
+                  authorization: "Bearer " ++ federationSecret,
+                  messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
+                  originServer: server, fromServer: serverHostN})
+                case fetchResult of
+                  Err _ -> do
+                    dropped <- atomic do
+                      ackedIds <- *ackedIds
+                      let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
+                      let combined = union ackedIds reinsert
+                      let excess = count combined - maxAckedIds
+                      let afterEviction = if excess <= 0 then combined
+                        else evictOldestAckedIds combined excess
+                      set *ackedIds = afterEviction
+                      yield excess
+                    when (dropped > 0)
+                      (println ("ackMessages: ackedIds at capacity (" ++ show maxAckedIds ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server))
+                  _ -> yield {})))
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.ack of
@@ -925,11 +924,12 @@ serve = \req -> case req of
 
   LookupPresence {pubkey, authorization, respond} -> do
     let pubkey = normalizeHex pubkey
+    let token = extractToken authorization
     t <- now
     result <- atomic do
       pr <- maybePrune t
       sessions <- *sessions
-      let auth = authenticateSession sessions (extractToken authorization) t
+      let auth = authenticateSession sessions token t
       case auth of
         Unauthorized {} ->
           yield {pr: pr, lookup: LookupUnauthorized {}}
@@ -953,7 +953,7 @@ serve = \req -> case req of
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
-    let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
+    let cappedHops = clamp 0 5 hopsRemaining
     let fromServer = normalizeServerName fromServer
     if not authorized || cappedHops < 1 || fromServer == serverHostN || count events > maxGossipEvents
       then do

@@ -15,8 +15,10 @@ module ApiClient =
     [<CLIMutable>]
     type PollEvent = { Id: string; EventType: string; Payload: EventPayload }
 
+    type MessageStatus = Delivered | Federated | Queued | Rejected | Unauthorized
+
     [<CLIMutable>]
-    type SendResult = { Status: string; MessageId: string }
+    type SendResult = { Status: MessageStatus; MessageId: string }
 
     [<CLIMutable>]
     type PollResponse = { Cursor: int64; Events: PollEvent array }
@@ -45,9 +47,29 @@ module ApiClient =
             | _ -> reader.GetInt64()
         override _.Write(writer, value, _) = writer.WriteNumberValue(value)
 
+    type private MessageStatusConverter() =
+        inherit JsonConverter<MessageStatus>()
+        override _.Read(reader, _, _) =
+            match reader.GetString() with
+            | "delivered" -> Delivered
+            | "federated" -> Federated
+            | "queued" -> Queued
+            | "rejected" -> Rejected
+            | "unauthorized" -> Unauthorized
+            | s -> failwith $"Unknown message status: {s}"
+        override _.Write(writer, value, _) =
+            writer.WriteStringValue(
+                match value with
+                | Delivered -> "delivered"
+                | Federated -> "federated"
+                | Queued -> "queued"
+                | Rejected -> "rejected"
+                | Unauthorized -> "unauthorized")
+
     let private jsonOpts =
         let opts = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
         opts.Converters.Add(FlexibleInt64Converter())
+        opts.Converters.Add(MessageStatusConverter())
         opts
 
     let private client =

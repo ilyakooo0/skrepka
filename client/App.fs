@@ -32,18 +32,21 @@ module App =
 
     type Session = { Url: string; Token: string; Identity: Identity }
 
-    type ConnState =
+    type ConnStatus =
         | Offline
         | Connecting
-        | Online of Session
+        | Online of token: string
+
+    type AuthState =
+        | NoIdentity
+        | Identified of identity: Identity * conn: ConnStatus
 
     // ── Model ──
 
     type Model =
         { Page: Page
-          Identity: Identity option
+          Auth: AuthState
           ServerUrl: string
-          Conn: ConnState
           Contacts: Contact list
           PollStatus: string
           Messages: Map<string, ChatMessage list>
@@ -114,12 +117,19 @@ module App =
             contacts @ [ contact ]
 
     let private pubKeyHex model =
-        model.Identity |> Option.map _.PubKeyHex |> Option.defaultValue ""
+        match model.Auth with
+        | Identified(id, _) -> id.PubKeyHex
+        | NoIdentity -> ""
 
     let private trySession model =
-        match model.Conn with
-        | Online session -> Some session
+        match model.Auth with
+        | Identified(id, Online token) -> Some { Url = model.ServerUrl; Token = token; Identity = id }
         | _ -> None
+
+    let private setConn status model =
+        match model.Auth with
+        | Identified(id, _) -> { model with Auth = Identified(id, status) }
+        | NoIdentity -> model
 
     let private saveCmd model =
         [ CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = model.ServerUrl; PollCursor = model.PollCursor } ]
@@ -128,9 +138,8 @@ module App =
 
     let init () =
         { Page = Setup
-          Identity = None
+          Auth = NoIdentity
           ServerUrl = "http://localhost:8080"
-          Conn = Offline
           PollStatus = ""
           Contacts = []
           Messages = Map.empty
@@ -147,28 +156,28 @@ module App =
         | GenIdentity -> model, [ CmdGenIdentity ]
 
         | IdentityReady identity ->
-            { model with Identity = Some identity; Page = Settings },
+            { model with Auth = Identified(identity, Offline); Page = Settings },
             [ CmdSaveIdentity identity ]
 
         | SetServerUrl url -> { model with ServerUrl = url }, []
 
         | DoConnect ->
-            match model.Identity with
-            | Some id ->
-                { model with Conn = Connecting }, [ CmdConnect(model.ServerUrl, id) ]
-            | None -> { model with Error = Some "No identity generated" }, []
+            match model.Auth with
+            | Identified(id, _) ->
+                model |> setConn Connecting, [ CmdConnect(model.ServerUrl, id) ]
+            | NoIdentity -> { model with Error = Some "No identity generated" }, []
 
         | AuthOk token ->
-            match model.Identity, model.Conn with
-            | Some id, Connecting ->
+            match model.Auth with
+            | Identified(id, Connecting) ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
-                { model with Conn = Online session; Page = Conversations; Error = None },
+                { model with Auth = Identified(id, Online token); Page = Conversations; Error = None },
                 [ CmdPoll(session, model.PollCursor) ]
             | _ -> model, []
 
-        | AuthErr err -> { model with Conn = Offline; Error = Some err }, []
+        | AuthErr err -> { setConn Offline model with Error = Some err }, []
 
-        | DoDisconnect -> { model with Conn = Offline }, []
+        | DoDisconnect -> model |> setConn Offline, []
 
         | SetCompose text ->
             match model.Page with
@@ -193,14 +202,18 @@ module App =
                 model', CmdSend(session, pk, compose, id) :: saveCmd model'
             | _ -> model, []
 
-        | Sent(Ok _) -> model, []
+        | Sent(Ok result) ->
+            match result.Status with
+            | ApiClient.Rejected -> { model with Error = Some "Message rejected by server" }, []
+            | ApiClient.Unauthorized -> { model with Error = Some "Not authorized to deliver message" }, []
+            | _ -> model, []
         | Sent(Error err) -> { model with Error = Some $"Send failed: {err}" }, []
 
         | PollResult(incoming, status, newCursor) ->
             let model' =
                 incoming
                 |> List.fold
-                    (fun m (fromPubkey, chatMsg) ->
+                    (fun (m: Model) (fromPubkey, chatMsg) ->
                         { m with
                             Contacts = m.Contacts |> addContactIfNew { Pubkey = fromPubkey; Nickname = truncKey fromPubkey }
                             Messages = m.Messages |> appendMessage fromPubkey chatMsg })
@@ -237,28 +250,26 @@ module App =
             | _ -> model, []
 
         | CopyPubKey ->
-            match model.Identity with
-            | Some id -> model, [ CmdCopyToClipboard id.PubKeyHex ]
-            | None -> model, []
+            match model.Auth with
+            | Identified(id, _) -> model, [ CmdCopyToClipboard id.PubKeyHex ]
+            | NoIdentity -> model, []
 
         | DismissError -> { model with Error = None }, []
 
         | StateLoaded(identity, dataOpt) ->
-            let model' =
-                match dataOpt with
-                | Some data ->
+            match dataOpt with
+            | Some data ->
+                let model' =
                     { model with
-                        Identity = Some identity
-                        Conn = Connecting
+                        Auth = Identified(identity, Connecting)
                         Contacts = data.Contacts
                         Messages = data.Messages
                         ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
                         PollCursor = data.PollCursor
                         Page = Conversations }
-                | None ->
-                    { model with Identity = Some identity; Conn = Connecting; Page = Settings }
-
-            model', [ CmdConnect(model'.ServerUrl, identity) ]
+                model', [ CmdConnect(model'.ServerUrl, identity) ]
+            | None ->
+                { model with Auth = Identified(identity, Offline); Page = Settings }, []
 
     // ── mapCmd ──
 
@@ -424,10 +435,10 @@ module App =
                         Button("Dismiss", DismissError)
                     | None -> ()
 
-                    match model.Conn with
-                    | Offline -> Button("Connect", DoConnect)
-                    | Connecting -> Label("Connecting...").centerTextHorizontal()
-                    | Online _ ->
+                    match model.Auth with
+                    | Identified(_, Offline) | NoIdentity -> Button("Connect", DoConnect)
+                    | Identified(_, Connecting) -> Label("Connecting...").centerTextHorizontal()
+                    | Identified(_, Online _) ->
                         Button("Disconnect", DoDisconnect)
                         Button("Go to Conversations", Nav Conversations)
                 })
@@ -437,10 +448,10 @@ module App =
 
     let private viewConversations model =
         let connStr =
-            match model.Conn with
-            | Offline -> "OFFLINE"
-            | Connecting -> "CONNECTING"
-            | Online _ -> "ONLINE"
+            match model.Auth with
+            | NoIdentity | Identified(_, Offline) -> "OFFLINE"
+            | Identified(_, Connecting) -> "CONNECTING"
+            | Identified(_, Online _) -> "ONLINE"
 
         let contactNames =
             model.Contacts

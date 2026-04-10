@@ -51,13 +51,13 @@ module Store =
                 SecureStorage.Default.GetAsync("identity_pubkey")
                 |> Async.AwaitTask
 
-            if isNull privKeyB64 || isNull pubKeyHex then
-                return None
-            else
-                return
-                    Some
-                        { Crypto.Identity.PrivKey = Convert.FromBase64String privKeyB64
-                          Crypto.Identity.PubKeyHex = pubKeyHex }
+            return
+                Option.map2
+                    (fun pk pub ->
+                        { Crypto.Identity.PrivKey = Convert.FromBase64String pk
+                          Crypto.Identity.PubKeyHex = pub })
+                    (Option.ofObj privKeyB64)
+                    (Option.ofObj pubKeyHex)
         }
 
     let saveIdentity (identity: Crypto.Identity) =
@@ -71,9 +71,9 @@ module Store =
             use db = openDb ()
             let settings = db.GetCollection<SettingsDoc>("settings").FindById(BsonValue "settings")
 
-            if box settings |> isNull then
-                None
-            else
+            match box settings with
+            | null -> None
+            | _ ->
                 let contacts = db.GetCollection<Contact>("contacts").FindAll() |> Seq.toList
 
                 let messages =
