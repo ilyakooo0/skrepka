@@ -49,7 +49,7 @@ module App =
     type ConnStatus =
         | Offline
         | Connecting
-        | Online of Session
+        | Online of url: string * token: string
 
     type AuthState =
         | NoIdentity
@@ -160,7 +160,7 @@ module App =
 
     let private trySession model =
         match model.Auth with
-        | Identified(_, Online session) -> Some session
+        | Identified(id, Online(url, token)) -> Some { Url = url; Token = token; Identity = id }
         | _ -> None
 
     let private setConn status model =
@@ -225,7 +225,7 @@ module App =
             match model.Auth with
             | Identified(id, Connecting) ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
-                { model with Auth = Identified(id, Online session); Page = Conversations; Error = None },
+                { model with Auth = Identified(id, Online(model.ServerUrl, token)); Page = Conversations; Error = None },
                 [ CmdPoll(session, model.PollCursor) ]
             | _ -> model, []
 

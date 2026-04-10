@@ -50,21 +50,23 @@ federationEnabled = federationSecret != ""
 
 type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
-type GossipEventType = GossipOnline {} | GossipOffline {}
+type GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
 
 impl ToJSON GossipEventType where
   toJson et = toJson (case et of
     GossipOnline {} -> "online"
-    GossipOffline {} -> "offline")
+    GossipOffline {} -> "offline"
+    GossipUnknown {} -> "unknown")
 
 impl FromJSON GossipEventType where
   parseJson t =
     let s : Text = parseJson t in
     if s == "online" then GossipOnline {}
     else if s == "offline" then GossipOffline {}
-    else GossipOffline {}
+    else GossipUnknown {}
 
 isGossipOnline = \et -> case et of GossipOnline {} -> True {}; _ -> False {}
+isGossipOffline = \et -> case et of GossipOffline {} -> True {}; _ -> False {}
 
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
@@ -79,16 +81,6 @@ impl ToJSON MessageStatus where
     MsDelivered {} -> "delivered"
     MsFederated {} -> "federated"
     MsQueued {} -> "queued")
-
-impl FromJSON MessageStatus where
-  parseJson t =
-    let s : Text = parseJson t in
-    if s == "unauthorized" then MsUnauthorized {}
-    else if s == "rejected" then MsRejected {}
-    else if s == "delivered" then MsDelivered {}
-    else if s == "federated" then MsFederated {}
-    else if s == "queued" then MsQueued {}
-    else MsQueued {}
 
 type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) && s == normalizeHex s
 type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen) && s == normalizeHex s
@@ -253,7 +245,7 @@ isCgnatRange = \s ->
     then True {}
   else False {}
 
-containsMultipleColons = \s -> fold (\n c -> if c == ":" then n + 1 else n) 0 (chars s) > 1
+containsMultipleColons = \s -> count (do c <- chars s; where c == ":"; yield c) > 1
 
 hasOctalOctet = \s ->
   if take 1 s == "0" && isDigitChar (take 1 (drop 1 s)) && isAllDigitsOrDotsUntilColonOrEnd (drop 2 s) then True {}
@@ -507,7 +499,7 @@ capGossipPresence = \afterOffline appliedOnline trustedDeduped presence trustedO
        withinCapacity: False {}}
 
 countMessagesFor = \messages toKey t ->
-  fold (\n m -> if m.toKey == toKey && m.receivedAt >= t - messageMaxAge then n + 1 else n) 0 messages
+  count (do m <- messages; where m.toKey == toKey && m.receivedAt >= t - messageMaxAge; yield m)
 
 
 validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
@@ -908,11 +900,9 @@ serve = \req -> case req of
             p <- presence
             where p.pubkey == pubkey && p.expiresAt > t
             yield p
-          let foundServer = (fold (\acc p ->
-            if acc.server == serverHostN then acc
-            else if p.server == serverHostN then {server: serverHostN, best: 0}
-            else if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt}
-            else acc) {server: "", best: 0} valid).server
+          let localOnline = any valid (\p -> p.server == serverHostN)
+          let foundServer = if localOnline then serverHostN
+            else (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
           yield {pr: pr, authorized: True {}, foundServer: foundServer}
     forkBroadcastOffline t result.pr
     yield (respond {online: result.foundServer != "", server: result.foundServer, authorized: result.authorized})
@@ -928,14 +918,13 @@ serve = \req -> case req of
       else do
         let allValidEntries = validGossipEvents events t
         let onlineEntries = do e <- allValidEntries; where isGossipOnline e.eventType; yield e
-        let offlineEntries = do e <- allValidEntries; where not (isGossipOnline e.eventType); yield e
-        let trustedOffline = do e <- offlineEntries; where e.server == fromServer; yield e
+        let trustedOffline = do e <- allValidEntries; where isGossipOffline e.eventType && e.server == fromServer; yield e
         let filteredOnline = do
           e <- onlineEntries
           where none trustedOffline (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
           yield e
         let filteredOffline = do
-          e <- offlineEntries
+          e <- trustedOffline
           where none onlineEntries (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
           yield e
         let deduped = mergeByPubkeyServer [] filteredOnline
