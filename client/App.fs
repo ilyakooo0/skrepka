@@ -77,6 +77,11 @@ module App =
 
     // ── Msg ──
 
+    type StateLoadResult =
+        | IdentityAndData of Identity * Data
+        | IdentityOnly of Identity
+        | NothingSaved
+
     type Msg =
         | SetPage of Page
         | SetCompose of string
@@ -95,7 +100,7 @@ module App =
         | PollResult of messages: (string * ChatMessage) list * status: string * cursor: int64
         | CopyPubKey
         | DismissError
-        | StateLoaded of (Identity * Data option) option
+        | StateLoaded of StateLoadResult
 
     // ── CmdMsg ──
 
@@ -156,11 +161,6 @@ module App =
         match contacts |> List.tryFindIndex (fun c -> c.Pubkey = contact.Pubkey) with
         | Some i -> contacts |> List.updateAt i contact
         | None -> contacts @ [ contact ]
-
-    let private pubKeyHex model =
-        match model.Auth with
-        | Identified(id, _) -> id.PubKeyHex
-        | NoIdentity -> ""
 
     let private trySession model =
         match model.Auth with
@@ -293,7 +293,7 @@ module App =
 
         | DismissError -> { model with Error = None }, []
 
-        | StateLoaded(Some(identity, Some data)) ->
+        | StateLoaded(IdentityAndData(identity, data)) ->
             let model' =
                 { model with
                     Auth = Identified(identity, Connecting)
@@ -303,9 +303,9 @@ module App =
                     PollCursor = data.PollCursor
                     Page = Conversations }
             model', [ CmdConnect(model'.ServerUrl, identity) ]
-        | StateLoaded(Some(identity, None)) ->
+        | StateLoaded(IdentityOnly identity) ->
             { model with Auth = Identified(identity, Offline); Page = Settings }, []
-        | StateLoaded None -> model, []
+        | StateLoaded NothingSaved -> model, []
 
     // ── mapCmd ──
 
@@ -411,8 +411,12 @@ module App =
         | CmdLoadState ->
             asyncCmd (async {
                 match! Store.loadIdentity () with
-                | Some id -> return StateLoaded(Some(id, Store.loadData ()))
-                | None -> return StateLoaded None
+                | Some id ->
+                    return StateLoaded(
+                        match Store.loadData () with
+                        | Some data -> IdentityAndData(id, data)
+                        | None -> IdentityOnly id)
+                | None -> return StateLoaded NothingSaved
             })
 
         | CmdSaveIdentity identity ->
@@ -449,32 +453,34 @@ module App =
                         .font(size = 24.)
                         .centerTextHorizontal()
 
-                    Label("Your Public Key:")
-
-                    Label(truncOb (hexToOb (pubKeyHex model)))
-                        .font(size = 14.)
-
-                    Button("Copy Public Key", CopyPubKey)
-
-                    Label("Server:")
-
-                    Entry(model.ServerUrl, SetServerUrl)
-
-                    match model.Error with
-                    | Some err ->
-                        Label(err)
-                            .textColor(Colors.Red)
-                            .font(size = 12.)
-
-                        Button("Dismiss", DismissError)
-                    | None -> ()
-
                     match model.Auth with
-                    | Identified(_, Offline) -> Button("Connect", DoConnect)
-                    | Identified(_, Connecting) -> Label("Connecting...").centerTextHorizontal()
-                    | Identified(_, Online _) ->
-                        Button("Disconnect", DoDisconnect)
-                        Button("Go to Conversations", SetPage Conversations)
+                    | Identified(id, conn) ->
+                        Label("Your Public Key:")
+
+                        Label(truncOb (hexToOb id.PubKeyHex))
+                            .font(size = 14.)
+
+                        Button("Copy Public Key", CopyPubKey)
+
+                        Label("Server:")
+
+                        Entry(model.ServerUrl, SetServerUrl)
+
+                        match model.Error with
+                        | Some err ->
+                            Label(err)
+                                .textColor(Colors.Red)
+                                .font(size = 12.)
+
+                            Button("Dismiss", DismissError)
+                        | None -> ()
+
+                        match conn with
+                        | Offline -> Button("Connect", DoConnect)
+                        | Connecting -> Label("Connecting...").centerTextHorizontal()
+                        | Online _ ->
+                            Button("Disconnect", DoDisconnect)
+                            Button("Go to Conversations", SetPage Conversations)
                     | NoIdentity -> ()
                 })
                     .padding(20.)
