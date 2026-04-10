@@ -18,7 +18,7 @@ module ApiClient =
     type MessageStatus = Delivered | Federated | Queued | Rejected | Unauthorized
 
     [<CLIMutable>]
-    type SendResult = { Status: MessageStatus; MessageId: string }
+    type private SendResult = { Status: MessageStatus; MessageId: string }
 
     [<CLIMutable>]
     type PollResponse = { Cursor: int64; Events: PollEvent array }
@@ -105,7 +105,10 @@ module ApiClient =
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
         let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
-        postJson<SendResult> client $"{serverUrl}/messages" body (Some token)
+        async {
+            let! result = postJson<SendResult> client $"{serverUrl}/messages" body (Some token)
+            return result.Status
+        }
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =
         let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})

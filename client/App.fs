@@ -67,7 +67,7 @@ module App =
         | DoDisconnect
         | SetCompose of string
         | DoSend
-        | Sent of Result<MessageStatus, string>
+        | Sent of Result<unit, string>
         | SetNewPubkey of string
         | SetNewNickname of string
         | DoSaveContact
@@ -89,6 +89,9 @@ module App =
         | CmdSaveData of Data
 
     // ── Helpers ──
+
+    let private nowStr () =
+        DateTimeOffset.UtcNow.ToString("HH:mm:ss")
 
     let private truncate maxLen (s: string) =
         if s.Length > maxLen then s.[..maxLen - 1] + "..." else s
@@ -204,12 +207,8 @@ module App =
                 model', [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
             | _ -> model, []
 
-        | Sent(Ok(Delivered | Federated | Queued)) -> model, []
-        | Sent(Ok Rejected) ->
-            { model with Error = Some "Message rejected by server" }, []
-        | Sent(Ok Unauthorized) ->
-            { model with Error = Some "Not authorized to deliver message" }, []
-        | Sent(Error err) -> { model with Error = Some $"Send failed: {err}" }, []
+        | Sent(Ok()) -> model, []
+        | Sent(Error err) -> { model with Error = Some err }, []
 
         | PollResult(incoming, status, newCursor) ->
             let model' =
@@ -327,10 +326,14 @@ module App =
 
                     let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob
-                    let! result = sendMessage session.Url session.Token recipientHex blobHex ts
-                    return Sent(Ok result.Status)
+                    let! status = sendMessage session.Url session.Token recipientHex blobHex ts
+                    return
+                        match status with
+                        | Delivered | Federated | Queued -> Sent(Ok())
+                        | Rejected -> Sent(Error "Message rejected by server")
+                        | Unauthorized -> Sent(Error "Not authorized to deliver message")
                 with ex ->
-                    return Sent(Error ex.Message)
+                    return Sent(Error $"Send failed: {ex.Message}")
             })
 
         | CmdPoll(session, cursor) ->
@@ -349,7 +352,7 @@ module App =
                     if not ackIds.IsEmpty then
                         do! ackMessages session.Url session.Token ackIds
 
-                    let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
+                    let now = nowStr ()
 
                     let status =
                         $"[{now}] evts:{response.Events.Length} msgs:{messages.Length} errs:{errors.Length}"
@@ -360,7 +363,7 @@ module App =
                 | :? TimeoutException ->
                     return PollResult([], "polling...", cursor)
                 | ex ->
-                    let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
+                    let now = nowStr ()
                     do! Async.Sleep 3000
                     return PollResult([], $"[{now}] poll error: {ex.Message}", cursor)
             })
