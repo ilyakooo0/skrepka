@@ -96,8 +96,9 @@ module ApiClient =
 
             match doc.RootElement.TryGetProperty("error") with
             | true, err ->
+                let msg = err.GetString()
                 doc.Dispose()
-                return failwith $"{url}: {err.GetString()}"
+                return failwith $"{url}: {msg}"
             | _ -> return doc
         }
 

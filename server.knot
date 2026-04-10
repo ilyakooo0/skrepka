@@ -555,8 +555,7 @@ pruneExpired = \t -> do
     yield a
   yield {expiredLocal: (do
     p <- presenceBefore
-    where p.expiresAt <= t
-    where p.server == serverHostN
+    where p.expiresAt <= t && p.server == serverHostN
     where none presenceAfter (\q -> q.pubkey == p.pubkey && q.server == serverHostN)
     yield p), peerServers: peerServersBefore}
 
@@ -576,17 +575,17 @@ forEachBatch = \items batchSize process ->
     process batch
     forEachBatch rest batchSize process
 
-sendBatchedGossipToServer : Text -> [GossipEvent] -> IO {network} {}
-sendBatchedGossipToServer = \server allEvents ->
+sendBatchedGossipToServer : Text -> [GossipEvent] -> Int -> IO {network} {}
+sendBatchedGossipToServer = \server allEvents hops ->
   forEachBatch allEvents maxGossipEvents (\batch -> do
     _ <- fetch (federationScheme ++ server) (RecvGossip {
       authorization: "Bearer " ++ federationSecret,
-      events: batch, hopsRemaining: 2, fromServer: serverHostN})
+      events: batch, hopsRemaining: hops, fromServer: serverHostN})
     yield {})
 
-sendBatchedGossip : [Text] -> [GossipEvent] -> IO {network} {}
-sendBatchedGossip = \peerServers allEvents ->
-  sendToEach peerServers (\server -> sendBatchedGossipToServer server allEvents)
+sendBatchedGossip : [Text] -> [GossipEvent] -> Int -> IO {network} {}
+sendBatchedGossip = \peerServers allEvents hops ->
+  sendToEach peerServers (\server -> sendBatchedGossipToServer server allEvents hops)
 
 broadcastOfflineGossip = \t peerServers expiredLocal ->
   when (federationEnabled && count peerServers > 0 && count expiredLocal > 0) (do
@@ -597,7 +596,7 @@ broadcastOfflineGossip = \t peerServers expiredLocal ->
     let gossipEvents = do
       e <- expiredEntries
       yield {eventType: "offline", pubkey: e.pubkey, server: serverHostN, timestamp: e.expiresAt, ttl: e.ttl}
-    sendBatchedGossip peerServers gossipEvents)
+    sendBatchedGossip peerServers gossipEvents 2)
 
 forkBroadcastOffline = \t result ->
   fork (broadcastOfflineGossip t result.peerServers result.expiredLocal)
@@ -765,18 +764,20 @@ serve = \req -> case req of
             then collectPeerServers updatedPresence (\p -> p.server)
             else []
           yield {pr: pr, verify: VerifyOk {peerServers: peerServers}}
-    fork (case result.verify of
-      VerifyOk {peerServers} -> do
-        when federationEnabled
-          (sendToEach peerServers (\server -> do
-            _ <- fetch (federationScheme ++ server) (RecvGossip {
-              authorization: "Bearer " ++ federationSecret,
-              events: [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHostN})
-            yield {}))
-        broadcastOfflineGossip t result.pr.peerServers
-          (do p <- result.pr.expiredLocal; where not (p.pubkey == pubkey); yield p)
-      _ ->
-        broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
+    let expiredLocal = case result.verify of
+      VerifyOk _ -> do p <- result.pr.expiredLocal; where not (p.pubkey == pubkey); yield p
+      _ -> result.pr.expiredLocal
+    fork (do
+      case result.verify of
+        VerifyOk {peerServers} ->
+          when federationEnabled
+            (sendToEach peerServers (\server -> do
+              _ <- fetch (federationScheme ++ server) (RecvGossip {
+                authorization: "Bearer " ++ federationSecret,
+                events: [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHostN})
+              yield {}))
+        _ -> yield {}
+      broadcastOfflineGossip t result.pr.peerServers expiredLocal)
     yield (case result.verify of
       VerifyFailed _ -> respond {token: "", expiresAt: 0}
       VerifyOk _ -> respond {token: token, expiresAt: expiry})
@@ -867,8 +868,7 @@ serve = \req -> case req of
           let ackedMessages = do
             m <- messages
             mid <- dedupedIds
-            where m.messageId == mid
-            where m.toKey == pubkey
+            where m.messageId == mid && m.toKey == pubkey
             yield m
           set *messages = diff messages ackedMessages
           let ackedFederated = do
@@ -877,12 +877,9 @@ serve = \req -> case req of
             yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
           ackedIds <- *ackedIds
           let combinedAckedIds = union ackedIds ackedFederated
-          let excessCount = count combinedAckedIds - maxAckedIds
-          let afterEviction = if excessCount <= 0 then combinedAckedIds
-            else evictOldestAckedIds combinedAckedIds excessCount
-          let evictedEntries = if excessCount <= 0 then []
-            else diff combinedAckedIds afterEviction
-          set *ackedIds = afterEviction
+          let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
+            if excessCount <= 0 then [] else boundedSmallest combinedAckedIds excessCount (\a -> a.ackedAt)
+          set *ackedIds = diff combinedAckedIds evictedEntries
           yield {pr: pr, ack: AckDone {pendingAcks: ackedFederated, evictedEntries: evictedEntries}}
     fork (do
       case result.ack of
@@ -1021,16 +1018,12 @@ serve = \req -> case req of
         when (not gossipResult.withinCapacity)
           (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer))
         fork (do
-          when (cappedHops > 1 && federationEnabled && count effectiveEvents > 0) (do
+          when (cappedHops > 1 && federationEnabled && count effectiveEvents > 0) (
             let targets = do
               s <- gossipResult.gossipPeerServers
               where not (s == fromServer)
               yield s
-            sendToEach targets (\server -> do
-              _ <- fetch (federationScheme ++ server) (RecvGossip {
-                authorization: "Bearer " ++ federationSecret,
-                events: effectiveEvents, hopsRemaining: cappedHops - 1, fromServer: serverHostN})
-              yield {}))
+            in sendBatchedGossip targets effectiveEvents (cappedHops - 1))
           let pr = gossipResult.pr
           broadcastOfflineGossip t pr.peerServers pr.expiredLocal)
         yield (respond {ok: True {}})

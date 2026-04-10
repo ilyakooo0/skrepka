@@ -111,10 +111,9 @@ module App =
         else contacts @ [ contact ]
 
     let private upsertContact (contact: Contact) (contacts: Contact list) =
-        if contacts |> List.exists (fun c -> c.Pubkey = contact.Pubkey) then
-            contacts |> List.map (fun c -> if c.Pubkey = contact.Pubkey then contact else c)
-        else
-            contacts @ [ contact ]
+        match contacts |> List.tryFindIndex (fun c -> c.Pubkey = contact.Pubkey) with
+        | Some i -> contacts |> List.updateAt i contact
+        | None -> contacts @ [ contact ]
 
     let private pubKeyHex model =
         match model.Auth with
@@ -202,11 +201,11 @@ module App =
                 model', CmdSend(session, pk, compose, id) :: saveCmd model'
             | _ -> model, []
 
-        | Sent(Ok result) ->
-            match result.Status with
-            | ApiClient.Rejected -> { model with Error = Some "Message rejected by server" }, []
-            | ApiClient.Unauthorized -> { model with Error = Some "Not authorized to deliver message" }, []
-            | _ -> model, []
+        | Sent(Ok { Status = ApiClient.Rejected }) ->
+            { model with Error = Some "Message rejected by server" }, []
+        | Sent(Ok { Status = ApiClient.Unauthorized }) ->
+            { model with Error = Some "Not authorized to deliver message" }, []
+        | Sent(Ok _) -> model, []
         | Sent(Error err) -> { model with Error = Some $"Send failed: {err}" }, []
 
         | PollResult(incoming, status, newCursor) ->
@@ -219,12 +218,11 @@ module App =
                             Messages = m.Messages |> appendMessage fromPubkey chatMsg })
                     { model with PollStatus = status; PollCursor = newCursor }
 
-            let cmds =
-                match trySession model' with
-                | Some session -> [ CmdPoll(session, model'.PollCursor) ]
-                | None -> []
-
-            model', cmds @ (if incoming.IsEmpty then [] else saveCmd model')
+            model',
+            [ match trySession model' with
+              | Some session -> CmdPoll(session, model'.PollCursor)
+              | None -> ()
+              if not incoming.IsEmpty then yield! saveCmd model' ]
 
         | SetNewPubkey pk ->
             match model.Page with
@@ -289,14 +287,14 @@ module App =
             | Some(plaintext, senderHex) ->
                 let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext)
 
-                if envelope.Type = "text" then
+                match envelope.Type with
+                | "text" ->
                     Ok(senderHex,
                        { Id = envelope.Id
                          Body = envelope.Body
                          Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
                          IsOutgoing = false })
-                else
-                    Error "unknown type"
+                | t -> Error $"unknown type: {t}"
             | None -> Error "decrypt failed"
         with ex ->
             Error $"parse: {ex.Message}"
@@ -459,7 +457,7 @@ module App =
             |> String.concat ", "
 
         let totalMsgs =
-            model.Messages |> Map.fold (fun acc _ msgs -> acc + List.length msgs) 0
+            model.Messages |> Map.values |> Seq.sumBy List.length
 
         ContentPage(
             ScrollView(
@@ -491,15 +489,13 @@ module App =
                             .textColor(Colors.Gray)
 
                     for c in model.Contacts do
-                        let lastMsg =
+                        let preview =
                             model.Messages
                             |> Map.tryFind c.Pubkey
                             |> Option.bind List.tryLast
                             |> Option.map _.Body
+                            |> Option.map (fun b -> if b.Length > 40 then b.[..39] + "..." else b)
                             |> Option.defaultValue ""
-
-                        let preview =
-                            if lastMsg.Length > 40 then lastMsg.[..39] + "..." else lastMsg
 
                         Button($"{c.Nickname}\n{preview}", Nav(Chat(c.Pubkey, "")))
                 })
