@@ -12,12 +12,46 @@ module ApiClient =
     [<CLIMutable>]
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
 
+    [<JsonConverter(typeof<EventTypeConverter>)>]
     type EventType = Message | Ack | UnknownEvent of string
+    and private EventTypeConverter() =
+        inherit JsonConverter<EventType>()
+        override _.Read(reader, _, _) =
+            match reader.GetString() with
+            | "message" -> Message
+            | "ack" -> Ack
+            | s -> UnknownEvent s
+        override _.Write(writer, value, _) =
+            writer.WriteStringValue(
+                match value with
+                | Message -> "message"
+                | Ack -> "ack"
+                | UnknownEvent s -> s)
 
     [<CLIMutable>]
     type PollEvent = { Id: string; EventType: EventType; Payload: EventPayload }
 
+    [<JsonConverter(typeof<MessageStatusConverter>)>]
     type MessageStatus = Delivered | Federated | Queued | Rejected | Unauthorized | UnknownStatus of string
+    and private MessageStatusConverter() =
+        inherit JsonConverter<MessageStatus>()
+        override _.Read(reader, _, _) =
+            match reader.GetString() with
+            | "delivered" -> Delivered
+            | "federated" -> Federated
+            | "queued" -> Queued
+            | "rejected" -> Rejected
+            | "unauthorized" -> Unauthorized
+            | s -> UnknownStatus s
+        override _.Write(writer, value, _) =
+            writer.WriteStringValue(
+                match value with
+                | Delivered -> "delivered"
+                | Federated -> "federated"
+                | Queued -> "queued"
+                | Rejected -> "rejected"
+                | Unauthorized -> "unauthorized"
+                | UnknownStatus s -> s)
 
     [<CLIMutable>]
     type private SendResult = { Status: MessageStatus }
@@ -41,45 +75,8 @@ module ApiClient =
                 else ok t.Result)
             |> ignore)
 
-    type private MessageStatusConverter() =
-        inherit JsonConverter<MessageStatus>()
-        override _.Read(reader, _, _) =
-            match reader.GetString() with
-            | "delivered" -> Delivered
-            | "federated" -> Federated
-            | "queued" -> Queued
-            | "rejected" -> Rejected
-            | "unauthorized" -> Unauthorized
-            | s -> UnknownStatus s
-        override _.Write(writer, value, _) =
-            writer.WriteStringValue(
-                match value with
-                | Delivered -> "delivered"
-                | Federated -> "federated"
-                | Queued -> "queued"
-                | Rejected -> "rejected"
-                | Unauthorized -> "unauthorized"
-                | UnknownStatus s -> s)
-
-    type private EventTypeConverter() =
-        inherit JsonConverter<EventType>()
-        override _.Read(reader, _, _) =
-            match reader.GetString() with
-            | "message" -> Message
-            | "ack" -> Ack
-            | s -> UnknownEvent s
-        override _.Write(writer, value, _) =
-            writer.WriteStringValue(
-                match value with
-                | Message -> "message"
-                | Ack -> "ack"
-                | UnknownEvent s -> s)
-
     let private jsonOpts =
-        let opts = JsonSerializerOptions(PropertyNameCaseInsensitive = true, NumberHandling = JsonNumberHandling.AllowReadingFromString)
-        opts.Converters.Add(MessageStatusConverter())
-        opts.Converters.Add(EventTypeConverter())
-        opts
+        JsonSerializerOptions(PropertyNameCaseInsensitive = true, NumberHandling = JsonNumberHandling.AllowReadingFromString)
 
     let private client =
         let c = new HttpClient()

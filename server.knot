@@ -115,7 +115,7 @@ type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Times
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
-type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
+type SendResult = SendFailed {status: MessageStatus} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
 
 
 -- ============================================
@@ -818,11 +818,11 @@ serve = \req -> case req of
       auth <- authenticateRequest authorization t
       case auth of
         Unauthorized {} ->
-          yield {pr: pr, send: SendUnauthorized {}}
+          yield {pr: pr, send: SendFailed {status: MsUnauthorized {}}}
         Authorized {pubkey: fromKey} -> do
           messages <- *messages
           if countMessagesFor messages to t >= maxMessagesPerRecipient
-            then yield {pr: pr, send: SendRejected {}}
+            then yield {pr: pr, send: SendFailed {status: MsRejected {}}}
             else do
               presence <- *presence
               seqCounter <- *seqCounter
@@ -860,8 +860,7 @@ serve = \req -> case req of
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
-      SendUnauthorized _ -> respond {status: MsUnauthorized {}, messageId: ""}
-      SendRejected _ -> respond {status: MsRejected {}, messageId: ""}
+      SendFailed {status} -> respond {status: status, messageId: ""}
       SendDone {status} -> respond {status: status, messageId: msgId})
 
   AckMessages {messageIds, authorization, respond} -> do
@@ -913,10 +912,10 @@ serve = \req -> case req of
             where p.pubkey == pubkey && p.expiresAt > t
             yield p
           let foundServer = (fold (\acc p ->
-            if acc.local then acc
-            else if p.server == serverHostN then {server: serverHostN, best: 0, local: True {}}
-            else if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt, local: False {}}
-            else acc) {server: "", best: 0, local: False {}} valid).server
+            if acc.server == serverHostN then acc
+            else if p.server == serverHostN then {server: serverHostN, best: 0}
+            else if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt}
+            else acc) {server: "", best: 0} valid).server
           yield {pr: pr, authorized: True {}, foundServer: foundServer}
     forkBroadcastOffline t result.pr
     yield (respond {online: result.foundServer != "", server: result.foundServer, authorized: result.authorized})
@@ -932,16 +931,16 @@ serve = \req -> case req of
       else do
         let allValidEntries = validGossipEvents events t
         let onlineEntries = do e <- allValidEntries; where isGossipOnline e.eventType; yield e
-        let offlineEntries = do e <- allValidEntries; where not (isGossipOnline e.eventType); yield e
+        let offlineEntries = diff allValidEntries onlineEntries
+        let trustedOffline = do e <- offlineEntries; where e.server == fromServer; yield e
         let filteredOnline = do
           e <- onlineEntries
-          where none offlineEntries (\o -> o.server == fromServer && samePubkeyServer o e && o.timestamp > e.timestamp)
+          where none trustedOffline (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
           yield e
         let filteredOffline = do
           e <- offlineEntries
           where none onlineEntries (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
           yield e
-        let trustedOffline = do e <- offlineEntries; where e.server == fromServer; yield e
         let deduped = mergeByPubkeyServer [] filteredOnline
         gossipResult <- atomic do
           pr <- maybePrune t

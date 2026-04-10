@@ -319,7 +319,7 @@ module App =
 
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
-                let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext, envelopeJsonOpts)
+                let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext)
 
                 match envelope.Type with
                 | Text ->
@@ -336,7 +336,7 @@ module App =
     let mapCmd cmdMsg =
         match cmdMsg with
         | CmdGenIdentity ->
-            asyncCmd (async { return IdentityReady(Crypto.generateIdentity ()) })
+            Cmd.ofEffect (fun dispatch -> dispatch (IdentityReady(Crypto.generateIdentity ())))
 
         | CmdConnect(url, identity) ->
             asyncCmd (async {
@@ -353,7 +353,7 @@ module App =
                     try
                         let recipPub = Crypto.fromHex recipientHex
                         let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                        let payload = JsonSerializer.Serialize<TextEnvelope>({ Type = Text; Id = messageId; Body = text }, envelopeJsonOpts)
+                        let payload = JsonSerializer.Serialize<TextEnvelope>({ Type = Text; Id = messageId; Body = text })
                         let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                         let! status = sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
 
