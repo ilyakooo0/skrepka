@@ -69,7 +69,24 @@ type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: Serve
 
 type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
-type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || s == "delivered" || s == "federated" || s == "queued"
+type MessageStatus = MsUnauthorized {} | MsRejected {} | MsDelivered {} | MsFederated {} | MsQueued {}
+
+impl ToJSON MessageStatus where
+  toJson ms = toJson (case ms of
+    MsUnauthorized {} -> "unauthorized"
+    MsRejected {} -> "rejected"
+    MsDelivered {} -> "delivered"
+    MsFederated {} -> "federated"
+    MsQueued {} -> "queued")
+
+impl FromJSON MessageStatus where
+  parseJson t =
+    let s : Text = parseJson t in
+    if s == "unauthorized" then MsUnauthorized {}
+    else if s == "rejected" then MsRejected {}
+    else if s == "delivered" then MsDelivered {}
+    else if s == "federated" then MsFederated {}
+    else MsQueued {}
 
 type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) && s == normalizeHex s
 type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen) && s == normalizeHex s
@@ -92,12 +109,7 @@ type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: T
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [ServerName]}
-type DeliveryStatus = Delivered {} | Federated {} | Queued {}
-deliveryStatusText = \s -> case s of
-  Delivered {} -> "delivered"
-  Federated {} -> "federated"
-  Queued {} -> "queued"
-type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: DeliveryStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
+type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
 
 
 -- ============================================
@@ -819,9 +831,9 @@ serve = \req -> case req of
               forwards <- *forwards
               let forwardServers = takeN remoteServers (maxForwardsEntries - count forwards)
               let shouldForward = federationEnabled && count forwardServers > 0
-              let status = if localOnline then Delivered {}
-                else if shouldForward then Federated {}
-                else Queued {}
+              let status = if localOnline then MsDelivered {}
+                else if shouldForward then MsFederated {}
+                else MsQueued {}
               set *forwards = if shouldForward
                 then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
                 else forwards
@@ -837,14 +849,14 @@ serve = \req -> case req of
                 authorization: "Bearer " ++ federationSecret})
               whenOk fwdResult (removeForward msgId server))
             case status of
-              Queued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
+              MsQueued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
               _ -> yield {})
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
-      SendUnauthorized _ -> respond {status: "unauthorized", messageId: ""}
-      SendRejected _ -> respond {status: "rejected", messageId: ""}
-      SendDone {status} -> respond {status: deliveryStatusText status, messageId: msgId})
+      SendUnauthorized _ -> respond {status: MsUnauthorized {}, messageId: ""}
+      SendRejected _ -> respond {status: MsRejected {}, messageId: ""}
+      SendDone {status} -> respond {status: status, messageId: msgId})
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
