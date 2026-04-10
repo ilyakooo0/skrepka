@@ -70,6 +70,11 @@ type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: T
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [Text]}
+type PollResult = PollUnauthorized {} | PollAuthorized {events: [PollEvent], cursor: Timestamp}
+type VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [Text]}
+type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: Text, remoteServers: [Text], fromKey: PubkeyHex}
+type AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
+type LookupResult = LookupUnauthorized {} | LookupDone {foundServer: Text}
 
 
 -- ============================================
@@ -412,18 +417,25 @@ boundedSmallest = \items n getKey ->
         let newHeap = union acc.heap [a] in
         let newSize = count newHeap in
         if newSize > acc.size
-          then {size: newSize, heap: newHeap, heapMax: if k > acc.heapMax then k else acc.heapMax}
+          then {size: newSize, heap: newHeap, heapMax: case acc.heapMax of
+            Nothing {} -> Just {value: k}
+            Just {value: v} -> if k > v then Just {value: k} else acc.heapMax}
           else acc
-      else if k < acc.heapMax
-        then
-          let removed = fold (\r x ->
-            if not r.done && getKey x == acc.heapMax
-              then {done: True {}, items: r.items}
-              else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
-          let newHeap = union removed.items [a] in
-          let newMax = fold (\best x -> if getKey x > best then getKey x else best) (-1) newHeap in
-          {size: acc.size, heap: newHeap, heapMax: newMax}
-        else acc) {size: 0, heap: [], heapMax: -1} items).heap
+      else case acc.heapMax of
+        Nothing {} -> acc
+        Just {value: maxVal} ->
+          if k < maxVal
+            then
+              let removed = fold (\r x ->
+                if not r.done && getKey x == maxVal
+                  then {done: True {}, items: r.items}
+                  else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
+              let newHeap = union removed.items [a] in
+              let newMax = fold (\best x -> case best of
+                Nothing {} -> Just {value: getKey x}
+                Just {value: v} -> if getKey x > v then Just {value: getKey x} else best) Nothing {} newHeap in
+              {size: acc.size, heap: newHeap, heapMax: newMax}
+            else acc) {size: 0, heap: [], heapMax: Nothing {}} items).heap
 
 evictOldestAckedIds = \items n ->
   if n <= 0 then items
@@ -774,23 +786,17 @@ serve = \req -> case req of
             then collectPeerServers updatedPresence (\p -> p.server)
             else []
           yield {pr: pr, verify: VerifyOk {peerServers: peerServers}}
-    fork (do
-      let expiredLocal = case result.verify of
-        VerifyOk _ -> do
-          p <- result.pr.expiredLocal
-          where not (p.pubkey == pubkey)
-          yield p
-        _ -> result.pr.expiredLocal
-      case result.verify of
-        VerifyOk {peerServers} ->
-          when federationEnabled
-            (sendToEach peerServers (\server -> do
-              _ <- fetch (federationScheme ++ server) (RecvGossip {
-                authorization: "Bearer " ++ federationSecret,
-                events: [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHostN})
-              yield {}))
-        _ -> yield {}
-      broadcastOfflineGossip t result.pr.peerServers expiredLocal)
+    fork (case result.verify of
+      VerifyOk {peerServers} -> do
+        when federationEnabled
+          (sendToEach peerServers (\server -> do
+            _ <- fetch (federationScheme ++ server) (RecvGossip {
+              authorization: "Bearer " ++ federationSecret,
+              events: [{eventType: "online", pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}], hopsRemaining: 2, fromServer: serverHostN})
+            yield {}))
+        broadcastOfflineGossip t result.pr.peerServers (do p <- result.pr.expiredLocal; where not (p.pubkey == pubkey); yield p)
+      VerifyFailed {} ->
+        broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.verify of
       VerifyFailed _ -> respond {token: "", expiresAt: 0}
       VerifyOk _ -> respond {token: token, expiresAt: expiry})
@@ -1089,11 +1095,11 @@ serve = \req -> case req of
     let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
-    let dedupedIds = dedupMessageIds messageIds
     let validAck = authorized && originServer == serverHostN && not (fromServer == serverHostN)
     pruneResult <- atomic do
       pr <- maybePrune t
       when validAck (do
+        let dedupedIds = dedupMessageIds messageIds
         forwards <- *forwards
         set *forwards = do
           f <- forwards
