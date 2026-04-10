@@ -23,6 +23,7 @@
   <ItemGroup>
     <Compile Include="Crypto.fs" />
     <Compile Include="ApiClient.fs" />
+    <Compile Include="Phonemic.fs" />
     <Compile Include="Store.fs" />
     <Compile Include="App.fs" />
     <Compile Include="MauiProgram.fs" />

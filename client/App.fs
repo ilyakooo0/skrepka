@@ -92,7 +92,17 @@ module App =
     let private truncate maxLen (s: string) =
         if s.Length > maxLen then s.[..maxLen - 1] + "..." else s
 
-    let private truncKey (hex: string) = truncate 16 hex
+    let private hexToOb (hex: string) =
+        Crypto.fromHex hex |> Phonemic.toOb
+
+    let private truncKey (hex: string) =
+        let ob = hexToOb hex
+        match ob.IndexOf('-') with
+        | -1 -> ob
+        | i ->
+            match ob.IndexOf('-', i + 1) with
+            | -1 -> ob
+            | j -> ob.[..j - 1]
 
     let private contactName (contacts: Contact list) (pk: string) =
         contacts
@@ -219,7 +229,15 @@ module App =
         | DoSaveContact ->
             match model.Page with
             | AddContact(pk, nn) when pk <> "" && nn <> "" ->
-                let contact: Contact = { Pubkey = pk; Nickname = nn }
+                let pubkeyHex =
+                    if pk.Contains("-") then
+                        match Phonemic.fromOb pk with
+                        | Some bytes -> Crypto.toHex bytes
+                        | None -> pk
+                    else
+                        pk
+
+                let contact: Contact = { Pubkey = pubkeyHex; Nickname = nn }
 
                 let model' =
                     { model with
@@ -232,7 +250,7 @@ module App =
         | CopyPubKey ->
             model,
             [ match model.Auth with
-              | Identified(id, _) -> CmdCopyToClipboard id.PubKeyHex
+              | Identified(id, _) -> CmdCopyToClipboard(hexToOb id.PubKeyHex)
               | NoIdentity -> () ]
 
         | DismissError -> { model with Error = None }, []
@@ -397,8 +415,8 @@ module App =
 
                     Label("Your Public Key:")
 
-                    Label(pubKeyHex model)
-                        .font(size = 9.)
+                    Label(hexToOb (pubKeyHex model))
+                        .font(size = 11.)
 
                     Button("Copy Public Key", CopyPubKey)
 
@@ -535,8 +553,9 @@ module App =
                         .font(size = 20.)
                 }
 
-                Label("Public Key (hex):")
+                Label("Public Key:")
                 Entry(pk, fun t -> SetPage(AddContact(t, nn)))
+                    .placeholder("sampel-palnet-...")
 
                 Label("Nickname:")
                 Entry(nn, fun t -> SetPage(AddContact(pk, t)))
