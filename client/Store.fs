@@ -1,31 +1,21 @@
 namespace Skrepka
 
 open System
-open System.Collections.Generic
 open System.IO
-open System.Text.Json
-open System.Text.Json.Serialization
+open LiteDB
 open Microsoft.Maui.Storage
 
 module Store =
 
     [<CLIMutable>]
     type Contact =
-        { Pubkey: string
+        { [<BsonId>] Pubkey: string
           Nickname: string }
 
-    type private UnixDateTimeOffsetConverter() =
-        inherit JsonConverter<DateTimeOffset>()
-        override _.Read(reader, _, _) =
-            DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64())
-        override _.Write(writer, value, _) =
-            writer.WriteNumberValue(value.ToUnixTimeSeconds())
-
-    [<CLIMutable>]
     type ChatMessage =
         { Id: string
           Body: string
-          [<JsonPropertyName("TimestampUnix")>] Timestamp: DateTimeOffset
+          Timestamp: DateTimeOffset
           IsOutgoing: bool }
 
     type Data =
@@ -35,19 +25,21 @@ module Store =
           PollCursor: uint64 }
 
     [<CLIMutable>]
-    type private DataDto =
-        { Contacts: Contact array
-          Messages: Dictionary<string, ChatMessage array>
+    type private MessageDoc =
+        { [<BsonId>] Id: string
+          ConversationId: string
+          Body: string
+          TimestampUnix: int64
+          IsOutgoing: bool }
+
+    [<CLIMutable>]
+    type private SettingsDoc =
+        { [<BsonId>] Id: string
           ServerUrl: string
-          PollCursor: uint64 }
+          PollCursor: int64 }
 
-    let private jsonOpts =
-        let opts = JsonSerializerOptions(WriteIndented = true, PropertyNameCaseInsensitive = true)
-        opts.Converters.Add(UnixDateTimeOffsetConverter())
-        opts
-
-    let private dataPath () =
-        Path.Combine(FileSystem.AppDataDirectory, "data.json")
+    let private openDb () =
+        new LiteDatabase(Path.Combine(FileSystem.AppDataDirectory, "skrepka.db"))
 
     let loadIdentity () =
         async {
@@ -75,42 +67,63 @@ module Store =
         }
 
     let loadData () : Data option =
-        let path = dataPath ()
+        try
+            use db = openDb ()
+            let settings = db.GetCollection<SettingsDoc>("settings").FindById(BsonValue "settings")
 
-        if File.Exists path then
-            try
-                let json = File.ReadAllText path
-                let dto = JsonSerializer.Deserialize<DataDto>(json, jsonOpts)
+            if box settings |> isNull then
+                None
+            else
+                let contacts = db.GetCollection<Contact>("contacts").FindAll() |> Seq.toList
+
+                let messages =
+                    db.GetCollection<MessageDoc>("messages").FindAll()
+                    |> Seq.groupBy _.ConversationId
+                    |> Seq.map (fun (convId, docs) ->
+                        convId,
+                        docs
+                        |> Seq.map (fun d ->
+                            { ChatMessage.Id = d.Id
+                              Body = d.Body
+                              Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix
+                              IsOutgoing = d.IsOutgoing })
+                        |> Seq.sortBy _.Timestamp
+                        |> Seq.toList)
+                    |> Map.ofSeq
 
                 Some
-                    { Contacts =
-                        if isNull dto.Contacts then [] else dto.Contacts |> Array.toList
-                      Messages =
-                        if isNull dto.Messages then
-                            Map.empty
-                        else
-                            dto.Messages
-                            |> Seq.map (fun (KeyValue(pk, msgs)) -> pk, msgs |> Array.toList)
-                            |> Map.ofSeq
-                      ServerUrl = if isNull dto.ServerUrl then "" else dto.ServerUrl
-                      PollCursor = dto.PollCursor }
-            with _ ->
-                None
-        else
+                    { Contacts = contacts
+                      Messages = messages
+                      ServerUrl = settings.ServerUrl
+                      PollCursor = uint64 settings.PollCursor }
+        with _ ->
             None
 
     let saveData (data: Data) =
         try
-            let messageDtos = Dictionary<string, ChatMessage array>()
-            data.Messages |> Map.iter (fun pk msgs -> messageDtos[pk] <- msgs |> Array.ofList)
+            use db = openDb ()
+            let contacts = db.GetCollection<Contact>("contacts")
+            let messages = db.GetCollection<MessageDoc>("messages")
+            let settings = db.GetCollection<SettingsDoc>("settings")
 
-            let dto: DataDto =
-                { Contacts = data.Contacts |> Array.ofList
-                  Messages = messageDtos
+            for c in data.Contacts do
+                contacts.Upsert c |> ignore
+
+            data.Messages
+            |> Map.iter (fun convId msgs ->
+                for m in msgs do
+                    messages.Upsert
+                        { Id = m.Id
+                          ConversationId = convId
+                          Body = m.Body
+                          TimestampUnix = m.Timestamp.ToUnixTimeSeconds()
+                          IsOutgoing = m.IsOutgoing }
+                    |> ignore)
+
+            settings.Upsert
+                { Id = "settings"
                   ServerUrl = data.ServerUrl
-                  PollCursor = data.PollCursor }
-
-            let json = JsonSerializer.Serialize(dto, jsonOpts)
-            File.WriteAllText(dataPath (), json)
+                  PollCursor = int64 data.PollCursor }
+            |> ignore
         with _ ->
             ()

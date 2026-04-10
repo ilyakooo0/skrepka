@@ -49,6 +49,7 @@
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-maccatalyst/maccatalyst-arm64/publish/../Skrepka.app/Contents/MonoBundle/Fabulous.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-maccatalyst/maccatalyst-arm64/publish/../Skrepka.app/Contents/MonoBundle/Fabulous.MauiControls.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-maccatalyst/maccatalyst-arm64/publish/../Skrepka.app/Contents/MonoBundle/FSharp.Core.dll
+/Users/iko/Developer/skrepka/client/bin/Debug/net10.0-maccatalyst/maccatalyst-arm64/publish/../Skrepka.app/Contents/MonoBundle/LiteDB.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-maccatalyst/maccatalyst-arm64/publish/../Skrepka.app/Contents/MonoBundle/Microsoft.Extensions.Configuration.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-maccatalyst/maccatalyst-arm64/publish/../Skrepka.app/Contents/MonoBundle/Microsoft.Extensions.Configuration.Abstractions.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-maccatalyst/maccatalyst-arm64/publish/../Skrepka.app/Contents/MonoBundle/Microsoft.Extensions.DependencyInjection.dll

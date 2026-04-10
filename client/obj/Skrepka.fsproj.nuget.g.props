@@ -28,6 +28,7 @@
     <PkgSodium_Core Condition=" '$(PkgSodium_Core)' == '' ">/Users/iko/.nuget/packages/sodium.core/1.4.0</PkgSodium_Core>
     <PkgMicrosoft_NET_ILLink_Tasks Condition=" '$(PkgMicrosoft_NET_ILLink_Tasks)' == '' ">/Users/iko/.nuget/packages/microsoft.net.illink.tasks/10.0.5</PkgMicrosoft_NET_ILLink_Tasks>
     <PkgMicrosoft_Maui_Controls Condition=" '$(PkgMicrosoft_Maui_Controls)' == '' ">/Users/iko/.nuget/packages/microsoft.maui.controls/10.0.0</PkgMicrosoft_Maui_Controls>
+    <PkgLiteDB Condition=" '$(PkgLiteDB)' == '' ">/Users/iko/.nuget/packages/litedb/5.0.21</PkgLiteDB>
     <PkgFSharp_Core Condition=" '$(PkgFSharp_Core)' == '' ">/Users/iko/.nuget/packages/fsharp.core/9.0.100</PkgFSharp_Core>
     <PkgFabulous_MauiControls Condition=" '$(PkgFabulous_MauiControls)' == '' ">/Users/iko/.nuget/packages/fabulous.mauicontrols/9.0.0-pre9</PkgFabulous_MauiControls>
   </PropertyGroup>
@@ -35,6 +36,7 @@
     <PkgSodium_Core Condition=" '$(PkgSodium_Core)' == '' ">/Users/iko/.nuget/packages/sodium.core/1.4.0</PkgSodium_Core>
     <PkgMicrosoft_NET_ILLink_Tasks Condition=" '$(PkgMicrosoft_NET_ILLink_Tasks)' == '' ">/Users/iko/.nuget/packages/microsoft.net.illink.tasks/10.0.5</PkgMicrosoft_NET_ILLink_Tasks>
     <PkgMicrosoft_Maui_Controls Condition=" '$(PkgMicrosoft_Maui_Controls)' == '' ">/Users/iko/.nuget/packages/microsoft.maui.controls/10.0.0</PkgMicrosoft_Maui_Controls>
+    <PkgLiteDB Condition=" '$(PkgLiteDB)' == '' ">/Users/iko/.nuget/packages/litedb/5.0.21</PkgLiteDB>
     <PkgFSharp_Core Condition=" '$(PkgFSharp_Core)' == '' ">/Users/iko/.nuget/packages/fsharp.core/9.0.100</PkgFSharp_Core>
     <PkgFabulous_MauiControls Condition=" '$(PkgFabulous_MauiControls)' == '' ">/Users/iko/.nuget/packages/fabulous.mauicontrols/9.0.0-pre9</PkgFabulous_MauiControls>
   </PropertyGroup>

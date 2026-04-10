@@ -49,6 +49,7 @@
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-ios/iossimulator-arm64/publish/../Skrepka.app/Fabulous.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-ios/iossimulator-arm64/publish/../Skrepka.app/Fabulous.MauiControls.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-ios/iossimulator-arm64/publish/../Skrepka.app/FSharp.Core.dll
+/Users/iko/Developer/skrepka/client/bin/Debug/net10.0-ios/iossimulator-arm64/publish/../Skrepka.app/LiteDB.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-ios/iossimulator-arm64/publish/../Skrepka.app/Microsoft.Extensions.Configuration.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-ios/iossimulator-arm64/publish/../Skrepka.app/Microsoft.Extensions.Configuration.Abstractions.dll
 /Users/iko/Developer/skrepka/client/bin/Debug/net10.0-ios/iossimulator-arm64/publish/../Skrepka.app/Microsoft.Extensions.DependencyInjection.dll

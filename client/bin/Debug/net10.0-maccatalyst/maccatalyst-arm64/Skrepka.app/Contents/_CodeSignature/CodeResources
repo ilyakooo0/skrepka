@@ -68,6 +68,13 @@
 			qpZJG5sHLu7WLZdd3Hp9GLV8v5gqy7cr5m0iSkYjBXc=
 			</data>
 		</dict>
+		<key>MonoBundle/LiteDB.dll</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			rjGsapNUkhe56LgUl9HugxZYrebfnh7iDyg48i3l4hg=
+			</data>
+		</dict>
 		<key>MonoBundle/Microsoft.CSharp.dll</key>
 		<dict>
 			<key>hash2</key>
@@ -240,14 +247,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			XU+yAt7vNt9BpnKXVtjK7OrVVcCx0NV5yVFk70jDuKA=
+			Ll855YGoZZ4EHbGdnm7YJ2/UrFtklAGRlFW9NlLbdXI=
 			</data>
 		</dict>
 		<key>MonoBundle/Skrepka.pdb</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			1rsqlbs6EGxpr47/dseRdpvX9mqCbc9lJ7fOrIUjaqs=
+			J4e+LdQyWbJGoueMWBhlFQg9tI6hYFwkIT6qA3pNgNU=
 			</data>
 		</dict>
 		<key>MonoBundle/Sodium.Core.dll</key>

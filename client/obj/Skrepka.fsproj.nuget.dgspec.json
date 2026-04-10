@@ -57,6 +57,11 @@
               "version": "[9.0.0-pre9, )",
               "generatePathProperty": true
             },
+            "LiteDB": {
+              "target": "Package",
+              "version": "[5.0.21, )",
+              "generatePathProperty": true
+            },
             "Microsoft.Maui.Controls": {
               "target": "Package",
               "version": "[10.0.0, )",
@@ -384,6 +389,11 @@
             "Fabulous.MauiControls": {
               "target": "Package",
               "version": "[9.0.0-pre9, )",
+              "generatePathProperty": true
+            },
+            "LiteDB": {
+              "target": "Package",
+              "version": "[5.0.21, )",
               "generatePathProperty": true
             },
             "Microsoft.Maui.Controls": {
