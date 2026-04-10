@@ -66,7 +66,7 @@ module App =
         | DoDisconnect
         | SetCompose of string
         | DoSend
-        | Sent of Result<ApiClient.SendResult, string>
+        | Sent of Result<ApiClient.MessageStatus, string>
         | SetNewPubkey of string
         | SetNewNickname of string
         | DoSaveContact
@@ -89,8 +89,10 @@ module App =
 
     // ── Helpers ──
 
-    let private truncKey (hex: string) =
-        if hex.Length > 16 then hex.[..15] + "..." else hex
+    let private truncate maxLen (s: string) =
+        if s.Length > maxLen then s.[..maxLen - 1] + "..." else s
+
+    let private truncKey (hex: string) = truncate 16 hex
 
     let private contactName (contacts: Contact list) (pk: string) =
         contacts
@@ -201,10 +203,10 @@ module App =
                 model', CmdSend(session, pk, compose, id) :: saveCmd model'
             | _ -> model, []
 
-        | Sent(Ok { Status = ApiClient.Delivered | ApiClient.Federated | ApiClient.Queued }) -> model, []
-        | Sent(Ok { Status = ApiClient.Rejected }) ->
+        | Sent(Ok(ApiClient.Delivered | ApiClient.Federated | ApiClient.Queued)) -> model, []
+        | Sent(Ok ApiClient.Rejected) ->
             { model with Error = Some "Message rejected by server" }, []
-        | Sent(Ok { Status = ApiClient.Unauthorized }) ->
+        | Sent(Ok ApiClient.Unauthorized) ->
             { model with Error = Some "Not authorized to deliver message" }, []
         | Sent(Error err) -> { model with Error = Some $"Send failed: {err}" }, []
 
@@ -325,7 +327,7 @@ module App =
                     let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob
                     let! result = ApiClient.sendMessage session.Url session.Token recipientHex blobHex ts
-                    return Sent(Ok result)
+                    return Sent(Ok result.Status)
                 with ex ->
                     return Sent(Error ex.Message)
             })
@@ -370,11 +372,8 @@ module App =
         | CmdLoadState ->
             Cmd.ofEffect (fun dispatch ->
                 async {
-                    let! identity = Store.loadIdentity ()
-                    match identity with
-                    | Some id ->
-                        let data = Store.loadData ()
-                        dispatch (StateLoaded(id, data))
+                    match! Store.loadIdentity () with
+                    | Some id -> dispatch (StateLoaded(id, Store.loadData ()))
                     | None -> ()
                 }
                 |> Async.Start)
@@ -493,7 +492,7 @@ module App =
                             model.Messages
                             |> Map.tryFind c.Pubkey
                             |> Option.bind List.tryLast
-                            |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
+                            |> Option.map (fun m -> truncate 40 m.Body)
                             |> Option.defaultValue ""
 
                         Button($"{c.Nickname}\n{preview}", Nav(Chat(c.Pubkey, "")))

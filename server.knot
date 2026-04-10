@@ -516,7 +516,7 @@ validGossipEvents = \events t -> do
   where expiresAt > t
   yield {eventType: e.eventType, pubkey: normalizeHex e.pubkey, server: server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
 
-sendToEach : [Text] -> (Text -> (a {})) -> a {}
+sendToEach : [ServerName] -> (ServerName -> (a {})) -> a {}
 sendToEach = \servers action ->
   case headOf servers of
     Nothing {} -> yield {}
@@ -994,7 +994,7 @@ serve = \req -> case req of
               let updatesOnlyMerged = mergeByPubkeyServer presence updatesOnly in
               let updatesOnlyAfterOffline = removeOffline updatesOnlyMerged offlineOnlyKeys trustedOffline t in
               let reclaimSlots = maxPresenceEntries - count updatesOnlyAfterOffline in
-              let newEntries = do e <- trustedDeduped; where none presence (\p -> samePubkeyServer p e); where none updatesOnlyAfterOffline (\p -> samePubkeyServer p e); yield e in
+              let newEntries = do e <- trustedDeduped; where none presence (\p -> samePubkeyServer p e) && none updatesOnlyAfterOffline (\p -> samePubkeyServer p e); yield e in
               let reclaimedEntries = takeN newEntries reclaimSlots in
               {finalPresence: union updatesOnlyAfterOffline reclaimedEntries,
                appliedOnline: union
@@ -1029,12 +1029,14 @@ serve = \req -> case req of
     t <- now
     let authorized = verifyFederationAuth authorization
     let validOrigin = isFederatedOrigin originServer
-    let clampedTs = clampTimestamp timestamp t
-    result <- atomic do
-      pr <- maybePrune t
-      if not (authorized && validOrigin)
-        then yield {pr: pr, ok: False {}}
-        else do
+    if not (authorized && validOrigin)
+      then do
+        maybePruneAndBroadcast t
+        yield (respond {ok: False {}})
+      else do
+        let clampedTs = clampTimestamp timestamp t
+        result <- atomic do
+          pr <- maybePrune t
           messages <- *messages
           ackedIds <- *ackedIds
           if any messages (\m -> m.messageId == messageId && m.toKey == toKey)
@@ -1050,27 +1052,30 @@ serve = \req -> case req of
                   [{messageId: messageId, toKey: toKey, fromKey: fromKey,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
                 yield {pr: pr, ok: True {}}
-    forkBroadcastOffline t result.pr
-    yield (respond {ok: result.ok})
+        forkBroadcastOffline t result.pr
+        yield (respond {ok: result.ok})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     let fromServer = normalizeServerName fromServer
     let originServer = normalizeServerName originServer
     t <- now
     let authorized = verifyFederationAuth authorization
-    let validAck = authorized && originServer == serverHostN && not (fromServer == serverHostN)
-    pruneResult <- atomic do
-      pr <- maybePrune t
-      when validAck (do
+    if not authorized || not (originServer == serverHostN) || fromServer == serverHostN
+      then do
+        maybePruneAndBroadcast t
+        yield (respond {ok: False {}})
+      else do
         let dedupedIds = dedupMessageIds messageIds
-        forwards <- *forwards
-        set *forwards = do
-          f <- forwards
-          where not (f.toServer == fromServer && any dedupedIds (\mid -> f.messageId == mid))
-          yield f)
-      yield pr
-    forkBroadcastOffline t pruneResult
-    yield (respond {ok: validAck})
+        pruneResult <- atomic do
+          pr <- maybePrune t
+          forwards <- *forwards
+          set *forwards = do
+            f <- forwards
+            where not (f.toServer == fromServer && any dedupedIds (\mid -> f.messageId == mid))
+            yield f
+          yield pr
+        forkBroadcastOffline t pruneResult
+        yield (respond {ok: True {}})
 
   Prune {authorization, respond} -> do
     t <- now
