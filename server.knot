@@ -49,7 +49,7 @@ type GossipEventType = Text where \s -> s == "online" || s == "offline"
 
 type GossipEvent = {eventType: GossipEventType, pubkey: Text, server: Text, timestamp: Timestamp, ttl: Int<S>}
 
-type ValidGossipEntry = {pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
+type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: Text, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
 type MessageStatus = Text where \s -> s == "unauthorized" || s == "rejected" || s == "delivered" || s == "federated" || s == "queued"
 
@@ -495,22 +495,20 @@ countMessagesFor = \messages toKey t ->
     yield m)
 
 
-validGossipEvents : [GossipEvent] -> Bool -> Timestamp -> GossipEventType -> [ValidGossipEntry]
-validGossipEvents = \events validRequest t eventType ->
-  if not validRequest then []
-  else do
-    e <- events
-    where e.eventType == eventType
-    where not (e.server == "")
-    where not (e.pubkey == "")
-    where not (tooLong e.pubkey maxPubkeyLen)
-    where not (tooLong e.server maxServerNameLen)
-    where not (isBadServerName e.server)
-    where isValidHex e.pubkey
-    where not (normalizeServerName e.server == serverHostN)
-    where e.timestamp <= t + clockSkewTolerance
-    where e.timestamp + (clampTtl e.ttl) * 1000 > t
-    yield {pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp, ttl: clampTtl e.ttl}
+validGossipEvents : [GossipEvent] -> Timestamp -> GossipEventType -> [ValidGossipEntry]
+validGossipEvents = \events t eventType -> do
+  e <- events
+  where e.eventType == eventType
+  where not (e.server == "")
+  where not (e.pubkey == "")
+  where not (tooLong e.pubkey maxPubkeyLen)
+  where not (tooLong e.server maxServerNameLen)
+  where not (isBadServerName e.server)
+  where isValidHex e.pubkey
+  where not (normalizeServerName e.server == serverHostN)
+  where e.timestamp <= t + clockSkewTolerance
+  where e.timestamp + (clampTtl e.ttl) * 1000 > t
+  yield {eventType: eventType, pubkey: normalizeHex e.pubkey, server: normalizeServerName e.server, expiresAt: e.timestamp + (clampTtl e.ttl) * 1000, timestamp: e.timestamp, ttl: clampTtl e.ttl}
 
 sendToEach : [Text] -> (Text -> (a {})) -> a {}
 sendToEach = \servers action ->
@@ -660,10 +658,9 @@ pruneAndRetry = \t -> do
     set *lastPrunedAt = t
     pr <- pruneExpired t
     forwards <- *forwards
-    let pendingForwards = forwards
     ackedIds <- *ackedIds
     let pendingAcks = do a <- ackedIds; where isFederatedOrigin a.originServer; yield a
-    yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: pendingForwards, pendingAcks: pendingAcks}
+    yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: forwards, pendingAcks: pendingAcks}
   broadcastOfflineGossip t result.peerServers result.expiredLocal
   if federationEnabled && count result.pendingForwards > 0
     then retryPendingForwards result.pendingForwards
@@ -836,15 +833,11 @@ serve = \req -> case req of
           [{messageId: msgId, toKey: to, fromKey: fromKey,
             encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
         else messages
-      let localOnline = authorized && any presence (\p -> p.pubkey == to && p.server == serverHostN && p.expiresAt > t)
-      let remoteServers = if authorized
-        then do
-          p <- presence
-          where p.pubkey == to
-          where not (p.server == serverHostN)
-          where p.expiresAt > t
-          yield p.server
+      let toPresence = if authorized
+        then do p <- presence; where p.pubkey == to; where p.expiresAt > t; yield p
         else []
+      let localOnline = any toPresence (\p -> p.server == serverHostN)
+      let remoteServers = do p <- toPresence; where not (p.server == serverHostN); yield p.server
       forwards <- *forwards
       let forwardsAtCapacity = count forwards >= maxForwardsEntries
       let status = if not authorized then "unauthorized"
@@ -904,25 +897,17 @@ serve = \req -> case req of
       let evictedEntries = if excessCount <= 0 then []
         else diff combinedAckedIds afterEviction
       set *ackedIds = afterEviction
-      yield {ok: auth.authorized, ackedMessages: ackedMessages, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, evictedEntries: evictedEntries}
-    let fedMessages = do
-      m <- result.ackedMessages
-      where isFederatedOrigin m.originServer
-      yield m
-    let originServers = collectPeerServers fedMessages (\m -> m.originServer)
+      yield {ok: auth.authorized, pendingAcks: ackedFederated, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, evictedEntries: evictedEntries}
+    let originServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
     fork (do
       if result.ok
         then do
           if count originServers > 0 && federationEnabled
-            then do
-              let pendingAcks = do
-                m <- fedMessages
-                yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
-              sendAcksAndClean pendingAcks originServers
+            then sendAcksAndClean result.pendingAcks originServers
             else yield {}
           let evictedToRetry = do
             a <- result.evictedEntries
-            where none fedMessages (\m -> m.messageId == a.messageId && m.toKey == a.toKey)
+            where none result.pendingAcks (\a2 -> a2.messageId == a.messageId && a2.toKey == a.toKey)
             yield a
           if count evictedToRetry > 0 && federationEnabled
             then do
@@ -982,19 +967,15 @@ serve = \req -> case req of
     let cappedHops = if hopsRemaining > 5 then 5 else hopsRemaining
     let fromServer = normalizeServerName fromServer
     let validRequest = authorized && cappedHops >= 1 && not (fromServer == serverHostN) && count events <= maxGossipEvents
-    let onlineEntries = validGossipEvents events validRequest t "online"
-    let offlineEntries = validGossipEvents events validRequest t "offline"
+    let onlineEntries = if validRequest then validGossipEvents events t "online" else []
+    let offlineEntries = if validRequest then validGossipEvents events t "offline" else []
     let filteredOnline = do
       e <- onlineEntries
       where none offlineEntries (\o -> o.server == fromServer && samePubkeyServer o e && o.timestamp > e.timestamp)
       yield e
-    let affectedKeys = union
-      (do
-        e <- onlineEntries
-        yield {pubkey: e.pubkey, server: e.server})
-      (do
-        e <- offlineEntries
-        yield {pubkey: e.pubkey, server: e.server})
+    let affectedKeys = do
+      e <- union onlineEntries offlineEntries
+      yield {pubkey: e.pubkey, server: e.server}
     let deduped = mergeByPubkeyServer [] filteredOnline
     gossipResult <- atomic do
       pr <- maybePrune t
@@ -1065,11 +1046,9 @@ serve = \req -> case req of
       where none onlineEntries (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
       yield e
     let effectiveEvents = do
-      e <- union
-        (do e <- filteredOnline; yield {eventType: "online", pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl})
-        (do e <- filteredOffline; yield {eventType: "offline", pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl})
+      e <- union filteredOnline filteredOffline
       where any gossipResult.appliedKeys (\a -> samePubkeyServer a e)
-      yield e
+      yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl}
     if not gossipResult.withinCapacity
       then println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer)
       else yield {}
