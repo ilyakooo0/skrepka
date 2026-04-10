@@ -11,8 +11,25 @@ module ApiClient =
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
     type PollEvent = { Id: string; Payload: EventPayload }
 
+    [<CLIMutable>]
     type SendResult = { Status: string; MessageId: string }
+
     type PollResponse = { Events: PollEvent list; Cursor: uint64 }
+
+    [<CLIMutable>]
+    type ChallengeResponse = { challenge: string }
+
+    [<CLIMutable>]
+    type VerifyResponse = { token: string }
+
+    [<CLIMutable>]
+    type PollPayloadDto = { encryptedBlob: string; timestamp: JsonElement }
+
+    [<CLIMutable>]
+    type PollEventDto = { id: string; eventType: string; payload: PollPayloadDto }
+
+    [<CLIMutable>]
+    type PollResponseDto = { cursor: uint64; events: PollEventDto array }
 
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
@@ -24,12 +41,19 @@ module ApiClient =
                 else ok t.Result)
             |> ignore)
 
+    let private jsonOpts = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+
     let private client =
         let c = new HttpClient()
         c.Timeout <- TimeSpan.FromSeconds(60.)
         c
 
-    let private postJsonWith (httpClient: HttpClient) (url: string) (body: string) (token: string option) =
+    let private pollClient =
+        let c = new HttpClient()
+        c.Timeout <- TimeSpan.FromSeconds(120.)
+        c
+
+    let private sendRequest (httpClient: HttpClient) (url: string) (body: string) (token: string option) =
         async {
             let request = new HttpRequestMessage(HttpMethod.Post, url)
             request.Content <- new StringContent(body, Encoding.UTF8, "application/json")
@@ -39,82 +63,60 @@ module ApiClient =
 
             let! response = httpClient.SendAsync(request) |> awaitTask
             let! text = response.Content.ReadAsStringAsync() |> awaitTask
-            return JsonDocument.Parse(text)
+            use doc = JsonDocument.Parse(text)
+
+            match doc.RootElement.TryGetProperty("error") with
+            | true, err -> return failwith $"{url}: {err.GetString()}"
+            | _ -> return text
         }
 
-    let private postJson url body token = postJsonWith client url body token
-
-    let private expectObject (doc: JsonDocument) (endpoint: string) =
-        let root = doc.RootElement
-
-        if root.ValueKind <> JsonValueKind.Object then
-            failwith $"{endpoint}: unexpected response: {root.GetRawText()}"
-
-        match root.TryGetProperty("error") with
-        | true, err -> failwith $"{endpoint}: server error: {err.GetString()}"
-        | _ -> root
+    let private postJson<'T> httpClient url body token =
+        async {
+            let! text = sendRequest httpClient url body token
+            return JsonSerializer.Deserialize<'T>(text, jsonOpts)
+        }
 
     let requestChallenge (serverUrl: string) (pubkeyHex: string) =
         async {
             let body = JsonSerializer.Serialize({| pubkey = pubkeyHex |})
-            let! doc = postJson $"{serverUrl}/auth/challenge" body None
-            let root = expectObject doc "/auth/challenge"
-            return root.GetProperty("challenge").GetString()
+            let! response = postJson<ChallengeResponse> client $"{serverUrl}/auth/challenge" body None
+            return response.challenge
         }
 
     let verify (serverUrl: string) (pubkeyHex: string) (challenge: string) (signatureHex: string) =
         async {
             let body = JsonSerializer.Serialize({| pubkey = pubkeyHex; challenge = challenge; signature = signatureHex |})
-
-            let! doc = postJson $"{serverUrl}/auth/verify" body None
-            let root = expectObject doc "/auth/verify"
-            let token = root.GetProperty("token").GetString()
-            if String.IsNullOrEmpty(token) then failwith "Authentication rejected by server"
-            return token
+            let! response = postJson<VerifyResponse> client $"{serverUrl}/auth/verify" body None
+            if String.IsNullOrEmpty(response.token) then failwith "Authentication rejected by server"
+            return response.token
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
         async {
             let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
-
-            let! doc = postJson $"{serverUrl}/messages" body (Some token)
-            let root = expectObject doc "/messages"
-            return
-                { Status = root.GetProperty("status").GetString()
-                  MessageId = root.GetProperty("messageId").GetString() }
+            return! postJson<SendResult> client $"{serverUrl}/messages" body (Some token)
         }
-
-    let private pollClient =
-        let c = new HttpClient()
-        c.Timeout <- TimeSpan.FromSeconds(120.)
-        c
 
     let poll (serverUrl: string) (token: string) (cursor: uint64) =
         async {
             let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
-            let! doc = postJsonWith pollClient $"{serverUrl}/poll" body (Some token)
-            let root = expectObject doc "/poll"
-            let cursor = root.GetProperty("cursor").GetUInt64()
-
-            let events = root.GetProperty("events")
+            let! response = postJson<PollResponseDto> pollClient $"{serverUrl}/poll" body (Some token)
 
             let events =
-                [ for e in events.EnumerateArray() do
-                      if e.ValueKind = JsonValueKind.Object
-                         && e.GetProperty("eventType").GetString() = "message" then
-                          let p = e.GetProperty("payload")
-                          let ts = p.GetProperty("timestamp")
-                          yield
-                              { Id = e.GetProperty("id").GetString()
-                                Payload =
-                                    { EncryptedBlob = p.GetProperty("encryptedBlob").GetString()
-                                      Timestamp = if ts.ValueKind = JsonValueKind.String then Int64.Parse(ts.GetString()) else ts.GetInt64() } } ]
+                [ for e in response.events do
+                      if e.eventType = "message" then
+                          let ts =
+                              if e.payload.timestamp.ValueKind = JsonValueKind.String
+                              then Int64.Parse(e.payload.timestamp.GetString())
+                              else e.payload.timestamp.GetInt64()
+                          { Id = e.id
+                            Payload = { EncryptedBlob = e.payload.encryptedBlob; Timestamp = ts } } ]
 
-            return { Events = events; Cursor = cursor }
+            return { Events = events; Cursor = response.cursor }
         }
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
         async {
             let body = JsonSerializer.Serialize({| messageIds = messageIds |})
-            do! postJson $"{serverUrl}/messages/ack" body (Some token) |> Async.Ignore
+            do! sendRequest client $"{serverUrl}/messages/ack" body (Some token) |> Async.Ignore
         }

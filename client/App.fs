@@ -2,6 +2,7 @@ namespace Skrepka
 
 open System
 open System.Text.Json
+open System.Text.Json.Serialization
 open Fabulous
 open Fabulous.Maui
 open System.Collections.Generic
@@ -23,7 +24,7 @@ module App =
 
     [<CLIMutable>]
     type TextEnvelope =
-        { ``type``: string
+        { [<JsonPropertyName("type")>] Type: string
           id: string
           timestamp: int64
           body: string }
@@ -311,7 +312,7 @@ module App =
             | Some(plaintext, senderHex) ->
                 let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext)
 
-                if envelope.``type`` = "text" then
+                if envelope.Type = "text" then
                     Ok(senderHex,
                        { Id = envelope.id
                          Body = envelope.body
@@ -346,7 +347,7 @@ module App =
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
                     let payload =
-                        JsonSerializer.Serialize({ ``type`` = "text"; id = messageId; timestamp = ts; body = text }: TextEnvelope)
+                        JsonSerializer.Serialize({ Type = "text"; id = messageId; timestamp = ts; body = text }: TextEnvelope)
 
                     let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob

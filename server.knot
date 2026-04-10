@@ -626,7 +626,7 @@ retryPendingForwards = \pending -> do
     retryForwardsForServer (do x <- pending; where x.toServer == server; yield x) maxForwardRetriesPerServer)
   yield {}
 
-sendBatchedAcksToServer : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: Text, | a}] -> Text -> IO {network} {}
+sendBatchedAcksToServer : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> ServerName -> IO {network} {}
 sendBatchedAcksToServer = \serverAcks server ->
   forEachBatch serverAcks maxMessageIds (\batch -> do
     result <- fetch (federationScheme ++ server) (FederationAck {
@@ -643,7 +643,7 @@ sendBatchedAcksToServer = \serverAcks server ->
             yield a
       Err _ -> yield {})
 
-sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: Text, | a}] -> [Text] -> IO {network} {}
+sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> [ServerName] -> IO {network} {}
 sendAcksAndClean = \pendingAcks servers ->
   sendToEach servers (\server ->
     sendBatchedAcksToServer (do a <- pendingAcks; where a.originServer == server; yield a) server)
@@ -668,15 +668,15 @@ pollOnce = \token cursor -> do
   t <- now
   atomic do
     sessions <- *sessions
-    seqCounter <- *seqCounter
     let auth = authenticateSession sessions token t
-    let cursorCeil = if seqCounter > t then seqCounter else t
-    let clampedCursor = if cursor < 0 then 0 else if cursor > cursorCeil then cursorCeil else cursor
     case auth of
       Unauthorized {} ->
         yield {events: [], cursor: -1, authorized: False {}}
       Authorized {pubkey} -> do
+        seqCounter <- *seqCounter
         messages <- *messages
+        let cursorCeil = if seqCounter > t then seqCounter else t
+        let clampedCursor = if cursor < 0 then 0 else if cursor > cursorCeil then cursorCeil else cursor
         let matchingMsgs = do
           m <- messages
           where m.toKey == pubkey
@@ -808,7 +808,7 @@ serve = \req -> case req of
       let auth = authenticateSession sessions (extractToken authorization) t
       case auth of
         Unauthorized {} ->
-          yield {status: "unauthorized", shouldInsert: False {}, remoteServers: [], fromKey: "", expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: False {}}
+          yield {status: "unauthorized", shouldInsert: False {}, remoteServers: [], fromKey: "", expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
         Authorized {pubkey: fromKey} -> do
           messages <- *messages
           presence <- *presence
@@ -825,17 +825,15 @@ serve = \req -> case req of
           let localOnline = any toPresence (\p -> p.server == serverHostN)
           let remoteServers = do p <- toPresence; where not (p.server == serverHostN); yield p.server
           forwards <- *forwards
-          let forwardsAtCapacity = count forwards >= maxForwardsEntries
+          let forwardServers = takeN remoteServers (maxForwardsEntries - count forwards)
           let status = if not shouldInsert then "rejected"
             else if localOnline then "delivered"
-            else if count remoteServers > 0 && federationEnabled && not forwardsAtCapacity then "federated"
+            else if federationEnabled && count forwardServers > 0 then "federated"
             else "queued"
-          let forwardSlots = maxForwardsEntries - count forwards
-          let forwardServers = takeN remoteServers forwardSlots
-          set *forwards = if shouldInsert && not forwardsAtCapacity && count forwardServers > 0 && federationEnabled
+          set *forwards = if shouldInsert && federationEnabled && count forwardServers > 0
             then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
             else forwards
-          yield {status: status, shouldInsert: shouldInsert, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, forwardsAtCapacity: forwardsAtCapacity}
+          yield {status: status, shouldInsert: shouldInsert, remoteServers: remoteServers, fromKey: fromKey, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers}
     fork (do
       when (count result.remoteServers > 0 && result.shouldInsert && federationEnabled)
         (sendToEach result.remoteServers (\server -> do
@@ -846,7 +844,7 @@ serve = \req -> case req of
           case fwdResult of
             Ok _ -> removeForward msgId server
             Err _ -> yield {}))
-      when (result.forwardsAtCapacity && count result.remoteServers > 0 && result.shouldInsert)
+      when (result.status == "queued" && count result.remoteServers > 0 && result.shouldInsert && federationEnabled)
         (println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking"))
       broadcastOfflineGossip t result.peerServers result.expiredLocal)
     yield (respond {status: result.status, messageId: if result.shouldInsert then msgId else ""})
@@ -953,9 +951,14 @@ serve = \req -> case req of
       e <- onlineEntries
       where none offlineEntries (\o -> o.server == fromServer && samePubkeyServer o e && o.timestamp > e.timestamp)
       yield e
-    let affectedKeys = do
-      e <- allValidEntries
-      yield {pubkey: e.pubkey, server: e.server}
+    let filteredOffline = do
+      e <- offlineEntries
+      where none onlineEntries (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
+      yield e
+    let trustedOffline = do
+      e <- offlineEntries
+      where e.server == fromServer
+      yield e
     let deduped = mergeByPubkeyServer [] filteredOnline
     gossipResult <- atomic do
       pr <- maybePrune t
@@ -964,19 +967,15 @@ serve = \req -> case req of
         e <- deduped
         where e.server == fromServer || any presence (\p -> p.server == e.server && p.expiresAt > t)
         yield e
-      let trustedOffline = do
-        e <- offlineEntries
-        where e.server == fromServer
-        yield e
       let appliedOnline = do
         e <- trustedDeduped
         where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt)
         yield {pubkey: e.pubkey, server: e.server}
       let merged = mergeByPubkeyServer presence trustedDeduped
       let offlineOnlyKeys = do
-        k <- affectedKeys
-        where none trustedDeduped (\d -> samePubkeyServer d k)
-        yield k
+        e <- allValidEntries
+        where none trustedDeduped (\d -> samePubkeyServer d e)
+        yield e
       let appliedOffline = do
         k <- offlineOnlyKeys
         where any presence (\p -> samePubkeyServer p k && any trustedOffline (\o -> samePubkeyServer o k && (if o.timestamp > t then t else o.timestamp) > p.timestamp))
@@ -1000,10 +999,6 @@ serve = \req -> case req of
       set *presence = finalPresence
       let gossipPeerServers = collectPeerServers finalPresence (\p -> p.server)
       yield {appliedKeys: union capResult.appliedOnline appliedOffline, expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, gossipPeerServers: gossipPeerServers, withinCapacity: withinCapacity}
-    let filteredOffline = do
-      e <- offlineEntries
-      where none onlineEntries (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
-      yield e
     let effectiveEvents = do
       e <- union filteredOnline filteredOffline
       where any gossipResult.appliedKeys (\a -> samePubkeyServer a e)
