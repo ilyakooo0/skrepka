@@ -25,9 +25,9 @@ module App =
     [<CLIMutable>]
     type TextEnvelope =
         { [<JsonPropertyName("type")>] Type: string
-          id: string
-          timestamp: int64
-          body: string }
+          [<JsonPropertyName("id")>] Id: string
+          [<JsonPropertyName("timestamp")>] Timestamp: int64
+          [<JsonPropertyName("body")>] Body: string }
 
     type Page =
         | Setup
@@ -82,7 +82,6 @@ module App =
         | PollResult of messages: (string * ChatMessage) list * status: string * cursor: uint64
         | CopyPubKey
         | DismissError
-        | NoIdentityFound
         | StateLoaded of Identity * Store.DataDto option
 
     // ── CmdMsg ──
@@ -255,7 +254,6 @@ module App =
 
         | DismissError -> { model with Error = None }, []
 
-        | NoIdentityFound -> model, []
         | StateLoaded(identity, dataOpt) ->
             let model' = { model with Identity = Some identity; Conn = Connecting identity }
 
@@ -306,8 +304,8 @@ module App =
 
                 if envelope.Type = "text" then
                     Ok(senderHex,
-                       { Id = envelope.id
-                         Body = envelope.body
+                       { Id = envelope.Id
+                         Body = envelope.Body
                          Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
                          IsOutgoing = false })
                 else
@@ -324,9 +322,7 @@ module App =
         | CmdConnect(url, identity) ->
             asyncCmd (async {
                 try
-                    let! challenge = ApiClient.requestChallenge url identity.PubKeyHex
-                    let sigHex = Crypto.signChallenge identity.PrivKey challenge
-                    let! token = ApiClient.verify url identity.PubKeyHex challenge sigHex
+                    let! token = ApiClient.authenticate url identity
                     return AuthOk token
                 with ex ->
                     return AuthErr ex.Message
@@ -339,7 +335,7 @@ module App =
                     let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
                     let payload =
-                        JsonSerializer.Serialize({ Type = "text"; id = messageId; timestamp = ts; body = text }: TextEnvelope)
+                        JsonSerializer.Serialize({ Type = "text"; Id = messageId; Timestamp = ts; Body = text }: TextEnvelope)
 
                     let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob
@@ -386,14 +382,16 @@ module App =
                 |> ignore)
 
         | CmdLoadState ->
-            asyncCmd (async {
-                let! identity = Store.loadIdentity ()
-                match identity with
-                | None -> return NoIdentityFound
-                | Some id ->
-                    let data = Store.loadData ()
-                    return StateLoaded(id, data)
-            })
+            Cmd.ofEffect (fun dispatch ->
+                async {
+                    let! identity = Store.loadIdentity ()
+                    match identity with
+                    | Some id ->
+                        let data = Store.loadData ()
+                        dispatch (StateLoaded(id, data))
+                    | None -> ()
+                }
+                |> Async.Start)
 
         | CmdSaveIdentity identity ->
             Cmd.ofEffect (fun _ -> Store.saveIdentity identity |> ignore)

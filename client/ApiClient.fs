@@ -22,10 +22,10 @@ module ApiClient =
     type PollResponse = { Cursor: uint64; Events: PollEvent array }
 
     [<CLIMutable>]
-    type ChallengeResponse = { challenge: string }
+    type private ChallengeResponse = { challenge: string }
 
     [<CLIMutable>]
-    type VerifyResponse = { token: string }
+    type private VerifyResponse = { token: string }
 
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
@@ -83,19 +83,15 @@ module ApiClient =
             return JsonSerializer.Deserialize<'T>(text, jsonOpts)
         }
 
-    let requestChallenge (serverUrl: string) (pubkeyHex: string) =
+    let authenticate (serverUrl: string) (identity: Crypto.Identity) =
         async {
-            let body = JsonSerializer.Serialize({| pubkey = pubkeyHex |})
-            let! response = postJson<ChallengeResponse> client $"{serverUrl}/auth/challenge" body None
-            return response.challenge
-        }
-
-    let verify (serverUrl: string) (pubkeyHex: string) (challenge: string) (signatureHex: string) =
-        async {
-            let body = JsonSerializer.Serialize({| pubkey = pubkeyHex; challenge = challenge; signature = signatureHex |})
-            let! response = postJson<VerifyResponse> client $"{serverUrl}/auth/verify" body None
-            if String.IsNullOrEmpty(response.token) then failwith "Authentication rejected by server"
-            return response.token
+            let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex |})
+            let! resp = postJson<ChallengeResponse> client $"{serverUrl}/auth/challenge" body None
+            let sigHex = Crypto.signChallenge identity.PrivKey resp.challenge
+            let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex; challenge = resp.challenge; signature = sigHex |})
+            let! resp = postJson<VerifyResponse> client $"{serverUrl}/auth/verify" body None
+            if String.IsNullOrEmpty(resp.token) then failwith "Authentication rejected by server"
+            return resp.token
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
