@@ -183,6 +183,7 @@ whenOk = \result action -> case result of
   Ok _ -> action
   Err _ -> yield {}
 clamp = \lo hi x -> if x < lo then lo else if x > hi then hi else x
+min = \a b -> if a < b then a else b
 headOf = \items -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
   _ -> acc) Nothing {} items
@@ -444,7 +445,7 @@ capPerKey = \items matchKey maxPerKey getExpiry t ->
   let active = do x <- items; where getExpiry x > t; yield x in
   let forKey = do x <- active; where matchKey x; yield x in
   if count forKey >= maxPerKey
-    then let others = do x <- active; where not (matchKey x); yield x in
+    then let others = diff active forKey in
          union others (evictOneOldest forKey getExpiry)
     else active
 
@@ -464,6 +465,7 @@ collectPeerServers = \items getServer ->
     else union acc [s]) [] items
 
 samePubkeyServer = \a b -> a.pubkey == b.pubkey && a.server == b.server
+pubkeyServer = \e -> {pubkey: e.pubkey, server: e.server}
 
 mergeByKey = \sameKey getFreshness initial items ->
   fold (\acc e ->
@@ -475,11 +477,14 @@ mergeByKey = \sameKey getFreshness initial items ->
 
 mergeByPubkeyServer = mergeByKey samePubkeyServer (\x -> x.expiresAt)
 
+resolveByTimestamp = \setA setB ->
+  do e <- setA; where none setB (\o -> samePubkeyServer o e && o.timestamp > e.timestamp); yield e
+
 removeOffline = \presenceSet trustedOffline t ->
   diff presenceSet (do
     p <- presenceSet
     o <- trustedOffline
-    where samePubkeyServer p o && (if o.timestamp > t then t else o.timestamp) > p.timestamp
+    where samePubkeyServer p o && min o.timestamp t > p.timestamp
     yield p)
 
 capGossipPresence = \afterOffline appliedOnline trustedDeduped presence trustedOffline t ->
@@ -494,8 +499,8 @@ capGossipPresence = \afterOffline appliedOnline trustedDeduped presence trustedO
       let reclaimedEntries = takeN newEntries reclaimSlots in
       {finalPresence: union updatesOnlyAfterOffline reclaimedEntries,
        appliedOnline: union
-        (do e <- updatesOnly; where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield {pubkey: e.pubkey, server: e.server})
-        (do e <- reclaimedEntries; yield {pubkey: e.pubkey, server: e.server}),
+        (do e <- updatesOnly; where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield (pubkeyServer e))
+        (do e <- reclaimedEntries; yield (pubkeyServer e)),
        withinCapacity: False {}}
 
 countMessagesFor = \messages toKey t ->
@@ -605,7 +610,7 @@ removeForward = \mid srv -> atomic do
   forwards <- *forwards
   set *forwards = do
     x <- forwards
-    where not (x.messageId == mid && x.toServer == srv)
+    where x.messageId != mid || x.toServer != srv
     yield x
 
 retryForwardsForServer : [ForwardEntry] -> Int -> IO {network} {}
@@ -762,13 +767,13 @@ serve = \req -> case req of
         else do
           set *challenges = do
             c <- challenges
-            where not (c.pubkey == pubkey && c.challenge == challenge)
+            where c.pubkey != pubkey || c.challenge != challenge
             yield c
           let capped = capPerKeyAndGlobal sessions (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t maxSessions
           set *sessions = union capped [{token: token, pubkey: pubkey, expiresAt: expiry}]
           let presenceWithout = do
                 p <- presence
-                where not (p.pubkey == pubkey && p.server == serverHostN)
+                where p.pubkey != pubkey || p.server != serverHostN
                 yield p
           let presenceEvicted = capGlobal presenceWithout maxPresenceEntries (\p -> p.expiresAt)
           let updatedPresence = union presenceEvicted [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]
@@ -901,8 +906,8 @@ serve = \req -> case req of
             where p.pubkey == pubkey && p.expiresAt > t
             yield p
           let localOnline = any valid (\p -> p.server == serverHostN)
-          let foundServer = if localOnline then serverHostN
-            else (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
+          let bestServer = (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
+          let foundServer = if localOnline then serverHostN else bestServer
           yield {pr: pr, authorized: True {}, foundServer: foundServer}
     forkBroadcastOffline t result.pr
     yield (respond {online: result.foundServer != "", server: result.foundServer, authorized: result.authorized})
@@ -919,14 +924,8 @@ serve = \req -> case req of
         let allValidEntries = validGossipEvents events t
         let onlineEntries = do e <- allValidEntries; where isGossipOnline e.eventType; yield e
         let trustedOffline = do e <- allValidEntries; where isGossipOffline e.eventType && e.server == fromServer; yield e
-        let filteredOnline = do
-          e <- onlineEntries
-          where none trustedOffline (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
-          yield e
-        let filteredOffline = do
-          e <- trustedOffline
-          where none onlineEntries (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
-          yield e
+        let filteredOnline = resolveByTimestamp onlineEntries trustedOffline
+        let filteredOffline = resolveByTimestamp trustedOffline onlineEntries
         let deduped = mergeByPubkeyServer [] filteredOnline
         gossipResult <- atomic do
           pr <- maybePrune t
@@ -938,10 +937,10 @@ serve = \req -> case req of
           let appliedOnline = do
             e <- trustedDeduped
             where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt)
-            yield {pubkey: e.pubkey, server: e.server}
+            yield (pubkeyServer e)
           let merged = mergeByPubkeyServer presence trustedDeduped
           let afterOffline = removeOffline merged trustedOffline t
-          let appliedOffline = do p <- diff merged afterOffline; yield {pubkey: p.pubkey, server: p.server}
+          let appliedOffline = do p <- diff merged afterOffline; yield (pubkeyServer p)
           let capResult = capGossipPresence afterOffline appliedOnline trustedDeduped presence trustedOffline t
           set *presence = capResult.finalPresence
           let gossipPeerServers = collectPeerServers capResult.finalPresence (\p -> p.server)
