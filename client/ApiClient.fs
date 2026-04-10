@@ -86,9 +86,6 @@ module ApiClient =
             | _ -> return text
         }
 
-    let private post httpClient url body token =
-        sendRequest httpClient url body token |> Async.Ignore
-
     let private postJson<'T> httpClient url body token =
         async {
             let! text = sendRequest httpClient url body token
@@ -107,22 +104,16 @@ module ApiClient =
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
-        async {
-            let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
-            return! postJson<SendResult> client $"{serverUrl}/messages" body (Some token)
-        }
+        let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
+        postJson<SendResult> client $"{serverUrl}/messages" body (Some token)
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =
+        let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
         async {
-            let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
             let! response = postJson<PollResponse> pollClient $"{serverUrl}/poll" body (Some token)
-            return
-                { response with
-                    Events = response.Events |> Array.filter (fun e -> e.EventType = "message") }
+            return { response with Events = response.Events |> Array.filter (fun e -> e.EventType = "message") }
         }
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
-        async {
-            let body = JsonSerializer.Serialize({| messageIds = messageIds |})
-            do! post client $"{serverUrl}/messages/ack" body (Some token)
-        }
+        let body = JsonSerializer.Serialize({| messageIds = messageIds |})
+        sendRequest client $"{serverUrl}/messages/ack" body (Some token) |> Async.Ignore

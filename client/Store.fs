@@ -38,6 +38,12 @@ module Store =
           ServerUrl: string
           PollCursor: int64 }
 
+    let private toChatMessage (d: MessageDoc) : ChatMessage =
+        { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix; IsOutgoing = d.IsOutgoing }
+
+    let private toMessageDoc convId (m: ChatMessage) : MessageDoc =
+        { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeSeconds(); IsOutgoing = m.IsOutgoing }
+
     let private openDb () =
         new LiteDatabase(Path.Combine(FileSystem.AppDataDirectory, "skrepka.db"))
 
@@ -80,15 +86,7 @@ module Store =
                     db.GetCollection<MessageDoc>("messages").FindAll()
                     |> Seq.groupBy _.ConversationId
                     |> Seq.map (fun (convId, docs) ->
-                        convId,
-                        docs
-                        |> Seq.map (fun d ->
-                            { ChatMessage.Id = d.Id
-                              Body = d.Body
-                              Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix
-                              IsOutgoing = d.IsOutgoing })
-                        |> Seq.sortBy _.Timestamp
-                        |> Seq.toList)
+                        convId, docs |> Seq.map toChatMessage |> Seq.sortBy _.Timestamp |> Seq.toList)
                     |> Map.ofSeq
 
                 Some
@@ -112,13 +110,7 @@ module Store =
             data.Messages
             |> Map.iter (fun convId msgs ->
                 for m in msgs do
-                    messages.Upsert
-                        { Id = m.Id
-                          ConversationId = convId
-                          Body = m.Body
-                          TimestampUnix = m.Timestamp.ToUnixTimeSeconds()
-                          IsOutgoing = m.IsOutgoing }
-                    |> ignore)
+                    messages.Upsert(toMessageDoc convId m) |> ignore)
 
             settings.Upsert
                 { Id = "settings"

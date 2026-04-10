@@ -13,6 +13,7 @@ module App =
 
     open Store
     open Crypto
+    open ApiClient
 
     // ── Domain Types ──
 
@@ -66,7 +67,7 @@ module App =
         | DoDisconnect
         | SetCompose of string
         | DoSend
-        | Sent of Result<ApiClient.MessageStatus, string>
+        | Sent of Result<MessageStatus, string>
         | SetNewPubkey of string
         | SetNewNickname of string
         | DoSaveContact
@@ -132,8 +133,8 @@ module App =
         | Identified(id, _) -> { model with Auth = Identified(id, status) }
         | NoIdentity -> model
 
-    let private saveCmd model =
-        [ CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = model.ServerUrl; PollCursor = model.PollCursor } ]
+    let private saveCmdMsg model =
+        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = model.ServerUrl; PollCursor = model.PollCursor }
 
     // ── Init ──
 
@@ -200,13 +201,13 @@ module App =
                         Page = Chat(pk, "")
                         Messages = model.Messages |> appendMessage pk outMsg }
 
-                model', CmdSend(session, pk, compose, id) :: saveCmd model'
+                model', [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
             | _ -> model, []
 
-        | Sent(Ok(ApiClient.Delivered | ApiClient.Federated | ApiClient.Queued)) -> model, []
-        | Sent(Ok ApiClient.Rejected) ->
+        | Sent(Ok(Delivered | Federated | Queued)) -> model, []
+        | Sent(Ok Rejected) ->
             { model with Error = Some "Message rejected by server" }, []
-        | Sent(Ok ApiClient.Unauthorized) ->
+        | Sent(Ok Unauthorized) ->
             { model with Error = Some "Not authorized to deliver message" }, []
         | Sent(Error err) -> { model with Error = Some $"Send failed: {err}" }, []
 
@@ -224,7 +225,7 @@ module App =
             [ match trySession model' with
               | Some session -> CmdPoll(session, model'.PollCursor)
               | None -> ()
-              if not incoming.IsEmpty then yield! saveCmd model' ]
+              if not incoming.IsEmpty then saveCmdMsg model' ]
 
         | SetNewPubkey pk ->
             match model.Page with
@@ -246,7 +247,7 @@ module App =
                         Contacts = model.Contacts |> upsertContact contact
                         Page = Conversations }
 
-                model', saveCmd model'
+                model', [ saveCmdMsg model' ]
             | _ -> model, []
 
         | CopyPubKey ->
@@ -281,7 +282,7 @@ module App =
             }
             |> Async.Start)
 
-    let private decryptEvent (privKey: byte[]) (payload: ApiClient.EventPayload) =
+    let private decryptEvent (privKey: byte[]) (payload: EventPayload) =
         try
             let blob = Crypto.fromHex payload.EncryptedBlob
 
@@ -309,7 +310,7 @@ module App =
         | CmdConnect(url, identity) ->
             asyncCmd (async {
                 try
-                    let! token = ApiClient.authenticate url identity
+                    let! token = authenticate url identity
                     return AuthOk token
                 with ex ->
                     return AuthErr ex.Message
@@ -326,7 +327,7 @@ module App =
 
                     let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                     let blobHex = Crypto.toHex blob
-                    let! result = ApiClient.sendMessage session.Url session.Token recipientHex blobHex ts
+                    let! result = sendMessage session.Url session.Token recipientHex blobHex ts
                     return Sent(Ok result.Status)
                 with ex ->
                     return Sent(Error ex.Message)
@@ -335,10 +336,10 @@ module App =
         | CmdPoll(session, cursor) ->
             asyncCmd (async {
                 try
-                    let! response = ApiClient.poll session.Url session.Token cursor
+                    let! response = poll session.Url session.Token cursor
                     let messages, ackIds, errors =
                         Array.foldBack
-                            (fun (evt: ApiClient.PollEvent) (msgs, acks, errs) ->
+                            (fun (evt: PollEvent) (msgs, acks, errs) ->
                                 match decryptEvent session.Identity.PrivKey evt.Payload with
                                 | Ok msg -> (msg :: msgs, evt.Id :: acks, errs)
                                 | Error err -> (msgs, acks, err :: errs))
@@ -346,7 +347,7 @@ module App =
                             ([], [], [])
 
                     if not ackIds.IsEmpty then
-                        do! ApiClient.ackMessages session.Url session.Token ackIds
+                        do! ackMessages session.Url session.Token ackIds
 
                     let now = DateTimeOffset.UtcNow.ToString("HH:mm:ss")
 
@@ -433,11 +434,12 @@ module App =
                     | None -> ()
 
                     match model.Auth with
-                    | Identified(_, Offline) | NoIdentity -> Button("Connect", DoConnect)
+                    | Identified(_, Offline) -> Button("Connect", DoConnect)
                     | Identified(_, Connecting) -> Label("Connecting...").centerTextHorizontal()
                     | Identified(_, Online _) ->
                         Button("Disconnect", DoDisconnect)
                         Button("Go to Conversations", Nav Conversations)
+                    | NoIdentity -> ()
                 })
                     .padding(20.)
             )
