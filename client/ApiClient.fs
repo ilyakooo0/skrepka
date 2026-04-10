@@ -12,7 +12,7 @@ module ApiClient =
     [<CLIMutable>]
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
 
-    type EventType = Message | UnknownEvent of string
+    type EventType = Message | Ack | UnknownEvent of string
 
     [<CLIMutable>]
     type PollEvent = { Id: string; EventType: EventType; Payload: EventPayload }
@@ -66,11 +66,13 @@ module ApiClient =
         override _.Read(reader, _, _) =
             match reader.GetString() with
             | "message" -> Message
+            | "ack" -> Ack
             | s -> UnknownEvent s
         override _.Write(writer, value, _) =
             writer.WriteStringValue(
                 match value with
                 | Message -> "message"
+                | Ack -> "ack"
                 | UnknownEvent s -> s)
 
     let private jsonOpts =
@@ -128,10 +130,7 @@ module ApiClient =
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =
         let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
-        async {
-            let! response = postJson<PollResponse> pollClient $"{serverUrl}/poll" body (Some token)
-            return { response with Events = response.Events |> Array.filter (fun e -> e.EventType = Message) }
-        }
+        postJson<PollResponse> pollClient $"{serverUrl}/poll" body (Some token)
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
         let body = JsonSerializer.Serialize({| messageIds = messageIds |})

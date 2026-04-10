@@ -137,7 +137,8 @@ module App =
 
     let private tryParsePubkey (input: string) =
         let input = input.Trim()
-        (Phonemic.fromOb input |> Option.orElseWith (fun () -> Crypto.tryFromHex input))
+        Phonemic.fromOb input
+        |> Option.orElseWith (fun () -> Crypto.tryFromHex input)
         |> Option.filter (fun bytes -> bytes.Length = 32)
 
     let private contactName (contacts: Contact list) (pk: string) =
@@ -287,10 +288,9 @@ module App =
             | _ -> model, []
 
         | CopyPubKey ->
-            model,
-            [ match model.Auth with
-              | Identified(id, _) -> CmdCopyToClipboard(hexToOb id.PubKeyHex)
-              | NoIdentity -> () ]
+            match model.Auth with
+            | Identified(id, _) -> model, [ CmdCopyToClipboard(hexToOb id.PubKeyHex) ]
+            | NoIdentity -> model, []
 
         | DismissError -> { model with Error = None }, []
 
@@ -381,9 +381,12 @@ module App =
                     let messages, errors =
                         Array.foldBack
                             (fun (evt: PollEvent) (msgs, errs) ->
-                                match decryptEvent session.Identity.PrivKey evt.Payload with
-                                | Ok msg -> (msg :: msgs, errs)
-                                | Error err -> (msgs, err :: errs))
+                                match evt.EventType with
+                                | Message ->
+                                    match decryptEvent session.Identity.PrivKey evt.Payload with
+                                    | Ok msg -> (msg :: msgs, errs)
+                                    | Error err -> (msgs, err :: errs)
+                                | Ack | UnknownEvent _ -> (msgs, errs))
                             response.Events
                             ([], [])
 

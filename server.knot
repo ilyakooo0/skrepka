@@ -115,7 +115,6 @@ type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Times
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
-type PruneResult = {expiredLocal: [PresenceEntry], peerServers: [ServerName]}
 type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
 
 
@@ -943,10 +942,7 @@ serve = \req -> case req of
           e <- offlineEntries
           where none onlineEntries (\o -> samePubkeyServer o e && o.timestamp > e.timestamp)
           yield e
-        let trustedOffline = do
-          e <- allValidEntries
-          where not (isGossipOnline e.eventType) && e.server == fromServer
-          yield e
+        let trustedOffline = do e <- offlineEntries; where e.server == fromServer; yield e
         let deduped = mergeByPubkeyServer [] filteredOnline
         gossipResult <- atomic do
           pr <- maybePrune t
@@ -964,11 +960,8 @@ serve = \req -> case req of
             e <- allValidEntries
             where none trustedDeduped (\d -> samePubkeyServer d e)
             yield e
-          let appliedOffline = do
-            k <- offlineOnlyKeys
-            where any presence (\p -> samePubkeyServer p k && any trustedOffline (\o -> samePubkeyServer o k && (if o.timestamp > t then t else o.timestamp) > p.timestamp))
-            yield {pubkey: k.pubkey, server: k.server}
           let afterOffline = removeOffline merged offlineOnlyKeys trustedOffline t
+          let appliedOffline = do p <- diff merged afterOffline; yield {pubkey: p.pubkey, server: p.server}
           let capResult = capGossipPresence afterOffline appliedOnline trustedDeduped presence offlineOnlyKeys trustedOffline t
           set *presence = capResult.finalPresence
           let gossipPeerServers = collectPeerServers capResult.finalPresence (\p -> p.server)
