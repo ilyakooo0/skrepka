@@ -165,6 +165,9 @@ module App =
         | Some i -> contacts |> List.updateAt i contact
         | None -> contacts @ [ contact ]
 
+    let private newContact pubkey nickname : Contact =
+        { Pubkey = pubkey; Nickname = nickname; DisplayName = ""; Bio = ""; PhotoBase64 = "" }
+
     let private trySession model =
         match model.Auth with
         | Identified(id, Online token) -> Some { Url = model.ServerUrl; Token = token; Identity = id }
@@ -278,7 +281,7 @@ module App =
                         match evt with
                         | IncomingChat(senderPubkey, message) ->
                             { m with
-                                Contacts = m.Contacts |> addContactIfNew { Pubkey = senderPubkey; Nickname = truncKey senderPubkey; DisplayName = ""; Bio = ""; PhotoBase64 = "" }
+                                Contacts = m.Contacts |> addContactIfNew (newContact senderPubkey (truncKey senderPubkey))
                                 Messages = m.Messages |> appendMessage senderPubkey message }
                         | IncomingDeliveryAck(senderPubkey, ackIds) ->
                             { m with Messages = m.Messages |> markDelivered senderPubkey ackIds }
@@ -308,7 +311,7 @@ module App =
                     let contact: Contact =
                         match existing with
                         | Some e -> { e with Nickname = cnn }
-                        | None -> { Pubkey = hex; Nickname = cnn; DisplayName = ""; Bio = ""; PhotoBase64 = "" }
+                        | None -> newContact hex cnn
 
                     let model' =
                         { model with
@@ -400,6 +403,11 @@ module App =
             return! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
         }
 
+    let private tryGetJsonString (el: JsonElement) (name: string) =
+        match el.TryGetProperty(name) with
+        | true, v when v.ValueKind <> JsonValueKind.Null -> Some(v.GetString())
+        | _ -> None
+
     let private parseEnvelope (json: string) =
         use doc = JsonDocument.Parse(json)
         let root = doc.RootElement
@@ -411,14 +419,8 @@ module App =
             Some(DeliveryAck(root.GetProperty("id").GetString(), ackIds))
         | "profile" ->
             let displayName = root.GetProperty("display_name").GetString()
-            let bio =
-                match root.TryGetProperty("bio") with
-                | true, el when el.ValueKind <> JsonValueKind.Null -> el.GetString()
-                | _ -> ""
-            let photo =
-                match root.TryGetProperty("photo") with
-                | true, el when el.ValueKind <> JsonValueKind.Null -> Some(el.GetString())
-                | _ -> None
+            let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
+            let photo = tryGetJsonString root "photo"
             Some(ProfileMessage(root.GetProperty("id").GetString(), displayName, bio, photo))
         | _ -> None
 
@@ -541,8 +543,7 @@ module App =
             asyncCmd (async {
                 try
                     let! results = Microsoft.Maui.Media.MediaPicker.Default.PickPhotosAsync() |> Async.AwaitTask
-                    let file = results |> Seq.tryHead
-                    match file with
+                    match results |> Seq.tryHead with
                     | None -> return PhotoPicked None
                     | Some file ->
                         use! stream = file.OpenReadAsync() |> Async.AwaitTask
@@ -619,19 +620,15 @@ module App =
                         Button("Copy Public Key", CopyPubKey)
 
                         Label("Profile:").font(size = 18.)
-                        match model.Profile with
-                        | Some profile when profile.DisplayName <> "" ->
-                            Label($"Name: {profile.DisplayName}").font(size = 14.)
-                        | _ -> ()
-                        match model.Profile with
-                        | Some profile when profile.Bio <> "" ->
-                            Label($"Bio: {profile.Bio}").font(size = 14.).textColor(Colors.DimGray)
-                        | _ -> ()
-                        let profilePage =
+                        let displayName, bio, photo =
                             match model.Profile with
-                            | Some p -> EditProfile(p.DisplayName, p.Bio, p.PhotoBase64)
-                            | None -> EditProfile("", "", None)
-                        Button("Edit Profile", SetPage profilePage)
+                            | Some p -> p.DisplayName, p.Bio, p.PhotoBase64
+                            | None -> "", "", None
+                        if displayName <> "" then
+                            Label($"Name: {displayName}").font(size = 14.)
+                        if bio <> "" then
+                            Label($"Bio: {bio}").font(size = 14.).textColor(Colors.DimGray)
+                        Button("Edit Profile", SetPage(EditProfile(displayName, bio, photo)))
 
                         Label("Server:")
 

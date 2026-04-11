@@ -60,7 +60,7 @@ module Store =
 
     let private toChatMessage (d: MessageDoc) : ChatMessage =
         { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix; IsOutgoing = d.IsOutgoing
-          Status = match d.Status with 0 -> DeliveryStatus.Sent | 1 -> DeliveryStatus.Delivered | n -> failwith $"Unknown delivery status: {n}" }
+          Status = match d.Status with 1 -> DeliveryStatus.Delivered | _ -> DeliveryStatus.Sent }
 
     let private toMessageDoc convId (m: ChatMessage) : MessageDoc =
         { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeSeconds(); IsOutgoing = m.IsOutgoing
