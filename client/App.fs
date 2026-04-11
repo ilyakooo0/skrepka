@@ -49,7 +49,7 @@ module App =
     type ConnStatus =
         | Offline
         | Connecting
-        | Online of url: string * token: string
+        | Online of token: string
 
     type AuthState =
         | NoIdentity
@@ -57,10 +57,12 @@ module App =
 
     type IncomingMessage = { SenderPubkey: string; Message: ChatMessage }
 
+    type PollReceived = { Events: int; Messages: int; Errors: int; FirstError: string option }
+
     type PollStatus =
         | Idle
         | Polling
-        | Received of events: int * messages: int * errors: int * firstError: string option
+        | Received of PollReceived
         | PollError of string
 
     // ── Model ──
@@ -160,7 +162,7 @@ module App =
 
     let private trySession model =
         match model.Auth with
-        | Identified(id, Online(url, token)) -> Some { Url = url; Token = token; Identity = id }
+        | Identified(id, Online token) -> Some { Url = model.ServerUrl; Token = token; Identity = id }
         | _ -> None
 
     let private setConn status model =
@@ -225,7 +227,7 @@ module App =
             match model.Auth with
             | Identified(id, Connecting) ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
-                { model with Auth = Identified(id, Online(model.ServerUrl, token)); Page = Conversations; Error = None },
+                { model with Auth = Identified(id, Online token); Page = Conversations; Error = None },
                 [ CmdPoll(session, model.PollCursor) ]
             | _ -> model, []
 
@@ -392,7 +394,7 @@ module App =
                     if not ackIds.IsEmpty then
                         do! ackMessages session.Url session.Token ackIds
 
-                    let status = Received(response.Events.Length, messages.Length, errors.Length, List.tryHead errors)
+                    let status = Received { Events = response.Events.Length; Messages = messages.Length; Errors = errors.Length; FirstError = List.tryHead errors }
                     return PollResult(messages, status, response.Cursor)
                 with
                 | :? TimeoutException ->
@@ -429,10 +431,19 @@ module App =
     let private formatPollStatus = function
         | Idle -> ""
         | Polling -> "polling..."
-        | Received(evts, msgs, errs, firstErr) ->
-            $"evts:{evts} msgs:{msgs} errs:{errs}"
-            + (match firstErr with Some e -> $" [{e}]" | None -> "")
+        | Received r ->
+            $"evts:{r.Events} msgs:{r.Messages} errs:{r.Errors}"
+            + (match r.FirstError with Some e -> $" [{e}]" | None -> "")
         | PollError msg -> $"poll error: {msg}"
+
+    let private viewErrorBanner (error: string option) =
+        VStack(spacing = 4.) {
+            match error with
+            | Some err ->
+                Label(err).textColor(Colors.Red).font(size = 12.)
+                Button("Dismiss", DismissError)
+            | None -> ()
+        }
 
     let private viewSetup () =
         ContentPage(
@@ -471,16 +482,11 @@ module App =
 
                         Label("Server:")
 
-                        Entry(model.ServerUrl, SetServerUrl)
+                        match conn with
+                        | Online _ -> Label(model.ServerUrl).font(size = 14.)
+                        | _ -> Entry(model.ServerUrl, SetServerUrl)
 
-                        match model.Error with
-                        | Some err ->
-                            Label(err)
-                                .textColor(Colors.Red)
-                                .font(size = 12.)
-
-                            Button("Dismiss", DismissError)
-                        | None -> ()
+                        viewErrorBanner model.Error
 
                         match conn with
                         | Offline -> Button("Connect", DoConnect)
@@ -516,11 +522,7 @@ module App =
                         .font(size = 10.)
                         .textColor(Colors.DimGray)
 
-                    match model.Error with
-                    | Some err ->
-                        Label(err).textColor(Colors.Red).font(size = 12.)
-                        Button("Dismiss", DismissError)
-                    | None -> ()
+                    viewErrorBanner model.Error
 
                     if model.Contacts.IsEmpty then
                         Label("No contacts yet. Tap + to add one.")
@@ -554,14 +556,7 @@ module App =
                         .centerTextHorizontal()
                 }
 
-                match model.Error with
-                | Some err ->
-                    Label(err)
-                        .textColor(Colors.Red)
-                        .font(size = 12.)
-
-                    Button("Dismiss", DismissError)
-                | None -> ()
+                viewErrorBanner model.Error
 
                 if msgs.IsEmpty then
                     Label("No messages yet")
@@ -593,11 +588,7 @@ module App =
                         .font(size = 20.)
                 }
 
-                match model.Error with
-                | Some err ->
-                    Label(err).textColor(Colors.Red).font(size = 12.)
-                    Button("Dismiss", DismissError)
-                | None -> ()
+                viewErrorBanner model.Error
 
                 Label("Public Key:")
                 Entry(pubkey, SetContactPubkey)

@@ -184,6 +184,7 @@ whenOk = \result action -> case result of
   Err _ -> yield {}
 clamp = \lo hi x -> if x < lo then lo else if x > hi then hi else x
 min = \a b -> if a < b then a else b
+max = \a b -> if a > b then a else b
 headOf = \items -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
   _ -> acc) Nothing {} items
@@ -397,9 +398,9 @@ boundedSmallest = \items n getKey ->
         let newHeap = union acc.heap [a] in
         let newSize = count newHeap in
         if newSize > acc.size
-          then {size: newSize, heap: newHeap, heapMax: case acc.heapMax of
-            Nothing {} -> Just {value: k}
-            Just {value: v} -> if k > v then Just {value: k} else acc.heapMax}
+          then {size: newSize, heap: newHeap, heapMax: Just {value: case acc.heapMax of
+            Nothing {} -> k
+            Just {value: v} -> max k v}}
           else acc
       else case acc.heapMax of
         Nothing {} -> acc
@@ -411,9 +412,9 @@ boundedSmallest = \items n getKey ->
                   then {done: True {}, items: r.items}
                   else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
               let newHeap = union removed.items [a] in
-              let newMax = fold (\best x -> case best of
-                Nothing {} -> Just {value: getKey x}
-                Just {value: v} -> if getKey x > v then Just {value: getKey x} else best) Nothing {} newHeap in
+              let newMax = fold (\best x -> Just {value: case best of
+                Nothing {} -> getKey x
+                Just {value: v} -> max (getKey x) v}) Nothing {} newHeap in
               {size: acc.size, heap: newHeap, heapMax: newMax}
             else acc) {size: 0, heap: [], heapMax: Nothing {}} items).heap
 
@@ -430,9 +431,9 @@ safeCompare = \a b ->
   safeCompareLoop a b maxTokenLen 0 + (if a == "" then 1 else 0) + (if b == "" then 1 else 0) == 0
 
 evictOneOldest = \items getKey ->
-  let oldest = fold (\acc x -> let k = getKey x in case acc of
-    Nothing {} -> Just {value: k}
-    Just {value: v} -> if k < v then Just {value: k} else acc) Nothing {} items in
+  let oldest = fold (\acc x -> let k = getKey x in Just {value: case acc of
+    Nothing {} -> k
+    Just {value: v} -> min k v}) Nothing {} items in
   case oldest of
     Nothing {} -> items
     Just {value: oldestKey} ->
@@ -706,8 +707,7 @@ pollOnce = \token cursor -> do
       Authorized {pubkey} -> do
         seqCounter <- *seqCounter
         messages <- *messages
-        let cursorCeil = if seqCounter > t then seqCounter else t
-        let clampedCursor = clamp 0 cursorCeil cursor
+        let clampedCursor = clamp 0 (max seqCounter t) cursor
         let matchingMsgs = do
           m <- messages
           where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > clampedCursor
@@ -719,7 +719,7 @@ pollOnce = \token cursor -> do
                  payload: {toKey: m.toKey, fromKey: m.fromKey,
                             encryptedBlob: m.encryptedBlob,
                             timestamp: m.timestamp}}
-        let lastReceivedAt = fold (\acc m -> if m.receivedAt > acc then m.receivedAt else acc) clampedCursor limitedMsgs
+        let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
         yield {events: evts, cursor: lastReceivedAt, authorized: True {}}
 
 pollLoop = \token cursor deadline -> do
@@ -761,7 +761,7 @@ serve = \req -> case req of
       sessions <- *sessions
       presence <- *presence
       let hasMatch = any challenges (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t)
-      let sigValid = if hasMatch then verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature) else False {}
+      let sigValid = hasMatch && verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
       if not sigValid
         then yield {pr: pr, verified: False {}, peerServers: []}
         else do
