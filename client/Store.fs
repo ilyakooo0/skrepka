@@ -18,7 +18,7 @@ module Store =
     type Profile =
         { DisplayName: string
           Bio: string
-          PhotoBase64: string option }
+          PhotoBase64: string }
 
     [<RequireQualifiedAccess>]
     type DeliveryStatus = Sent | Delivered
@@ -31,7 +31,7 @@ module Store =
           Status: DeliveryStatus }
 
     type Data =
-        { Contacts: Contact list
+        { Contacts: Map<string, Contact>
           Messages: Map<string, ChatMessage list>
           ServerUrl: string option
           PollCursor: int64 }
@@ -93,7 +93,7 @@ module Store =
             |> Option.map (fun p ->
                 { DisplayName = p.DisplayName |> Option.ofObj |> Option.defaultValue ""
                   Bio = p.Bio |> Option.ofObj |> Option.defaultValue ""
-                  PhotoBase64 = p.PhotoBase64 |> Option.ofObj })
+                  PhotoBase64 = p.PhotoBase64 |> Option.ofObj |> Option.defaultValue "" })
         with _ -> None
 
     let saveProfile (profile: Profile) =
@@ -103,7 +103,7 @@ module Store =
                 { Id = "me"
                   DisplayName = profile.DisplayName
                   Bio = profile.Bio
-                  PhotoBase64 = profile.PhotoBase64 |> Option.defaultValue null }
+                  PhotoBase64 = profile.PhotoBase64 }
             |> ignore
         with _ -> ()
 
@@ -122,7 +122,8 @@ module Store =
                             DisplayName = c.DisplayName |> Option.ofObj |> Option.defaultValue ""
                             Bio = c.Bio |> Option.ofObj |> Option.defaultValue ""
                             PhotoBase64 = c.PhotoBase64 |> Option.ofObj |> Option.defaultValue "" })
-                    |> Seq.toList
+                    |> Seq.map (fun c -> c.Pubkey, c)
+                    |> Map.ofSeq
 
                 let messages =
                     db.GetCollection<MessageDoc>("messages").FindAll()
@@ -145,7 +146,7 @@ module Store =
             let messages = db.GetCollection<MessageDoc>("messages")
             let settings = db.GetCollection<SettingsDoc>("settings")
 
-            for c in data.Contacts do
+            for c in data.Contacts.Values do
                 contacts.Upsert c |> ignore
 
             data.Messages

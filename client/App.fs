@@ -24,7 +24,7 @@ module App =
         | Chat of pubkey: string * compose: string
         | AddContact of pubkey: string * nickname: string
         | Settings
-        | EditProfile of displayName: string * bio: string * photo: string option
+        | EditProfile of displayName: string * bio: string * photo: string
 
     type Session = { Url: string; Token: string; Identity: Identity }
 
@@ -40,7 +40,7 @@ module App =
     type DecryptedEvent =
         | IncomingChat of senderPubkey: string * message: ChatMessage
         | IncomingDeliveryAck of senderPubkey: string * ackIds: string list
-        | IncomingProfile of senderPubkey: string * displayName: string * bio: string * photo: string option
+        | IncomingProfile of senderPubkey: string * displayName: string * bio: string * photo: string
 
     type PollReceived = { Events: int; Messages: int; Errors: int; FirstError: string option }
 
@@ -56,7 +56,7 @@ module App =
         { Page: Page
           Auth: AuthState
           ServerUrl: string
-          Contacts: Contact list
+          Contacts: Map<string, Contact>
           PollStatus: PollStatus
           Messages: Map<string, ChatMessage list>
           Error: string option
@@ -92,7 +92,7 @@ module App =
         | SetProfileDisplayName of string
         | SetProfileBio of string
         | DoPickPhoto
-        | PhotoPicked of string option
+        | PhotoPicked of string
         | DoSaveProfile
 
     // ── CmdMsg ──
@@ -130,10 +130,10 @@ module App =
         |> Option.orElseWith (fun () -> Crypto.tryFromHex input)
         |> Option.filter (fun bytes -> bytes.Length = 32)
 
-    let private contactName (contacts: Contact list) (pk: string) =
+    let private contactName (contacts: Map<string, Contact>) (pk: string) =
         let fallback = truncKey pk
         contacts
-        |> List.tryFind (fun c -> c.Pubkey = pk)
+        |> Map.tryFind pk
         |> Option.map (fun c ->
             if c.Nickname <> fallback then c.Nickname
             elif c.DisplayName <> "" then c.DisplayName
@@ -155,15 +155,6 @@ module App =
             |> List.map (fun m -> if m.IsOutgoing && List.contains m.Id ackIds then { m with Status = DeliveryStatus.Delivered } else m)
             |> fun updated -> Map.add pk updated messages
         | None -> messages
-
-    let private addContactIfNew (contact: Contact) (contacts: Contact list) =
-        if contacts |> List.exists (fun c -> c.Pubkey = contact.Pubkey) then contacts
-        else contacts @ [ contact ]
-
-    let private upsertContact (contact: Contact) (contacts: Contact list) =
-        match contacts |> List.tryFindIndex (fun c -> c.Pubkey = contact.Pubkey) with
-        | Some i -> contacts |> List.updateAt i contact
-        | None -> contacts @ [ contact ]
 
     let private newContact pubkey nickname : Contact =
         { Pubkey = pubkey; Nickname = nickname; DisplayName = ""; Bio = ""; PhotoBase64 = "" }
@@ -193,7 +184,7 @@ module App =
           Auth = NoIdentity
           ServerUrl = "http://localhost:8080"
           PollStatus = Idle
-          Contacts = []
+          Contacts = Map.empty
           Messages = Map.empty
           Error = None
           PollCursor = 0L
@@ -281,18 +272,17 @@ module App =
                         match evt with
                         | IncomingChat(senderPubkey, message) ->
                             { m with
-                                Contacts = m.Contacts |> addContactIfNew (newContact senderPubkey (truncKey senderPubkey))
+                                Contacts =
+                                    if Map.containsKey senderPubkey m.Contacts then m.Contacts
+                                    else Map.add senderPubkey (newContact senderPubkey (truncKey senderPubkey)) m.Contacts
                                 Messages = m.Messages |> appendMessage senderPubkey message }
                         | IncomingDeliveryAck(senderPubkey, ackIds) ->
                             { m with Messages = m.Messages |> markDelivered senderPubkey ackIds }
                         | IncomingProfile(senderPubkey, displayName, bio, photo) ->
                             { m with
                                 Contacts =
-                                    m.Contacts
-                                    |> List.map (fun c ->
-                                        if c.Pubkey = senderPubkey then
-                                            { c with DisplayName = displayName; Bio = bio; PhotoBase64 = photo |> Option.defaultValue "" }
-                                        else c) })
+                                    m.Contacts |> Map.change senderPubkey (Option.map (fun c ->
+                                        { c with DisplayName = displayName; Bio = bio; PhotoBase64 = photo })) })
                     { model with PollStatus = status; PollCursor = newCursor }
 
             model',
@@ -307,15 +297,14 @@ module App =
                 match tryParsePubkey cpk with
                 | Some bytes ->
                     let hex = Crypto.toHex bytes
-                    let existing = model.Contacts |> List.tryFind (fun c -> c.Pubkey = hex)
-                    let contact: Contact =
-                        match existing with
+                    let contact =
+                        match Map.tryFind hex model.Contacts with
                         | Some e -> { e with Nickname = cnn }
                         | None -> newContact hex cnn
 
                     let model' =
                         { model with
-                            Contacts = model.Contacts |> upsertContact contact
+                            Contacts = Map.add hex contact model.Contacts
                             Page = Conversations }
 
                     model', [ saveCmdMsg model' ]
@@ -353,7 +342,7 @@ module App =
                 { model with Profile = Some profile; Page = Settings },
                 [ CmdSaveProfile profile
                   match trySession model with
-                  | Some session -> CmdSendProfileToAll(session, profile, model.Contacts |> List.map _.Pubkey)
+                  | Some session -> CmdSendProfileToAll(session, profile, model.Contacts.Keys |> Seq.toList)
                   | None -> () ]
             | _ -> model, []
 
@@ -385,7 +374,7 @@ module App =
     type private Envelope =
         | TextMessage of id: string * body: string
         | DeliveryAck of id: string * ackIds: string list
-        | ProfileMessage of id: string * displayName: string * bio: string * photo: string option
+        | ProfileMessage of id: string * displayName: string * bio: string * photo: string
 
     let private serializeEnvelope = function
         | TextMessage(id, body) ->
@@ -393,7 +382,7 @@ module App =
         | DeliveryAck(id, ackIds) ->
             JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = id; ack_ids = ackIds |})
         | ProfileMessage(id, displayName, bio, photo) ->
-            JsonSerializer.Serialize({| ``type`` = "profile"; id = id; timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = displayName; bio = bio; photo = (photo |> Option.defaultValue null) |})
+            JsonSerializer.Serialize({| ``type`` = "profile"; id = id; timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = displayName; bio = bio; photo = photo |})
 
     let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
         async {
@@ -420,7 +409,7 @@ module App =
         | "profile" ->
             let displayName = root.GetProperty("display_name").GetString()
             let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
-            let photo = tryGetJsonString root "photo"
+            let photo = tryGetJsonString root "photo" |> Option.defaultValue ""
             Some(ProfileMessage(root.GetProperty("id").GetString(), displayName, bio, photo))
         | _ -> None
 
@@ -487,17 +476,15 @@ module App =
                     let! response = poll session.Url session.Token cursor
                     let ackIds = response.Events |> Array.map _.Id |> Array.toList
 
-                    let events, errors =
-                        Array.foldBack
-                            (fun (evt: PollEvent) (evts, errs) ->
-                                match evt.EventType with
-                                | Message ->
-                                    match decryptEvent session.Identity.PrivKey evt.Payload with
-                                    | Ok event -> (event :: evts, errs)
-                                    | Error err -> (evts, err :: errs)
-                                | UnknownEvent _ -> (evts, errs))
-                            response.Events
-                            ([], [])
+                    let results =
+                        response.Events
+                        |> Array.choose (fun evt ->
+                            match evt.EventType with
+                            | Message -> Some(decryptEvent session.Identity.PrivKey evt.Payload)
+                            | UnknownEvent _ -> None)
+
+                    let events = results |> Array.choose (function Ok e -> Some e | _ -> None) |> Array.toList
+                    let errors = results |> Array.choose (function Error e -> Some e | _ -> None) |> Array.toList
 
                     if not ackIds.IsEmpty then
                         try do! ackMessages session.Url session.Token ackIds
@@ -544,14 +531,14 @@ module App =
                 try
                     let! results = Microsoft.Maui.Media.MediaPicker.Default.PickPhotosAsync() |> Async.AwaitTask
                     match results |> Seq.tryHead with
-                    | None -> return PhotoPicked None
+                    | None -> return PhotoPicked ""
                     | Some file ->
                         use! stream = file.OpenReadAsync() |> Async.AwaitTask
                         use ms = new MemoryStream()
                         do! stream.CopyToAsync(ms) |> Async.AwaitTask
-                        return PhotoPicked(Some(Convert.ToBase64String(ms.ToArray())))
+                        return PhotoPicked(Convert.ToBase64String(ms.ToArray()))
                 with _ ->
-                    return PhotoPicked None
+                    return PhotoPicked ""
             })
 
         | CmdSaveProfile profile ->
@@ -623,7 +610,7 @@ module App =
                         let displayName, bio, photo =
                             match model.Profile with
                             | Some p -> p.DisplayName, p.Bio, p.PhotoBase64
-                            | None -> "", "", None
+                            | None -> "", "", ""
                         if displayName <> "" then
                             Label($"Name: {displayName}").font(size = 14.)
                         if bio <> "" then
@@ -673,7 +660,7 @@ module App =
                             .centerTextHorizontal()
                             .textColor(Colors.Gray)
 
-                    for c in model.Contacts do
+                    for c in model.Contacts.Values do
                         let preview =
                             messagesFor c.Pubkey model.Messages
                             |> List.tryLast
@@ -759,13 +746,12 @@ module App =
 
                     viewErrorBanner model.Error
 
-                    match photo with
-                    | Some p when p <> "" ->
-                        Image(new MemoryStream(Convert.FromBase64String(p)) :> Stream)
+                    if photo <> "" then
+                        Image(new MemoryStream(Convert.FromBase64String(photo)) :> Stream)
                             .width(120.)
                             .height(120.)
                             .centerHorizontal()
-                    | _ ->
+                    else
                         Label("No Photo")
                             .font(size = 16.)
                             .centerTextHorizontal()

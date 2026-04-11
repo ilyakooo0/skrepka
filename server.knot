@@ -70,10 +70,6 @@ impl FromJSON GossipEventType where
     else if s == "offline" then GossipOffline {}
     else GossipUnknown {}
 
-isGossipOnline = \et -> case et of GossipOnline {} -> True {}; _ -> False {}
-isGossipOffline = \et -> case et of GossipOffline {} -> True {}; _ -> False {}
-isGossipUnknown = \et -> case et of GossipUnknown {} -> True {}; _ -> False {}
-
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
 type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
@@ -523,12 +519,14 @@ countMessagesFor = \messages toKey t ->
 validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
 validGossipEvents = \events t -> do
   e <- events
-  where not (isGossipUnknown e.eventType)
-  where e.server != serverHostN && e.timestamp <= t + clockSkewTolerance
-  let ttl = clampTtl e.ttl
-  let expiresAt = e.timestamp + ttl * 1000
-  where expiresAt > t
-  yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
+  case e.eventType of
+    GossipUnknown {} -> []
+    _ -> do
+      where e.server != serverHostN && e.timestamp <= t + clockSkewTolerance
+      let ttl = clampTtl e.ttl
+      let expiresAt = e.timestamp + ttl * 1000
+      where expiresAt > t
+      yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
 
 sendToEach : [ServerName] -> (ServerName -> (a {})) -> a {}
 sendToEach = \servers action ->
@@ -850,7 +848,7 @@ serve = \req -> case req of
                   encryptedBlob: encryptedBlob, timestamp: clampedTs, origin: LocalOrigin {}, receivedAt: seqTs}]
               let toPresence = do p <- presence; where p.pubkey == to && p.expiresAt > t; yield p
               let localOnline = any toPresence (\p -> p.server == serverHostN)
-              let remoteServers = do p <- toPresence; where p.server != serverHostN; yield p.server
+              let remoteServers = collectPeerServers toPresence (\p -> p.server)
               forwards <- *forwards
               let forwardServers = takeN remoteServers (maxForwardsEntries - count forwards)
               let shouldForward = federationEnabled && count forwardServers > 0
@@ -950,8 +948,8 @@ serve = \req -> case req of
       then rejectFederation t respond
       else do
         let allValidEntries = validGossipEvents events t
-        let onlineEntries = do e <- allValidEntries; where isGossipOnline e.eventType; yield e
-        let trustedOffline = do e <- allValidEntries; where isGossipOffline e.eventType && e.server == fromServer; yield e
+        let onlineEntries = do e <- allValidEntries; case e.eventType of GossipOnline {} -> yield e; _ -> []
+        let trustedOffline = do e <- allValidEntries; case e.eventType of GossipOffline {} -> do where e.server == fromServer; yield e; _ -> []
         let filteredOnline = resolveByTimestamp onlineEntries trustedOffline
         let filteredOffline = resolveByTimestamp trustedOffline onlineEntries
         let deduped = mergeByPubkeyServer [] filteredOnline
