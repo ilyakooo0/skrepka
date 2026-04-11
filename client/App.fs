@@ -72,9 +72,6 @@ module App =
 
     type Msg =
         | SetPage of Page
-        | SetCompose of string
-        | SetContactPubkey of string
-        | SetContactNickname of string
         | GenIdentity
         | SetServerUrl of string
         | DoConnect
@@ -89,8 +86,6 @@ module App =
         | CopyPubKey
         | DismissError
         | StateLoaded of StateLoadResult
-        | SetProfileDisplayName of string
-        | SetProfileBio of string
         | DoPickPhoto
         | PhotoPicked of string
         | DoSaveProfile
@@ -207,19 +202,6 @@ module App =
         match msg with
         | SetPage page -> { model with Page = page }, []
 
-        | SetCompose text ->
-            match model.Page with
-            | Chat(pk, _) -> { model with Page = Chat(pk, text) }, []
-            | _ -> model, []
-        | SetContactPubkey pk ->
-            match model.Page with
-            | AddContact(_, nn) -> { model with Page = AddContact(pk, nn) }, []
-            | _ -> model, []
-        | SetContactNickname nn ->
-            match model.Page with
-            | AddContact(pk, _) -> { model with Page = AddContact(pk, nn) }, []
-            | _ -> model, []
-
         | GenIdentity ->
             let identity = Crypto.generateIdentity ()
             { model with Auth = Identified(identity, Offline); Page = Settings },
@@ -309,16 +291,6 @@ module App =
             | NoIdentity -> model, []
 
         | DismissError -> { model with Error = None }, []
-
-        | SetProfileDisplayName name ->
-            match model.Page with
-            | EditProfile(_, bio, photo) -> { model with Page = EditProfile(name, bio, photo) }, []
-            | _ -> model, []
-
-        | SetProfileBio bio ->
-            match model.Page with
-            | EditProfile(name, _, photo) -> { model with Page = EditProfile(name, bio, photo) }, []
-            | _ -> model, []
 
         | DoPickPhoto -> model, [ CmdPickPhoto ]
 
@@ -476,7 +448,7 @@ module App =
                             | Message -> Some(decryptEvent session.Identity.PrivKey evt.Payload)
                             | UnknownEvent _ -> None)
 
-                    let events = results |> Array.choose (function Ok e -> Some e | _ -> None) |> Array.toList
+                    let events = results |> Array.choose Result.toOption |> Array.toList
                     let errors = results |> Array.choose (function Error e -> Some e | _ -> None) |> Array.toList
 
                     if not ackIds.IsEmpty then
@@ -690,7 +662,7 @@ module App =
                             .font(size = 14.)
 
                 HStack(spacing = 8.) {
-                    Entry(compose, SetCompose)
+                    Entry(compose, fun text -> SetPage(Chat(pk, text)))
                         .placeholder("Message...")
 
                     Button("Send", DoSend)
@@ -712,11 +684,11 @@ module App =
                 viewErrorBanner model.Error
 
                 Label("Public Key:")
-                Entry(cpk, SetContactPubkey)
+                Entry(cpk, fun text -> SetPage(AddContact(text, cnn)))
                     .placeholder("sampel-palnet-...")
 
                 Label("Nickname:")
-                Entry(cnn, SetContactNickname)
+                Entry(cnn, fun text -> SetPage(AddContact(cpk, text)))
 
                 Button("Save Contact", DoSaveContact)
                     .centerHorizontal()
@@ -749,11 +721,11 @@ module App =
                     Button("Change Photo", DoPickPhoto).centerHorizontal()
 
                     Label("Display Name:")
-                    Entry(displayName, SetProfileDisplayName)
+                    Entry(displayName, fun text -> SetPage(EditProfile(text, bio, photo)))
                         .placeholder("Your name")
 
                     Label("Bio:")
-                    Entry(bio, SetProfileBio)
+                    Entry(bio, fun text -> SetPage(EditProfile(displayName, text, photo)))
                         .placeholder("Tell something about yourself")
 
                     Button("Save Profile", DoSaveProfile).centerHorizontal()

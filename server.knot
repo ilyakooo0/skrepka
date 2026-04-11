@@ -956,7 +956,7 @@ serve = \req -> case req of
           let trustedDeduped = do
             e <- deduped
             where e.server == fromServer || any presence (\p -> p.server == e.server && p.expiresAt > t)
-            yield e
+            yield {expiresAt: e.expiresAt, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp}
           let appliedOnline = do
             e <- trustedDeduped
             where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt)
