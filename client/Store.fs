@@ -12,16 +12,20 @@ module Store =
         { [<BsonId>] Pubkey: string
           Nickname: string }
 
+    [<RequireQualifiedAccess>]
+    type DeliveryStatus = Sent | Delivered
+
     type ChatMessage =
         { Id: string
           Body: string
           Timestamp: DateTimeOffset
-          IsOutgoing: bool }
+          IsOutgoing: bool
+          Status: DeliveryStatus }
 
     type Data =
         { Contacts: Contact list
           Messages: Map<string, ChatMessage list>
-          ServerUrl: string option
+          ServerUrl: string
           PollCursor: int64 }
 
     [<CLIMutable>]
@@ -30,7 +34,8 @@ module Store =
           ConversationId: string
           Body: string
           TimestampUnix: int64
-          IsOutgoing: bool }
+          IsOutgoing: bool
+          Status: int }
 
     [<CLIMutable>]
     type private SettingsDoc =
@@ -39,10 +44,12 @@ module Store =
           PollCursor: int64 }
 
     let private toChatMessage (d: MessageDoc) : ChatMessage =
-        { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix; IsOutgoing = d.IsOutgoing }
+        { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix; IsOutgoing = d.IsOutgoing
+          Status = if d.Status = 1 then DeliveryStatus.Delivered else DeliveryStatus.Sent }
 
     let private toMessageDoc convId (m: ChatMessage) : MessageDoc =
-        { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeSeconds(); IsOutgoing = m.IsOutgoing }
+        { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeSeconds(); IsOutgoing = m.IsOutgoing
+          Status = match m.Status with DeliveryStatus.Delivered -> 1 | DeliveryStatus.Sent -> 0 }
 
     let private openDb () =
         new LiteDatabase(Path.Combine(FileSystem.AppDataDirectory, "skrepka.db"))
@@ -82,7 +89,7 @@ module Store =
 
                 { Contacts = contacts
                   Messages = messages
-                  ServerUrl = settings.ServerUrl |> Option.ofObj |> Option.filter ((<>) "")
+                  ServerUrl = settings.ServerUrl |> Option.ofObj |> Option.defaultValue ""
                   PollCursor = settings.PollCursor })
         with _ ->
             None
@@ -104,7 +111,7 @@ module Store =
 
             settings.Upsert
                 { Id = "settings"
-                  ServerUrl = data.ServerUrl |> Option.defaultValue ""
+                  ServerUrl = data.ServerUrl
                   PollCursor = data.PollCursor }
             |> ignore
         with _ ->

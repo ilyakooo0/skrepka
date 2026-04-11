@@ -375,14 +375,9 @@ The client makes a blocking GET request. The server holds the connection open un
       "type": "message",
       "data": { "to": "...", "from": "...", "encrypted_blob": "...", "timestamp": 1679000000 },
       "id": "evt_001"
-    },
-    {
-      "type": "ack",
-      "data": { "message_ids": ["msg_abc123"] },
-      "id": "evt_002"
     }
   ],
-  "cursor": "evt_002"
+  "cursor": "evt_001"
 }
 ```
 
@@ -396,7 +391,6 @@ The client makes a blocking GET request. The server holds the connection open un
 | Type       | Data                                |
 |------------|-------------------------------------|
 | `message`  | Envelope JSON (see §4)             |
-| `ack`      | `{ "message_ids": ["id1", "id2"] }`|
 
 #### `POST /messages` — Send a message
 
@@ -438,7 +432,7 @@ The server fills in `from` from the authenticated session.
 { "ok": true }
 ```
 
-The server deletes acknowledged messages from its queue and forwards the ACK to the sender's server.
+The server deletes acknowledged messages from its queue. If the message arrived via federation, the ACK is forwarded to the origin server so it can also clean up. This is a server-side queue management operation — delivery notification to the sender is handled by encrypted `delivery.ack` messages (see §4).
 
 #### `GET /lookup/:pubkey` — Look up a user's presence
 
@@ -629,10 +623,11 @@ All messages have a **30-day TTL**, enforced in two places:
 5. Server C gossips: ONLINE { bob_pubkey, server_c }
 6. Alice's server sees the gossip, forwards the queued message to Server C.
 7. Server C delivers to Bob on his next poll.
-8. Bob's client sends ACK to Server C.
+8. Bob's client sends ACK to Server C (queue cleanup).
 9. Server C forwards ACK to Alice's server.
 10. Alice's server deletes the blob.
-11. Next time Alice connects, she receives delivery confirmation.
+11. Bob's client sends an encrypted `delivery.ack` message to Alice.
+12. When Alice receives it, she marks the message as delivered.
 ```
 
 Alice does not need to stay online. Her server handles delivery independently.

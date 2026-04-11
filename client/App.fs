@@ -17,31 +17,11 @@ module App =
 
     // ── Domain Types ──
 
-    [<JsonConverter(typeof<EnvelopeTypeConverter>)>]
-    type private EnvelopeType = Text | UnknownEnvelope of string
-    and private EnvelopeTypeConverter() =
-        inherit JsonConverter<EnvelopeType>()
-        override _.Read(reader, _, _) =
-            match reader.GetString() with
-            | "text" -> Text
-            | s -> UnknownEnvelope s
-        override _.Write(writer, value, _) =
-            writer.WriteStringValue(
-                match value with
-                | Text -> "text"
-                | UnknownEnvelope s -> s)
-
-    [<CLIMutable>]
-    type private TextEnvelope =
-        { [<JsonPropertyName("type")>] Type: EnvelopeType
-          [<JsonPropertyName("id")>] Id: string
-          [<JsonPropertyName("body")>] Body: string }
-
     type Page =
         | Setup
         | Conversations
-        | Chat of pubkey: string
-        | AddContact
+        | Chat of pubkey: string * compose: string
+        | AddContact of pubkey: string * nickname: string
         | Settings
 
     type Session = { Url: string; Token: string; Identity: Identity }
@@ -56,6 +36,10 @@ module App =
         | Identified of identity: Identity * conn: ConnStatus
 
     type IncomingMessage = { SenderPubkey: string; Message: ChatMessage }
+
+    type DecryptedEvent =
+        | IncomingChat of IncomingMessage
+        | IncomingDeliveryAck of senderPubkey: string * ackIds: string list
 
     type PollReceived = { Events: int; Messages: int; Errors: int; FirstError: string option }
 
@@ -75,10 +59,7 @@ module App =
           PollStatus: PollStatus
           Messages: Map<string, ChatMessage list>
           Error: string option
-          PollCursor: int64
-          Compose: string
-          ContactPubkey: string
-          ContactNickname: string }
+          PollCursor: int64 }
 
     // ── Msg ──
 
@@ -93,7 +74,6 @@ module App =
         | SetContactPubkey of string
         | SetContactNickname of string
         | GenIdentity
-        | IdentityReady of Identity
         | SetServerUrl of string
         | DoConnect
         | AuthOk of string
@@ -102,7 +82,7 @@ module App =
         | DoSend
         | SendFailed of string
         | DoSaveContact
-        | PollResult of messages: IncomingMessage list * status: PollStatus * cursor: int64
+        | PollResult of events: DecryptedEvent list * status: PollStatus * cursor: int64
         | CopyPubKey
         | DismissError
         | StateLoaded of StateLoadResult
@@ -110,7 +90,6 @@ module App =
     // ── CmdMsg ──
 
     type CmdMsg =
-        | CmdGenIdentity
         | CmdConnect of url: string * identity: Identity
         | CmdSend of session: Session * recipientHex: string * text: string * messageId: string
         | CmdPoll of session: Session * cursor: int64
@@ -154,6 +133,14 @@ module App =
         if existing |> List.exists (fun m -> m.Id = msg.Id) then messages
         else Map.add pk (existing @ [ msg ]) messages
 
+    let private markDelivered (pk: string) (ackIds: string list) (messages: Map<string, ChatMessage list>) =
+        match Map.tryFind pk messages with
+        | Some msgs ->
+            msgs
+            |> List.map (fun m -> if m.IsOutgoing && List.contains m.Id ackIds then { m with Status = DeliveryStatus.Delivered } else m)
+            |> fun updated -> Map.add pk updated messages
+        | None -> messages
+
     let private addContactIfNew (contact: Contact) (contacts: Contact list) =
         if contacts |> List.exists (fun c -> c.Pubkey = contact.Pubkey) then contacts
         else contacts @ [ contact ]
@@ -174,7 +161,7 @@ module App =
         | NoIdentity -> model
 
     let private saveCmdMsg model =
-        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = Some model.ServerUrl; PollCursor = model.PollCursor }
+        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = model.ServerUrl; PollCursor = model.PollCursor }
 
     let private connStatusLabel = function
         | NoIdentity | Identified(_, Offline) -> "OFFLINE"
@@ -191,29 +178,30 @@ module App =
           Contacts = []
           Messages = Map.empty
           Error = None
-          PollCursor = 0L
-          Compose = ""
-          ContactPubkey = ""
-          ContactNickname = "" },
+          PollCursor = 0L },
         [ CmdLoadState ]
 
     // ── Update ──
 
     let update msg model =
         match msg with
-        | SetPage(Chat pk) ->
-            { model with Page = Chat pk; Compose = "" }, []
-        | SetPage AddContact ->
-            { model with Page = AddContact; ContactPubkey = ""; ContactNickname = "" }, []
         | SetPage page -> { model with Page = page }, []
 
-        | SetCompose text -> { model with Compose = text }, []
-        | SetContactPubkey pk -> { model with ContactPubkey = pk }, []
-        | SetContactNickname nn -> { model with ContactNickname = nn }, []
+        | SetCompose text ->
+            match model.Page with
+            | Chat(pk, _) -> { model with Page = Chat(pk, text) }, []
+            | _ -> model, []
+        | SetContactPubkey pk ->
+            match model.Page with
+            | AddContact(_, nn) -> { model with Page = AddContact(pk, nn) }, []
+            | _ -> model, []
+        | SetContactNickname nn ->
+            match model.Page with
+            | AddContact(pk, _) -> { model with Page = AddContact(pk, nn) }, []
+            | _ -> model, []
 
-        | GenIdentity -> model, [ CmdGenIdentity ]
-
-        | IdentityReady identity ->
+        | GenIdentity ->
+            let identity = Crypto.generateIdentity ()
             { model with Auth = Identified(identity, Offline); Page = Settings },
             [ CmdSaveIdentity identity ]
 
@@ -239,45 +227,51 @@ module App =
 
         | DoSend ->
             match model.Page, trySession model with
-            | Chat pk, Some session when model.Compose <> "" ->
+            | Chat(pk, compose), Some session when compose <> "" ->
                 let id = Guid.NewGuid().ToString()
                 let outMsg =
                     { Id = id
-                      Body = model.Compose
+                      Body = compose
                       Timestamp = DateTimeOffset.UtcNow
-                      IsOutgoing = true }
+                      IsOutgoing = true
+                      Status = DeliveryStatus.Sent }
 
                 let model' =
                     { model with
-                        Compose = ""
+                        Page = Chat(pk, "")
                         Messages = model.Messages |> appendMessage pk outMsg }
 
-                model', [ CmdSend(session, pk, model.Compose, id); saveCmdMsg model' ]
+                model', [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
 
-        | PollResult(incoming, status, newCursor) ->
+        | PollResult(events, status, newCursor) ->
             let model' =
-                incoming
+                events
                 |> List.fold
-                    (fun (m: Model) msg ->
-                        { m with
-                            Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.SenderPubkey; Nickname = truncKey msg.SenderPubkey }
-                            Messages = m.Messages |> appendMessage msg.SenderPubkey msg.Message })
+                    (fun (m: Model) evt ->
+                        match evt with
+                        | IncomingChat msg ->
+                            { m with
+                                Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.SenderPubkey; Nickname = truncKey msg.SenderPubkey }
+                                Messages = m.Messages |> appendMessage msg.SenderPubkey msg.Message }
+                        | IncomingDeliveryAck(senderPubkey, ackIds) ->
+                            { m with Messages = m.Messages |> markDelivered senderPubkey ackIds })
                     { model with PollStatus = status; PollCursor = newCursor }
 
             model',
             [ match trySession model' with
               | Some session -> CmdPoll(session, model'.PollCursor)
               | None -> ()
-              if not incoming.IsEmpty then saveCmdMsg model' ]
+              if not events.IsEmpty then saveCmdMsg model' ]
 
         | DoSaveContact ->
-            if model.ContactPubkey <> "" && model.ContactNickname <> "" then
-                match tryParsePubkey model.ContactPubkey with
+            match model.Page with
+            | AddContact(cpk, cnn) when cpk <> "" && cnn <> "" ->
+                match tryParsePubkey cpk with
                 | Some bytes ->
-                    let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = model.ContactNickname }
+                    let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = cnn }
 
                     let model' =
                         { model with
@@ -286,8 +280,7 @@ module App =
 
                     model', [ saveCmdMsg model' ]
                 | None -> { model with Error = Some "Invalid public key" }, []
-            else
-                model, []
+            | _ -> model, []
 
         | CopyPubKey ->
             match model.Auth with
@@ -302,7 +295,7 @@ module App =
                     Auth = Identified(identity, Connecting)
                     Contacts = data.Contacts
                     Messages = data.Messages
-                    ServerUrl = data.ServerUrl |> Option.defaultValue model.ServerUrl
+                    ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
                     PollCursor = data.PollCursor
                     Page = Conversations }
             model', [ CmdConnect(model'.ServerUrl, identity) ]
@@ -326,26 +319,32 @@ module App =
 
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
-                let envelope = JsonSerializer.Deserialize<TextEnvelope>(plaintext)
+                use doc = JsonDocument.Parse(plaintext)
+                let root = doc.RootElement
 
-                match envelope.Type with
-                | Text ->
-                    Ok { SenderPubkey = senderHex
-                         Message =
-                             { Id = envelope.Id
-                               Body = envelope.Body
-                               Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
-                               IsOutgoing = false } }
-                | UnknownEnvelope t -> Error $"unknown envelope type: {t}"
+                match root.GetProperty("type").GetString() with
+                | "text" ->
+                    Ok(IncomingChat
+                        { SenderPubkey = senderHex
+                          Message =
+                            { Id = root.GetProperty("id").GetString()
+                              Body = root.GetProperty("body").GetString()
+                              Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
+                              IsOutgoing = false
+                              Status = DeliveryStatus.Delivered } })
+                | "delivery.ack" ->
+                    let ackIds =
+                        root.GetProperty("ack_ids").EnumerateArray()
+                        |> Seq.map _.GetString()
+                        |> Seq.toList
+                    Ok(IncomingDeliveryAck(senderHex, ackIds))
+                | t -> Error $"unknown envelope type: {t}"
             | None -> Error "decrypt failed"
         with ex ->
             Error $"parse: {ex.Message}"
 
     let mapCmd cmdMsg =
         match cmdMsg with
-        | CmdGenIdentity ->
-            Cmd.ofEffect (fun dispatch -> dispatch (IdentityReady(Crypto.generateIdentity ())))
-
         | CmdConnect(url, identity) ->
             asyncCmd (async {
                 try
@@ -361,7 +360,7 @@ module App =
                     try
                         let recipPub = Crypto.fromHex recipientHex
                         let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                        let payload = JsonSerializer.Serialize<TextEnvelope>({ Type = Text; Id = messageId; Body = text })
+                        let payload = JsonSerializer.Serialize({| ``type`` = "text"; id = messageId; body = text |})
                         let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
                         let! status = sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
 
@@ -381,23 +380,39 @@ module App =
                     let! response = poll session.Url session.Token cursor
                     let ackIds = response.Events |> Array.map _.Id |> Array.toList
 
-                    let messages, errors =
+                    let events, errors =
                         Array.foldBack
-                            (fun (evt: PollEvent) (msgs, errs) ->
+                            (fun (evt: PollEvent) (evts, errs) ->
                                 match evt.EventType with
                                 | Message ->
                                     match decryptEvent session.Identity.PrivKey evt.Payload with
-                                    | Ok msg -> (msg :: msgs, errs)
-                                    | Error err -> (msgs, err :: errs)
-                                | Ack | UnknownEvent _ -> (msgs, errs))
+                                    | Ok event -> (event :: evts, errs)
+                                    | Error err -> (evts, err :: errs)
+                                | UnknownEvent _ -> (evts, errs))
                             response.Events
                             ([], [])
 
                     if not ackIds.IsEmpty then
-                        do! ackMessages session.Url session.Token ackIds
+                        try do! ackMessages session.Url session.Token ackIds
+                        with _ -> ()
 
-                    let status = Received { Events = response.Events.Length; Messages = messages.Length; Errors = errors.Length; FirstError = List.tryHead errors }
-                    return PollResult(messages, status, response.Cursor)
+                    // Send delivery.ack for received chat messages (not for delivery.ack messages — no infinite loop)
+                    let chatsBySender =
+                        events
+                        |> List.choose (function IncomingChat msg -> Some(msg.SenderPubkey, msg.Message.Id) | _ -> None)
+                        |> List.groupBy fst
+                        |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
+
+                    for sender, msgIds in chatsBySender do
+                        try
+                            let ackPayload = JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = Guid.NewGuid().ToString(); ack_ids = msgIds |})
+                            let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex sender) ackPayload
+                            do! sendMessage session.Url session.Token sender (Crypto.toHex blob) (DateTimeOffset.UtcNow.ToUnixTimeSeconds()) |> Async.Ignore
+                        with _ -> ()
+
+                    let chatCount = events |> List.sumBy (function IncomingChat _ -> 1 | _ -> 0)
+                    let status = Received { Events = response.Events.Length; Messages = chatCount; Errors = errors.Length; FirstError = List.tryHead errors }
+                    return PollResult(events, status, response.Cursor)
                 with
                 | :? TimeoutException ->
                     return PollResult([], Polling, cursor)
@@ -510,7 +525,7 @@ module App =
                         Label("Conversations")
                             .font(size = 24.)
 
-                        Button("+", SetPage AddContact)
+                        Button("+", SetPage(AddContact("", "")))
                         Button("Settings", SetPage Settings)
                     }
 
@@ -532,13 +547,13 @@ module App =
                             |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
                             |> Option.defaultValue ""
 
-                        Button($"{c.Nickname}\n{preview}", SetPage(Chat c.Pubkey))
+                        Button($"{c.Nickname}\n{preview}", SetPage(Chat(c.Pubkey, "")))
                 })
                     .padding(20.)
             )
         )
 
-    let private viewChat model pk =
+    let private viewChat model pk compose =
         let name = contactName model.Contacts pk
         let msgs = messagesFor pk model.Messages
 
@@ -560,12 +575,13 @@ module App =
                         .font(size = 14.)
                 else
                     for m in msgs do
-                        Label(if m.IsOutgoing then $"You: {m.Body}" else m.Body)
+                        let tick = if m.IsOutgoing && m.Status = DeliveryStatus.Delivered then " \u2713" else ""
+                        Label((if m.IsOutgoing then $"You: {m.Body}" else m.Body) + tick)
                             .padding(8.)
                             .font(size = 14.)
 
                 HStack(spacing = 8.) {
-                    Entry(model.Compose, SetCompose)
+                    Entry(compose, SetCompose)
                         .placeholder("Message...")
 
                     Button("Send", DoSend)
@@ -574,7 +590,7 @@ module App =
                 .padding(12.)
         )
 
-    let private viewAddContact model =
+    let private viewAddContact model cpk cnn =
         ContentPage(
             (VStack(spacing = 16.) {
                 HStack(spacing = 8.) {
@@ -587,11 +603,11 @@ module App =
                 viewErrorBanner model.Error
 
                 Label("Public Key:")
-                Entry(model.ContactPubkey, SetContactPubkey)
+                Entry(cpk, SetContactPubkey)
                     .placeholder("sampel-palnet-...")
 
                 Label("Nickname:")
-                Entry(model.ContactNickname, SetContactNickname)
+                Entry(cnn, SetContactNickname)
 
                 Button("Save Contact", DoSaveContact)
                     .centerHorizontal()
@@ -605,8 +621,8 @@ module App =
             | Setup -> viewSetup ()
             | Settings -> viewSettings model
             | Conversations -> viewConversations model
-            | Chat pk -> viewChat model pk
-            | AddContact -> viewAddContact model
+            | Chat(pk, compose) -> viewChat model pk compose
+            | AddContact(pk, nn) -> viewAddContact model pk nn
 
         Application() { Window(page) }
 

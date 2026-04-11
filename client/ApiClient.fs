@@ -13,19 +13,17 @@ module ApiClient =
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
 
     [<JsonConverter(typeof<EventTypeConverter>)>]
-    type EventType = Message | Ack | UnknownEvent of string
+    type EventType = Message | UnknownEvent of string
     and private EventTypeConverter() =
         inherit JsonConverter<EventType>()
         override _.Read(reader, _, _) =
             match reader.GetString() with
             | "message" -> Message
-            | "ack" -> Ack
             | s -> UnknownEvent s
         override _.Write(writer, value, _) =
             writer.WriteStringValue(
                 match value with
                 | Message -> "message"
-                | Ack -> "ack"
                 | UnknownEvent s -> s)
 
     [<CLIMutable>]
