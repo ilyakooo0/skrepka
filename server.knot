@@ -48,7 +48,12 @@ federationEnabled = federationSecret != ""
 -- Types
 -- ============================================
 
-type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
+data PollEventType = PtMessage {}
+
+impl ToJSON PollEventType where
+  toJson _ = toJson "message"
+
+type PollEvent = {id: MessageIdHex, eventType: PollEventType, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
 data GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
 
@@ -73,15 +78,15 @@ type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: Serve
 
 type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
-data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {}
-
-messageStatusText = \ms -> case ms of
-  MsDelivered {} -> "delivered"
-  MsFederated {} -> "federated"
-  MsQueued {} -> "queued"
+data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {} | MsUnauthorized {} | MsRejected {}
 
 impl ToJSON MessageStatus where
-  toJson ms = toJson (messageStatusText ms)
+  toJson ms = toJson (case ms of
+    MsDelivered {} -> "delivered"
+    MsFederated {} -> "federated"
+    MsQueued {} -> "queued"
+    MsUnauthorized {} -> "unauthorized"
+    MsRejected {} -> "rejected")
 
 type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) && s == normalizeHex s
 type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen) && s == normalizeHex s
@@ -150,7 +155,7 @@ route ClientApi where
     = Poll
   /messages
     POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp} / headers {authorization: Text}
-      -> {status: Text, messageId: OptionalMessageId}
+      -> {status: MessageStatus, messageId: OptionalMessageId}
       = SendMessage
     POST {messageIds: [MessageIdHex]} /ack headers {authorization: Text}
       -> {ok: Bool}
@@ -727,7 +732,7 @@ pollOnce = \token cursor -> do
         let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
         let evts = do
           m <- limitedMsgs
-          yield {id: m.messageId, eventType: "message",
+          yield {id: m.messageId, eventType: PtMessage {},
                  payload: {toKey: m.toKey, fromKey: m.fromKey,
                             encryptedBlob: m.encryptedBlob,
                             timestamp: m.timestamp}}
@@ -872,9 +877,9 @@ serve = \req -> case req of
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
-      SendUnauthorized {} -> respond {status: "unauthorized", messageId: ""}
-      SendRejected {} -> respond {status: "rejected", messageId: ""}
-      SendDone {status} -> respond {status: messageStatusText status, messageId: msgId})
+      SendUnauthorized {} -> respond {status: MsUnauthorized {}, messageId: ""}
+      SendRejected {} -> respond {status: MsRejected {}, messageId: ""}
+      SendDone {status} -> respond {status: status, messageId: msgId})
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -892,9 +897,11 @@ serve = \req -> case req of
             where m.toKey == pubkey && any dedupedIds (\mid -> m.messageId == mid)
             yield m
           set *messages = diff messages ackedMessages
-          let ackedFederated = fold (\acc m -> case m.origin of
-            FederatedOrigin {server} -> union acc [{messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: server}]
-            LocalOrigin {} -> acc) [] ackedMessages
+          let ackedFederated = do
+            m <- ackedMessages
+            case m.origin of
+              FederatedOrigin {server} -> yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: server}
+              LocalOrigin {} -> []
           ackedIds <- *ackedIds
           let combinedAckedIds = union ackedIds ackedFederated
           let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
