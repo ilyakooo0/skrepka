@@ -120,11 +120,11 @@ module Store =
                 let contacts =
                     db.GetCollection<Contact>("contacts").FindAll()
                     |> Seq.map (fun c ->
+                        c.Pubkey,
                         { c with
                             DisplayName = orEmpty c.DisplayName
                             Bio = orEmpty c.Bio
                             PhotoBase64 = orEmpty c.PhotoBase64 })
-                    |> Seq.map (fun c -> c.Pubkey, c)
                     |> Map.ofSeq
 
                 let messages =

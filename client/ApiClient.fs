@@ -51,12 +51,6 @@ module ApiClient =
                 | Unauthorized -> "unauthorized"
                 | UnknownStatus s -> s)
 
-    let messageStatusToError = function
-        | Delivered | Federated | Queued -> None
-        | Rejected -> Some "Message rejected by server"
-        | Unauthorized -> Some "Not authorized to deliver message"
-        | UnknownStatus s -> Some $"Unexpected status: {s}"
-
     [<CLIMutable>]
     type private SendResult = { Status: MessageStatus }
 
@@ -126,7 +120,11 @@ module ApiClient =
         let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
         async {
             let! result = postJson<SendResult> client $"{serverUrl}/messages" body (Some token)
-            return result.Status
+            match result.Status with
+            | Delivered | Federated | Queued -> ()
+            | Rejected -> failwith "Message rejected by server"
+            | Unauthorized -> failwith "Not authorized to deliver message"
+            | UnknownStatus s -> failwith $"Unexpected status: {s}"
         }
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =

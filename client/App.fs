@@ -36,19 +36,18 @@ module App =
         | NoIdentity
         | Identified of identity: Identity * conn: ConnStatus
 
-    type DecryptedEvent =
-        | ChatMsg of ChatMessage
+    [<RequireQualifiedAccess>]
+    type Envelope =
+        | TextMessage of id: string * body: string
         | DeliveryAck of ackIds: string list
-        | ProfileUpdate of Profile
+        | ProfileMessage of profile: Profile
 
-    type IncomingEvent = { Sender: string; Event: DecryptedEvent }
-
-    type PollReceived = { Events: int; Messages: int; Errors: int; FirstError: string option }
+    type IncomingEvent = { Sender: string; Timestamp: int64; Envelope: Envelope }
 
     type PollStatus =
         | Idle
         | Polling
-        | Received of PollReceived
+        | Received of string
         | PollError of string
 
     // ── Model ──
@@ -152,16 +151,19 @@ module App =
         { c with DisplayName = p.DisplayName; Bio = p.Bio; PhotoBase64 = p.PhotoBase64 }
 
     let private applyEvent (m: Model) (evt: IncomingEvent) =
-        match evt.Event with
-        | ChatMsg message ->
+        match evt.Envelope with
+        | Envelope.TextMessage(id, body) ->
+            let message =
+                { Id = id; Body = body; Timestamp = DateTimeOffset.FromUnixTimeSeconds(evt.Timestamp)
+                  IsOutgoing = false; Status = DeliveryStatus.Delivered }
             { m with
                 Contacts =
                     if Map.containsKey evt.Sender m.Contacts then m.Contacts
                     else Map.add evt.Sender (newContact evt.Sender (truncKey evt.Sender)) m.Contacts
                 Messages = m.Messages |> appendMessage evt.Sender message }
-        | DeliveryAck ackIds ->
+        | Envelope.DeliveryAck ackIds ->
             { m with Messages = m.Messages |> markDelivered evt.Sender ackIds }
-        | ProfileUpdate profile ->
+        | Envelope.ProfileMessage profile ->
             { m with Contacts = m.Contacts |> Map.change evt.Sender (Option.map (withProfile profile)) }
 
     let private trySession model =
@@ -335,12 +337,6 @@ module App =
             }
             |> Async.Start)
 
-    [<RequireQualifiedAccess>]
-    type private Envelope =
-        | TextMessage of id: string * body: string
-        | DeliveryAck of ackIds: string list
-        | ProfileMessage of profile: Profile
-
     let private serializeEnvelope = function
         | Envelope.TextMessage(id, body) ->
             JsonSerializer.Serialize({| ``type`` = "text"; id = id; body = body |})
@@ -354,7 +350,7 @@ module App =
             let payload = serializeEnvelope envelope
             let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload
             let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-            return! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
+            do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
         }
 
     let private tryGetJsonString (el: JsonElement) (name: string) =
@@ -378,23 +374,13 @@ module App =
             Some(Envelope.ProfileMessage { DisplayName = displayName; Bio = bio; PhotoBase64 = photo })
         | _ -> None
 
-    let private toDecryptedEvent timestamp = function
-        | Envelope.TextMessage(id, body) ->
-            ChatMsg
-                { Id = id; Body = body
-                  Timestamp = DateTimeOffset.FromUnixTimeSeconds(timestamp)
-                  IsOutgoing = false
-                  Status = DeliveryStatus.Delivered }
-        | Envelope.DeliveryAck ackIds -> DeliveryAck ackIds
-        | Envelope.ProfileMessage profile -> ProfileUpdate profile
-
     let private decryptEvent (privKey: byte[]) (payload: EventPayload) =
         try
             let blob = Crypto.fromHex payload.EncryptedBlob
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
                 match parseEnvelope plaintext with
-                | Some envelope -> Ok { Sender = senderHex; Event = toDecryptedEvent payload.Timestamp envelope }
+                | Some envelope -> Ok { Sender = senderHex; Timestamp = payload.Timestamp; Envelope = envelope }
                 | None -> Error "unknown envelope type"
             | None -> Error "decrypt failed"
         with ex ->
@@ -404,12 +390,12 @@ module App =
         async {
             let chatsBySender =
                 events
-                |> List.choose (fun evt -> match evt.Event with ChatMsg msg -> Some(evt.Sender, msg.Id) | _ -> None)
+                |> List.choose (fun evt -> match evt.Envelope with Envelope.TextMessage(id, _) -> Some(evt.Sender, id) | _ -> None)
                 |> List.groupBy fst
                 |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
 
             for sender, msgIds in chatsBySender do
-                try do! sendEnvelope session sender (Envelope.DeliveryAck msgIds) |> Async.Ignore
+                try do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
                 with _ -> ()
         }
 
@@ -427,12 +413,10 @@ module App =
         | CmdSend(session, recipientHex, text, messageId) ->
             asyncCmd (async {
                 try
-                    let! status = sendEnvelope session recipientHex (Envelope.TextMessage(messageId, text))
-                    match messageStatusToError status with
-                    | Some err -> return SendFailed err
-                    | None -> return SendOk
+                    do! sendEnvelope session recipientHex (Envelope.TextMessage(messageId, text))
+                    return SendOk
                 with ex ->
-                    return SendFailed $"Send failed: {ex.Message}"
+                    return SendFailed ex.Message
             })
 
         | CmdPoll(session, cursor) ->
@@ -457,9 +441,11 @@ module App =
 
                     do! sendDeliveryAcks session events
 
-                    let chatCount = events |> List.sumBy (fun e -> match e.Event with ChatMsg _ -> 1 | _ -> 0)
-                    let status = Received { Events = response.Events.Length; Messages = chatCount; Errors = errors.Length; FirstError = List.tryHead errors }
-                    return PollResult(events, status, response.Cursor)
+                    let chatCount = events |> List.sumBy (fun e -> match e.Envelope with Envelope.TextMessage _ -> 1 | _ -> 0)
+                    let status =
+                        $"evts:{response.Events.Length} msgs:{chatCount} errs:{errors.Length}"
+                        + (match List.tryHead errors with Some e -> $" [{e}]" | None -> "")
+                    return PollResult(events, Received status, response.Cursor)
                 with
                 | :? TimeoutException ->
                     return PollResult([], Polling, cursor)
@@ -509,7 +495,7 @@ module App =
             Cmd.ofEffect (fun _ ->
                 async {
                     for recipientHex in recipientHexes do
-                        try do! sendEnvelope session recipientHex (Envelope.ProfileMessage profile) |> Async.Ignore
+                        try do! sendEnvelope session recipientHex (Envelope.ProfileMessage profile)
                         with _ -> ()
                 } |> Async.Start)
 
@@ -518,9 +504,7 @@ module App =
     let private formatPollStatus = function
         | Idle -> ""
         | Polling -> "polling..."
-        | Received r ->
-            $"evts:{r.Events} msgs:{r.Messages} errs:{r.Errors}"
-            + (match r.FirstError with Some e -> $" [{e}]" | None -> "")
+        | Received s -> s
         | PollError msg -> $"poll error: {msg}"
 
     let private viewErrorBanner (error: string option) =
