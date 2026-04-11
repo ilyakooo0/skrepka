@@ -81,6 +81,7 @@ module App =
         | DoDisconnect
         | DoSend
         | SendFailed of string
+        | SendOk
         | DoSaveContact
         | PollResult of events: DecryptedEvent list * status: PollStatus * cursor: int64
         | CopyPubKey
@@ -161,7 +162,7 @@ module App =
         | NoIdentity -> model
 
     let private saveCmdMsg model =
-        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = model.ServerUrl; PollCursor = model.PollCursor }
+        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = Some model.ServerUrl; PollCursor = model.PollCursor }
 
     let private connStatusLabel = function
         | NoIdentity | Identified(_, Offline) -> "OFFLINE"
@@ -245,6 +246,7 @@ module App =
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
+        | SendOk -> model, []
 
         | PollResult(events, status, newCursor) ->
             let model' =
@@ -295,7 +297,7 @@ module App =
                     Auth = Identified(identity, Connecting)
                     Contacts = data.Contacts
                     Messages = data.Messages
-                    ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
+                    ServerUrl = data.ServerUrl |> Option.defaultValue model.ServerUrl
                     PollCursor = data.PollCursor
                     Page = Conversations }
             model', [ CmdConnect(model'.ServerUrl, identity) ]
@@ -313,35 +315,64 @@ module App =
             }
             |> Async.Start)
 
+    type private Envelope =
+        | TextMessage of id: string * body: string
+        | DeliveryAck of id: string * ackIds: string list
+
+    let private serializeEnvelope = function
+        | TextMessage(id, body) ->
+            JsonSerializer.Serialize({| ``type`` = "text"; id = id; body = body |})
+        | DeliveryAck(id, ackIds) ->
+            JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = id; ack_ids = ackIds |})
+
+    let private parseEnvelope (json: string) =
+        use doc = JsonDocument.Parse(json)
+        let root = doc.RootElement
+        match root.GetProperty("type").GetString() with
+        | "text" ->
+            Some(TextMessage(root.GetProperty("id").GetString(), root.GetProperty("body").GetString()))
+        | "delivery.ack" ->
+            let ackIds = root.GetProperty("ack_ids").EnumerateArray() |> Seq.map _.GetString() |> Seq.toList
+            Some(DeliveryAck(root.GetProperty("id").GetString(), ackIds))
+        | _ -> None
+
     let private decryptEvent (privKey: byte[]) (payload: EventPayload) =
         try
             let blob = Crypto.fromHex payload.EncryptedBlob
 
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
-                use doc = JsonDocument.Parse(plaintext)
-                let root = doc.RootElement
-
-                match root.GetProperty("type").GetString() with
-                | "text" ->
+                match parseEnvelope plaintext with
+                | Some(TextMessage(id, body)) ->
                     Ok(IncomingChat
                         { SenderPubkey = senderHex
                           Message =
-                            { Id = root.GetProperty("id").GetString()
-                              Body = root.GetProperty("body").GetString()
+                            { Id = id; Body = body
                               Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
                               IsOutgoing = false
                               Status = DeliveryStatus.Delivered } })
-                | "delivery.ack" ->
-                    let ackIds =
-                        root.GetProperty("ack_ids").EnumerateArray()
-                        |> Seq.map _.GetString()
-                        |> Seq.toList
+                | Some(DeliveryAck(_, ackIds)) ->
                     Ok(IncomingDeliveryAck(senderHex, ackIds))
-                | t -> Error $"unknown envelope type: {t}"
+                | None -> Error "unknown envelope type"
             | None -> Error "decrypt failed"
         with ex ->
             Error $"parse: {ex.Message}"
+
+    let private sendDeliveryAcks (session: Session) (events: DecryptedEvent list) =
+        async {
+            let chatsBySender =
+                events
+                |> List.choose (function IncomingChat msg -> Some(msg.SenderPubkey, msg.Message.Id) | _ -> None)
+                |> List.groupBy fst
+                |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
+
+            for sender, msgIds in chatsBySender do
+                try
+                    let ackPayload = serializeEnvelope (DeliveryAck(Guid.NewGuid().ToString(), msgIds))
+                    let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex sender) ackPayload
+                    do! sendMessage session.Url session.Token sender (Crypto.toHex blob) (DateTimeOffset.UtcNow.ToUnixTimeSeconds()) |> Async.Ignore
+                with _ -> ()
+        }
 
     let mapCmd cmdMsg =
         match cmdMsg with
@@ -355,24 +386,20 @@ module App =
             })
 
         | CmdSend(session, recipientHex, text, messageId) ->
-            Cmd.ofEffect (fun dispatch ->
-                async {
-                    try
-                        let recipPub = Crypto.fromHex recipientHex
-                        let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                        let payload = JsonSerializer.Serialize({| ``type`` = "text"; id = messageId; body = text |})
-                        let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
-                        let! status = sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
+            asyncCmd (async {
+                try
+                    let recipPub = Crypto.fromHex recipientHex
+                    let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                    let payload = serializeEnvelope (TextMessage(messageId, text))
+                    let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
+                    let! status = sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
 
-                        match status with
-                        | Delivered | Federated | Queued -> ()
-                        | Rejected -> dispatch (SendFailed "Message rejected by server")
-                        | Unauthorized -> dispatch (SendFailed "Not authorized to deliver message")
-                        | UnknownStatus s -> dispatch (SendFailed $"Unexpected status: {s}")
-                    with ex ->
-                        dispatch (SendFailed $"Send failed: {ex.Message}")
-                }
-                |> Async.Start)
+                    match messageStatusToError status with
+                    | Some err -> return SendFailed err
+                    | None -> return SendOk
+                with ex ->
+                    return SendFailed $"Send failed: {ex.Message}"
+            })
 
         | CmdPoll(session, cursor) ->
             asyncCmd (async {
@@ -396,19 +423,7 @@ module App =
                         try do! ackMessages session.Url session.Token ackIds
                         with _ -> ()
 
-                    // Send delivery.ack for received chat messages (not for delivery.ack messages — no infinite loop)
-                    let chatsBySender =
-                        events
-                        |> List.choose (function IncomingChat msg -> Some(msg.SenderPubkey, msg.Message.Id) | _ -> None)
-                        |> List.groupBy fst
-                        |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
-
-                    for sender, msgIds in chatsBySender do
-                        try
-                            let ackPayload = JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = Guid.NewGuid().ToString(); ack_ids = msgIds |})
-                            let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex sender) ackPayload
-                            do! sendMessage session.Url session.Token sender (Crypto.toHex blob) (DateTimeOffset.UtcNow.ToUnixTimeSeconds()) |> Async.Ignore
-                        with _ -> ()
+                    do! sendDeliveryAcks session events
 
                     let chatCount = events |> List.sumBy (function IncomingChat _ -> 1 | _ -> 0)
                     let status = Received { Events = response.Events.Length; Messages = chatCount; Errors = errors.Length; FirstError = List.tryHead errors }

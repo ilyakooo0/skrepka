@@ -51,6 +51,12 @@ module ApiClient =
                 | Unauthorized -> "unauthorized"
                 | UnknownStatus s -> s)
 
+    let messageStatusToError = function
+        | Delivered | Federated | Queued -> None
+        | Rejected -> Some "Message rejected by server"
+        | Unauthorized -> Some "Not authorized to deliver message"
+        | UnknownStatus s -> Some $"Unexpected status: {s}"
+
     [<CLIMutable>]
     type private SendResult = { Status: MessageStatus }
 

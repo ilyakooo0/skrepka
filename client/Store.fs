@@ -25,7 +25,7 @@ module Store =
     type Data =
         { Contacts: Contact list
           Messages: Map<string, ChatMessage list>
-          ServerUrl: string
+          ServerUrl: string option
           PollCursor: int64 }
 
     [<CLIMutable>]
@@ -45,7 +45,7 @@ module Store =
 
     let private toChatMessage (d: MessageDoc) : ChatMessage =
         { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix; IsOutgoing = d.IsOutgoing
-          Status = if d.Status = 1 then DeliveryStatus.Delivered else DeliveryStatus.Sent }
+          Status = match d.Status with 0 -> DeliveryStatus.Sent | 1 -> DeliveryStatus.Delivered | n -> failwith $"Unknown delivery status: {n}" }
 
     let private toMessageDoc convId (m: ChatMessage) : MessageDoc =
         { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeSeconds(); IsOutgoing = m.IsOutgoing
@@ -89,7 +89,7 @@ module Store =
 
                 { Contacts = contacts
                   Messages = messages
-                  ServerUrl = settings.ServerUrl |> Option.ofObj |> Option.defaultValue ""
+                  ServerUrl = settings.ServerUrl |> Option.ofObj
                   PollCursor = settings.PollCursor })
         with _ ->
             None
@@ -111,7 +111,7 @@ module Store =
 
             settings.Upsert
                 { Id = "settings"
-                  ServerUrl = data.ServerUrl
+                  ServerUrl = data.ServerUrl |> Option.defaultValue ""
                   PollCursor = data.PollCursor }
             |> ignore
         with _ ->
