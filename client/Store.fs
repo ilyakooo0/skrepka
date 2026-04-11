@@ -56,10 +56,7 @@ module Store =
             return
                 privKeyB64
                 |> Option.ofObj
-                |> Option.map (fun b64 ->
-                    let privKey = Convert.FromBase64String b64
-                    { Crypto.Identity.PrivKey = privKey
-                      Crypto.Identity.PubKeyHex = Crypto.toHex privKey.[32..63] })
+                |> Option.map (Convert.FromBase64String >> Crypto.identityFromPrivKey)
         }
 
     let saveIdentity (identity: Crypto.Identity) =

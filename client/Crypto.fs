@@ -19,9 +19,11 @@ module Crypto =
         try Some(Convert.FromHexString(hex))
         with :? FormatException -> None
 
+    let identityFromPrivKey (privKey: byte[]) : Identity =
+        { PrivKey = privKey; PubKeyHex = toHex privKey.[32..63] }
+
     let generateIdentity () : Identity =
-        let kp = PublicKeyAuth.GenerateKeyPair()
-        { PrivKey = kp.PrivateKey; PubKeyHex = toHex kp.PublicKey }
+        PublicKeyAuth.GenerateKeyPair().PrivateKey |> identityFromPrivKey
 
     let signChallenge (privKey: byte[]) (challenge: string) : string =
         let message = Encoding.UTF8.GetBytes(challenge)
@@ -31,6 +33,15 @@ module Crypto =
         let salt = Array.append ephPub recipientX25519Pub
         let info = Encoding.UTF8.GetBytes("skrepka-v1")
         HKDF.DeriveKey(HashAlgorithmName.SHA256, rawSecret, 32, salt, info)
+
+    // Blob layout: [ephPub(32) | nonce(24) | ciphertext | senderPub(32) | signature(64)]
+    let private ephPubLen = 32
+    let private nonceLen = 24
+    let private pubLen = 32
+    let private sigLen = 64
+    let private headerLen = ephPubLen + nonceLen
+    let private trailerLen = pubLen + sigLen
+    let private minBlobLen = headerLen + 16 + trailerLen // 16 = AEAD tag
 
     let encrypt (senderPrivKey: byte[]) (recipientEd25519Pub: byte[]) (plaintext: string) : byte[] =
         let senderPubKey = senderPrivKey.[32..63]
@@ -46,15 +57,15 @@ module Crypto =
         Array.concat [| ephKp.PublicKey; nonce; ciphertext; senderPubKey; signature |]
 
     let decrypt (recipientPrivKey: byte[]) (blob: byte[]) : (string * string) option =
-        if blob.Length < 168 then
+        if blob.Length < minBlobLen then
             None
         else
             try
-                let ephPub = blob.[0..31]
-                let nonce = blob.[32..55]
-                let senderPub = blob.[blob.Length - 96 .. blob.Length - 65]
-                let signature = blob.[blob.Length - 64 .. blob.Length - 1]
-                let ciphertext = blob.[56 .. blob.Length - 97]
+                let ephPub = blob.[.. ephPubLen - 1]
+                let nonce = blob.[ephPubLen .. headerLen - 1]
+                let ciphertext = blob.[headerLen .. blob.Length - trailerLen - 1]
+                let senderPub = blob.[blob.Length - trailerLen .. blob.Length - sigLen - 1]
+                let signature = blob.[blob.Length - sigLen ..]
 
                 if not (PublicKeyAuth.VerifyDetached(signature, ciphertext, senderPub)) then
                     None

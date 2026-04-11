@@ -40,8 +40,8 @@ module App =
     type Page =
         | Setup
         | Conversations
-        | Chat of pubkey: string * compose: string
-        | AddContact of pubkey: string * nickname: string
+        | Chat of pubkey: string
+        | AddContact
         | Settings
 
     type Session = { Url: string; Token: string; Identity: Identity }
@@ -75,7 +75,10 @@ module App =
           PollStatus: PollStatus
           Messages: Map<string, ChatMessage list>
           Error: string option
-          PollCursor: int64 }
+          PollCursor: int64
+          Compose: string
+          ContactPubkey: string
+          ContactNickname: string }
 
     // ── Msg ──
 
@@ -173,6 +176,11 @@ module App =
     let private saveCmdMsg model =
         CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = Some model.ServerUrl; PollCursor = model.PollCursor }
 
+    let private connStatusLabel = function
+        | NoIdentity | Identified(_, Offline) -> "OFFLINE"
+        | Identified(_, Connecting) -> "CONNECTING"
+        | Identified(_, Online _) -> "ONLINE"
+
     // ── Init ──
 
     let init () =
@@ -183,31 +191,25 @@ module App =
           Contacts = []
           Messages = Map.empty
           Error = None
-          PollCursor = 0L },
+          PollCursor = 0L
+          Compose = ""
+          ContactPubkey = ""
+          ContactNickname = "" },
         [ CmdLoadState ]
 
     // ── Update ──
 
     let update msg model =
         match msg with
-        | SetPage(Chat(pk, _)) ->
-            { model with Page = Chat(pk, "") }, []
-        | SetPage(AddContact _) ->
-            { model with Page = AddContact("", "") }, []
+        | SetPage(Chat pk) ->
+            { model with Page = Chat pk; Compose = "" }, []
+        | SetPage AddContact ->
+            { model with Page = AddContact; ContactPubkey = ""; ContactNickname = "" }, []
         | SetPage page -> { model with Page = page }, []
 
-        | SetCompose text ->
-            match model.Page with
-            | Chat(pk, _) -> { model with Page = Chat(pk, text) }, []
-            | _ -> model, []
-        | SetContactPubkey pk ->
-            match model.Page with
-            | AddContact(_, nn) -> { model with Page = AddContact(pk, nn) }, []
-            | _ -> model, []
-        | SetContactNickname nn ->
-            match model.Page with
-            | AddContact(pk, _) -> { model with Page = AddContact(pk, nn) }, []
-            | _ -> model, []
+        | SetCompose text -> { model with Compose = text }, []
+        | SetContactPubkey pk -> { model with ContactPubkey = pk }, []
+        | SetContactNickname nn -> { model with ContactNickname = nn }, []
 
         | GenIdentity -> model, [ CmdGenIdentity ]
 
@@ -237,20 +239,20 @@ module App =
 
         | DoSend ->
             match model.Page, trySession model with
-            | Chat(pk, compose), Some session when compose <> "" ->
+            | Chat pk, Some session when model.Compose <> "" ->
                 let id = Guid.NewGuid().ToString()
                 let outMsg =
                     { Id = id
-                      Body = compose
+                      Body = model.Compose
                       Timestamp = DateTimeOffset.UtcNow
                       IsOutgoing = true }
 
                 let model' =
                     { model with
-                        Page = Chat(pk, "")
+                        Compose = ""
                         Messages = model.Messages |> appendMessage pk outMsg }
 
-                model', [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
+                model', [ CmdSend(session, pk, model.Compose, id); saveCmdMsg model' ]
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
@@ -272,11 +274,10 @@ module App =
               if not incoming.IsEmpty then saveCmdMsg model' ]
 
         | DoSaveContact ->
-            match model.Page with
-            | AddContact(pk, nn) when pk <> "" && nn <> "" ->
-                match tryParsePubkey pk with
+            if model.ContactPubkey <> "" && model.ContactNickname <> "" then
+                match tryParsePubkey model.ContactPubkey with
                 | Some bytes ->
-                    let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = nn }
+                    let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = model.ContactNickname }
 
                     let model' =
                         { model with
@@ -284,8 +285,9 @@ module App =
                             Page = Conversations }
 
                     model', [ saveCmdMsg model' ]
-                | _ -> { model with Error = Some "Invalid public key" }, []
-            | _ -> model, []
+                | None -> { model with Error = Some "Invalid public key" }, []
+            else
+                model, []
 
         | CopyPubKey ->
             match model.Auth with
@@ -501,12 +503,6 @@ module App =
         )
 
     let private viewConversations model =
-        let connStr =
-            match model.Auth with
-            | NoIdentity | Identified(_, Offline) -> "OFFLINE"
-            | Identified(_, Connecting) -> "CONNECTING"
-            | Identified(_, Online _) -> "ONLINE"
-
         ContentPage(
             ScrollView(
                 (VStack(spacing = 8.) {
@@ -514,11 +510,11 @@ module App =
                         Label("Conversations")
                             .font(size = 24.)
 
-                        Button("+", SetPage(AddContact("", "")))
+                        Button("+", SetPage AddContact)
                         Button("Settings", SetPage Settings)
                     }
 
-                    Label($"{connStr} | {formatPollStatus model.PollStatus}")
+                    Label($"{connStatusLabel model.Auth} | {formatPollStatus model.PollStatus}")
                         .font(size = 10.)
                         .textColor(Colors.DimGray)
 
@@ -536,13 +532,13 @@ module App =
                             |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
                             |> Option.defaultValue ""
 
-                        Button($"{c.Nickname}\n{preview}", SetPage(Chat(c.Pubkey, "")))
+                        Button($"{c.Nickname}\n{preview}", SetPage(Chat c.Pubkey))
                 })
                     .padding(20.)
             )
         )
 
-    let private viewChat model pk compose =
+    let private viewChat model pk =
         let name = contactName model.Contacts pk
         let msgs = messagesFor pk model.Messages
 
@@ -569,7 +565,7 @@ module App =
                             .font(size = 14.)
 
                 HStack(spacing = 8.) {
-                    Entry(compose, SetCompose)
+                    Entry(model.Compose, SetCompose)
                         .placeholder("Message...")
 
                     Button("Send", DoSend)
@@ -578,7 +574,7 @@ module App =
                 .padding(12.)
         )
 
-    let private viewAddContact model pubkey nickname =
+    let private viewAddContact model =
         ContentPage(
             (VStack(spacing = 16.) {
                 HStack(spacing = 8.) {
@@ -591,11 +587,11 @@ module App =
                 viewErrorBanner model.Error
 
                 Label("Public Key:")
-                Entry(pubkey, SetContactPubkey)
+                Entry(model.ContactPubkey, SetContactPubkey)
                     .placeholder("sampel-palnet-...")
 
                 Label("Nickname:")
-                Entry(nickname, SetContactNickname)
+                Entry(model.ContactNickname, SetContactNickname)
 
                 Button("Save Contact", DoSaveContact)
                     .centerHorizontal()
@@ -609,8 +605,8 @@ module App =
             | Setup -> viewSetup ()
             | Settings -> viewSettings model
             | Conversations -> viewConversations model
-            | Chat(pk, compose) -> viewChat model pk compose
-            | AddContact(pubkey, nickname) -> viewAddContact model pubkey nickname
+            | Chat pk -> viewChat model pk
+            | AddContact -> viewAddContact model
 
         Application() { Window(page) }
 
