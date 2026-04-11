@@ -42,6 +42,12 @@ onlineGossipTtl = 3600 -- 1 hour
 offlineGossipMinTtl : Int<S>
 offlineGossipMinTtl = 60 -- minimum TTL for offline gossip events
 maxForwardRetriesPerServer = 100
+maxGossipHops = 5
+gossipOriginHops = 2
+maxPollTimeout : Int<Ms>
+maxPollTimeout = 60000 -- 1 minute
+backgroundPruneInterval : Int<Ms>
+backgroundPruneInterval = 30000 -- 30 seconds
 federationEnabled = federationSecret != ""
 federationAuth = "Bearer " ++ federationSecret
 federationUrl = \server -> federationScheme ++ server
@@ -598,7 +604,7 @@ broadcastOfflineGossip = \t peerServers expiredLocal ->
       p <- expiredLocal
       let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
       yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: p.expiresAt, ttl: ttl})
-    sendBatchedGossip peerServers gossipEvents 2)
+    sendBatchedGossip peerServers gossipEvents gossipOriginHops)
 
 forkBroadcastOffline = \t result ->
   fork (broadcastOfflineGossip t result.peerServers result.expiredLocal)
@@ -798,13 +804,13 @@ serve = \req -> case req of
         let expiredLocal = do p <- result.pr.expiredLocal; where p.pubkey != pubkey; yield p
         fork (do
           when federationEnabled
-            (sendBatchedGossip peerServers [{eventType: GossipOnline {}, pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}] 2)
+            (sendBatchedGossip peerServers [{eventType: GossipOnline {}, pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}] gossipOriginHops)
           broadcastOfflineGossip t result.pr.peerServers expiredLocal)
         yield (respond {token: token, expiresAt: expiry})
 
   Poll {cursor, timeout, authorization, respond} -> do
     t <- now
-    let clampedTimeout = clamp 0 60000 timeout
+    let clampedTimeout = clamp 0 maxPollTimeout timeout
     let deadline = t + clampedTimeout
     let token = extractToken authorization
     result <- pollLoop token cursor deadline
@@ -862,8 +868,7 @@ serve = \req -> case req of
             case status of
               MsQueued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
               _ -> yield {})
-        SendUnauthorized {} -> yield {}
-        SendRejected {} -> yield {}
+        _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
       SendUnauthorized {} -> respond {status: MsUnauthorized {}, messageId: ""}
@@ -922,8 +927,7 @@ serve = \req -> case req of
             where p.pubkey == pubkey && p.expiresAt > t
             yield p
           let localOnline = any valid (\p -> p.server == serverHostN)
-          let remoteValid = do p <- valid; where p.server != serverHostN; yield p
-          let bestRemote = (fold (\acc p -> if p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} remoteValid).server
+          let bestRemote = (fold (\acc p -> if p.server != serverHostN && p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
           let foundServer = if localOnline then serverHostN else bestRemote
           yield {pr: pr, lookup: LookupDone {server: foundServer}}
     forkBroadcastOffline t result.pr
@@ -934,7 +938,7 @@ serve = \req -> case req of
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
-    let cappedHops = clamp 0 5 hopsRemaining
+    let cappedHops = clamp 0 maxGossipHops hopsRemaining
     if not authorized || cappedHops < 1 || fromServer == serverHostN || count events > maxGossipEvents
       then rejectFederation t respond
       else do
@@ -1003,7 +1007,7 @@ serve = \req -> case req of
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, origin: FederatedOrigin {server: originServer}, receivedAt: seqTs}]
                 yield {pr: pr, forward: ForwardStored {}}
         forkBroadcastOffline t result.pr
-        yield (respond {ok: case result.forward of ForwardDuplicate {} -> True {}; ForwardStored {} -> True {}; ForwardFull {} -> False {}})
+        yield (respond {ok: case result.forward of ForwardFull {} -> False {}; _ -> True {}})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
@@ -1034,7 +1038,7 @@ serve = \req -> case req of
 -- ============================================
 
 backgroundPrune = do
-  sleep 30000
+  sleep backgroundPruneInterval
   t <- now
   pruneAndRetry t
   fork backgroundPrune

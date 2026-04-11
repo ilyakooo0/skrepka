@@ -3,7 +3,6 @@ namespace Skrepka
 open System
 open System.IO
 open System.Text.Json
-open System.Text.Json.Serialization
 open Fabulous
 open Fabulous.Maui
 open Microsoft.Maui.Graphics
@@ -66,8 +65,7 @@ module App =
     // ── Msg ──
 
     type StateLoadResult =
-        | IdentityAndData of Identity * Data * Profile option
-        | IdentityOnly of Identity * Profile option
+        | Loaded of Identity * Data option * Profile option
         | NothingSaved
 
     type Msg =
@@ -340,7 +338,7 @@ module App =
                   | None -> () ]
             | _ -> model, []
 
-        | StateLoaded(IdentityAndData(identity, data, profile)) ->
+        | StateLoaded(Loaded(identity, Some data, profile)) ->
             let model' =
                 { model with
                     Auth = Identified(identity, Connecting)
@@ -351,7 +349,7 @@ module App =
                     Profile = profile
                     Page = Conversations }
             model', [ CmdConnect(model'.ServerUrl, identity) ]
-        | StateLoaded(IdentityOnly(identity, profile)) ->
+        | StateLoaded(Loaded(identity, None, profile)) ->
             { model with Auth = Identified(identity, Offline); Profile = profile; Page = Settings }, []
         | StateLoaded NothingSaved -> model, []
 
@@ -367,16 +365,16 @@ module App =
 
     type private Envelope =
         | TextMessage of id: string * body: string
-        | DeliveryAck of id: string * ackIds: string list
-        | ProfileMessage of id: string * profile: Profile
+        | DeliveryAck of ackIds: string list
+        | ProfileMessage of profile: Profile
 
     let private serializeEnvelope = function
         | TextMessage(id, body) ->
             JsonSerializer.Serialize({| ``type`` = "text"; id = id; body = body |})
-        | DeliveryAck(id, ackIds) ->
-            JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = id; ack_ids = ackIds |})
-        | ProfileMessage(id, profile) ->
-            JsonSerializer.Serialize({| ``type`` = "profile"; id = id; timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = profile.DisplayName; bio = profile.Bio; photo = profile.PhotoBase64 |})
+        | DeliveryAck ackIds ->
+            JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = Guid.NewGuid().ToString(); ack_ids = ackIds |})
+        | ProfileMessage profile ->
+            JsonSerializer.Serialize({| ``type`` = "profile"; id = Guid.NewGuid().ToString(); timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = profile.DisplayName; bio = profile.Bio; photo = profile.PhotoBase64 |})
 
     let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
         async {
@@ -399,12 +397,12 @@ module App =
             Some(TextMessage(root.GetProperty("id").GetString(), root.GetProperty("body").GetString()))
         | "delivery.ack" ->
             let ackIds = root.GetProperty("ack_ids").EnumerateArray() |> Seq.map _.GetString() |> Seq.toList
-            Some(DeliveryAck(root.GetProperty("id").GetString(), ackIds))
+            Some(DeliveryAck ackIds)
         | "profile" ->
             let displayName = root.GetProperty("display_name").GetString()
             let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
             let photo = tryGetJsonString root "photo" |> Option.defaultValue ""
-            Some(ProfileMessage(root.GetProperty("id").GetString(), { DisplayName = displayName; Bio = bio; PhotoBase64 = photo }))
+            Some(ProfileMessage { DisplayName = displayName; Bio = bio; PhotoBase64 = photo })
         | _ -> None
 
     let private decryptEvent (privKey: byte[]) (payload: EventPayload) =
@@ -420,9 +418,9 @@ module App =
                           Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
                           IsOutgoing = false
                           Status = DeliveryStatus.Delivered }))
-                | Some(DeliveryAck(_, ackIds)) ->
+                | Some(DeliveryAck ackIds) ->
                     Ok(IncomingDeliveryAck(senderHex, ackIds))
-                | Some(ProfileMessage(_, profile)) ->
+                | Some(ProfileMessage profile) ->
                     Ok(IncomingProfile(senderHex, profile))
                 | None -> Error "unknown envelope type"
             | None -> Error "decrypt failed"
@@ -438,7 +436,7 @@ module App =
                 |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
 
             for sender, msgIds in chatsBySender do
-                try do! sendEnvelope session sender (DeliveryAck(Guid.NewGuid().ToString(), msgIds)) |> Async.Ignore
+                try do! sendEnvelope session sender (DeliveryAck msgIds) |> Async.Ignore
                 with _ -> ()
         }
 
@@ -506,11 +504,7 @@ module App =
             asyncCmd (async {
                 match! Store.loadIdentity () with
                 | Some id ->
-                    let profile = Store.loadProfile ()
-                    return StateLoaded(
-                        match Store.loadData () with
-                        | Some data -> IdentityAndData(id, data, profile)
-                        | None -> IdentityOnly(id, profile))
+                    return StateLoaded(Loaded(id, Store.loadData (), Store.loadProfile ()))
                 | None -> return StateLoaded NothingSaved
             })
 
@@ -542,7 +536,7 @@ module App =
             Cmd.ofEffect (fun _ ->
                 async {
                     for recipientHex in recipientHexes do
-                        try do! sendEnvelope session recipientHex (ProfileMessage(Guid.NewGuid().ToString(), profile)) |> Async.Ignore
+                        try do! sendEnvelope session recipientHex (ProfileMessage profile) |> Async.Ignore
                         with _ -> ()
                 } |> Async.Start)
 
