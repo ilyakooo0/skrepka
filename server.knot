@@ -78,6 +78,10 @@ impl FromJSON GossipEventType where
     else if s == "offline" then GossipOffline {}
     else GossipUnknown {}
 
+isKnownEvent = \et -> case et of GossipUnknown {} -> False {}; _ -> True {}
+isOnlineEvent = \et -> case et of GossipOnline {} -> True {}; _ -> False {}
+isOfflineEvent = \et -> case et of GossipOffline {} -> True {}; _ -> False {}
+
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
 type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
@@ -514,14 +518,12 @@ countMessagesFor = \messages toKey t ->
 validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
 validGossipEvents = \events t -> do
   e <- events
-  case e.eventType of
-    GossipUnknown {} -> []
-    _ -> do
-      where e.server != serverHostN && e.timestamp <= t + clockSkewTolerance
-      let ttl = clampTtl e.ttl
-      let expiresAt = e.timestamp + ttl * 1000
-      where expiresAt > t
-      yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
+  where isKnownEvent e.eventType
+  where e.server != serverHostN && e.timestamp <= t + clockSkewTolerance
+  let ttl = clampTtl e.ttl
+  let expiresAt = e.timestamp + ttl * 1000
+  where expiresAt > t
+  yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
 
 sendToEach : [ServerName] -> (ServerName -> (a {})) -> a {}
 sendToEach = \servers action ->
@@ -895,7 +897,7 @@ serve = \req -> case req of
             m <- ackedMessages
             case m.origin of
               FederatedOrigin {server} -> yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: server}
-              LocalOrigin {} -> []
+              _ -> []
           ackedIds <- *ackedIds
           let combinedAckedIds = union ackedIds ackedFederated
           let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
@@ -908,9 +910,9 @@ serve = \req -> case req of
           when federationEnabled (do
             sendAcksAndClean pendingAcks
             retryEvictedAcks evictedEntries pendingAcks)
-        AckUnauthorized {} -> yield {}
+        _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
-    yield (respond {ok: case result.ack of AckDone _ -> True {}; AckUnauthorized {} -> False {}})
+    yield (respond {ok: case result.ack of AckDone _ -> True {}; _ -> False {}})
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
@@ -943,8 +945,8 @@ serve = \req -> case req of
       then rejectFederation t respond
       else do
         let allValidEntries = validGossipEvents events t
-        let onlineEntries = do e <- allValidEntries; case e.eventType of GossipOnline {} -> yield e; _ -> []
-        let trustedOffline = do e <- allValidEntries; case e.eventType of GossipOffline {} -> do where e.server == fromServer; yield e; _ -> []
+        let onlineEntries = do e <- allValidEntries; where isOnlineEvent e.eventType; yield e
+        let trustedOffline = do e <- allValidEntries; where isOfflineEvent e.eventType && e.server == fromServer; yield e
         let filteredOnline = resolveByTimestamp onlineEntries trustedOffline
         let filteredOffline = resolveByTimestamp trustedOffline onlineEntries
         let deduped = mergeByPubkeyServer [] filteredOnline
