@@ -64,6 +64,7 @@ impl ToJSON PollEventType where
 type PollEvent = {id: MessageIdHex, eventType: PollEventType, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
 data GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
+data ValidGossipType = ValidOnline {} | ValidOffline {}
 
 impl ToJSON GossipEventType where
   toJson et = toJson (case et of
@@ -78,13 +79,13 @@ impl FromJSON GossipEventType where
     else if s == "offline" then GossipOffline {}
     else GossipUnknown {}
 
-isKnownEvent = \et -> case et of GossipUnknown {} -> False {}; _ -> True {}
-isOnlineEvent = \et -> case et of GossipOnline {} -> True {}; _ -> False {}
-isOfflineEvent = \et -> case et of GossipOffline {} -> True {}; _ -> False {}
+isOnlineEvent = \et -> case et of ValidOnline {} -> True {}; _ -> False {}
+isOfflineEvent = \et -> case et of ValidOffline {} -> True {}; _ -> False {}
+toGossipEventType = \et -> case et of ValidOnline {} -> GossipOnline {}; ValidOffline {} -> GossipOffline {}
 
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
-type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
+type ValidGossipEntry = {eventType: ValidGossipType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
 data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {} | MsUnauthorized {} | MsRejected {}
 
@@ -514,16 +515,21 @@ capGossipPresence = \args ->
 countMessagesFor = \messages toKey t ->
   count (do m <- messages; where m.toKey == toKey && m.receivedAt >= t - messageMaxAge; yield m)
 
+hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey == toKey)
+
 
 validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
 validGossipEvents = \events t -> do
   e <- events
-  where isKnownEvent e.eventType
+  validType <- case e.eventType of
+    GossipOnline {} -> [ValidOnline {}]
+    GossipOffline {} -> [ValidOffline {}]
+    _ -> []
   where e.server != serverHostN && e.timestamp <= t + clockSkewTolerance
   let ttl = clampTtl e.ttl
   let expiresAt = e.timestamp + ttl * 1000
   where expiresAt > t
-  yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
+  yield {eventType: validType, pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
 
 sendToEach : [ServerName] -> (ServerName -> (a {})) -> a {}
 sendToEach = \servers action ->
@@ -659,7 +665,7 @@ sendBatchedAcksToServer = \serverAcks server ->
       ackedIds <- *ackedIds
       set *ackedIds = do
         a <- ackedIds
-        where not (a.originServer == server && any batch (\sa -> sa.messageId == a.messageId && sa.toKey == a.toKey))
+        where not (a.originServer == server && hasMessage a.messageId a.toKey batch)
         yield a))
 
 sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> IO {network} {}
@@ -671,7 +677,7 @@ sendAcksAndClean = \pendingAcks ->
 retryEvictedAcks = \evictedEntries pendingAcks ->
   let evictedToRetry = do
     a <- evictedEntries
-    where none pendingAcks (\a2 -> a2.messageId == a.messageId && a2.toKey == a.toKey)
+    where not (hasMessage a.messageId a.toKey pendingAcks)
     yield a
   in do
     let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
@@ -971,7 +977,7 @@ serve = \req -> case req of
         let effectiveEvents = do
           e <- union filteredOnline filteredOffline
           where any gossipResult.appliedKeys (\a -> samePubkeyServer a e)
-          yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl}
+          yield {eventType: toGossipEventType e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl}
         when (not gossipResult.withinCapacity)
           (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer))
         fork (do
@@ -995,8 +1001,7 @@ serve = \req -> case req of
           pr <- maybePrune t
           messages <- *messages
           ackedIds <- *ackedIds
-          if any messages (\m -> m.messageId == messageId && m.toKey == toKey)
-            || any ackedIds (\a -> a.messageId == messageId && a.toKey == toKey)
+          if hasMessage messageId toKey messages || hasMessage messageId toKey ackedIds
             then yield {pr: pr, forward: ForwardDuplicate {}}
             else if countMessagesFor messages toKey t >= maxMessagesPerRecipient
               then yield {pr: pr, forward: ForwardFull {}}
