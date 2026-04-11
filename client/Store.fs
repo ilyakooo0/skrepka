@@ -10,7 +10,15 @@ module Store =
     [<CLIMutable>]
     type Contact =
         { [<BsonId>] Pubkey: string
-          Nickname: string }
+          Nickname: string
+          DisplayName: string
+          Bio: string
+          PhotoBase64: string }
+
+    type Profile =
+        { DisplayName: string
+          Bio: string
+          PhotoBase64: string option }
 
     [<RequireQualifiedAccess>]
     type DeliveryStatus = Sent | Delivered
@@ -43,6 +51,13 @@ module Store =
           ServerUrl: string
           PollCursor: int64 }
 
+    [<CLIMutable>]
+    type private ProfileDoc =
+        { [<BsonId>] Id: string
+          DisplayName: string
+          Bio: string
+          PhotoBase64: string }
+
     let private toChatMessage (d: MessageDoc) : ChatMessage =
         { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix; IsOutgoing = d.IsOutgoing
           Status = match d.Status with 0 -> DeliveryStatus.Sent | 1 -> DeliveryStatus.Delivered | n -> failwith $"Unknown delivery status: {n}" }
@@ -69,6 +84,28 @@ module Store =
     let saveIdentity (identity: Crypto.Identity) =
         SecureStorage.Default.SetAsync("identity_privkey", Convert.ToBase64String identity.PrivKey)
         |> Async.AwaitTask
+
+    let loadProfile () : Profile option =
+        try
+            use db = openDb ()
+            db.GetCollection<ProfileDoc>("profile").FindById(BsonValue "me")
+            |> Option.ofObj
+            |> Option.map (fun p ->
+                { DisplayName = p.DisplayName |> Option.ofObj |> Option.defaultValue ""
+                  Bio = p.Bio |> Option.ofObj |> Option.defaultValue ""
+                  PhotoBase64 = p.PhotoBase64 |> Option.ofObj })
+        with _ -> None
+
+    let saveProfile (profile: Profile) =
+        try
+            use db = openDb ()
+            db.GetCollection<ProfileDoc>("profile").Upsert
+                { Id = "me"
+                  DisplayName = profile.DisplayName
+                  Bio = profile.Bio
+                  PhotoBase64 = profile.PhotoBase64 |> Option.defaultValue null }
+            |> ignore
+        with _ -> ()
 
     let loadData () : Data option =
         try

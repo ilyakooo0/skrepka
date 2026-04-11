@@ -1,6 +1,7 @@
 namespace Skrepka
 
 open System
+open System.IO
 open System.Text.Json
 open System.Text.Json.Serialization
 open Fabulous
@@ -23,6 +24,7 @@ module App =
         | Chat of pubkey: string * compose: string
         | AddContact of pubkey: string * nickname: string
         | Settings
+        | EditProfile of displayName: string * bio: string * photo: string option
 
     type Session = { Url: string; Token: string; Identity: Identity }
 
@@ -40,6 +42,7 @@ module App =
     type DecryptedEvent =
         | IncomingChat of IncomingMessage
         | IncomingDeliveryAck of senderPubkey: string * ackIds: string list
+        | IncomingProfile of senderPubkey: string * displayName: string * bio: string * photo: string option
 
     type PollReceived = { Events: int; Messages: int; Errors: int; FirstError: string option }
 
@@ -59,13 +62,14 @@ module App =
           PollStatus: PollStatus
           Messages: Map<string, ChatMessage list>
           Error: string option
-          PollCursor: int64 }
+          PollCursor: int64
+          Profile: Profile option }
 
     // ── Msg ──
 
     type StateLoadResult =
-        | IdentityAndData of Identity * Data
-        | IdentityOnly of Identity
+        | IdentityAndData of Identity * Data * Profile option
+        | IdentityOnly of Identity * Profile option
         | NothingSaved
 
     type Msg =
@@ -87,6 +91,11 @@ module App =
         | CopyPubKey
         | DismissError
         | StateLoaded of StateLoadResult
+        | SetProfileDisplayName of string
+        | SetProfileBio of string
+        | DoPickPhoto
+        | PhotoPicked of string option
+        | DoSaveProfile
 
     // ── CmdMsg ──
 
@@ -98,6 +107,9 @@ module App =
         | CmdLoadState
         | CmdSaveIdentity of Identity
         | CmdSaveData of Data
+        | CmdPickPhoto
+        | CmdSaveProfile of Profile
+        | CmdSendProfileToAll of session: Session * Profile * recipientHexes: string list
 
     // ── Helpers ──
 
@@ -121,10 +133,14 @@ module App =
         |> Option.filter (fun bytes -> bytes.Length = 32)
 
     let private contactName (contacts: Contact list) (pk: string) =
+        let fallback = truncKey pk
         contacts
         |> List.tryFind (fun c -> c.Pubkey = pk)
-        |> Option.map _.Nickname
-        |> Option.defaultValue (truncKey pk)
+        |> Option.map (fun c ->
+            if c.Nickname <> fallback then c.Nickname
+            elif not (String.IsNullOrEmpty c.DisplayName) then c.DisplayName
+            else c.Nickname)
+        |> Option.defaultValue fallback
 
     let private messagesFor (pk: string) (messages: Map<string, ChatMessage list>) =
         messages |> Map.tryFind pk |> Option.defaultValue []
@@ -179,7 +195,8 @@ module App =
           Contacts = []
           Messages = Map.empty
           Error = None
-          PollCursor = 0L },
+          PollCursor = 0L
+          Profile = None },
         [ CmdLoadState ]
 
     // ── Update ──
@@ -237,12 +254,20 @@ module App =
                       IsOutgoing = true
                       Status = DeliveryStatus.Sent }
 
+                let isFirstInteraction = model.Messages |> messagesFor pk |> List.isEmpty
+
                 let model' =
                     { model with
                         Page = Chat(pk, "")
                         Messages = model.Messages |> appendMessage pk outMsg }
 
-                model', [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
+                let cmds = [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
+                let cmds =
+                    match model.Profile, isFirstInteraction with
+                    | Some profile, true -> cmds @ [ CmdSendProfileToAll(session, profile, [ pk ]) ]
+                    | _ -> cmds
+
+                model', cmds
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
@@ -256,10 +281,18 @@ module App =
                         match evt with
                         | IncomingChat msg ->
                             { m with
-                                Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.SenderPubkey; Nickname = truncKey msg.SenderPubkey }
+                                Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.SenderPubkey; Nickname = truncKey msg.SenderPubkey; DisplayName = null; Bio = null; PhotoBase64 = null }
                                 Messages = m.Messages |> appendMessage msg.SenderPubkey msg.Message }
                         | IncomingDeliveryAck(senderPubkey, ackIds) ->
-                            { m with Messages = m.Messages |> markDelivered senderPubkey ackIds })
+                            { m with Messages = m.Messages |> markDelivered senderPubkey ackIds }
+                        | IncomingProfile(senderPubkey, displayName, bio, photo) ->
+                            { m with
+                                Contacts =
+                                    m.Contacts
+                                    |> List.map (fun c ->
+                                        if c.Pubkey = senderPubkey then
+                                            { c with DisplayName = displayName; Bio = bio; PhotoBase64 = photo |> Option.defaultValue null }
+                                        else c) })
                     { model with PollStatus = status; PollCursor = newCursor }
 
             model',
@@ -273,7 +306,12 @@ module App =
             | AddContact(cpk, cnn) when cpk <> "" && cnn <> "" ->
                 match tryParsePubkey cpk with
                 | Some bytes ->
-                    let contact: Contact = { Pubkey = Crypto.toHex bytes; Nickname = cnn }
+                    let hex = Crypto.toHex bytes
+                    let existing = model.Contacts |> List.tryFind (fun c -> c.Pubkey = hex)
+                    let contact: Contact =
+                        match existing with
+                        | Some e -> { e with Nickname = cnn }
+                        | None -> { Pubkey = hex; Nickname = cnn; DisplayName = null; Bio = null; PhotoBase64 = null }
 
                     let model' =
                         { model with
@@ -291,7 +329,37 @@ module App =
 
         | DismissError -> { model with Error = None }, []
 
-        | StateLoaded(IdentityAndData(identity, data)) ->
+        | SetProfileDisplayName name ->
+            match model.Page with
+            | EditProfile(_, bio, photo) -> { model with Page = EditProfile(name, bio, photo) }, []
+            | _ -> model, []
+
+        | SetProfileBio bio ->
+            match model.Page with
+            | EditProfile(name, _, photo) -> { model with Page = EditProfile(name, bio, photo) }, []
+            | _ -> model, []
+
+        | DoPickPhoto -> model, [ CmdPickPhoto ]
+
+        | PhotoPicked photo ->
+            match model.Page with
+            | EditProfile(name, bio, _) -> { model with Page = EditProfile(name, bio, photo) }, []
+            | _ -> model, []
+
+        | DoSaveProfile ->
+            match model.Page with
+            | EditProfile(name, bio, photo) ->
+                let profile: Profile = { DisplayName = name; Bio = bio; PhotoBase64 = photo }
+                let cmds = [ CmdSaveProfile profile ]
+                let cmds =
+                    match trySession model with
+                    | Some session ->
+                        cmds @ [ CmdSendProfileToAll(session, profile, model.Contacts |> List.map _.Pubkey) ]
+                    | None -> cmds
+                { model with Profile = Some profile; Page = Settings }, cmds
+            | _ -> model, []
+
+        | StateLoaded(IdentityAndData(identity, data, profile)) ->
             let model' =
                 { model with
                     Auth = Identified(identity, Connecting)
@@ -299,10 +367,11 @@ module App =
                     Messages = data.Messages
                     ServerUrl = data.ServerUrl |> Option.defaultValue model.ServerUrl
                     PollCursor = data.PollCursor
+                    Profile = profile
                     Page = Conversations }
             model', [ CmdConnect(model'.ServerUrl, identity) ]
-        | StateLoaded(IdentityOnly identity) ->
-            { model with Auth = Identified(identity, Offline); Page = Settings }, []
+        | StateLoaded(IdentityOnly(identity, profile)) ->
+            { model with Auth = Identified(identity, Offline); Profile = profile; Page = Settings }, []
         | StateLoaded NothingSaved -> model, []
 
     // ── mapCmd ──
@@ -318,12 +387,15 @@ module App =
     type private Envelope =
         | TextMessage of id: string * body: string
         | DeliveryAck of id: string * ackIds: string list
+        | ProfileMessage of id: string * displayName: string * bio: string * photo: string option
 
     let private serializeEnvelope = function
         | TextMessage(id, body) ->
             JsonSerializer.Serialize({| ``type`` = "text"; id = id; body = body |})
         | DeliveryAck(id, ackIds) ->
             JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = id; ack_ids = ackIds |})
+        | ProfileMessage(id, displayName, bio, photo) ->
+            JsonSerializer.Serialize({| ``type`` = "profile"; id = id; timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = displayName; bio = bio; photo = (photo |> Option.defaultValue null) |})
 
     let private parseEnvelope (json: string) =
         use doc = JsonDocument.Parse(json)
@@ -334,6 +406,17 @@ module App =
         | "delivery.ack" ->
             let ackIds = root.GetProperty("ack_ids").EnumerateArray() |> Seq.map _.GetString() |> Seq.toList
             Some(DeliveryAck(root.GetProperty("id").GetString(), ackIds))
+        | "profile" ->
+            let displayName = root.GetProperty("display_name").GetString()
+            let bio =
+                match root.TryGetProperty("bio") with
+                | true, el when el.ValueKind <> JsonValueKind.Null -> el.GetString()
+                | _ -> ""
+            let photo =
+                match root.TryGetProperty("photo") with
+                | true, el when el.ValueKind <> JsonValueKind.Null -> Some(el.GetString())
+                | _ -> None
+            Some(ProfileMessage(root.GetProperty("id").GetString(), displayName, bio, photo))
         | _ -> None
 
     let private decryptEvent (privKey: byte[]) (payload: EventPayload) =
@@ -353,6 +436,8 @@ module App =
                               Status = DeliveryStatus.Delivered } })
                 | Some(DeliveryAck(_, ackIds)) ->
                     Ok(IncomingDeliveryAck(senderHex, ackIds))
+                | Some(ProfileMessage(_, displayName, bio, photo)) ->
+                    Ok(IncomingProfile(senderHex, displayName, bio, photo))
                 | None -> Error "unknown envelope type"
             | None -> Error "decrypt failed"
         with ex ->
@@ -445,10 +530,11 @@ module App =
             asyncCmd (async {
                 match! Store.loadIdentity () with
                 | Some id ->
+                    let profile = Store.loadProfile ()
                     return StateLoaded(
                         match Store.loadData () with
-                        | Some data -> IdentityAndData(id, data)
-                        | None -> IdentityOnly id)
+                        | Some data -> IdentityAndData(id, data, profile)
+                        | None -> IdentityOnly(id, profile))
                 | None -> return StateLoaded NothingSaved
             })
 
@@ -457,6 +543,36 @@ module App =
 
         | CmdSaveData data ->
             Cmd.ofEffect (fun _ -> Store.saveData data)
+
+        | CmdPickPhoto ->
+            asyncCmd (async {
+                try
+                    let! results = Microsoft.Maui.Media.MediaPicker.Default.PickPhotosAsync() |> Async.AwaitTask
+                    let file = results |> Seq.tryHead
+                    match file with
+                    | None -> return PhotoPicked None
+                    | Some file ->
+                        use! stream = file.OpenReadAsync() |> Async.AwaitTask
+                        use ms = new MemoryStream()
+                        do! stream.CopyToAsync(ms) |> Async.AwaitTask
+                        return PhotoPicked(Some(Convert.ToBase64String(ms.ToArray())))
+                with _ ->
+                    return PhotoPicked None
+            })
+
+        | CmdSaveProfile profile ->
+            Cmd.ofEffect (fun _ -> Store.saveProfile profile)
+
+        | CmdSendProfileToAll(session, profile, recipientHexes) ->
+            Cmd.ofEffect (fun _ ->
+                async {
+                    for recipientHex in recipientHexes do
+                        try
+                            let payload = serializeEnvelope (ProfileMessage(Guid.NewGuid().ToString(), profile.DisplayName, profile.Bio, profile.PhotoBase64))
+                            let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload
+                            do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) (DateTimeOffset.UtcNow.ToUnixTimeSeconds()) |> Async.Ignore
+                        with _ -> ()
+                } |> Async.Start)
 
     // ── View ──
 
@@ -511,6 +627,21 @@ module App =
                             .font(size = 14.)
 
                         Button("Copy Public Key", CopyPubKey)
+
+                        Label("Profile:").font(size = 18.)
+                        match model.Profile with
+                        | Some profile when not (String.IsNullOrEmpty profile.DisplayName) ->
+                            Label($"Name: {profile.DisplayName}").font(size = 14.)
+                        | _ -> ()
+                        match model.Profile with
+                        | Some profile when not (String.IsNullOrEmpty profile.Bio) ->
+                            Label($"Bio: {profile.Bio}").font(size = 14.).textColor(Colors.DimGray)
+                        | _ -> ()
+                        let profilePage =
+                            match model.Profile with
+                            | Some p -> EditProfile(p.DisplayName, p.Bio, p.PhotoBase64)
+                            | None -> EditProfile("", "", None)
+                        Button("Edit Profile", SetPage profilePage)
 
                         Label("Server:")
 
@@ -630,6 +761,45 @@ module App =
                 .padding(20.)
         )
 
+    let private viewEditProfile model displayName bio photo =
+        ContentPage(
+            ScrollView(
+                (VStack(spacing = 16.) {
+                    HStack(spacing = 8.) {
+                        Button("< Back", SetPage Settings)
+                        Label("Edit Profile").font(size = 20.)
+                    }
+
+                    viewErrorBanner model.Error
+
+                    match photo with
+                    | Some p when not (String.IsNullOrEmpty p) ->
+                        Image(new MemoryStream(Convert.FromBase64String(p)) :> Stream)
+                            .width(120.)
+                            .height(120.)
+                            .centerHorizontal()
+                    | _ ->
+                        Label("No Photo")
+                            .font(size = 16.)
+                            .centerTextHorizontal()
+                            .textColor(Colors.Gray)
+
+                    Button("Change Photo", DoPickPhoto).centerHorizontal()
+
+                    Label("Display Name:")
+                    Entry(displayName, SetProfileDisplayName)
+                        .placeholder("Your name")
+
+                    Label("Bio:")
+                    Entry(bio, SetProfileBio)
+                        .placeholder("Tell something about yourself")
+
+                    Button("Save Profile", DoSaveProfile).centerHorizontal()
+                })
+                    .padding(20.)
+            )
+        )
+
     let view model =
         let page =
             match model.Page with
@@ -638,6 +808,7 @@ module App =
             | Conversations -> viewConversations model
             | Chat(pk, compose) -> viewChat model pk compose
             | AddContact(pk, nn) -> viewAddContact model pk nn
+            | EditProfile(displayName, bio, photo) -> viewEditProfile model displayName bio photo
 
         Application() { Window(page) }
 
