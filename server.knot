@@ -106,6 +106,8 @@ type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: Mess
 type VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
 type AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 type LookupResult = LookupUnauthorized {} | LookupDone {server: AnyServerName}
+type ForwardResult = ForwardDuplicate {} | ForwardStored {} | ForwardFull {}
+type PollResult = PollUnauthorized {} | PollDone {events: [PollEvent], cursor: Timestamp}
 
 
 -- ============================================
@@ -614,7 +616,7 @@ removeForward = \mid srv -> atomic do
   forwards <- *forwards
   set *forwards = do
     x <- forwards
-    where x.messageId != mid || x.toServer != srv
+    where not (x.messageId == mid && x.toServer == srv)
     yield x
 
 retryForwardsForServer : [ForwardEntry] -> Int -> IO {network} {}
@@ -706,7 +708,7 @@ pollOnce = \token cursor -> do
     let auth = authenticateSession sessions token t
     case auth of
       Unauthorized {} ->
-        yield {events: [], cursor: -1, authorized: False {}}
+        yield PollUnauthorized {}
       Authorized {pubkey} -> do
         seqCounter <- *seqCounter
         messages <- *messages
@@ -723,16 +725,19 @@ pollOnce = \token cursor -> do
                             encryptedBlob: m.encryptedBlob,
                             timestamp: m.timestamp}}
         let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
-        yield {events: evts, cursor: lastReceivedAt, authorized: True {}}
+        yield PollDone {events: evts, cursor: lastReceivedAt}
 
 pollLoop = \token cursor deadline -> do
   result <- pollOnce token cursor
-  t <- now
-  if result.authorized && count result.events == 0 && t < deadline
-    then do
-      sleep (clamp 1 500 (deadline - t))
-      pollLoop token cursor deadline
-    else yield result
+  case result of
+    PollUnauthorized {} -> yield result
+    PollDone {events} -> do
+      t <- now
+      if count events == 0 && t < deadline
+        then do
+          sleep (clamp 1 500 (deadline - t))
+          pollLoop token cursor deadline
+        else yield result
 
 -- ============================================
 -- Request Handler
@@ -805,7 +810,9 @@ serve = \req -> case req of
     result <- pollLoop token cursor deadline
     tAfterPoll <- now
     maybePruneAndBroadcast tAfterPoll
-    yield (respond result)
+    yield (respond (case result of
+      PollUnauthorized {} -> {events: [], cursor: 0, authorized: False {}}
+      PollDone r -> {events: r.events, cursor: r.cursor, authorized: True {}}))
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
@@ -990,9 +997,9 @@ serve = \req -> case req of
           ackedIds <- *ackedIds
           if any messages (\m -> m.messageId == messageId && m.toKey == toKey)
             || any ackedIds (\a -> a.messageId == messageId && a.toKey == toKey)
-            then yield {pr: pr, ok: True {}}
+            then yield {pr: pr, forward: ForwardDuplicate {}}
             else if countMessagesFor messages toKey t >= maxMessagesPerRecipient
-              then yield {pr: pr, ok: False {}}
+              then yield {pr: pr, forward: ForwardFull {}}
               else do
                 seqCounter <- *seqCounter
                 let seqTs = nextSeqTs t seqCounter
@@ -1000,9 +1007,9 @@ serve = \req -> case req of
                 set *messages = union messages
                   [{messageId: messageId, toKey: toKey, fromKey: fromKey,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
-                yield {pr: pr, ok: True {}}
+                yield {pr: pr, forward: ForwardStored {}}
         forkBroadcastOffline t result.pr
-        yield (respond {ok: result.ok})
+        yield (respond {ok: case result.forward of ForwardFull {} -> False {}; _ -> True {}})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
