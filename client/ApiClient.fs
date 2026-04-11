@@ -29,39 +29,8 @@ module ApiClient =
     [<CLIMutable>]
     type PollEvent = { Id: string; EventType: EventType; Payload: EventPayload }
 
-    [<JsonConverter(typeof<MessageStatusConverter>)>]
-    type MessageStatus = Delivered | Federated | Queued | Rejected | Unauthorized | UnknownStatus of string
-    and private MessageStatusConverter() =
-        inherit JsonConverter<MessageStatus>()
-        override _.Read(reader, _, _) =
-            match reader.GetString() with
-            | "delivered" -> Delivered
-            | "federated" -> Federated
-            | "queued" -> Queued
-            | "rejected" -> Rejected
-            | "unauthorized" -> Unauthorized
-            | s -> UnknownStatus s
-        override _.Write(writer, value, _) =
-            writer.WriteStringValue(
-                match value with
-                | Delivered -> "delivered"
-                | Federated -> "federated"
-                | Queued -> "queued"
-                | Rejected -> "rejected"
-                | Unauthorized -> "unauthorized"
-                | UnknownStatus s -> s)
-
-    [<CLIMutable>]
-    type private SendResult = { Status: MessageStatus }
-
     [<CLIMutable>]
     type PollResponse = { Cursor: int64; Events: PollEvent array }
-
-    [<CLIMutable>]
-    type private ChallengeResponse = { challenge: string }
-
-    [<CLIMutable>]
-    type private VerifyResponse = { token: string }
 
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
@@ -105,26 +74,32 @@ module ApiClient =
             return JsonSerializer.Deserialize<'T>(text, jsonOpts)
         }
 
+    let private getString (text: string) (prop: string) =
+        use doc = JsonDocument.Parse(text)
+        doc.RootElement.GetProperty(prop).GetString()
+
     let authenticate (serverUrl: string) (identity: Crypto.Identity) =
         async {
             let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex |})
-            let! resp = postJson<ChallengeResponse> client $"{serverUrl}/auth/challenge" body None
-            let sigHex = Crypto.signChallenge identity.PrivKey resp.challenge
-            let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex; challenge = resp.challenge; signature = sigHex |})
-            let! resp = postJson<VerifyResponse> client $"{serverUrl}/auth/verify" body None
-            if String.IsNullOrEmpty(resp.token) then failwith "Authentication rejected by server"
-            return resp.token
+            let! text = sendRequest client $"{serverUrl}/auth/challenge" body None
+            let challenge = getString text "challenge"
+            let sigHex = Crypto.signChallenge identity.PrivKey challenge
+            let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex; challenge = challenge; signature = sigHex |})
+            let! text = sendRequest client $"{serverUrl}/auth/verify" body None
+            let token = getString text "token"
+            if String.IsNullOrEmpty(token) then failwith "Authentication rejected by server"
+            return token
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
         let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
         async {
-            let! result = postJson<SendResult> client $"{serverUrl}/messages" body (Some token)
-            match result.Status with
-            | Delivered | Federated | Queued -> ()
-            | Rejected -> failwith "Message rejected by server"
-            | Unauthorized -> failwith "Not authorized to deliver message"
-            | UnknownStatus s -> failwith $"Unexpected status: {s}"
+            let! text = sendRequest client $"{serverUrl}/messages" body (Some token)
+            match getString text "status" with
+            | "delivered" | "federated" | "queued" -> ()
+            | "rejected" -> failwith "Message rejected by server"
+            | "unauthorized" -> failwith "Not authorized to deliver message"
+            | s -> failwith $"Unexpected status: {s}"
         }
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =
