@@ -43,6 +43,8 @@ offlineGossipMinTtl : Int<S>
 offlineGossipMinTtl = 60 -- minimum TTL for offline gossip events
 maxForwardRetriesPerServer = 100
 federationEnabled = federationSecret != ""
+federationAuth = "Bearer " ++ federationSecret
+federationUrl = \server -> federationScheme ++ server
 
 -- ============================================
 -- Types
@@ -84,10 +86,11 @@ impl ToJSON MessageStatus where
     MsUnauthorized {} -> "unauthorized"
     MsRejected {} -> "rejected")
 
-type PubkeyHex = Text where \s -> isValidHex s && not (tooLong s maxPubkeyLen) && s == normalizeHex s
-type BlobHex = Text where \s -> isValidHex s && not (tooLong s maxBlobLen) && s == normalizeHex s
-type SignatureHex = Text where \s -> isValidHex s && not (tooLong s maxSignatureLen) && s == normalizeHex s
-isValidMessageId = \s -> isValidHex s && not (tooLong s maxMessageIdLen) && s == normalizeHex s
+isValidBoundedHex = \maxLen s -> isValidHex s && not (tooLong s maxLen) && s == normalizeHex s
+type PubkeyHex = Text where isValidBoundedHex maxPubkeyLen
+type BlobHex = Text where isValidBoundedHex maxBlobLen
+type SignatureHex = Text where isValidBoundedHex maxSignatureLen
+isValidMessageId = isValidBoundedHex maxMessageIdLen
 type MessageIdHex = Text where isValidMessageId
 type OptionalMessageId = Text where \s -> s == "" || isValidMessageId s
 isValidServerName = \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
@@ -235,44 +238,30 @@ isAllowedServerChar = \c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:"
 containsBadUrlChar = \s -> any (chars s) (\c -> not (isAllowedServerChar c))
 
 isCgnatRange = \s ->
-  if take 4 s != "100." then False {}
-  else let d4 = take 1 (drop 4 s) in
+  take 4 s == "100."
+  && let d4 = take 1 (drop 4 s) in
   let d5 = take 1 (drop 5 s) in
   let d6 = take 1 (drop 6 s) in
   let d7 = take 1 (drop 7 s) in
-  if contains d4 "789" && isDigitChar d5 && d6 == "."
-    && isAllDigitsOrDotsUntilColonOrEnd (drop 7 s)
-    then True {}
-  else if d4 == "6" && contains d5 "456789" && d6 == "."
-    && isAllDigitsOrDotsUntilColonOrEnd (drop 7 s)
-    then True {}
-  else if d4 == "1" && contains d5 "01" && isDigitChar d6 && d7 == "."
-    && isAllDigitsOrDotsUntilColonOrEnd (drop 8 s)
-    then True {}
-  else if d4 == "1" && d5 == "2" && contains d6 "01234567" && d7 == "."
-    && isAllDigitsOrDotsUntilColonOrEnd (drop 8 s)
-    then True {}
-  else False {}
+  let twoDigitOctet = d6 == "." && isAllDigitsOrDotsUntilColonOrEnd (drop 7 s) in
+  let threeDigitOctet = d7 == "." && isAllDigitsOrDotsUntilColonOrEnd (drop 8 s) in
+  ((contains d4 "789" && isDigitChar d5 && twoDigitOctet)
+  || (d4 == "6" && contains d5 "456789" && twoDigitOctet)
+  || (d4 == "1" && contains d5 "01" && isDigitChar d6 && threeDigitOctet)
+  || (d4 == "1" && d5 == "2" && contains d6 "01234567" && threeDigitOctet))
 
 containsMultipleColons = \s -> count (do c <- chars s; where c == ":"; yield c) > 1
 
-hasOctalOctet = \s ->
-  if take 1 s == "0" && isDigitChar (take 1 (drop 1 s)) && isAllDigitsOrDotsUntilColonOrEnd (drop 2 s) then True {}
-  else hasOctalOctetAfterDot s
-
-hasOctalOctetAfterDot = \s ->
+hasPatternAfterDot = \pred s ->
   if s == "" then False {}
-  else if take 1 s == "." && take 1 (drop 1 s) == "0" && isDigitChar (take 1 (drop 2 s)) && isAllDigitsOrDotsUntilColonOrEnd (drop 3 s) then True {}
-  else hasOctalOctetAfterDot (drop 1 s)
+  else if take 1 s == "." && pred (drop 1 s) then True {}
+  else hasPatternAfterDot pred (drop 1 s)
 
-hasHexPrefix = \s ->
-  if take 2 s == "0x" || take 2 s == "0X" then True {}
-  else hasHexPrefixAfterDot s
+isOctalStart = \s -> take 1 s == "0" && isDigitChar (take 1 (drop 1 s)) && isAllDigitsOrDotsUntilColonOrEnd (drop 2 s)
+hasOctalOctet = \s -> isOctalStart s || hasPatternAfterDot isOctalStart s
 
-hasHexPrefixAfterDot = \s ->
-  if s == "" then False {}
-  else if take 1 s == "." && (take 2 (drop 1 s) == "0x" || take 2 (drop 1 s) == "0X") then True {}
-  else hasHexPrefixAfterDot (drop 1 s)
+isHexStart = \s -> take 2 s == "0x" || take 2 s == "0X"
+hasHexPrefix = \s -> isHexStart s || hasPatternAfterDot isHexStart s
 
 isAllDigitsOrDotsUntilColonOrEnd = \s ->
   if s == "" then True {}
@@ -324,18 +313,18 @@ matchesHostname = \sn name ->
   let nameLen = count (chars name) in
   take nameLen sn == name && (drop nameLen sn == "" || take 1 (drop nameLen sn) == ":")
 
+matchesHostnameOrSubdomain = \sn name ->
+  matchesHostname sn name || containsSuffix ("." ++ name) sn
+
 isBadServerName = \sn ->
   sn == ""
   || take 1 sn == "."
   || take 1 sn == ":"
   || containsBadUrlChar sn
-  || matchesHostname sn "localhost"
+  || matchesHostnameOrSubdomain sn "localhost"
   || matchesHostname sn "localhost.localdomain"
-  || containsSuffix ".localhost" sn
-  || matchesHostname sn "local"
-  || containsSuffix ".local" sn
-  || matchesHostname sn "internal"
-  || containsSuffix ".internal" sn
+  || matchesHostnameOrSubdomain sn "local"
+  || matchesHostnameOrSubdomain sn "internal"
   || matchesHostname sn "metadata"
   || take 4 sn == "127." || take 3 sn == "10."
   || take 8 sn == "192.168." || take 8 sn == "169.254."
@@ -594,8 +583,8 @@ forEachBatch = \items batchSize process ->
 sendBatchedGossipToServer : ServerName -> [GossipEvent] -> Int -> IO {network} {}
 sendBatchedGossipToServer = \server allEvents hops ->
   forEachBatch allEvents maxGossipEvents (\batch -> do
-    _ <- fetch (federationScheme ++ server) (RecvGossip {
-      authorization: "Bearer " ++ federationSecret,
+    _ <- fetch (federationUrl server) (RecvGossip {
+      authorization: federationAuth,
       events: batch, hopsRemaining: hops, fromServer: serverHostN})
     yield {})
 
@@ -637,10 +626,10 @@ retryForwardsForServer = \entries remaining ->
       Nothing {} -> yield {}
       Just {value: f} -> do
         let rest = do x <- entries; where x.messageId != f.messageId; yield x
-        result <- fetch (federationScheme ++ f.toServer) (ForwardMessage {
+        result <- fetch (federationUrl f.toServer) (ForwardMessage {
           toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob,
           timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
-          authorization: "Bearer " ++ federationSecret})
+          authorization: federationAuth})
         whenOk result (removeForward f.messageId f.toServer)
         retryForwardsForServer rest (remaining - 1)
 
@@ -654,8 +643,8 @@ retryPendingForwards = \pending -> do
 sendBatchedAcksToServer : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> ServerName -> IO {network} {}
 sendBatchedAcksToServer = \serverAcks server ->
   forEachBatch serverAcks maxMessageIds (\batch -> do
-    result <- fetch (federationScheme ++ server) (FederationAck {
-      authorization: "Bearer " ++ federationSecret,
+    result <- fetch (federationUrl server) (FederationAck {
+      authorization: federationAuth,
       messageIds: (do a <- batch; yield a.messageId),
       originServer: server, fromServer: serverHostN})
     whenOk result (atomic do
@@ -679,8 +668,8 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
   in do
     let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
     sendToEach evictedOriginServers (\server -> do
-      fetchResult <- fetch (federationScheme ++ server) (FederationAck {
-        authorization: "Bearer " ++ federationSecret,
+      fetchResult <- fetch (federationUrl server) (FederationAck {
+        authorization: federationAuth,
         messageIds: (do a <- evictedToRetry; where a.originServer == server; yield a.messageId),
         originServer: server, fromServer: serverHostN})
       case fetchResult of
@@ -737,6 +726,7 @@ pollOnce = \token cursor -> do
         let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
         yield PollDone {events: evts, cursor: lastReceivedAt}
 
+pollLoop : Text -> Int -> Int<Ms> -> IO {clock} PollResult
 pollLoop = \token cursor deadline -> do
   result <- pollOnce token cursor
   case result of
@@ -864,15 +854,16 @@ serve = \req -> case req of
         SendDone {status, remoteServers, fromKey} ->
           when (count remoteServers > 0 && federationEnabled) (do
             sendToEach remoteServers (\server -> do
-              fwdResult <- fetch (federationScheme ++ server) (ForwardMessage {
+              fwdResult <- fetch (federationUrl server) (ForwardMessage {
                 toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob,
                 timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
-                authorization: "Bearer " ++ federationSecret})
+                authorization: federationAuth})
               whenOk fwdResult (removeForward msgId server))
             case status of
               MsQueued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
               _ -> yield {})
-        _ -> yield {}
+        SendUnauthorized {} -> yield {}
+        SendRejected {} -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
       SendUnauthorized {} -> respond {status: MsUnauthorized {}, messageId: ""}
@@ -912,9 +903,9 @@ serve = \req -> case req of
           when federationEnabled (do
             sendAcksAndClean pendingAcks
             retryEvictedAcks evictedEntries pendingAcks)
-        _ -> yield {}
+        AckUnauthorized {} -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
-    yield (respond {ok: case result.ack of AckDone _ -> True {}; _ -> False {}})
+    yield (respond {ok: case result.ack of AckDone _ -> True {}; AckUnauthorized {} -> False {}})
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
@@ -990,8 +981,7 @@ serve = \req -> case req of
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
     t <- now
     let authorized = verifyFederationAuth authorization
-    let validOrigin = originServer != serverHostN
-    if not authorized || not validOrigin
+    if not authorized || originServer == serverHostN
       then rejectFederation t respond
       else do
         let clampedTs = clampTimestamp timestamp t
@@ -1013,7 +1003,7 @@ serve = \req -> case req of
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, origin: FederatedOrigin {server: originServer}, receivedAt: seqTs}]
                 yield {pr: pr, forward: ForwardStored {}}
         forkBroadcastOffline t result.pr
-        yield (respond {ok: case result.forward of ForwardFull {} -> False {}; _ -> True {}})
+        yield (respond {ok: case result.forward of ForwardDuplicate {} -> True {}; ForwardStored {} -> True {}; ForwardFull {} -> False {}})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now

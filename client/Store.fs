@@ -58,6 +58,8 @@ module Store =
           Bio: string
           PhotoBase64: string }
 
+    let private orEmpty s = s |> Option.ofObj |> Option.defaultValue ""
+
     let private toChatMessage (d: MessageDoc) : ChatMessage =
         { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix; IsOutgoing = d.IsOutgoing
           Status = match d.Status with 1 -> DeliveryStatus.Delivered | _ -> DeliveryStatus.Sent }
@@ -91,9 +93,9 @@ module Store =
             db.GetCollection<ProfileDoc>("profile").FindById(BsonValue "me")
             |> Option.ofObj
             |> Option.map (fun p ->
-                { DisplayName = p.DisplayName |> Option.ofObj |> Option.defaultValue ""
-                  Bio = p.Bio |> Option.ofObj |> Option.defaultValue ""
-                  PhotoBase64 = p.PhotoBase64 |> Option.ofObj |> Option.defaultValue "" })
+                { DisplayName = orEmpty p.DisplayName
+                  Bio = orEmpty p.Bio
+                  PhotoBase64 = orEmpty p.PhotoBase64 })
         with _ -> None
 
     let saveProfile (profile: Profile) =
@@ -119,9 +121,9 @@ module Store =
                     db.GetCollection<Contact>("contacts").FindAll()
                     |> Seq.map (fun c ->
                         { c with
-                            DisplayName = c.DisplayName |> Option.ofObj |> Option.defaultValue ""
-                            Bio = c.Bio |> Option.ofObj |> Option.defaultValue ""
-                            PhotoBase64 = c.PhotoBase64 |> Option.ofObj |> Option.defaultValue "" })
+                            DisplayName = orEmpty c.DisplayName
+                            Bio = orEmpty c.Bio
+                            PhotoBase64 = orEmpty c.PhotoBase64 })
                     |> Seq.map (fun c -> c.Pubkey, c)
                     |> Map.ofSeq
 

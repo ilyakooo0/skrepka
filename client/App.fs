@@ -40,7 +40,7 @@ module App =
     type DecryptedEvent =
         | IncomingChat of senderPubkey: string * message: ChatMessage
         | IncomingDeliveryAck of senderPubkey: string * ackIds: string list
-        | IncomingProfile of senderPubkey: string * displayName: string * bio: string * photo: string
+        | IncomingProfile of senderPubkey: string * profile: Profile
 
     type PollReceived = { Events: int; Messages: int; Errors: int; FirstError: string option }
 
@@ -149,15 +149,27 @@ module App =
         else Map.add pk (existing @ [ msg ]) messages
 
     let private markDelivered (pk: string) (ackIds: string list) (messages: Map<string, ChatMessage list>) =
-        match Map.tryFind pk messages with
-        | Some msgs ->
-            msgs
-            |> List.map (fun m -> if m.IsOutgoing && List.contains m.Id ackIds then { m with Status = DeliveryStatus.Delivered } else m)
-            |> fun updated -> Map.add pk updated messages
-        | None -> messages
+        let ackSet = Set.ofList ackIds
+        messages |> Map.change pk (Option.map (List.map (fun m ->
+            if m.IsOutgoing && Set.contains m.Id ackSet then { m with Status = DeliveryStatus.Delivered } else m)))
 
     let private newContact pubkey nickname : Contact =
         { Pubkey = pubkey; Nickname = nickname; DisplayName = ""; Bio = ""; PhotoBase64 = "" }
+
+    let private withProfile (p: Profile) (c: Contact) =
+        { c with DisplayName = p.DisplayName; Bio = p.Bio; PhotoBase64 = p.PhotoBase64 }
+
+    let private applyEvent (m: Model) = function
+        | IncomingChat(senderPubkey, message) ->
+            { m with
+                Contacts =
+                    if Map.containsKey senderPubkey m.Contacts then m.Contacts
+                    else Map.add senderPubkey (newContact senderPubkey (truncKey senderPubkey)) m.Contacts
+                Messages = m.Messages |> appendMessage senderPubkey message }
+        | IncomingDeliveryAck(senderPubkey, ackIds) ->
+            { m with Messages = m.Messages |> markDelivered senderPubkey ackIds }
+        | IncomingProfile(senderPubkey, profile) ->
+            { m with Contacts = m.Contacts |> Map.change senderPubkey (Option.map (withProfile profile)) }
 
     let private trySession model =
         match model.Auth with
@@ -265,25 +277,7 @@ module App =
         | SendOk -> model, []
 
         | PollResult(events, status, newCursor) ->
-            let model' =
-                events
-                |> List.fold
-                    (fun (m: Model) evt ->
-                        match evt with
-                        | IncomingChat(senderPubkey, message) ->
-                            { m with
-                                Contacts =
-                                    if Map.containsKey senderPubkey m.Contacts then m.Contacts
-                                    else Map.add senderPubkey (newContact senderPubkey (truncKey senderPubkey)) m.Contacts
-                                Messages = m.Messages |> appendMessage senderPubkey message }
-                        | IncomingDeliveryAck(senderPubkey, ackIds) ->
-                            { m with Messages = m.Messages |> markDelivered senderPubkey ackIds }
-                        | IncomingProfile(senderPubkey, displayName, bio, photo) ->
-                            { m with
-                                Contacts =
-                                    m.Contacts |> Map.change senderPubkey (Option.map (fun c ->
-                                        { c with DisplayName = displayName; Bio = bio; PhotoBase64 = photo })) })
-                    { model with PollStatus = status; PollCursor = newCursor }
+            let model' = events |> List.fold applyEvent { model with PollStatus = status; PollCursor = newCursor }
 
             model',
             [ match trySession model' with
@@ -374,15 +368,15 @@ module App =
     type private Envelope =
         | TextMessage of id: string * body: string
         | DeliveryAck of id: string * ackIds: string list
-        | ProfileMessage of id: string * displayName: string * bio: string * photo: string
+        | ProfileMessage of id: string * profile: Profile
 
     let private serializeEnvelope = function
         | TextMessage(id, body) ->
             JsonSerializer.Serialize({| ``type`` = "text"; id = id; body = body |})
         | DeliveryAck(id, ackIds) ->
             JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = id; ack_ids = ackIds |})
-        | ProfileMessage(id, displayName, bio, photo) ->
-            JsonSerializer.Serialize({| ``type`` = "profile"; id = id; timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = displayName; bio = bio; photo = photo |})
+        | ProfileMessage(id, profile) ->
+            JsonSerializer.Serialize({| ``type`` = "profile"; id = id; timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = profile.DisplayName; bio = profile.Bio; photo = profile.PhotoBase64 |})
 
     let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
         async {
@@ -410,7 +404,7 @@ module App =
             let displayName = root.GetProperty("display_name").GetString()
             let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
             let photo = tryGetJsonString root "photo" |> Option.defaultValue ""
-            Some(ProfileMessage(root.GetProperty("id").GetString(), displayName, bio, photo))
+            Some(ProfileMessage(root.GetProperty("id").GetString(), { DisplayName = displayName; Bio = bio; PhotoBase64 = photo }))
         | _ -> None
 
     let private decryptEvent (privKey: byte[]) (payload: EventPayload) =
@@ -428,8 +422,8 @@ module App =
                           Status = DeliveryStatus.Delivered }))
                 | Some(DeliveryAck(_, ackIds)) ->
                     Ok(IncomingDeliveryAck(senderHex, ackIds))
-                | Some(ProfileMessage(_, displayName, bio, photo)) ->
-                    Ok(IncomingProfile(senderHex, displayName, bio, photo))
+                | Some(ProfileMessage(_, profile)) ->
+                    Ok(IncomingProfile(senderHex, profile))
                 | None -> Error "unknown envelope type"
             | None -> Error "decrypt failed"
         with ex ->
@@ -548,7 +542,7 @@ module App =
             Cmd.ofEffect (fun _ ->
                 async {
                     for recipientHex in recipientHexes do
-                        try do! sendEnvelope session recipientHex (ProfileMessage(Guid.NewGuid().ToString(), profile.DisplayName, profile.Bio, profile.PhotoBase64)) |> Async.Ignore
+                        try do! sendEnvelope session recipientHex (ProfileMessage(Guid.NewGuid().ToString(), profile)) |> Async.Ignore
                         with _ -> ()
                 } |> Async.Start)
 
