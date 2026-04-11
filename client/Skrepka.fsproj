@@ -54,6 +54,10 @@
     <None Include="$(MacCatalystProjectFolder)Info.plist" LogicalName="Info.plist" />
     <Compile Include="$(MacCatalystProjectFolder)AppDelegate.fs" />
     <Compile Include="$(MacCatalystProjectFolder)Program.fs" />
+    <NativeReference Include="native/maccatalyst-arm64/libsodium.a">
+      <Kind>Static</Kind>
+      <ForceLoad>true</ForceLoad>
+    </NativeReference>
   </ItemGroup>
 
   <ItemGroup>

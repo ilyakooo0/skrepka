@@ -61,11 +61,11 @@ module Store =
     let private orEmpty s = s |> Option.ofObj |> Option.defaultValue ""
 
     let private toChatMessage (d: MessageDoc) : ChatMessage =
-        { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeSeconds d.TimestampUnix; IsOutgoing = d.IsOutgoing
+        { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeMilliseconds d.TimestampUnix; IsOutgoing = d.IsOutgoing
           Status = match d.Status with 1 -> DeliveryStatus.Delivered | _ -> DeliveryStatus.Sent }
 
     let private toMessageDoc convId (m: ChatMessage) : MessageDoc =
-        { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeSeconds(); IsOutgoing = m.IsOutgoing
+        { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds(); IsOutgoing = m.IsOutgoing
           Status = match m.Status with DeliveryStatus.Delivered -> 1 | DeliveryStatus.Sent -> 0 }
 
     let private openDb () =
@@ -73,9 +73,11 @@ module Store =
 
     let loadIdentity () =
         async {
-            let! privKeyB64 =
-                SecureStorage.Default.GetAsync("identity_privkey")
-                |> Async.AwaitTask
+            let privKeyB64 =
+                try
+                    SecureStorage.Default.GetAsync("identity_privkey").Result
+                with _ ->
+                    Preferences.Default.Get<string>("identity_privkey", null)
 
             return
                 privKeyB64
@@ -84,8 +86,13 @@ module Store =
         }
 
     let saveIdentity (identity: Crypto.Identity) =
-        SecureStorage.Default.SetAsync("identity_privkey", Convert.ToBase64String identity.PrivKey)
-        |> Async.AwaitTask
+        async {
+            let b64 = Convert.ToBase64String identity.PrivKey
+            try
+                do! SecureStorage.Default.SetAsync("identity_privkey", b64) |> Async.AwaitTask
+            with _ ->
+                Preferences.Default.Set("identity_privkey", b64)
+        }
 
     let loadProfile () : Profile option =
         try

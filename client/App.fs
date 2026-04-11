@@ -81,7 +81,7 @@ module App =
         | SendFailed of string
         | SendOk
         | DoSaveContact
-        | PollResult of events: IncomingEvent list * status: PollStatus * cursor: int64
+        | PollResult of events: IncomingEvent list * ackIds: string list * status: PollStatus * cursor: int64
         | CopyPubKey
         | DismissError
         | StateLoaded of StateLoadResult
@@ -95,6 +95,7 @@ module App =
         | CmdConnect of url: string * identity: Identity
         | CmdSend of session: Session * recipientHex: string * text: string * messageId: string
         | CmdPoll of session: Session * cursor: int64
+        | CmdAckAndDeliver of session: Session * ackIds: string list * events: IncomingEvent list
         | CmdCopyToClipboard of string
         | CmdLoadState
         | CmdSaveIdentity of Identity
@@ -154,7 +155,7 @@ module App =
         match evt.Envelope with
         | Envelope.TextMessage(id, body) ->
             let message =
-                { Id = id; Body = body; Timestamp = DateTimeOffset.FromUnixTimeSeconds(evt.Timestamp)
+                { Id = id; Body = body; Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(evt.Timestamp)
                   IsOutgoing = false; Status = DeliveryStatus.Delivered }
             { m with
                 Contacts =
@@ -221,7 +222,7 @@ module App =
             match model.Auth with
             | Identified(id, Connecting) ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
-                { model with Auth = Identified(id, Online token); Page = Conversations; Error = None },
+                { model with Auth = Identified(id, Online token); Page = Conversations; Error = None; PollStatus = Polling },
                 [ CmdPoll(session, model.PollCursor) ]
             | _ -> model, []
 
@@ -258,12 +259,15 @@ module App =
         | SendFailed err -> { model with Error = Some err }, []
         | SendOk -> model, []
 
-        | PollResult(events, status, newCursor) ->
+        | PollResult(events, ackIds, status, newCursor) ->
             let model' = events |> List.fold applyEvent { model with PollStatus = status; PollCursor = newCursor }
 
             model',
             [ match trySession model' with
-              | Some session -> CmdPoll(session, model'.PollCursor)
+              | Some session ->
+                  if not ackIds.IsEmpty || not events.IsEmpty then
+                      CmdAckAndDeliver(session, ackIds, events)
+                  CmdPoll(session, model'.PollCursor)
               | None -> ()
               if not events.IsEmpty then saveCmdMsg model' ]
 
@@ -329,6 +333,8 @@ module App =
 
     // ── mapCmd ──
 
+    let private log msg = eprintfn $"[skrepka] {msg}"
+
     let private asyncCmd (op: Async<Msg>) : Cmd<Msg> =
         Cmd.ofEffect (fun dispatch ->
             async {
@@ -343,13 +349,13 @@ module App =
         | Envelope.DeliveryAck ackIds ->
             JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = Guid.NewGuid().ToString(); ack_ids = ackIds |})
         | Envelope.ProfileMessage profile ->
-            JsonSerializer.Serialize({| ``type`` = "profile"; id = Guid.NewGuid().ToString(); timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = profile.DisplayName; bio = profile.Bio; photo = profile.PhotoBase64 |})
+            JsonSerializer.Serialize({| ``type`` = "profile"; id = Guid.NewGuid().ToString(); timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); display_name = profile.DisplayName; bio = profile.Bio; photo = profile.PhotoBase64 |})
 
     let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
         async {
             let payload = serializeEnvelope envelope
             let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload
-            let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
             do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
         }
 
@@ -421,8 +427,11 @@ module App =
 
         | CmdPoll(session, cursor) ->
             asyncCmd (async {
+                log $"poll start cursor={cursor}"
                 try
                     let! response = poll session.Url session.Token cursor
+                    log $"poll response: {response.Events.Length} events, cursor={response.Cursor}"
+
                     let ackIds = response.Events |> Array.map _.Id |> Array.toList
 
                     let results =
@@ -430,29 +439,39 @@ module App =
                         |> Array.choose (fun evt ->
                             match evt.EventType with
                             | Message -> Some(decryptEvent session.Identity.PrivKey evt.Payload)
-                            | UnknownEvent _ -> None)
+                            | UnknownEvent s -> log $"unknown event type: {s}"; None)
 
                     let events = results |> Array.choose Result.toOption |> Array.toList
                     let errors = results |> Array.choose (function Error e -> Some e | _ -> None) |> Array.toList
 
-                    if not ackIds.IsEmpty then
-                        try do! ackMessages session.Url session.Token ackIds
-                        with _ -> ()
+                    for e in errors do log $"decrypt error: {e}"
 
-                    do! sendDeliveryAcks session events
+                    if response.Events.Length = 0 then
+                        do! Async.Sleep 5000
 
                     let chatCount = events |> List.sumBy (fun e -> match e.Envelope with Envelope.TextMessage _ -> 1 | _ -> 0)
                     let status =
                         $"evts:{response.Events.Length} msgs:{chatCount} errs:{errors.Length}"
                         + (match List.tryHead errors with Some e -> $" [{e}]" | None -> "")
-                    return PollResult(events, Received status, response.Cursor)
+                    return PollResult(events, ackIds, Received status, response.Cursor)
                 with
                 | :? TimeoutException ->
-                    return PollResult([], Polling, cursor)
+                    log "poll timeout"
+                    return PollResult([], [], Polling, cursor)
                 | ex ->
+                    log $"poll error: {ex.Message}"
                     do! Async.Sleep 3000
-                    return PollResult([], PollError ex.Message, cursor)
+                    return PollResult([], [], PollError ex.Message, cursor)
             })
+
+        | CmdAckAndDeliver(session, ackIds, events) ->
+            Cmd.ofEffect (fun _ ->
+                async {
+                    if not ackIds.IsEmpty then
+                        try do! ackMessages session.Url session.Token ackIds
+                        with _ -> ()
+                    do! sendDeliveryAcks session events
+                } |> Async.Start)
 
         | CmdCopyToClipboard text ->
             Cmd.ofEffect (fun _ ->
@@ -594,7 +613,8 @@ module App =
                         Button("Settings", SetPage Settings)
                     }
 
-                    Label($"{connStatusLabel model.Auth} | {formatPollStatus model.PollStatus}")
+                    let pubPrefix = match model.Auth with Identified(id, _) -> id.PubKeyHex.[..7] | _ -> "?"
+                    Label($"{connStatusLabel model.Auth} [{pubPrefix}] | {formatPollStatus model.PollStatus}")
                         .font(size = 10.)
                         .textColor(Colors.DimGray)
 
