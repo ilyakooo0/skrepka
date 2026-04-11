@@ -115,7 +115,14 @@ module Store =
             settings
             |> Option.ofObj
             |> Option.map (fun settings ->
-                let contacts = db.GetCollection<Contact>("contacts").FindAll() |> Seq.toList
+                let contacts =
+                    db.GetCollection<Contact>("contacts").FindAll()
+                    |> Seq.map (fun c ->
+                        { c with
+                            DisplayName = c.DisplayName |> Option.ofObj |> Option.defaultValue ""
+                            Bio = c.Bio |> Option.ofObj |> Option.defaultValue ""
+                            PhotoBase64 = c.PhotoBase64 |> Option.ofObj |> Option.defaultValue "" })
+                    |> Seq.toList
 
                 let messages =
                     db.GetCollection<MessageDoc>("messages").FindAll()

@@ -50,7 +50,7 @@ federationEnabled = federationSecret != ""
 
 type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
-type GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
+data GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
 
 impl ToJSON GossipEventType where
   toJson et = toJson (case et of
@@ -73,7 +73,7 @@ type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: Serve
 
 type ValidGossipEntry = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
-type MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {}
+data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {}
 
 messageStatusText = \ms -> case ms of
   MsDelivered {} -> "delivered"
@@ -91,7 +91,7 @@ type MessageIdHex = Text where isValidMessageId
 type OptionalMessageId = Text where \s -> s == "" || isValidMessageId s
 isValidServerName = \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
 type ServerName = Text where isValidServerName
-type MessageOrigin = LocalOrigin {} | FederatedOrigin {server: ServerName}
+data MessageOrigin = LocalOrigin {} | FederatedOrigin {server: ServerName}
 type AnyServerName = Text where \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s
 
 type Timestamp = Int<Ms>
@@ -102,13 +102,13 @@ type Message = {messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, e
 type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Timestamp, timestamp: Timestamp}
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
-type AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
-type SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
-type VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
-type AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
-type LookupResult = LookupUnauthorized {} | LookupDone {server: AnyServerName}
-type ForwardResult = ForwardDuplicate {} | ForwardStored {} | ForwardFull {}
-type PollResult = PollUnauthorized {} | PollDone {events: [PollEvent], cursor: Timestamp}
+data AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
+data SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
+data VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
+data AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
+data LookupResult = LookupUnauthorized {} | LookupDone {server: AnyServerName}
+data ForwardResult = ForwardDuplicate {} | ForwardStored {} | ForwardFull {}
+data PollResult = PollUnauthorized {} | PollDone {events: [PollEvent], cursor: Timestamp}
 
 
 -- ============================================
@@ -386,9 +386,6 @@ clampTimestamp = \timestamp t -> clamp (t - messageMaxAge) t timestamp
 
 nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
 
-isFederatedOrigin = \origin -> case origin of FederatedOrigin _ -> True {}; _ -> False {}
-originServerName = \origin -> case origin of FederatedOrigin {server} -> server; LocalOrigin {} -> ""
-
 takeN = \items n -> (fold (\acc e -> if acc.n >= n then acc else {n: acc.n + 1, items: union acc.items [e]}) {n: 0, items: []} items).items
 
 dedupMessageIds = \messageIds ->
@@ -407,7 +404,8 @@ boundedSmallest = \items n getKey ->
         if newSize > acc.size
           then {size: newSize, heap: newHeap, heapMax: Just {value: case acc.heapMax of
             Nothing {} -> k
-            Just {value: v} -> max k v}}
+            Just {value: v} -> max k v
+          }}
           else acc
       else case acc.heapMax of
         Nothing {} -> acc
@@ -421,7 +419,8 @@ boundedSmallest = \items n getKey ->
               let newHeap = union removed.items [a] in
               let newMax = fold (\best x -> Just {value: case best of
                 Nothing {} -> getKey x
-                Just {value: v} -> max (getKey x) v}) Nothing {} newHeap in
+                Just {value: v} -> max (getKey x) v
+              }) Nothing {} newHeap in
               {size: acc.size, heap: newHeap, heapMax: newMax}
             else acc) {size: 0, heap: [], heapMax: Nothing {}} items).heap
 
@@ -440,7 +439,8 @@ safeCompare = \a b ->
 evictOneOldest = \items getKey ->
   let oldest = fold (\acc x -> let k = getKey x in Just {value: case acc of
     Nothing {} -> k
-    Just {value: v} -> min k v}) Nothing {} items in
+    Just {value: v} -> min k v
+  }) Nothing {} items in
   case oldest of
     Nothing {} -> items
     Just {value: oldestKey} ->
@@ -662,8 +662,9 @@ sendBatchedAcksToServer = \serverAcks server ->
         where not (a.originServer == server && any batch (\sa -> sa.messageId == a.messageId && sa.toKey == a.toKey))
         yield a))
 
-sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> [ServerName] -> IO {network} {}
-sendAcksAndClean = \pendingAcks servers ->
+sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> IO {network} {}
+sendAcksAndClean = \pendingAcks ->
+  let servers = collectPeerServers pendingAcks (\a -> a.originServer) in
   sendToEach servers (\server ->
     sendBatchedAcksToServer (do a <- pendingAcks; where a.originServer == server; yield a) server)
 
@@ -692,7 +693,7 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
             yield excess
           when (dropped > 0)
             (println ("ackMessages: ackedIds at capacity (" ++ show maxAckedIds ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server))
-        _ -> yield {})
+        Ok _ -> yield {})
 
 pruneAndRetry = \t -> do
   result <- atomic do
@@ -705,8 +706,7 @@ pruneAndRetry = \t -> do
   broadcastOfflineGossip t result.peerServers result.expiredLocal
   when federationEnabled (do
     retryPendingForwards result.pendingForwards
-    let ackOriginServers = collectPeerServers result.pendingAcks (\a -> a.originServer)
-    sendAcksAndClean result.pendingAcks ackOriginServers)
+    sendAcksAndClean result.pendingAcks)
 
 pollOnce = \token cursor -> do
   t <- now
@@ -892,10 +892,9 @@ serve = \req -> case req of
             where m.toKey == pubkey && any dedupedIds (\mid -> m.messageId == mid)
             yield m
           set *messages = diff messages ackedMessages
-          let ackedFederated = do
-            m <- ackedMessages
-            where isFederatedOrigin m.origin
-            yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: originServerName m.origin}
+          let ackedFederated = fold (\acc m -> case m.origin of
+            FederatedOrigin {server} -> union acc [{messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: server}]
+            LocalOrigin {} -> acc) [] ackedMessages
           ackedIds <- *ackedIds
           let combinedAckedIds = union ackedIds ackedFederated
           let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
@@ -906,8 +905,7 @@ serve = \req -> case req of
       case result.ack of
         AckDone {pendingAcks, evictedEntries} ->
           when federationEnabled (do
-            let originServers = collectPeerServers pendingAcks (\a -> a.originServer)
-            sendAcksAndClean pendingAcks originServers
+            sendAcksAndClean pendingAcks
             retryEvictedAcks evictedEntries pendingAcks)
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)

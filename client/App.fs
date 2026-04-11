@@ -37,10 +37,8 @@ module App =
         | NoIdentity
         | Identified of identity: Identity * conn: ConnStatus
 
-    type IncomingMessage = { SenderPubkey: string; Message: ChatMessage }
-
     type DecryptedEvent =
-        | IncomingChat of IncomingMessage
+        | IncomingChat of senderPubkey: string * message: ChatMessage
         | IncomingDeliveryAck of senderPubkey: string * ackIds: string list
         | IncomingProfile of senderPubkey: string * displayName: string * bio: string * photo: string option
 
@@ -138,8 +136,8 @@ module App =
         |> List.tryFind (fun c -> c.Pubkey = pk)
         |> Option.map (fun c ->
             if c.Nickname <> fallback then c.Nickname
-            elif not (String.IsNullOrEmpty c.DisplayName) then c.DisplayName
-            else c.Nickname)
+            elif c.DisplayName <> "" then c.DisplayName
+            else fallback)
         |> Option.defaultValue fallback
 
     let private messagesFor (pk: string) (messages: Map<string, ChatMessage list>) =
@@ -261,13 +259,12 @@ module App =
                         Page = Chat(pk, "")
                         Messages = model.Messages |> appendMessage pk outMsg }
 
-                let cmds = [ CmdSend(session, pk, compose, id); saveCmdMsg model' ]
-                let cmds =
-                    match model.Profile, isFirstInteraction with
-                    | Some profile, true -> cmds @ [ CmdSendProfileToAll(session, profile, [ pk ]) ]
-                    | _ -> cmds
-
-                model', cmds
+                model',
+                [ CmdSend(session, pk, compose, id)
+                  saveCmdMsg model'
+                  match model.Profile, isFirstInteraction with
+                  | Some profile, true -> CmdSendProfileToAll(session, profile, [ pk ])
+                  | _ -> () ]
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
@@ -279,10 +276,10 @@ module App =
                 |> List.fold
                     (fun (m: Model) evt ->
                         match evt with
-                        | IncomingChat msg ->
+                        | IncomingChat(senderPubkey, message) ->
                             { m with
-                                Contacts = m.Contacts |> addContactIfNew { Pubkey = msg.SenderPubkey; Nickname = truncKey msg.SenderPubkey; DisplayName = null; Bio = null; PhotoBase64 = null }
-                                Messages = m.Messages |> appendMessage msg.SenderPubkey msg.Message }
+                                Contacts = m.Contacts |> addContactIfNew { Pubkey = senderPubkey; Nickname = truncKey senderPubkey; DisplayName = ""; Bio = ""; PhotoBase64 = "" }
+                                Messages = m.Messages |> appendMessage senderPubkey message }
                         | IncomingDeliveryAck(senderPubkey, ackIds) ->
                             { m with Messages = m.Messages |> markDelivered senderPubkey ackIds }
                         | IncomingProfile(senderPubkey, displayName, bio, photo) ->
@@ -291,7 +288,7 @@ module App =
                                     m.Contacts
                                     |> List.map (fun c ->
                                         if c.Pubkey = senderPubkey then
-                                            { c with DisplayName = displayName; Bio = bio; PhotoBase64 = photo |> Option.defaultValue null }
+                                            { c with DisplayName = displayName; Bio = bio; PhotoBase64 = photo |> Option.defaultValue "" }
                                         else c) })
                     { model with PollStatus = status; PollCursor = newCursor }
 
@@ -311,7 +308,7 @@ module App =
                     let contact: Contact =
                         match existing with
                         | Some e -> { e with Nickname = cnn }
-                        | None -> { Pubkey = hex; Nickname = cnn; DisplayName = null; Bio = null; PhotoBase64 = null }
+                        | None -> { Pubkey = hex; Nickname = cnn; DisplayName = ""; Bio = ""; PhotoBase64 = "" }
 
                     let model' =
                         { model with
@@ -350,13 +347,11 @@ module App =
             match model.Page with
             | EditProfile(name, bio, photo) ->
                 let profile: Profile = { DisplayName = name; Bio = bio; PhotoBase64 = photo }
-                let cmds = [ CmdSaveProfile profile ]
-                let cmds =
-                    match trySession model with
-                    | Some session ->
-                        cmds @ [ CmdSendProfileToAll(session, profile, model.Contacts |> List.map _.Pubkey) ]
-                    | None -> cmds
-                { model with Profile = Some profile; Page = Settings }, cmds
+                { model with Profile = Some profile; Page = Settings },
+                [ CmdSaveProfile profile
+                  match trySession model with
+                  | Some session -> CmdSendProfileToAll(session, profile, model.Contacts |> List.map _.Pubkey)
+                  | None -> () ]
             | _ -> model, []
 
         | StateLoaded(IdentityAndData(identity, data, profile)) ->
@@ -397,6 +392,14 @@ module App =
         | ProfileMessage(id, displayName, bio, photo) ->
             JsonSerializer.Serialize({| ``type`` = "profile"; id = id; timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); display_name = displayName; bio = bio; photo = (photo |> Option.defaultValue null) |})
 
+    let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
+        async {
+            let payload = serializeEnvelope envelope
+            let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload
+            let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            return! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
+        }
+
     let private parseEnvelope (json: string) =
         use doc = JsonDocument.Parse(json)
         let root = doc.RootElement
@@ -427,13 +430,11 @@ module App =
             | Some(plaintext, senderHex) ->
                 match parseEnvelope plaintext with
                 | Some(TextMessage(id, body)) ->
-                    Ok(IncomingChat
-                        { SenderPubkey = senderHex
-                          Message =
-                            { Id = id; Body = body
-                              Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
-                              IsOutgoing = false
-                              Status = DeliveryStatus.Delivered } })
+                    Ok(IncomingChat(senderHex,
+                        { Id = id; Body = body
+                          Timestamp = DateTimeOffset.FromUnixTimeSeconds(payload.Timestamp)
+                          IsOutgoing = false
+                          Status = DeliveryStatus.Delivered }))
                 | Some(DeliveryAck(_, ackIds)) ->
                     Ok(IncomingDeliveryAck(senderHex, ackIds))
                 | Some(ProfileMessage(_, displayName, bio, photo)) ->
@@ -447,15 +448,12 @@ module App =
         async {
             let chatsBySender =
                 events
-                |> List.choose (function IncomingChat msg -> Some(msg.SenderPubkey, msg.Message.Id) | _ -> None)
+                |> List.choose (function IncomingChat(senderPubkey, msg) -> Some(senderPubkey, msg.Id) | _ -> None)
                 |> List.groupBy fst
                 |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
 
             for sender, msgIds in chatsBySender do
-                try
-                    let ackPayload = serializeEnvelope (DeliveryAck(Guid.NewGuid().ToString(), msgIds))
-                    let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex sender) ackPayload
-                    do! sendMessage session.Url session.Token sender (Crypto.toHex blob) (DateTimeOffset.UtcNow.ToUnixTimeSeconds()) |> Async.Ignore
+                try do! sendEnvelope session sender (DeliveryAck(Guid.NewGuid().ToString(), msgIds)) |> Async.Ignore
                 with _ -> ()
         }
 
@@ -473,12 +471,7 @@ module App =
         | CmdSend(session, recipientHex, text, messageId) ->
             asyncCmd (async {
                 try
-                    let recipPub = Crypto.fromHex recipientHex
-                    let ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                    let payload = serializeEnvelope (TextMessage(messageId, text))
-                    let blob = Crypto.encrypt session.Identity.PrivKey recipPub payload
-                    let! status = sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
-
+                    let! status = sendEnvelope session recipientHex (TextMessage(messageId, text))
                     match messageStatusToError status with
                     | Some err -> return SendFailed err
                     | None -> return SendOk
@@ -567,10 +560,7 @@ module App =
             Cmd.ofEffect (fun _ ->
                 async {
                     for recipientHex in recipientHexes do
-                        try
-                            let payload = serializeEnvelope (ProfileMessage(Guid.NewGuid().ToString(), profile.DisplayName, profile.Bio, profile.PhotoBase64))
-                            let blob = Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload
-                            do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) (DateTimeOffset.UtcNow.ToUnixTimeSeconds()) |> Async.Ignore
+                        try do! sendEnvelope session recipientHex (ProfileMessage(Guid.NewGuid().ToString(), profile.DisplayName, profile.Bio, profile.PhotoBase64)) |> Async.Ignore
                         with _ -> ()
                 } |> Async.Start)
 
@@ -630,11 +620,11 @@ module App =
 
                         Label("Profile:").font(size = 18.)
                         match model.Profile with
-                        | Some profile when not (String.IsNullOrEmpty profile.DisplayName) ->
+                        | Some profile when profile.DisplayName <> "" ->
                             Label($"Name: {profile.DisplayName}").font(size = 14.)
                         | _ -> ()
                         match model.Profile with
-                        | Some profile when not (String.IsNullOrEmpty profile.Bio) ->
+                        | Some profile when profile.Bio <> "" ->
                             Label($"Bio: {profile.Bio}").font(size = 14.).textColor(Colors.DimGray)
                         | _ -> ()
                         let profilePage =
@@ -773,7 +763,7 @@ module App =
                     viewErrorBanner model.Error
 
                     match photo with
-                    | Some p when not (String.IsNullOrEmpty p) ->
+                    | Some p when p <> "" ->
                         Image(new MemoryStream(Convert.FromBase64String(p)) :> Stream)
                             .width(120.)
                             .height(120.)
