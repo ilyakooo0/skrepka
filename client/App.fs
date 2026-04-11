@@ -493,19 +493,21 @@ module App =
             Cmd.ofEffect (fun _ -> Store.saveData data)
 
         | CmdPickPhoto ->
-            asyncCmd (async {
-                try
-                    let! results = Microsoft.Maui.Media.MediaPicker.Default.PickPhotosAsync() |> Async.AwaitTask
-                    match results |> Seq.tryHead with
-                    | None -> return PhotoPicked ""
-                    | Some file ->
-                        use! stream = file.OpenReadAsync() |> Async.AwaitTask
-                        use ms = new MemoryStream()
-                        do! stream.CopyToAsync(ms) |> Async.AwaitTask
-                        return PhotoPicked(Convert.ToBase64String(ms.ToArray()))
-                with _ ->
-                    return PhotoPicked ""
-            })
+            Cmd.ofEffect (fun dispatch ->
+                Microsoft.Maui.ApplicationModel.MainThread.BeginInvokeOnMainThread(fun () ->
+                    task {
+                        try
+                            let! results = Microsoft.Maui.Media.MediaPicker.Default.PickPhotosAsync()
+                            match results |> Seq.tryHead with
+                            | None -> dispatch (PhotoPicked "")
+                            | Some file ->
+                                use! stream = file.OpenReadAsync()
+                                use ms = new MemoryStream()
+                                do! stream.CopyToAsync(ms)
+                                dispatch (PhotoPicked(Convert.ToBase64String(ms.ToArray())))
+                        with _ ->
+                            dispatch (PhotoPicked "")
+                    } |> ignore))
 
         | CmdSaveProfile profile ->
             Cmd.ofEffect (fun _ -> Store.saveProfile profile)
