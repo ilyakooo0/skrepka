@@ -19,5 +19,6 @@ type MauiProgram =
                     .AddFont("Unbounded-ExtraLight.ttf", "UnboundedExtraLight")
                     .AddFont("Unbounded-Light.ttf", "UnboundedLight")
                     .AddFont("Unbounded-Medium.ttf", "UnboundedMedium")
-                    .AddFont("Unbounded-Regular.ttf", "UnboundedRegular")                |> ignore)
+                    .AddFont("Unbounded-Regular.ttf", "UnboundedRegular")
+                |> ignore)
             .Build()

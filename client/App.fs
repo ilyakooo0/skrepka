@@ -495,17 +495,12 @@ module App =
     let mapCmd cmdMsg =
         match cmdMsg with
         | CmdConnect(url, identity) ->
-            Cmd.OfAsync.either
-                (fun (url, id) -> authenticate url id)
-                (url, identity)
-                AuthOk
-                (fun ex -> AuthErr ex.Message)
+            Cmd.OfAsync.either (fun (url, id) -> authenticate url id) (url, identity) AuthOk (fun ex ->
+                AuthErr ex.Message)
 
         | CmdSend(session, recipientHex, envelope) ->
-            Cmd.OfAsync.attempt
-                (fun (s, r, e) -> sendEnvelope s r e)
-                (session, recipientHex, envelope)
-                (fun ex -> SendFailed ex.Message)
+            Cmd.OfAsync.attempt (fun (s, r, e) -> sendEnvelope s r e) (session, recipientHex, envelope) (fun ex ->
+                SendFailed ex.Message)
 
         | CmdPoll(session, cursor) ->
             Cmd.ofEffect (fun dispatch ->
@@ -650,13 +645,10 @@ module App =
             (VStack(spacing = 24.) {
                 Image("logo.png").margin(8, 0).maximumWidth (300)
 
-                Label("Skrepka").font(size = 32.).centerTextHorizontal ()
-
-                Label("End-to-end encrypted messaging").font(size = 16.).centerTextHorizontal ()
-
+                Label("Skrepka").font(size = 32., fontFamily = "UnboundedBold").centerTextHorizontal ()
+                BoxView(Colors.Transparent).height (50)
 
                 button "Next" GenIdentity
-                Button("Generate Identity", GenIdentity).centerHorizontal ()
             })
                 .padding(30.)
                 .centerVertical ()
