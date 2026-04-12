@@ -5,7 +5,7 @@ ApplicationTitle=Skrepka
 ApplicationVersion=1
 AppManifest=Platforms/iOS/Info.plist
 CompiledAppManifest=obj/Debug/net10.0-ios/iossimulator-arm64/AppManifest.plist
-DefaultSdkVersion=26.2
+DefaultSdkVersion=26.4
 FontFilesToRegister=
 GenerateApplicationManifest=true
 IsAppExtension=false
@@ -16,7 +16,7 @@ ProjectDir=/Users/iko/Developer/skrepka/client
 ResourcePrefix=Platforms/iOS/Resources
 ResourceRules=
 SdkIsSimulator=True
-SdkVersion=26.2
+SdkVersion=26.4
 SupportedOSPlatformVersion=26.2
 TargetArchitectures=ARM64
 TargetFrameworkMoniker=.NETCoreApp,Version=v10.0,Profile=ios

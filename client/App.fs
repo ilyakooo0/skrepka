@@ -44,12 +44,6 @@ module App =
 
     type IncomingEvent = { Sender: string; Timestamp: DateTimeOffset; Envelope: Envelope }
 
-    type PollStatus =
-        | Idle
-        | Polling
-        | Received of string
-        | PollError of string
-
     // ── Model ──
 
     type Model =
@@ -57,7 +51,7 @@ module App =
           Auth: AuthState
           ServerUrl: string
           Contacts: Map<string, Contact>
-          PollStatus: PollStatus
+          PollStatus: string
           Messages: Map<string, ChatMessage list>
           Error: string option
           PollCursor: int64
@@ -80,7 +74,7 @@ module App =
         | DoSend
         | SendFailed of string
         | DoSaveContact
-        | PollResult of events: IncomingEvent list * ackIds: string list * status: PollStatus * cursor: int64
+        | PollResult of events: IncomingEvent list * ackIds: string list * status: string * cursor: int64
         | CopyPubKey
         | DismissError
         | StateLoaded of StateLoadResult
@@ -121,11 +115,10 @@ module App =
         |> Option.filter (fun bytes -> bytes.Length = 32)
 
     let private contactName (contacts: Map<string, Contact>) (pk: string) =
-        let fallback = truncKey pk
         match Map.tryFind pk contacts with
-        | Some c when c.Nickname <> fallback -> c.Nickname
+        | Some c when c.Nickname <> "" -> c.Nickname
         | Some c when c.DisplayName <> "" -> c.DisplayName
-        | _ -> fallback
+        | _ -> truncKey pk
 
     let private messagesFor (pk: string) (messages: Map<string, ChatMessage list>) =
         messages |> Map.tryFind pk |> Option.defaultValue []
@@ -155,7 +148,7 @@ module App =
             { m with
                 Contacts =
                     if Map.containsKey evt.Sender m.Contacts then m.Contacts
-                    else Map.add evt.Sender (newContact evt.Sender (truncKey evt.Sender)) m.Contacts
+                    else Map.add evt.Sender (newContact evt.Sender "") m.Contacts
                 Messages = m.Messages |> appendMessage evt.Sender message }
         | Envelope.DeliveryAck ackIds ->
             { m with Messages = m.Messages |> markDelivered evt.Sender ackIds }
@@ -186,7 +179,7 @@ module App =
         { Page = Setup
           Auth = NoIdentity
           ServerUrl = "http://localhost:8080"
-          PollStatus = Idle
+          PollStatus = ""
           Contacts = Map.empty
           Messages = Map.empty
           Error = None
@@ -217,13 +210,13 @@ module App =
             match model.Auth with
             | Identified(id, Connecting) ->
                 let session = { Url = model.ServerUrl; Token = token; Identity = id }
-                { model with Auth = Identified(id, Online token); Page = Conversations; Error = None; PollStatus = Polling },
+                { model with Auth = Identified(id, Online token); Page = Conversations; Error = None; PollStatus = "polling..." },
                 [ CmdPoll(session, model.PollCursor) ]
             | _ -> model, []
 
         | AuthErr err -> { setConn Offline model with Error = Some err }, []
 
-        | DoDisconnect -> model |> setConn Offline, []
+        | DoDisconnect -> { model |> setConn Offline with PollStatus = "" }, []
 
         | DoSend ->
             match model.Page, trySession model with
@@ -445,15 +438,15 @@ module App =
                     let status =
                         $"evts:{response.Events.Length} msgs:{chatCount} errs:{errors.Length}"
                         + (match List.tryHead errors with Some e -> $" [{e}]" | None -> "")
-                    return PollResult(events, ackIds, Received status, response.Cursor)
+                    return PollResult(events, ackIds, status, response.Cursor)
                 with
                 | :? TimeoutException ->
                     log "poll timeout"
-                    return PollResult([], [], Polling, cursor)
+                    return PollResult([], [], "polling...", cursor)
                 | ex ->
                     log $"poll error: {ex.Message}"
                     do! Async.Sleep 3000
-                    return PollResult([], [], PollError ex.Message, cursor)
+                    return PollResult([], [], $"poll error: {ex.Message}", cursor)
             })
 
         | CmdAckAndDeliver(session, ackIds, events) ->
@@ -513,12 +506,6 @@ module App =
                 } |> Async.Start)
 
     // ── View ──
-
-    let private formatPollStatus = function
-        | Idle -> ""
-        | Polling -> "polling..."
-        | Received s -> s
-        | PollError msg -> $"poll error: {msg}"
 
     let private viewErrorBanner (error: string option) =
         VStack(spacing = 4.) {
@@ -608,7 +595,8 @@ module App =
                     }
 
                     let pubPrefix = match model.Auth with Identified(id, _) -> id.PubKeyHex.[..7] | _ -> "?"
-                    Label($"{connStatusLabel model.Auth} [{pubPrefix}] | {formatPollStatus model.PollStatus}")
+                    let pollInfo = if model.PollStatus <> "" then $" | {model.PollStatus}" else ""
+                    Label($"{connStatusLabel model.Auth} [{pubPrefix}]{pollInfo}")
                         .font(size = 10.)
                         .textColor(Colors.DimGray)
 

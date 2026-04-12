@@ -87,6 +87,20 @@ impl ToJSON MessageStatus where
     MsUnauthorized {} -> "unauthorized"
     MsRejected {} -> "rejected")
 
+data DeliveryStatus = Delivered {} | Federated {} | Queued {}
+
+impl ToJSON DeliveryStatus where
+  toJson ds = toJson (case ds of
+    Delivered {} -> "delivered"
+    Federated {} -> "federated"
+    Queued {} -> "queued")
+
+deliveryToStatus : DeliveryStatus -> MessageStatus
+deliveryToStatus = \ds -> case ds of
+  Delivered {} -> MsDelivered {}
+  Federated {} -> MsFederated {}
+  Queued {} -> MsQueued {}
+
 isValidBoundedHex = \maxLen s -> isValidHex s && not (tooLong s maxLen) && s == normalizeHex s
 type PubkeyHex = Text where isValidBoundedHex maxPubkeyLen
 type BlobHex = Text where isValidBoundedHex maxBlobLen
@@ -108,12 +122,9 @@ type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Times
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 data AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
-data SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
+data SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: DeliveryStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
 data VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
-data AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
-data LookupResult = LookupUnauthorized {} | LookupDone {server: AnyServerName}
-data ForwardResult = ForwardDuplicate {} | ForwardStored {} | ForwardFull {}
-data PollResult = PollUnauthorized {} | PollDone {events: [PollEvent], cursor: Timestamp}
+type PollResponse = {events: [PollEvent], cursor: Timestamp, authorized: Bool}
 
 
 -- ============================================
@@ -714,7 +725,7 @@ pollOnce = \token cursor -> do
     let auth = authenticateSession sessions token t
     case auth of
       Unauthorized {} ->
-        yield PollUnauthorized {}
+        yield {events: [], cursor: 0, authorized: False {}}
       Authorized {pubkey} -> do
         seqCounter <- *seqCounter
         messages <- *messages
@@ -731,20 +742,19 @@ pollOnce = \token cursor -> do
                             encryptedBlob: m.encryptedBlob,
                             timestamp: m.timestamp}}
         let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
-        yield PollDone {events: evts, cursor: lastReceivedAt}
+        yield {events: evts, cursor: lastReceivedAt, authorized: True {}}
 
-pollLoop : Text -> Int -> Int<Ms> -> IO {clock} PollResult
+pollLoop : Text -> Int -> Int<Ms> -> IO {clock} PollResponse
 pollLoop = \token cursor deadline -> do
   result <- pollOnce token cursor
-  case result of
-    PollUnauthorized {} -> yield result
-    PollDone {events} -> do
-      t <- now
-      if count events == 0 && t < deadline
-        then do
-          sleep (clamp 1 500 (deadline - t))
-          pollLoop token cursor deadline
-        else yield result
+  if not result.authorized then yield result
+  else do
+    t <- now
+    if count result.events == 0 && t < deadline
+      then do
+        sleep (clamp 1 500 (deadline - t))
+        pollLoop token cursor deadline
+      else yield result
 
 -- ============================================
 -- Request Handler
@@ -817,9 +827,7 @@ serve = \req -> case req of
     result <- pollLoop token cursor deadline
     tAfterPoll <- now
     maybePruneAndBroadcast tAfterPoll
-    yield (respond (case result of
-      PollUnauthorized {} -> {events: [], cursor: 0, authorized: False {}}
-      PollDone r -> {events: r.events, cursor: r.cursor, authorized: True {}}))
+    yield (respond result)
 
   SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
     t <- now
@@ -849,9 +857,9 @@ serve = \req -> case req of
               forwards <- *forwards
               let forwardServers = takeN remoteServers (maxForwardsEntries - count forwards)
               let shouldForward = federationEnabled && count forwardServers > 0
-              let status = if localOnline then MsDelivered {}
-                else if shouldForward then MsFederated {}
-                else MsQueued {}
+              let status = if localOnline then Delivered {}
+                else if shouldForward then Federated {}
+                else Queued {}
               set *forwards = if shouldForward
                 then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
                 else forwards
@@ -867,14 +875,14 @@ serve = \req -> case req of
                 authorization: federationAuth})
               whenOk fwdResult (removeForward msgId server))
             case status of
-              MsQueued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
+              Queued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
               _ -> yield {})
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
       SendUnauthorized {} -> respond {status: MsUnauthorized {}, messageId: ""}
       SendRejected {} -> respond {status: MsRejected {}, messageId: ""}
-      SendDone {status} -> respond {status: status, messageId: msgId})
+      SendDone {status} -> respond {status: deliveryToStatus status, messageId: msgId})
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -884,7 +892,7 @@ serve = \req -> case req of
       auth <- authenticateRequest authorization t
       case auth of
         Unauthorized {} ->
-          yield {pr: pr, ack: AckUnauthorized {}}
+          yield {pr: pr, authorized: False {}, pendingAcks: [], evictedEntries: []}
         Authorized {pubkey} -> do
           messages <- *messages
           let ackedMessages = do
@@ -902,16 +910,13 @@ serve = \req -> case req of
           let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
             if excessCount <= 0 then [] else boundedSmallest combinedAckedIds excessCount (\a -> a.ackedAt)
           set *ackedIds = diff combinedAckedIds evictedEntries
-          yield {pr: pr, ack: AckDone {pendingAcks: ackedFederated, evictedEntries: evictedEntries}}
+          yield {pr: pr, authorized: True {}, pendingAcks: ackedFederated, evictedEntries: evictedEntries}
     fork (do
-      case result.ack of
-        AckDone {pendingAcks, evictedEntries} ->
-          when federationEnabled (do
-            sendAcksAndClean pendingAcks
-            retryEvictedAcks evictedEntries pendingAcks)
-        _ -> yield {}
+      when (result.authorized && federationEnabled) (do
+        sendAcksAndClean result.pendingAcks
+        retryEvictedAcks result.evictedEntries result.pendingAcks)
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
-    yield (respond {ok: case result.ack of AckDone _ -> True {}; _ -> False {}})
+    yield (respond {ok: result.authorized})
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
@@ -920,7 +925,7 @@ serve = \req -> case req of
       auth <- authenticateRequest authorization t
       case auth of
         Unauthorized {} ->
-          yield {pr: pr, lookup: LookupUnauthorized {}}
+          yield {pr: pr, server: "", authorized: False {}}
         Authorized _ -> do
           presence <- *presence
           let valid = do
@@ -933,11 +938,9 @@ serve = \req -> case req of
             if not (isLocalServer p.server) && dominated then Just {value: p} else acc) Nothing {} valid
           let foundServer = if localOnline then serverHostN
             else case bestRemote of Just {value: p} -> p.server; Nothing {} -> ""
-          yield {pr: pr, lookup: LookupDone {server: foundServer}}
+          yield {pr: pr, server: foundServer, authorized: True {}}
     forkBroadcastOffline t result.pr
-    yield (case result.lookup of
-      LookupUnauthorized {} -> respond {server: "", authorized: False {}}
-      LookupDone {server} -> respond {server: server, authorized: True {}})
+    yield (respond {server: result.server, authorized: result.authorized})
 
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
@@ -999,9 +1002,9 @@ serve = \req -> case req of
           messages <- *messages
           ackedIds <- *ackedIds
           if hasMessage messageId toKey messages || hasMessage messageId toKey ackedIds
-            then yield {pr: pr, forward: ForwardDuplicate {}}
+            then yield {pr: pr, ok: True {}}
             else if countMessagesFor messages toKey t >= maxMessagesPerRecipient
-              then yield {pr: pr, forward: ForwardFull {}}
+              then yield {pr: pr, ok: False {}}
               else do
                 seqCounter <- *seqCounter
                 let seqTs = nextSeqTs t seqCounter
@@ -1009,9 +1012,9 @@ serve = \req -> case req of
                 set *messages = union messages
                   [{messageId: messageId, toKey: toKey, fromKey: fromKey,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, origin: FederatedOrigin {server: originServer}, receivedAt: seqTs}]
-                yield {pr: pr, forward: ForwardStored {}}
+                yield {pr: pr, ok: True {}}
         forkBroadcastOffline t result.pr
-        yield (respond {ok: case result.forward of ForwardFull {} -> False {}; _ -> True {}})
+        yield (respond {ok: result.ok})
 
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
