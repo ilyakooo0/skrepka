@@ -412,14 +412,6 @@ module App =
 
     let private log msg = eprintfn $"[skrepka] {msg}"
 
-    let private asyncCmd (op: Async<Msg>) : Cmd<Msg> =
-        Cmd.ofEffect (fun dispatch ->
-            async {
-                let! msg = op
-                dispatch msg
-            }
-            |> Async.Start)
-
     let private serializeEnvelope =
         function
         | Envelope.TextMessage(id, body) ->
@@ -503,28 +495,20 @@ module App =
     let mapCmd cmdMsg =
         match cmdMsg with
         | CmdConnect(url, identity) ->
-            asyncCmd (
-                async {
-                    try
-                        let! token = authenticate url identity
-                        return AuthOk token
-                    with ex ->
-                        return AuthErr ex.Message
-                }
-            )
+            Cmd.OfAsync.either
+                (fun (url, id) -> authenticate url id)
+                (url, identity)
+                AuthOk
+                (fun ex -> AuthErr ex.Message)
 
         | CmdSend(session, recipientHex, envelope) ->
-            Cmd.ofEffect (fun dispatch ->
-                async {
-                    try
-                        do! sendEnvelope session recipientHex envelope
-                    with ex ->
-                        dispatch (SendFailed ex.Message)
-                }
-                |> Async.Start)
+            Cmd.OfAsync.attempt
+                (fun (s, r, e) -> sendEnvelope s r e)
+                (session, recipientHex, envelope)
+                (fun ex -> SendFailed ex.Message)
 
         | CmdPoll(session, cursor) ->
-            asyncCmd (
+            Cmd.ofEffect (fun dispatch ->
                 async {
                     log $"poll start cursor={cursor}"
 
@@ -597,17 +581,17 @@ module App =
                                | Some e -> $" [{e}]"
                                | None -> "")
 
-                        return PollResult(events, status, response.Cursor)
+                        dispatch (PollResult(events, status, response.Cursor))
                     with
                     | :? TimeoutException ->
                         log "poll timeout"
-                        return PollResult([], "polling...", cursor)
+                        dispatch (PollResult([], "polling...", cursor))
                     | ex ->
                         log $"poll error: {ex.Message}"
                         do! Async.Sleep 3000
-                        return PollResult([], $"poll error: {ex.Message}", cursor)
+                        dispatch (PollResult([], $"poll error: {ex.Message}", cursor))
                 }
-            )
+                |> Async.Start)
 
         | CmdCopyToClipboard text ->
             Cmd.ofEffect (fun _ ->
@@ -615,13 +599,15 @@ module App =
                 |> ignore)
 
         | CmdLoadState ->
-            asyncCmd (
-                async {
-                    match! Store.loadIdentity () with
-                    | Some id -> return StateLoaded(Some id, Store.loadData (), Store.loadProfile ())
-                    | None -> return StateLoaded(None, None, None)
-                }
-            )
+            Cmd.OfAsync.perform
+                (fun () ->
+                    async {
+                        match! Store.loadIdentity () with
+                        | Some id -> return (Some id, Store.loadData (), Store.loadProfile ())
+                        | None -> return (None, None, None)
+                    })
+                ()
+                StateLoaded
 
         | CmdSaveIdentity identity -> Cmd.ofEffect (fun _ -> Store.saveIdentity identity |> Async.Start)
 
@@ -669,6 +655,7 @@ module App =
                 Label("End-to-end encrypted messaging").font(size = 16.).centerTextHorizontal ()
 
 
+                button "Next" GenIdentity
                 Button("Generate Identity", GenIdentity).centerHorizontal ()
             })
                 .padding(30.)
