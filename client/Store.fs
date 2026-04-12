@@ -23,12 +23,13 @@ module Store =
     [<RequireQualifiedAccess>]
     type DeliveryStatus = Sent | Delivered
 
+    type MessageDirection = Incoming | Outgoing of DeliveryStatus
+
     type ChatMessage =
         { Id: string
           Body: string
           Timestamp: DateTimeOffset
-          IsOutgoing: bool
-          Status: DeliveryStatus }
+          Direction: MessageDirection }
 
     type Data =
         { Contacts: Map<string, Contact>
@@ -61,12 +62,17 @@ module Store =
     let private orEmpty s = s |> Option.ofObj |> Option.defaultValue ""
 
     let private toChatMessage (d: MessageDoc) : ChatMessage =
-        { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeMilliseconds d.TimestampUnix; IsOutgoing = d.IsOutgoing
-          Status = match d.Status with 1 -> DeliveryStatus.Delivered | _ -> DeliveryStatus.Sent }
+        { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeMilliseconds d.TimestampUnix
+          Direction = if not d.IsOutgoing then Incoming else Outgoing(match d.Status with 1 -> DeliveryStatus.Delivered | _ -> DeliveryStatus.Sent) }
 
     let private toMessageDoc convId (m: ChatMessage) : MessageDoc =
-        { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds(); IsOutgoing = m.IsOutgoing
-          Status = match m.Status with DeliveryStatus.Delivered -> 1 | DeliveryStatus.Sent -> 0 }
+        let isOutgoing, status =
+            match m.Direction with
+            | Incoming -> false, 0
+            | Outgoing DeliveryStatus.Delivered -> true, 1
+            | Outgoing DeliveryStatus.Sent -> true, 0
+        { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds()
+          IsOutgoing = isOutgoing; Status = status }
 
     let private openDb () =
         new LiteDatabase(Path.Combine(FileSystem.AppDataDirectory, "skrepka.db"))

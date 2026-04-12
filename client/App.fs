@@ -70,7 +70,7 @@ module App =
         | DoSend
         | SendFailed of string
         | DoSaveContact
-        | PollResult of events: IncomingEvent list * ackIds: string list * status: string * cursor: int64
+        | PollResult of events: IncomingEvent list * status: string * cursor: int64
         | CopyPubKey
         | DismissError
         | StateLoaded of Identity option * Data option * Profile option
@@ -84,14 +84,12 @@ module App =
         | CmdConnect of url: string * identity: Identity
         | CmdSend of session: Session * recipientHex: string * envelope: Envelope
         | CmdPoll of session: Session * cursor: int64
-        | CmdAckAndDeliver of session: Session * ackIds: string list * events: IncomingEvent list
         | CmdCopyToClipboard of string
         | CmdLoadState
         | CmdSaveIdentity of Identity
         | CmdSaveData of Data
         | CmdPickPhoto
         | CmdSaveProfile of Profile
-        | CmdSendProfileToAll of session: Session * Profile * recipientHexes: string list
 
     // ── Helpers ──
 
@@ -127,7 +125,9 @@ module App =
     let private markDelivered (pk: string) (ackIds: string list) (messages: Map<string, ChatMessage list>) =
         let ackSet = Set.ofList ackIds
         messages |> Map.change pk (Option.map (List.map (fun m ->
-            if m.IsOutgoing && Set.contains m.Id ackSet then { m with Status = DeliveryStatus.Delivered } else m)))
+            match m.Direction with
+            | Outgoing _ when Set.contains m.Id ackSet -> { m with Direction = Outgoing DeliveryStatus.Delivered }
+            | _ -> m)))
 
     let private newContact pubkey nickname : Contact =
         { Pubkey = pubkey; Nickname = nickname; DisplayName = ""; Bio = ""; PhotoBase64 = "" }
@@ -139,8 +139,7 @@ module App =
         match evt.Envelope with
         | Envelope.TextMessage(id, body) ->
             let message =
-                { Id = id; Body = body; Timestamp = evt.Timestamp
-                  IsOutgoing = false; Status = DeliveryStatus.Delivered }
+                { Id = id; Body = body; Timestamp = evt.Timestamp; Direction = Incoming }
             { m with
                 Contacts =
                     if Map.containsKey evt.Sender m.Contacts then m.Contacts
@@ -222,8 +221,7 @@ module App =
                     { Id = id
                       Body = compose
                       Timestamp = DateTimeOffset.UtcNow
-                      IsOutgoing = true
-                      Status = DeliveryStatus.Sent }
+                      Direction = Outgoing DeliveryStatus.Sent }
 
                 let isFirstInteraction = model.Messages |> messagesFor pk |> List.isEmpty
 
@@ -235,22 +233,19 @@ module App =
                 model',
                 [ CmdSend(session, pk, Envelope.TextMessage(id, compose))
                   saveCmdMsg model'
-                  match model.Profile, isFirstInteraction with
-                  | Some profile, true -> CmdSendProfileToAll(session, profile, [ pk ])
+                  match model.Profile with
+                  | Some profile when isFirstInteraction -> CmdSend(session, pk, Envelope.ProfileMessage profile)
                   | _ -> () ]
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
 
-        | PollResult(events, ackIds, status, newCursor) ->
+        | PollResult(events, status, newCursor) ->
             let model' = events |> List.fold applyEvent { model with PollStatus = status; PollCursor = newCursor }
 
             model',
             [ match trySession model' with
-              | Some session ->
-                  if not ackIds.IsEmpty || not events.IsEmpty then
-                      CmdAckAndDeliver(session, ackIds, events)
-                  CmdPoll(session, model'.PollCursor)
+              | Some session -> CmdPoll(session, model'.PollCursor)
               | None -> ()
               if not events.IsEmpty then saveCmdMsg model' ]
 
@@ -295,7 +290,9 @@ module App =
                 { model with Profile = Some profile; Page = Settings },
                 [ CmdSaveProfile profile
                   match trySession model with
-                  | Some session -> CmdSendProfileToAll(session, profile, model.Contacts.Keys |> Seq.toList)
+                  | Some session ->
+                      for pk in model.Contacts.Keys do
+                          CmdSend(session, pk, Envelope.ProfileMessage profile)
                   | None -> () ]
             | _ -> model, []
 
@@ -375,19 +372,6 @@ module App =
         with ex ->
             Error $"parse: {ex.Message}"
 
-    let private sendDeliveryAcks (session: Session) (events: IncomingEvent list) =
-        async {
-            let chatsBySender =
-                events
-                |> List.choose (fun evt -> match evt.Envelope with Envelope.TextMessage(id, _) -> Some(evt.Sender, id) | _ -> None)
-                |> List.groupBy fst
-                |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
-
-            for sender, msgIds in chatsBySender do
-                try do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
-                with _ -> ()
-        }
-
     let mapCmd cmdMsg =
         match cmdMsg with
         | CmdConnect(url, identity) ->
@@ -427,6 +411,22 @@ module App =
 
                     for e in errors do log $"decrypt error: {e}"
 
+                    // Fire-and-forget: ack server + send delivery acks
+                    if not ackIds.IsEmpty || not events.IsEmpty then
+                        async {
+                            if not ackIds.IsEmpty then
+                                try do! ackMessages session.Url session.Token ackIds
+                                with _ -> ()
+                            let acksBySender =
+                                events
+                                |> List.choose (fun evt -> match evt.Envelope with Envelope.TextMessage(id, _) -> Some(evt.Sender, id) | _ -> None)
+                                |> List.groupBy fst
+                                |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
+                            for sender, msgIds in acksBySender do
+                                try do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
+                                with _ -> ()
+                        } |> Async.Start
+
                     if response.Events.Length = 0 then
                         do! Async.Sleep 5000
 
@@ -434,25 +434,16 @@ module App =
                     let status =
                         $"evts:{response.Events.Length} msgs:{chatCount} errs:{errors.Length}"
                         + (match List.tryHead errors with Some e -> $" [{e}]" | None -> "")
-                    return PollResult(events, ackIds, status, response.Cursor)
+                    return PollResult(events, status, response.Cursor)
                 with
                 | :? TimeoutException ->
                     log "poll timeout"
-                    return PollResult([], [], "polling...", cursor)
+                    return PollResult([], "polling...", cursor)
                 | ex ->
                     log $"poll error: {ex.Message}"
                     do! Async.Sleep 3000
-                    return PollResult([], [], $"poll error: {ex.Message}", cursor)
+                    return PollResult([], $"poll error: {ex.Message}", cursor)
             })
-
-        | CmdAckAndDeliver(session, ackIds, events) ->
-            Cmd.ofEffect (fun _ ->
-                async {
-                    if not ackIds.IsEmpty then
-                        try do! ackMessages session.Url session.Token ackIds
-                        with _ -> ()
-                    do! sendDeliveryAcks session events
-                } |> Async.Start)
 
         | CmdCopyToClipboard text ->
             Cmd.ofEffect (fun _ ->
@@ -492,14 +483,6 @@ module App =
         | CmdSaveProfile profile ->
             Cmd.ofEffect (fun _ -> Store.saveProfile profile)
 
-        | CmdSendProfileToAll(session, profile, recipientHexes) ->
-            Cmd.ofEffect (fun _ ->
-                async {
-                    for recipientHex in recipientHexes do
-                        try do! sendEnvelope session recipientHex (Envelope.ProfileMessage profile)
-                        with _ -> ()
-                } |> Async.Start)
-
     // ── View ──
 
     let private viewErrorBanner (error: string option) =
@@ -514,6 +497,8 @@ module App =
     let private viewSetup () =
         ContentPage(
             (VStack(spacing = 24.) {
+                Image("logo.png")
+                    .margin(8, 0)
                 Label("Skrepka")
                     .font(size = 32.)
                     .centerTextHorizontal()
@@ -637,8 +622,12 @@ module App =
                         .font(size = 14.)
                 else
                     for m in msgs do
-                        let tick = if m.IsOutgoing && m.Status = DeliveryStatus.Delivered then " \u2713" else ""
-                        Label((if m.IsOutgoing then $"You: {m.Body}" else m.Body) + tick)
+                        let prefix, tick =
+                            match m.Direction with
+                            | Outgoing DeliveryStatus.Delivered -> "You: ", " \u2713"
+                            | Outgoing _ -> "You: ", ""
+                            | Incoming -> "", ""
+                        Label($"{prefix}{m.Body}{tick}")
                             .padding(8.)
                             .font(size = 14.)
 
