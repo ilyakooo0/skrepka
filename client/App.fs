@@ -144,7 +144,7 @@ module App =
             (Option.map (
                 List.map (fun m ->
                     match m.Direction with
-                    | Outgoing _ when Set.contains m.Id ackSet ->
+                    | Outgoing DeliveryStatus.Sent when Set.contains m.Id ackSet ->
                         { m with
                             Direction = Outgoing DeliveryStatus.Delivered }
                     | _ -> m)
@@ -669,7 +669,7 @@ module App =
                 Label("End-to-end encrypted messaging").font(size = 16.).centerTextHorizontal ()
 
 
-                button "Generate Identity" GenIdentity
+                Button("Generate Identity", GenIdentity).centerHorizontal ()
             })
                 .padding(30.)
                 .centerVertical ()
@@ -789,7 +789,7 @@ module App =
                         let prefix, tick =
                             match m.Direction with
                             | Outgoing DeliveryStatus.Delivered -> "You: ", " \u2713"
-                            | Outgoing _ -> "You: ", ""
+                            | Outgoing DeliveryStatus.Sent -> "You: ", ""
                             | Incoming -> "", ""
 
                         Label($"{prefix}{m.Body}{tick}").padding(8.).font (size = 14.)

@@ -62,31 +62,29 @@ module ApiClient =
             token |> Option.iter (fun t -> request.Headers.Add("Authorization", $"Bearer {t}"))
             use! response = httpClient.SendAsync(request) |> awaitTask
             let! text = response.Content.ReadAsStringAsync() |> awaitTask
-            use doc = JsonDocument.Parse(text)
+            let doc = JsonDocument.Parse(text)
             match doc.RootElement.TryGetProperty("error") with
-            | true, err -> return failwith $"{url}: {err.GetString()}"
-            | _ -> return text
+            | true, err ->
+                doc.Dispose()
+                return failwith $"{url}: {err.GetString()}"
+            | _ -> return doc
         }
 
     let private postJson<'T> httpClient url body token =
         async {
-            let! text = sendRequest httpClient url body token
-            return JsonSerializer.Deserialize<'T>(text, jsonOpts)
+            use! doc = sendRequest httpClient url body token
+            return doc.RootElement.Deserialize<'T>(jsonOpts)
         }
-
-    let private getString (text: string) (prop: string) =
-        use doc = JsonDocument.Parse(text)
-        doc.RootElement.GetProperty(prop).GetString()
 
     let authenticate (serverUrl: string) (identity: Crypto.Identity) =
         async {
             let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex |})
-            let! text = sendRequest client $"{serverUrl}/auth/challenge" body None
-            let challenge = getString text "challenge"
+            use! challengeDoc = sendRequest client $"{serverUrl}/auth/challenge" body None
+            let challenge = challengeDoc.RootElement.GetProperty("challenge").GetString()
             let sigHex = Crypto.signChallenge identity.PrivKey challenge
             let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex; challenge = challenge; signature = sigHex |})
-            let! text = sendRequest client $"{serverUrl}/auth/verify" body None
-            let token = getString text "token"
+            use! tokenDoc = sendRequest client $"{serverUrl}/auth/verify" body None
+            let token = tokenDoc.RootElement.GetProperty("token").GetString()
             if String.IsNullOrEmpty(token) then failwith "Authentication rejected by server"
             return token
         }
@@ -94,8 +92,8 @@ module ApiClient =
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
         let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
         async {
-            let! text = sendRequest client $"{serverUrl}/messages" body (Some token)
-            match getString text "status" with
+            use! doc = sendRequest client $"{serverUrl}/messages" body (Some token)
+            match doc.RootElement.GetProperty("status").GetString() with
             | "delivered" | "federated" | "queued" -> ()
             | "rejected" -> failwith "Message rejected by server"
             | "unauthorized" -> failwith "Not authorized to deliver message"
@@ -108,4 +106,7 @@ module ApiClient =
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
         let body = JsonSerializer.Serialize({| messageIds = messageIds |})
-        sendRequest client $"{serverUrl}/messages/ack" body (Some token) |> Async.Ignore
+        async {
+            use! _ = sendRequest client $"{serverUrl}/messages/ack" body (Some token)
+            ()
+        }

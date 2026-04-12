@@ -79,11 +79,13 @@ module Store =
 
     let loadIdentity () =
         async {
-            let privKeyB64 =
-                try
-                    SecureStorage.Default.GetAsync("identity_privkey").Result
-                with _ ->
-                    Preferences.Default.Get<string>("identity_privkey", null)
+            let! privKeyB64 =
+                async {
+                    try
+                        return! SecureStorage.Default.GetAsync("identity_privkey") |> Async.AwaitTask
+                    with _ ->
+                        return Preferences.Default.Get<string>("identity_privkey", null)
+                }
 
             return
                 privKeyB64
