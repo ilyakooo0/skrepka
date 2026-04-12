@@ -241,7 +241,7 @@ module App =
 
             { model with
                 Auth = Identified(identity, Offline)
-                Page = Settings },
+                Page = EditProfile("", "", "") },
             [ CmdSaveIdentity identity ]
 
         | SetServerUrl url -> { model with ServerUrl = url }, []
