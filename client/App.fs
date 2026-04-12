@@ -59,10 +59,6 @@ module App =
 
     // ── Msg ──
 
-    type StateLoadResult =
-        | Loaded of Identity * Data option * Profile option
-        | NothingSaved
-
     type Msg =
         | SetPage of Page
         | GenIdentity
@@ -77,7 +73,7 @@ module App =
         | PollResult of events: IncomingEvent list * ackIds: string list * status: string * cursor: int64
         | CopyPubKey
         | DismissError
-        | StateLoaded of StateLoadResult
+        | StateLoaded of Identity option * Data option * Profile option
         | DoPickPhoto
         | PhotoPicked of string
         | DoSaveProfile
@@ -86,7 +82,7 @@ module App =
 
     type CmdMsg =
         | CmdConnect of url: string * identity: Identity
-        | CmdSend of session: Session * recipientHex: string * text: string * messageId: string
+        | CmdSend of session: Session * recipientHex: string * envelope: Envelope
         | CmdPoll of session: Session * cursor: int64
         | CmdAckAndDeliver of session: Session * ackIds: string list * events: IncomingEvent list
         | CmdCopyToClipboard of string
@@ -166,7 +162,7 @@ module App =
         | NoIdentity -> model
 
     let private saveCmdMsg model =
-        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = Some model.ServerUrl; PollCursor = model.PollCursor }
+        CmdSaveData { Contacts = model.Contacts; Messages = model.Messages; ServerUrl = model.ServerUrl; PollCursor = model.PollCursor }
 
     let private connStatusLabel = function
         | NoIdentity | Identified(_, Offline) -> "OFFLINE"
@@ -216,7 +212,7 @@ module App =
 
         | AuthErr err -> { setConn Offline model with Error = Some err }, []
 
-        | DoDisconnect -> { model |> setConn Offline with PollStatus = "" }, []
+        | DoDisconnect -> { setConn Offline model with PollStatus = "" }, []
 
         | DoSend ->
             match model.Page, trySession model with
@@ -237,7 +233,7 @@ module App =
                         Messages = model.Messages |> appendMessage pk outMsg }
 
                 model',
-                [ CmdSend(session, pk, compose, id)
+                [ CmdSend(session, pk, Envelope.TextMessage(id, compose))
                   saveCmdMsg model'
                   match model.Profile, isFirstInteraction with
                   | Some profile, true -> CmdSendProfileToAll(session, profile, [ pk ])
@@ -303,20 +299,20 @@ module App =
                   | None -> () ]
             | _ -> model, []
 
-        | StateLoaded(Loaded(identity, Some data, profile)) ->
+        | StateLoaded(Some identity, Some data, profile) ->
             let model' =
                 { model with
                     Auth = Identified(identity, Connecting)
                     Contacts = data.Contacts
                     Messages = data.Messages
-                    ServerUrl = data.ServerUrl |> Option.defaultValue model.ServerUrl
+                    ServerUrl = if data.ServerUrl <> "" then data.ServerUrl else model.ServerUrl
                     PollCursor = data.PollCursor
                     Profile = profile
                     Page = Conversations }
             model', [ CmdConnect(model'.ServerUrl, identity) ]
-        | StateLoaded(Loaded(identity, None, profile)) ->
+        | StateLoaded(Some identity, None, profile) ->
             { model with Auth = Identified(identity, Offline); Profile = profile; Page = Settings }, []
-        | StateLoaded NothingSaved -> model, []
+        | StateLoaded(None, _, _) -> model, []
 
     // ── mapCmd ──
 
@@ -334,9 +330,9 @@ module App =
         | Envelope.TextMessage(id, body) ->
             JsonSerializer.Serialize({| ``type`` = "text"; id = id; body = body |})
         | Envelope.DeliveryAck ackIds ->
-            JsonSerializer.Serialize({| ``type`` = "delivery.ack"; id = Guid.NewGuid().ToString(); ack_ids = ackIds |})
+            JsonSerializer.Serialize({| ``type`` = "delivery.ack"; ack_ids = ackIds |})
         | Envelope.ProfileMessage profile ->
-            JsonSerializer.Serialize({| ``type`` = "profile"; id = Guid.NewGuid().ToString(); timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); display_name = profile.DisplayName; bio = profile.Bio; photo = profile.PhotoBase64 |})
+            JsonSerializer.Serialize({| ``type`` = "profile"; display_name = profile.DisplayName; bio = profile.Bio; photo = profile.PhotoBase64 |})
 
     let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
         async {
@@ -403,10 +399,10 @@ module App =
                     return AuthErr ex.Message
             })
 
-        | CmdSend(session, recipientHex, text, messageId) ->
+        | CmdSend(session, recipientHex, envelope) ->
             Cmd.ofEffect (fun dispatch ->
                 async {
-                    try do! sendEnvelope session recipientHex (Envelope.TextMessage(messageId, text))
+                    try do! sendEnvelope session recipientHex envelope
                     with ex -> dispatch (SendFailed ex.Message)
                 } |> Async.Start)
 
@@ -466,9 +462,8 @@ module App =
         | CmdLoadState ->
             asyncCmd (async {
                 match! Store.loadIdentity () with
-                | Some id ->
-                    return StateLoaded(Loaded(id, Store.loadData (), Store.loadProfile ()))
-                | None -> return StateLoaded NothingSaved
+                | Some id -> return StateLoaded(Some id, Store.loadData (), Store.loadProfile ())
+                | None -> return StateLoaded(None, None, None)
             })
 
         | CmdSaveIdentity identity ->

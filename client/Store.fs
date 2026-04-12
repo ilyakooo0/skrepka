@@ -33,7 +33,7 @@ module Store =
     type Data =
         { Contacts: Map<string, Contact>
           Messages: Map<string, ChatMessage list>
-          ServerUrl: string option
+          ServerUrl: string
           PollCursor: int64 }
 
     [<CLIMutable>]
@@ -143,7 +143,7 @@ module Store =
 
                 { Contacts = contacts
                   Messages = messages
-                  ServerUrl = settings.ServerUrl |> Option.ofObj
+                  ServerUrl = settings.ServerUrl |> orEmpty
                   PollCursor = settings.PollCursor })
         with _ ->
             None
@@ -165,7 +165,7 @@ module Store =
 
             settings.Upsert
                 { Id = "settings"
-                  ServerUrl = data.ServerUrl |> Option.defaultValue ""
+                  ServerUrl = data.ServerUrl
                   PollCursor = data.PollCursor }
             |> ignore
         with _ ->
