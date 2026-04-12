@@ -56,16 +56,9 @@ federationUrl = \server -> federationScheme ++ server
 -- Types
 -- ============================================
 
-data PollEventType = PtMessage {}
-
-impl ToJSON PollEventType where
-  toJson _ = toJson "message"
-
-type PollEvent = {id: MessageIdHex, eventType: PollEventType, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
+type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
 data GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
-data ValidGossipType = ValidOnline {} | ValidOffline {}
-data DeliveryStatus = DsDelivered {} | DsFederated {} | DsQueued {}
 
 impl ToJSON GossipEventType where
   toJson et = toJson (case et of
@@ -80,14 +73,9 @@ impl FromJSON GossipEventType where
     else if s == "offline" then GossipOffline {}
     else GossipUnknown {}
 
-isOnlineEvent = \et -> case et of ValidOnline {} -> True {}; _ -> False {}
-isOfflineEvent = \et -> case et of ValidOffline {} -> True {}; _ -> False {}
-toGossipEventType = \et -> case et of ValidOnline {} -> GossipOnline {}; ValidOffline {} -> GossipOffline {}
-toMessageStatus = \ds -> case ds of DsDelivered {} -> MsDelivered {}; DsFederated {} -> MsFederated {}; DsQueued {} -> MsQueued {}
-
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
-type ValidGossipEntry = {eventType: ValidGossipType, pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
+type ValidGossipEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
 data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {} | MsUnauthorized {} | MsRejected {}
 
@@ -120,7 +108,7 @@ type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Times
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 data AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
-data SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: DeliveryStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
+data SendResult = SendUnauthorized {} | SendRejected {} | SendDone {status: MessageStatus, remoteServers: [ServerName], fromKey: PubkeyHex}
 data VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
 data AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 data LookupResult = LookupUnauthorized {} | LookupDone {server: AnyServerName}
@@ -521,18 +509,20 @@ countMessagesFor = \messages toKey t ->
 hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey == toKey)
 
 
-validGossipEvents : [GossipEvent] -> Timestamp -> [ValidGossipEntry]
-validGossipEvents = \events t -> do
-  e <- events
-  validType <- case e.eventType of
-    GossipOnline {} -> [ValidOnline {}]
-    GossipOffline {} -> [ValidOffline {}]
-    _ -> []
-  where not (isLocalServer e.server) && e.timestamp <= t + clockSkewTolerance
-  let ttl = clampTtl e.ttl
-  let expiresAt = e.timestamp + ttl * 1000
-  where expiresAt > t
-  yield {eventType: validType, pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}
+validGossipEvents : [GossipEvent] -> Timestamp -> {online: [ValidGossipEntry], offline: [ValidGossipEntry]}
+validGossipEvents = \events t ->
+  let validate = \e ->
+    if not (isLocalServer e.server) && e.timestamp <= t + clockSkewTolerance
+      then let ttl = clampTtl e.ttl in
+           let expiresAt = e.timestamp + ttl * 1000 in
+           if expiresAt > t
+             then [{pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, ttl: ttl}]
+             else []
+      else []
+  in {
+    online: do e <- events; case e.eventType of GossipOnline {} -> validate e; _ -> [],
+    offline: do e <- events; case e.eventType of GossipOffline {} -> validate e; _ -> []
+  }
 
 sendToEach : [ServerName] -> (ServerName -> (a {})) -> a {}
 sendToEach = \servers action ->
@@ -736,7 +726,7 @@ pollOnce = \token cursor -> do
         let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
         let evts = do
           m <- limitedMsgs
-          yield {id: m.messageId, eventType: PtMessage {},
+          yield {id: m.messageId, eventType: "message",
                  payload: {toKey: m.toKey, fromKey: m.fromKey,
                             encryptedBlob: m.encryptedBlob,
                             timestamp: m.timestamp}}
@@ -859,9 +849,9 @@ serve = \req -> case req of
               forwards <- *forwards
               let forwardServers = takeN remoteServers (maxForwardsEntries - count forwards)
               let shouldForward = federationEnabled && count forwardServers > 0
-              let status = if localOnline then DsDelivered {}
-                else if shouldForward then DsFederated {}
-                else DsQueued {}
+              let status = if localOnline then MsDelivered {}
+                else if shouldForward then MsFederated {}
+                else MsQueued {}
               set *forwards = if shouldForward
                 then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
                 else forwards
@@ -877,14 +867,14 @@ serve = \req -> case req of
                 authorization: federationAuth})
               whenOk fwdResult (removeForward msgId server))
             case status of
-              DsQueued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
+              MsQueued {} -> println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")
               _ -> yield {})
         _ -> yield {}
       broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
     yield (case result.send of
       SendUnauthorized {} -> respond {status: MsUnauthorized {}, messageId: ""}
       SendRejected {} -> respond {status: MsRejected {}, messageId: ""}
-      SendDone {status} -> respond {status: toMessageStatus status, messageId: msgId})
+      SendDone {status} -> respond {status: status, messageId: msgId})
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now
@@ -938,8 +928,11 @@ serve = \req -> case req of
             where p.pubkey == pubkey && p.expiresAt > t
             yield p
           let localOnline = any valid (\p -> isLocalServer p.server)
-          let bestRemote = (fold (\acc p -> if not (isLocalServer p.server) && p.expiresAt > acc.best then {server: p.server, best: p.expiresAt} else acc) {server: "", best: 0} valid).server
-          let foundServer = if localOnline then serverHostN else bestRemote
+          let bestRemote = fold (\acc p ->
+            let dominated = case acc of Nothing {} -> True {}; Just {value: v} -> p.expiresAt > v.expiresAt in
+            if not (isLocalServer p.server) && dominated then Just {value: p} else acc) Nothing {} valid
+          let foundServer = if localOnline then serverHostN
+            else case bestRemote of Just {value: p} -> p.server; Nothing {} -> ""
           yield {pr: pr, lookup: LookupDone {server: foundServer}}
     forkBroadcastOffline t result.pr
     yield (case result.lookup of
@@ -953,9 +946,9 @@ serve = \req -> case req of
     if not authorized || cappedHops < 1 || isLocalServer fromServer || count events > maxGossipEvents
       then rejectFederation t respond
       else do
-        let allValidEntries = validGossipEvents events t
-        let onlineEntries = do e <- allValidEntries; where isOnlineEvent e.eventType; yield e
-        let trustedOffline = do e <- allValidEntries; where isOfflineEvent e.eventType && e.server == fromServer; yield e
+        let validated = validGossipEvents events t
+        let onlineEntries = validated.online
+        let trustedOffline = do e <- validated.offline; where e.server == fromServer; yield e
         let filteredOnline = resolveByTimestamp onlineEntries trustedOffline
         let filteredOffline = resolveByTimestamp trustedOffline onlineEntries
         let deduped = mergeByPubkeyServer [] filteredOnline
@@ -977,10 +970,11 @@ serve = \req -> case req of
           set *presence = capResult.finalPresence
           let gossipPeerServers = collectPeerServers capResult.finalPresence (\p -> p.server)
           yield {appliedKeys: union capResult.appliedOnline appliedOffline, pr: pr, gossipPeerServers: gossipPeerServers, withinCapacity: capResult.withinCapacity}
-        let effectiveEvents = do
-          e <- union filteredOnline filteredOffline
+        let effectiveFor = \entries eventType -> do
+          e <- entries
           where any gossipResult.appliedKeys (\a -> samePubkeyServer a e)
-          yield {eventType: toGossipEventType e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl}
+          yield {eventType: eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl}
+        let effectiveEvents = union (effectiveFor filteredOnline (GossipOnline {})) (effectiveFor filteredOffline (GossipOffline {}))
         when (not gossipResult.withinCapacity)
           (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer))
         fork (do

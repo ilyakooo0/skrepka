@@ -42,7 +42,7 @@ module App =
         | DeliveryAck of ackIds: string list
         | ProfileMessage of profile: Profile
 
-    type IncomingEvent = { Sender: string; Timestamp: int64; Envelope: Envelope }
+    type IncomingEvent = { Sender: string; Timestamp: DateTimeOffset; Envelope: Envelope }
 
     type PollStatus =
         | Idle
@@ -79,7 +79,6 @@ module App =
         | DoDisconnect
         | DoSend
         | SendFailed of string
-        | SendOk
         | DoSaveContact
         | PollResult of events: IncomingEvent list * ackIds: string list * status: PollStatus * cursor: int64
         | CopyPubKey
@@ -109,15 +108,11 @@ module App =
     let private hexToOb (hex: string) =
         Crypto.fromHex hex |> Phonemic.toOb
 
-    let private truncOb (ob: string) =
+    let private truncKey (hex: string) =
+        let ob = hexToOb hex
         let parts = ob.Split('-')
-
-        if parts.Length <= 4 then
-            ob
-        else
-            $"{parts.[0]}-{parts.[1]}..{parts.[parts.Length - 2]}-{parts.[parts.Length - 1]}"
-
-    let private truncKey (hex: string) = hexToOb hex |> truncOb
+        if parts.Length <= 4 then ob
+        else $"{parts.[0]}-{parts.[1]}..{parts.[parts.Length - 2]}-{parts.[parts.Length - 1]}"
 
     let private tryParsePubkey (input: string) =
         let input = input.Trim()
@@ -155,7 +150,7 @@ module App =
         match evt.Envelope with
         | Envelope.TextMessage(id, body) ->
             let message =
-                { Id = id; Body = body; Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(evt.Timestamp)
+                { Id = id; Body = body; Timestamp = evt.Timestamp
                   IsOutgoing = false; Status = DeliveryStatus.Delivered }
             { m with
                 Contacts =
@@ -257,7 +252,6 @@ module App =
             | _ -> model, []
 
         | SendFailed err -> { model with Error = Some err }, []
-        | SendOk -> model, []
 
         | PollResult(events, ackIds, status, newCursor) ->
             let model' = events |> List.fold applyEvent { model with PollStatus = status; PollCursor = newCursor }
@@ -386,7 +380,7 @@ module App =
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
                 match parseEnvelope plaintext with
-                | Some envelope -> Ok { Sender = senderHex; Timestamp = payload.Timestamp; Envelope = envelope }
+                | Some envelope -> Ok { Sender = senderHex; Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(payload.Timestamp); Envelope = envelope }
                 | None -> Error "unknown envelope type"
             | None -> Error "decrypt failed"
         with ex ->
@@ -417,13 +411,11 @@ module App =
             })
 
         | CmdSend(session, recipientHex, text, messageId) ->
-            asyncCmd (async {
-                try
-                    do! sendEnvelope session recipientHex (Envelope.TextMessage(messageId, text))
-                    return SendOk
-                with ex ->
-                    return SendFailed ex.Message
-            })
+            Cmd.ofEffect (fun dispatch ->
+                async {
+                    try do! sendEnvelope session recipientHex (Envelope.TextMessage(messageId, text))
+                    with ex -> dispatch (SendFailed ex.Message)
+                } |> Async.Start)
 
         | CmdPoll(session, cursor) ->
             asyncCmd (async {
@@ -567,7 +559,7 @@ module App =
                     | Identified(id, conn) ->
                         Label("Your Public Key:")
 
-                        Label(truncOb (hexToOb id.PubKeyHex))
+                        Label(truncKey id.PubKeyHex)
                             .font(size = 14.)
 
                         Button("Copy Public Key", CopyPubKey)
@@ -634,7 +626,7 @@ module App =
                             |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
                             |> Option.defaultValue ""
 
-                        Button($"{c.Nickname}\n{preview}", SetPage(Chat(c.Pubkey, "")))
+                        Button($"{contactName model.Contacts c.Pubkey}\n{preview}", SetPage(Chat(c.Pubkey, "")))
                 })
                     .padding(20.)
             )
