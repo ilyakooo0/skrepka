@@ -14,10 +14,9 @@ type AppDelegate() =
     override this.CreateAppBuilder() =
         NSTimer.CreateScheduledTimer(0.0, false, fun _ ->
             if this.Window <> null then
-                this.Window.BackgroundColor <- UIColor.White
-                if this.Window.RootViewController <> null then
-                    this.Window.RootViewController.View.BackgroundColor <- UIColor.White)
+                this.Window.BackgroundColor <- UIColor.White)
         |> ignore
+
         App.create().UseiOS()
 
 module Main =
