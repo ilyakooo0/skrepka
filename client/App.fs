@@ -25,7 +25,7 @@ module App =
         | Chat of pubkey: string * compose: string
         | AddContact of pubkey: string * nickname: string
         | Settings
-        | EditProfile of displayName: string * bio: string * photo: string
+        | EditProfile of displayName: string * bio: string * photo: byte[]
 
     type Session =
         { Url: string
@@ -83,7 +83,7 @@ module App =
         | DismissError
         | StateLoaded of Identity option * Data option * Profile option
         | DoPickPhoto
-        | PhotoPicked of string
+        | PhotoPicked of byte[]
         | DoSaveProfile
 
     // ── CmdMsg ──
@@ -156,13 +156,13 @@ module App =
           Nickname = nickname
           DisplayName = ""
           Bio = ""
-          PhotoBase64 = "" }
+          Photo = [||] }
 
     let private withProfile (p: Profile) (c: Contact) =
         { c with
             DisplayName = p.DisplayName
             Bio = p.Bio
-            PhotoBase64 = p.PhotoBase64 }
+            Photo = p.Photo }
 
     let private applyEvent (m: Model) (evt: IncomingEvent) =
         match evt.Envelope with
@@ -242,7 +242,7 @@ module App =
 
             { model with
                 Auth = Identified(identity, Offline)
-                Page = EditProfile("", "", "") },
+                Page = EditProfile("", "", [||]) },
             [ CmdSaveIdentity identity ]
 
         | SetServerUrl url -> { model with ServerUrl = url }, []
@@ -372,7 +372,7 @@ module App =
                 let profile: Profile =
                     { DisplayName = name
                       Bio = bio
-                      PhotoBase64 = photo }
+                      Photo = photo }
 
                 { model with
                     Profile = Some profile
@@ -431,7 +431,7 @@ module App =
                 {| ``type`` = "profile"
                    display_name = profile.DisplayName
                    bio = profile.Bio
-                   photo = profile.PhotoBase64 |}
+                   photo = Convert.ToBase64String profile.Photo |}
             )
 
     let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
@@ -472,7 +472,7 @@ module App =
                 Envelope.ProfileMessage
                     { DisplayName = displayName
                       Bio = bio
-                      PhotoBase64 = photo }
+                      Photo = if photo = "" then [||] else Convert.FromBase64String photo }
             )
         | _ -> None
 
@@ -510,9 +510,7 @@ module App =
         | app ->
             match app.ApplicationLifetime with
             | :? Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime as desktop ->
-                desktop.MainWindow
-                |> Option.ofObj
-                |> Option.map (fun w -> w.StorageProvider)
+                desktop.MainWindow |> Option.ofObj |> Option.map (fun w -> w.StorageProvider)
             | _ -> None
 
     let mapCmd cmdMsg =
@@ -638,25 +636,31 @@ module App =
                         try
                             match getStorageProvider () with
                             | Some sp ->
-                                let opts = Avalonia.Platform.Storage.FilePickerOpenOptions(
-                                    AllowMultiple = false,
-                                    Title = "Pick Photo",
-                                    FileTypeFilter = [
-                                        Avalonia.Platform.Storage.FilePickerFileType("Images",
-                                            Patterns = [ "*.png"; "*.jpg"; "*.jpeg"; "*.gif"; "*.bmp" ])
-                                    ])
+                                let opts =
+                                    Avalonia.Platform.Storage.FilePickerOpenOptions(
+                                        AllowMultiple = false,
+                                        Title = "Pick Photo",
+                                        FileTypeFilter =
+                                            [ Avalonia.Platform.Storage.FilePickerFileType(
+                                                  "Images",
+                                                  Patterns = [ "*.png"; "*.jpg"; "*.jpeg"; "*.gif"; "*.bmp" ]
+                                              ) ]
+                                    )
+
                                 let! files = sp.OpenFilePickerAsync(opts)
+
                                 match files |> Seq.tryHead with
-                                | None -> dispatch (PhotoPicked "")
+                                | None -> dispatch (PhotoPicked [||])
                                 | Some file ->
                                     use! stream = file.OpenReadAsync()
                                     use ms = new MemoryStream()
                                     do! stream.CopyToAsync(ms)
-                                    dispatch (PhotoPicked(Convert.ToBase64String(ms.ToArray())))
-                            | None -> dispatch (PhotoPicked "")
+                                    dispatch (PhotoPicked(ms.ToArray()))
+                            | None -> dispatch (PhotoPicked [||])
                         with _ ->
-                            dispatch (PhotoPicked "")
-                    } :> System.Threading.Tasks.Task)
+                            dispatch (PhotoPicked [||])
+                    }
+                    :> System.Threading.Tasks.Task)
                 |> ignore)
 
         | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile)
@@ -667,7 +671,7 @@ module App =
         VStack(4.) {
             match error with
             | Some err ->
-                TextBlock(err).foreground(SolidColorBrush(Colors.Red)).fontSize(12.)
+                TextBlock(err).foreground(SolidColorBrush(Colors.Red)).fontSize (12.)
                 Button("Dismiss", DismissError)
             | None -> ()
         }
@@ -676,77 +680,73 @@ module App =
         (VStack(24.) {
             Image("avares://Skrepka/Assets/Images/logo.png", Avalonia.Media.Stretch.Uniform)
                 .margin(8., 0., 8., 0.)
-                .maxWidth(300.)
+                .maxWidth (300.)
 
             TextBlock("Skrepka")
                 .fontSize(32.)
                 .fontFamily(FontFamily("avares://Skrepka/Assets/Fonts#Unbounded"))
                 .fontWeight(FontWeight.Bold)
-                .centerText()
+                .centerText ()
 
-            TextBlock("").height(50.)
+            TextBlock("").height (50.)
 
             button "Next" GenIdentity
         })
             .margin(30.)
-            .centerVertical()
+            .centerVertical ()
 
     let private viewSettings model =
         ScrollViewer(
             (VStack(16.) {
-                TextBlock("Settings")
-                    .fontSize(24.)
-                    .centerText()
+                TextBlock("Settings").fontSize(24.).centerText ()
 
                 match model.Auth with
                 | Identified(id, conn) ->
                     TextBlock("Your Public Key:")
 
-                    TextBlock(truncKey id.PubKeyHex).fontSize(14.)
+                    TextBlock(truncKey id.PubKeyHex).fontSize (14.)
 
                     Button("Copy Public Key", CopyPubKey)
 
-                    TextBlock("Profile:").fontSize(18.)
+                    TextBlock("Profile:").fontSize (18.)
 
                     let displayName, bio, photo =
                         match model.Profile with
-                        | Some p -> p.DisplayName, p.Bio, p.PhotoBase64
-                        | None -> "", "", ""
+                        | Some p -> p.DisplayName, p.Bio, p.Photo
+                        | None -> "", "", [||]
 
                     if displayName <> "" then
-                        TextBlock($"Name: {displayName}").fontSize(14.)
+                        TextBlock($"Name: {displayName}").fontSize (14.)
 
                     if bio <> "" then
-                        TextBlock($"Bio: {bio}")
-                            .fontSize(14.)
-                            .foreground(SolidColorBrush(Colors.DimGray))
+                        TextBlock($"Bio: {bio}").fontSize(14.).foreground (SolidColorBrush(Colors.DimGray))
 
                     Button("Edit Profile", SetPage(EditProfile(displayName, bio, photo)))
 
                     TextBlock("Server:")
 
                     match conn with
-                    | Online _ -> TextBlock(model.ServerUrl).fontSize(14.)
+                    | Online _ -> TextBlock(model.ServerUrl).fontSize (14.)
                     | _ -> TextBox(model.ServerUrl, SetServerUrl)
 
                     viewErrorBanner model.Error
 
                     match conn with
                     | Offline -> Button("Connect", DoConnect)
-                    | Connecting -> TextBlock("Connecting...").centerText()
+                    | Connecting -> TextBlock("Connecting...").centerText ()
                     | Online _ ->
                         Button("Disconnect", DoDisconnect)
                         Button("Go to Conversations", SetPage Conversations)
                 | NoIdentity -> ()
             })
-                .margin(20.)
+                .margin (20.)
         )
 
     let private viewConversations model =
         ScrollViewer(
             (VStack(8.) {
                 HStack(8.) {
-                    TextBlock("Conversations").fontSize(24.)
+                    TextBlock("Conversations").fontSize (24.)
 
                     Button("+", SetPage(AddContact("", "")))
                     Button("Settings", SetPage Settings)
@@ -765,14 +765,14 @@ module App =
 
                 TextBlock($"{connStatusLabel model.Auth} [{pubPrefix}]{pollInfo}")
                     .fontSize(10.)
-                    .foreground(SolidColorBrush(Colors.DimGray))
+                    .foreground (SolidColorBrush(Colors.DimGray))
 
                 viewErrorBanner model.Error
 
                 if model.Contacts.IsEmpty then
                     TextBlock("No contacts yet. Tap + to add one.")
                         .centerText()
-                        .foreground(SolidColorBrush(Colors.Gray))
+                        .foreground (SolidColorBrush(Colors.Gray))
 
                 for c in model.Contacts.Values do
                     let preview =
@@ -783,7 +783,7 @@ module App =
 
                     Button($"{contactName model.Contacts c.Pubkey}\n{preview}", SetPage(Chat(c.Pubkey, "")))
             })
-                .margin(20.)
+                .margin (20.)
         )
 
     let private viewChat model pk compose =
@@ -794,7 +794,7 @@ module App =
             HStack(8.) {
                 Button("< Back", SetPage Conversations)
 
-                TextBlock(name).fontSize(20.).centerVertical()
+                TextBlock(name).fontSize(20.).centerVertical ()
             }
 
             viewErrorBanner model.Error
@@ -802,7 +802,7 @@ module App =
             ScrollViewer(
                 VStack(4.) {
                     if msgs.IsEmpty then
-                        TextBlock("No messages yet").padding(8.).fontSize(14.)
+                        TextBlock("No messages yet").padding(8.).fontSize (14.)
                     else
                         for m in msgs do
                             let prefix, tick =
@@ -811,76 +811,74 @@ module App =
                                 | Outgoing DeliveryStatus.Sent -> "You: ", ""
                                 | Incoming -> "", ""
 
-                            TextBlock($"{prefix}{m.Body}{tick}").padding(8.).fontSize(14.)
+                            TextBlock($"{prefix}{m.Body}{tick}").padding(8.).fontSize (14.)
                 }
             )
 
             HStack(8.) {
                 TextBox(compose, fun text -> SetPage(Chat(pk, text)))
                     .watermark("Message...")
-                    .horizontalAlignment(Avalonia.Layout.HorizontalAlignment.Stretch)
+                    .horizontalAlignment (Avalonia.Layout.HorizontalAlignment.Stretch)
 
                 Button("Send", DoSend)
             }
         })
-            .margin(12.)
+            .margin (12.)
 
     let private viewAddContact model cpk cnn =
         (VStack(16.) {
             HStack(8.) {
                 Button("< Back", SetPage Conversations)
 
-                TextBlock("Add Contact").fontSize(20.)
+                TextBlock("Add Contact").fontSize (20.)
             }
 
             viewErrorBanner model.Error
 
             TextBlock("Public Key:")
-            TextBox(cpk, fun text -> SetPage(AddContact(text, cnn))).watermark("sampel-palnet-...")
+            TextBox(cpk, fun text -> SetPage(AddContact(text, cnn))).watermark ("sampel-palnet-...")
 
             TextBlock("Nickname:")
             TextBox(cnn, fun text -> SetPage(AddContact(cpk, text)))
 
-            Button("Save Contact", DoSaveContact).centerHorizontal()
+            Button("Save Contact", DoSaveContact).centerHorizontal ()
         })
-            .margin(20.)
+            .margin (20.)
 
-    let private viewEditProfile model displayName bio photo =
+    let private viewEditProfile model displayName bio (photo: byte[]) =
         ScrollViewer(
             (VStack(16.) {
                 HStack(8.) {
                     Button("< Back", SetPage Settings)
-                    TextBlock("Edit Profile").fontSize(20.)
+                    TextBlock("Edit Profile").fontSize (20.)
                 }
 
                 viewErrorBanner model.Error
 
-                if photo <> "" then
+                if photo.Length > 0 then
                     Image(
-                        new Avalonia.Media.Imaging.Bitmap(new MemoryStream(Convert.FromBase64String(photo))),
-                        Avalonia.Media.Stretch.Uniform)
+                        new Avalonia.Media.Imaging.Bitmap(new MemoryStream(photo: byte[])),
+                        Avalonia.Media.Stretch.Uniform
+                    )
                         .width(120.)
                         .height(120.)
-                        .centerHorizontal()
+                        .centerHorizontal ()
                 else
-                    TextBlock("No Photo")
-                        .fontSize(16.)
-                        .centerText()
-                        .foreground(SolidColorBrush(Colors.Gray))
+                    TextBlock("No Photo").fontSize(16.).centerText().foreground (SolidColorBrush(Colors.Gray))
 
-                Button("Change Photo", DoPickPhoto).centerHorizontal()
+                Button("Change Photo", DoPickPhoto).centerHorizontal ()
 
                 TextBlock("Display Name:")
-                TextBox(displayName, fun text -> SetPage(EditProfile(text, bio, photo))).watermark("Your name")
+                TextBox(displayName, fun text -> SetPage(EditProfile(text, bio, photo))).watermark ("Your name")
 
                 TextBlock("Bio:")
 
                 TextBox(bio, fun text -> SetPage(EditProfile(displayName, text, photo)))
-                    .watermark("Tell something about yourself")
+                    .watermark ("Tell something about yourself")
 
-                Button("Save Profile", DoSaveProfile).centerHorizontal()
+                Button("Save Profile", DoSaveProfile).centerHorizontal ()
             })
-                .margin(20.)
+                .margin (20.)
         )
 
     let private pageContent model =
@@ -893,7 +891,7 @@ module App =
             | AddContact(pk, nn) -> AnyView(viewAddContact model pk nn)
             | EditProfile(displayName, bio, photo) -> AnyView(viewEditProfile model displayName bio photo)
 
-        Border(page).background(SolidColorBrush(Colors.White))
+        Border(page).background (SolidColorBrush(Colors.White))
 
     let view model =
 #if MOBILE
@@ -902,11 +900,13 @@ module App =
         DesktopApplication() {
             Window(pageContent model)
                 .title("Skrepka")
+                .icon("avares://Skrepka/Assets/Images/logo.png")
                 .width(450.)
-                .height(750.)
+                .height (750.)
         }
 #endif
 
     let program = Program.statefulWithCmdMsg init update mapCmd |> Program.withView view
 
-    let create () = FabulousAppBuilder.Configure(FluentTheme, program)
+    let create () =
+        FabulousAppBuilder.Configure(FluentTheme, program)

@@ -12,12 +12,12 @@ module Store =
           Nickname: string
           DisplayName: string
           Bio: string
-          PhotoBase64: string }
+          Photo: byte[] }
 
     type Profile =
         { DisplayName: string
           Bio: string
-          PhotoBase64: string }
+          Photo: byte[] }
 
     [<RequireQualifiedAccess>]
     type DeliveryStatus = Sent | Delivered
@@ -56,7 +56,7 @@ module Store =
         { [<BsonId>] Id: string
           DisplayName: string
           Bio: string
-          PhotoBase64: string }
+          Photo: byte[] }
 
     let private orEmpty s = s |> Option.ofObj |> Option.defaultValue ""
 
@@ -123,7 +123,7 @@ module Store =
             |> Option.map (fun p ->
                 { DisplayName = orEmpty p.DisplayName
                   Bio = orEmpty p.Bio
-                  PhotoBase64 = orEmpty p.PhotoBase64 })
+                  Photo = if p.Photo = null then [||] else p.Photo })
         with _ -> None
 
     let saveProfile (profile: Profile) =
@@ -133,7 +133,7 @@ module Store =
                 { Id = "me"
                   DisplayName = profile.DisplayName
                   Bio = profile.Bio
-                  PhotoBase64 = profile.PhotoBase64 }
+                  Photo = profile.Photo }
             |> ignore
         with _ -> ()
 
@@ -152,7 +152,7 @@ module Store =
                         { c with
                             DisplayName = orEmpty c.DisplayName
                             Bio = orEmpty c.Bio
-                            PhotoBase64 = orEmpty c.PhotoBase64 })
+                            Photo = if c.Photo = null then [||] else c.Photo })
                     |> Map.ofSeq
 
                 let messages =
