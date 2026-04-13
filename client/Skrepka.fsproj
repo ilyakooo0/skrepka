@@ -48,10 +48,14 @@
   <ItemGroup Condition="$(AvaloniaPlatform) == 'iOS'">
     <None Include="$(iOSPlatformFolder)Entitlements.plist" />
     <None Include="$(iOSPlatformFolder)Info.plist" LogicalName="Info.plist" />
-    <InterfaceDefinition Include="$(iOSPlatformFolder)Resources\LaunchScreen.xib" />
+    <InterfaceDefinition Include="$(iOSPlatformFolder)Resources\LaunchScreen.storyboard" />
     <Compile Include="$(iOSPlatformFolder)AppDelegate.fs" />
     <PackageReference Include="Avalonia.iOS" Version="11.3.0" />
   </ItemGroup>
+
+  <Target Name="AddLaunchScreenToPlist" AfterTargets="_GenerateInfoPList" Condition="$(AvaloniaPlatform) == 'iOS'">
+    <Exec Command="/usr/libexec/PlistBuddy -c 'Add :UILaunchStoryboardName string LaunchScreen' '$(AppBundleDir)/Info.plist'" ContinueOnError="true" />
+  </Target>
 
   <ItemGroup Condition="$(AvaloniaPlatform) == 'iOS' And $(RuntimeIdentifier.StartsWith('iossimulator'))">
     <NativeReference Include="native/iossimulator-arm64/libsodium.a">

@@ -286,9 +286,11 @@ stripTrailingDot = \s ->
   else if take 1 s == "." && isTrailingDots (drop 1 s) then stripTrailingDot (drop 1 s)
   else take 1 s ++ stripTrailingDot (drop 1 s)
 
+normalizeServerName : Text -> Text
 normalizeServerName = \s -> toLower (stripTrailingDot s)
 
 serverHostN = normalizeServerName serverHost
+isLocalServer : Text -> Bool
 isLocalServer = \s -> s == serverHostN
 
 containsSuffixN = \suffix suffixLen s ->
@@ -323,6 +325,7 @@ matchesHostname = \sn name ->
 matchesHostnameOrSubdomain = \sn name ->
   matchesHostname sn name || containsSuffix ("." ++ name) sn
 
+isBadServerName : Text -> Bool
 isBadServerName = \sn ->
   sn == ""
   || take 1 sn == "."
@@ -363,32 +366,40 @@ extractToken = \authHeader ->
     then Just {value: token}
     else Nothing {}
 
+verifySecret : Text -> Text -> Bool
 verifySecret = \token secret ->
   secret != "" && safeCompare token secret
 
+verifyFederationAuth : Text -> Bool
 verifyFederationAuth = \authorization ->
   case extractToken authorization of
     Nothing {} -> False {}
     Just {value: token} -> verifySecret token federationSecret
 
+verifyMaintenanceAuth : Text -> Bool
 verifyMaintenanceAuth = \authorization ->
   case extractToken authorization of
     Nothing {} -> False {}
     Just {value: token} -> verifySecret token federationSecret || verifySecret token maintenanceSecret
 
+clampTtl : Int<S> -> Int<S>
 clampTtl = clamp 1 maxPresenceTtl
 
+clampTimestamp : Timestamp -> Timestamp -> Timestamp
 clampTimestamp = \timestamp t -> clamp (t - messageMaxAge) t timestamp
 
+deliveryToMessageStatus : DeliveryStatus -> MessageStatus
 deliveryToMessageStatus = \ds -> case ds of
   DsDelivered {} -> MsDelivered {}
   DsFederated {} -> MsFederated {}
   DsQueued {} -> MsQueued {}
 
+nextSeqTs : Timestamp -> Timestamp -> Timestamp
 nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
 
 takeN = \items n -> (fold (\acc e -> if acc.n >= n then acc else {n: acc.n + 1, items: union acc.items [e]}) {n: 0, items: []} items).items
 
+dedupMessageIds : [MessageIdHex] -> [MessageIdHex]
 dedupMessageIds = \messageIds ->
   fold (\acc mid ->
     if count acc >= maxMessageIds then acc
@@ -502,9 +513,11 @@ capGossipPresence = \args ->
         (do e <- reclaimedEntries; yield (pubkeyServer e)),
        withinCapacity: False {}}
 
+countMessagesFor : [Message] -> PubkeyHex -> Timestamp -> Int
 countMessagesFor = \messages toKey t ->
   count (do m <- messages; where m.toKey == toKey && m.receivedAt >= t - messageMaxAge; yield m)
 
+hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
 hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey == toKey)
 
 
@@ -627,13 +640,11 @@ mergeGossipPresence = \presence deduped trustedOffline fromServer t ->
    gossipPeerServers: collectPeerServers capResult.finalPresence (\p -> p.server),
    withinCapacity: capResult.withinCapacity}
 
-rejectFederation = \t respond -> do
-  maybePruneAndBroadcast t
-  yield (respond {ok: False {}})
-
 withFederationAuth = \authorization t respond precondition action ->
   if not (verifyFederationAuth authorization) || not precondition
-    then rejectFederation t respond
+    then do
+      maybePruneAndBroadcast t
+      yield (respond {ok: False {}})
     else action
 
 maybePruneAndBroadcast = \t -> do

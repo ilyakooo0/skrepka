@@ -10,14 +10,15 @@ open Skrepka
 [<Register(nameof AppDelegate)>]
 type AppDelegate() =
     inherit AvaloniaAppDelegate<FabApplication>()
-    override this.CreateAppBuilder() = App.create().UseiOS()
 
-    [<Export("application:didFinishLaunchingWithOptions:")>]
-    member this.FinishedLaunching(app: UIApplication, options: NSDictionary) : bool =
-        let result = base.FinishedLaunching(app, options)
-        if this.Window <> null then
-            this.Window.BackgroundColor <- UIColor.White
-        result
+    override this.CreateAppBuilder() =
+        NSTimer.CreateScheduledTimer(0.0, false, fun _ ->
+            if this.Window <> null then
+                this.Window.BackgroundColor <- UIColor.White
+                if this.Window.RootViewController <> null then
+                    this.Window.RootViewController.View.BackgroundColor <- UIColor.White)
+        |> ignore
+        App.create().UseiOS()
 
 module Main =
     [<EntryPoint>]
