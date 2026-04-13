@@ -15,8 +15,13 @@ module Buttons =
             match shadowRef.TryValue with
             | None -> ()
             | Some c ->
-                let offset = if pressed then 8. else 12.
-                c.RenderTransform <- Avalonia.Media.TranslateTransform(offset, offset)
+                let offset = if pressed then 4. else 12.
+                match c.RenderTransform with
+                | :? TranslateTransform as t ->
+                    t.X <- offset
+                    t.Y <- offset
+                | _ ->
+                    c.RenderTransform <- TranslateTransform(offset, offset)
 
         Component(text) {
             Grid() {
