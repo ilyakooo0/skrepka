@@ -74,9 +74,19 @@ module Store =
           IsOutgoing = isOutgoing; Status = status }
 
     let private appDataDir =
-        let dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Skrepka")
-        Directory.CreateDirectory(dir) |> ignore
-        dir
+        let baseDir =
+            let appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
+            if String.IsNullOrEmpty(appData) then
+                // iOS: use the app's Documents directory
+                let personal = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+                if String.IsNullOrEmpty(personal) then
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Skrepka")
+                else
+                    Path.Combine(personal, "Skrepka")
+            else
+                Path.Combine(appData, "Skrepka")
+        Directory.CreateDirectory(baseDir) |> ignore
+        baseDir
 
     let private openDb () =
         new LiteDatabase(Path.Combine(appDataDir, "skrepka.db"))

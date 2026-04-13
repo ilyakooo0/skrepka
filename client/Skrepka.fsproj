@@ -23,6 +23,7 @@
     <SupportedOSPlatformVersion>15.0</SupportedOSPlatformVersion>
     <RuntimeIdentifier>iossimulator-arm64</RuntimeIdentifier>
     <ValidateXcodeVersion>false</ValidateXcodeVersion>
+    <UseInterpreter>true</UseInterpreter>
   </PropertyGroup>
 
   <ItemGroup>
@@ -53,7 +54,7 @@
     <PackageReference Include="Avalonia.iOS" Version="11.3.0" />
   </ItemGroup>
 
-  <Target Name="AddLaunchScreenToPlist" AfterTargets="_GenerateInfoPList" Condition="$(AvaloniaPlatform) == 'iOS'">
+  <Target Name="AddLaunchScreenToPlist" AfterTargets="_CompileAppManifest" Condition="$(AvaloniaPlatform) == 'iOS'">
     <Exec Command="/usr/libexec/PlistBuddy -c 'Add :UILaunchStoryboardName string LaunchScreen' '$(AppBundleDir)/Info.plist'" ContinueOnError="true" />
   </Target>
 

@@ -89,13 +89,16 @@ impl ToJSON MessageStatus where
 
 data DeliveryStatus = DsDelivered {} | DsFederated {} | DsQueued {}
 
+isValidBoundedHex : Int -> Text -> Bool
 isValidBoundedHex = \maxLen s -> isValidHex s && not (tooLong s maxLen) && s == normalizeHex s
 type PubkeyHex = Text where isValidBoundedHex maxPubkeyLen
 type BlobHex = Text where isValidBoundedHex maxBlobLen
 type SignatureHex = Text where isValidBoundedHex maxSignatureLen
+isValidMessageId : Text -> Bool
 isValidMessageId = isValidBoundedHex maxMessageIdLen
 type MessageIdHex = Text where isValidMessageId
 type OptionalMessageId = Text where \s -> s == "" || isValidMessageId s
+isValidServerName : Text -> Bool
 isValidServerName = \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
 type ServerName = Text where isValidServerName
 data MessageOrigin = LocalOrigin {} | FederatedOrigin {server: ServerName}
@@ -188,7 +191,9 @@ route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
 -- Helpers
 -- ============================================
 
+any : [a] -> (a -> Bool) -> Bool
 any = \xs pred -> fold (\acc x -> if acc then acc else pred x) (False {}) xs
+none : [a] -> (a -> Bool) -> Bool
 none = \xs pred -> not (any xs pred)
 when = \cond action -> if cond then action else yield {}
 whenOk = \result action -> case result of
@@ -205,10 +210,17 @@ maxBy = \items getKey -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
   Just {value: v} -> if getKey x > getKey v then Just {value: x} else acc) Nothing {} items
 
+minBy = \items getKey -> fold (\acc x -> case acc of
+  Nothing {} -> Just {value: x}
+  Just {value: v} -> if getKey x < getKey v then Just {value: x} else acc) Nothing {} items
+
+hexDigit : Int -> Text
 hexDigit = \n -> take 1 (drop (clamp 0 15 n) "0123456789abcdef")
 
+byteToHex : Int -> Text
 byteToHex = \n -> hexDigit (n / 16) ++ hexDigit (n - (n / 16) * 16)
 
+intTo3Hex : Int -> Text
 intTo3Hex = \n ->
   let b0 = n / 65536 in
   let r0 = n - b0 * 65536 in
@@ -223,26 +235,35 @@ genTokenN = \n -> if n <= 0 then yield "" else do
 
 genToken = genTokenN 8
 
+tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> drop maxLen s != ""
 
+isHexChar : Text -> Bool
 isHexChar = \c -> contains c "0123456789abcdef"
 
+isValidHexPairs : Text -> Bool
 isValidHexPairs = \s ->
   if s == "" then True {}
   else if drop 1 s == "" then False {}
   else if isHexChar (take 1 s) && isHexChar (take 1 (drop 1 s)) then isValidHexPairs (drop 2 s)
   else False {}
 
+isValidHex : Text -> Bool
 isValidHex = \s -> s != "" && isValidHexPairs s
 
+normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
 
+isDigitChar : Text -> Bool
 isDigitChar = \c -> contains c "0123456789"
 
+isAllowedServerChar : Text -> Bool
 isAllowedServerChar = \c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:"
 
+containsBadUrlChar : Text -> Bool
 containsBadUrlChar = \s -> any (chars s) (\c -> not (isAllowedServerChar c))
 
+isCgnatRange : Text -> Bool
 isCgnatRange = \s ->
   take 4 s == "100."
   && let d4 = take 1 (drop 4 s) in
@@ -256,31 +277,40 @@ isCgnatRange = \s ->
   || (d4 == "1" && contains d5 "01" && isDigitChar d6 && threeDigitOctet)
   || (d4 == "1" && d5 == "2" && contains d6 "01234567" && threeDigitOctet))
 
+containsMultipleColons : Text -> Bool
 containsMultipleColons = \s -> count (do c <- chars s; where c == ":"; yield c) > 1
 
+hasPatternAfterDot : (Text -> Bool) -> Text -> Bool
 hasPatternAfterDot = \pred s ->
   if s == "" then False {}
   else if take 1 s == "." && pred (drop 1 s) then True {}
   else hasPatternAfterDot pred (drop 1 s)
 
+isOctalStart : Text -> Bool
 isOctalStart = \s -> take 1 s == "0" && isDigitChar (take 1 (drop 1 s)) && isAllDigitsOrDotsUntilColonOrEnd (drop 2 s)
+hasOctalOctet : Text -> Bool
 hasOctalOctet = \s -> isOctalStart s || hasPatternAfterDot isOctalStart s
 
+isHexStart : Text -> Bool
 isHexStart = \s -> take 2 s == "0x" || take 2 s == "0X"
+hasHexPrefix : Text -> Bool
 hasHexPrefix = \s -> isHexStart s || hasPatternAfterDot isHexStart s
 
+isAllDigitsOrDotsUntilColonOrEnd : Text -> Bool
 isAllDigitsOrDotsUntilColonOrEnd = \s ->
   if s == "" then True {}
   else if take 1 s == ":" then True {}
   else if isDigitChar (take 1 s) || take 1 s == "." then isAllDigitsOrDotsUntilColonOrEnd (drop 1 s)
   else False {}
 
+isTrailingDots : Text -> Bool
 isTrailingDots = \s ->
   if s == "" then True {}
   else if take 1 s == ":" then True {}
   else if take 1 s == "." then isTrailingDots (drop 1 s)
   else False {}
 
+stripTrailingDot : Text -> Text
 stripTrailingDot = \s ->
   if s == "" then ""
   else if take 1 s == "." && isTrailingDots (drop 1 s) then stripTrailingDot (drop 1 s)
@@ -289,17 +319,21 @@ stripTrailingDot = \s ->
 normalizeServerName : Text -> Text
 normalizeServerName = \s -> toLower (stripTrailingDot s)
 
+serverHostN : Text
 serverHostN = normalizeServerName serverHost
 isLocalServer : Text -> Bool
 isLocalServer = \s -> s == serverHostN
 
+containsSuffixN : Text -> Int -> Text -> Bool
 containsSuffixN = \suffix suffixLen s ->
   if s == "" then False {}
   else if take suffixLen s == suffix && (drop suffixLen s == "" || take 1 (drop suffixLen s) == ":") then True {}
   else containsSuffixN suffix suffixLen (drop 1 s)
 
+containsSuffix : Text -> Text -> Bool
 containsSuffix = \suffix s -> containsSuffixN suffix (count (chars suffix)) s
 
+is172Private : Text -> Bool
 is172Private = \sn ->
   take 4 sn == "172."
   && let d1 = take 1 (drop 4 sn) in
@@ -309,6 +343,7 @@ is172Private = \sn ->
     || (d1 == "2" && isDigitChar d2)
     || (d1 == "3" && contains d2 "01"))
 
+isHighOctetPrefix : Text -> Bool
 isHighOctetPrefix = \sn ->
   take 1 sn == "2"
   && let d2 = take 1 (drop 1 sn) in
@@ -318,10 +353,12 @@ isHighOctetPrefix = \sn ->
     || (contains d2 "34" && isDigitChar d3)
     || (d2 == "5" && contains d3 "012345"))
 
+matchesHostname : Text -> Text -> Bool
 matchesHostname = \sn name ->
   let nameLen = count (chars name) in
   take nameLen sn == name && (drop nameLen sn == "" || take 1 (drop nameLen sn) == ":")
 
+matchesHostnameOrSubdomain : Text -> Text -> Bool
 matchesHostnameOrSubdomain = \sn name ->
   matchesHostname sn name || containsSuffix ("." ++ name) sn
 
@@ -370,17 +407,17 @@ verifySecret : Text -> Text -> Bool
 verifySecret = \token secret ->
   secret != "" && safeCompare token secret
 
-verifyFederationAuth : Text -> Bool
-verifyFederationAuth = \authorization ->
+verifyAuthWith : (Text -> Bool) -> Text -> Bool
+verifyAuthWith = \check authorization ->
   case extractToken authorization of
     Nothing {} -> False {}
-    Just {value: token} -> verifySecret token federationSecret
+    Just {value: token} -> check token
+
+verifyFederationAuth : Text -> Bool
+verifyFederationAuth = verifyAuthWith (\token -> verifySecret token federationSecret)
 
 verifyMaintenanceAuth : Text -> Bool
-verifyMaintenanceAuth = \authorization ->
-  case extractToken authorization of
-    Nothing {} -> False {}
-    Just {value: token} -> verifySecret token federationSecret || verifySecret token maintenanceSecret
+verifyMaintenanceAuth = verifyAuthWith (\token -> verifySecret token federationSecret || verifySecret token maintenanceSecret)
 
 clampTtl : Int<S> -> Int<S>
 clampTtl = clamp 1 maxPresenceTtl
@@ -394,9 +431,13 @@ deliveryToMessageStatus = \ds -> case ds of
   DsFederated {} -> MsFederated {}
   DsQueued {} -> MsQueued {}
 
+isQueued : DeliveryStatus -> Bool
+isQueued = \ds -> case ds of DsQueued {} -> True {}; _ -> False {}
+
 nextSeqTs : Timestamp -> Timestamp -> Timestamp
 nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
 
+takeN : [a] -> Int -> [a]
 takeN = \items n -> (fold (\acc e -> if acc.n >= n then acc else {n: acc.n + 1, items: union acc.items [e]}) {n: 0, items: []} items).items
 
 dedupMessageIds : [MessageIdHex] -> [MessageIdHex]
@@ -440,16 +481,20 @@ evictOldestAckedIds = \items n ->
   if n <= 0 then items
   else diff items (boundedSmallest items n (\a -> a.ackedAt))
 
+safeCompareLoop : Text -> Text -> Int -> Int -> Int
 safeCompareLoop = \s1 s2 n result ->
   if n <= 0 && s1 == "" && s2 == ""
     then result
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
+safeCompare : Text -> Text -> Bool
 safeCompare = \a b ->
   safeCompareLoop a b maxTokenLen 0 + (if a == "" then 1 else 0) + (if b == "" then 1 else 0) == 0
 
 evictOneOldest = \items getKey ->
-  diff items (boundedSmallest items 1 getKey)
+  case minBy items getKey of
+    Nothing {} -> items
+    Just {value: v} -> diff items [v]
 
 capPerKey = \items matchKey maxPerKey getExpiry t ->
   let active = do x <- items; where getExpiry x > t; yield x in
@@ -467,6 +512,7 @@ capGlobal = \items maxCount getKey ->
 capPerKeyAndGlobal = \items matchKey maxPerKey getExpiry t maxGlobal ->
   capGlobal (capPerKey items matchKey maxPerKey getExpiry t) maxGlobal getExpiry
 
+collectPeerServers : [a] -> (a -> Text) -> [Text]
 collectPeerServers = \items getServer ->
   fold (\acc item ->
     let s = getServer item in
@@ -908,7 +954,7 @@ serve = \req -> case req of
                 authorization: federationAuth})
               when (any forwardServers (\s -> s == server))
                 (whenOk fwdResult (removeForward msgId server)))
-            when (case delivery of DsQueued {} -> True {}; _ -> False {})
+            when (isQueued delivery)
               (println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")))
           broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
       _ -> forkBroadcastOffline t result.pr

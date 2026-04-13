@@ -23,9 +23,9 @@ module Buttons =
                 Rectangle()
                     .reference(shadowRef)
                     .fill(SolidColorBrush(Colors.Black))
-                    .renderTransform(TranslateTransform(12., 12.))
+                    .renderTransform (TranslateTransform(12., 12.))
 
-                Rectangle().fill(SolidColorBrush(Constants.accentColor))
+                Rectangle().fill (SolidColorBrush(Constants.accentColor))
 
                 TextBlock(text)
                     .foreground(SolidColorBrush(Colors.White))
@@ -33,13 +33,9 @@ module Buttons =
                     .fontFamily(FontFamily("avares://Skrepka/Assets/Fonts#Unbounded"))
                     .fontWeight(FontWeight.Bold)
                     .center()
-                    .margin(8.)
+                    .margin (8.)
 
-                Button(msg,
-                    Rectangle()
-                        .strokeThickness(4.)
-                        .stroke(SolidColorBrush(Colors.Black))
-                        .margin(-3.))
+                Button(msg, Rectangle().strokeThickness(4.).stroke(SolidColorBrush(Colors.Black)).margin (-3.))
                     .onPointerPressed(fun _ -> animate true)
                     .onPointerReleased(fun _ -> animate false)
                     .onPointerExited(fun _ -> animate false)
@@ -47,6 +43,6 @@ module Buttons =
                     .borderThickness(0.)
                     .padding(0.)
                     .horizontalAlignment(Avalonia.Layout.HorizontalAlignment.Stretch)
-                    .verticalAlignment(Avalonia.Layout.VerticalAlignment.Stretch)
+                    .verticalAlignment (Avalonia.Layout.VerticalAlignment.Stretch)
             }
         }
