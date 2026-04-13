@@ -46,6 +46,8 @@ module Buttons =
                     .fontWeight(FontWeight.Bold)
                     .center()
                     .margin (8.)
+
+                Rectangle().stroke(Colors.Black).strokeThickness (4.)
             })
                 .background(Brushes.Transparent)
                 .onPointerPressed(fun _ -> pressed.Set true)
@@ -55,7 +57,12 @@ module Buttons =
         }
 
     let imageButton (img: byte[] option) (msg: 'msg) =
-        Component(Option.defaultWith (fun _ -> "img") img) {
+        let key =
+            match img with
+            | None -> "img-button"
+            | Some i -> $"img-button-{hash i}"
+
+        Component(key) {
             let! pressed = Context.State(false)
             let offset = if pressed.Current then 4. else 8.
 
@@ -68,19 +75,39 @@ module Buttons =
                             Avalonia.Visual.RenderTransformProperty,
                             TimeSpan.FromMilliseconds animationDuration
                         )
-                            .easing (BackEaseOut())
+                            .easing (easing)
                     )
 
-                Rectangle().fill (SolidColorBrush(Constants.accentColor))
+                Rectangle().fill (SolidColorBrush(Colors.White))
 
                 match img with
-                | None -> Image("avares://Skrepka/Assets/Images/user.svg", Stretch.Uniform)
-                | Some i -> Image(new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(i)), Stretch.Uniform)
+                | None ->
+                    ViewBox(
+                        (VStack(32) {
+                            Image("avares://Skrepka/Assets/Images/user.png", Stretch.Uniform)
+                                .width(80.)
+                                .margin (0., 20., 0., 0.)
 
+                            Label("Upload")
+                                .fontFamily(FontFamily("avares://Skrepka/Assets/Fonts#Unbounded"))
+                                .fontWeight(FontWeight.Bold)
+                                .fontSize(24.)
+                                .centerContentHorizontal ()
+                        })
+                    )
+                        .margin (24.)
+
+                | Some i ->
+                    Image(new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(i)), Stretch.UniformToFill)
+                        .clipToBounds (true)
+
+                Rectangle().stroke(Colors.Black).strokeThickness (4.)
             })
                 .background(Brushes.Transparent)
                 .onPointerPressed(fun _ -> pressed.Set true)
                 .onPointerReleased(fun _ -> pressed.Set false)
                 .onPointerExited(fun _ -> pressed.Set false)
+                .width(200.)
+                .height(200.)
                 .onTapped (fun _ -> msg)
         }

@@ -2,13 +2,14 @@ namespace Skrepka
 
 open System
 open System.IO
-open LiteDB
+open Dapper
+open Microsoft.Data.Sqlite
+open Dapper.FSharp.SQLite
 
 module Store =
 
-    [<CLIMutable>]
     type Contact =
-        { [<BsonId>] Pubkey: string
+        { Pubkey: string
           Nickname: string
           DisplayName: string
           Bio: string
@@ -17,12 +18,16 @@ module Store =
     type Profile =
         { DisplayName: string
           Bio: string
-          Photo: byte[] }
+          Photo: byte[] option }
 
     [<RequireQualifiedAccess>]
-    type DeliveryStatus = Sent | Delivered
+    type DeliveryStatus =
+        | Sent
+        | Delivered
 
-    type MessageDirection = Incoming | Outgoing of DeliveryStatus
+    type MessageDirection =
+        | Incoming
+        | Outgoing of DeliveryStatus
 
     type ChatMessage =
         { Id: string
@@ -36,9 +41,25 @@ module Store =
           ServerUrl: string
           PollCursor: int64 }
 
+    // DB row types matching table columns
     [<CLIMutable>]
-    type private MessageDoc =
-        { [<BsonId>] Id: string
+    type ProfileRow =
+        { Id: string
+          DisplayName: string
+          Bio: string
+          Photo: byte[] option }
+
+    [<CLIMutable>]
+    type ContactRow =
+        { Pubkey: string
+          Nickname: string
+          DisplayName: string
+          Bio: string
+          Photo: byte[] option }
+
+    [<CLIMutable>]
+    type MessageRow =
+        { Id: string
           ConversationId: string
           Body: string
           TimestampUnix: int64
@@ -46,50 +67,55 @@ module Store =
           Status: int }
 
     [<CLIMutable>]
-    type private SettingsDoc =
-        { [<BsonId>] Id: string
+    type SettingsRow =
+        { Id: string
           ServerUrl: string
           PollCursor: int64 }
 
-    [<CLIMutable>]
-    type private ProfileDoc =
-        { [<BsonId>] Id: string
-          DisplayName: string
-          Bio: string
-          Photo: byte[] }
-
-    let private orEmpty s = s |> Option.ofObj |> Option.defaultValue ""
-
-    let private toChatMessage (d: MessageDoc) : ChatMessage =
-        { Id = d.Id; Body = d.Body; Timestamp = DateTimeOffset.FromUnixTimeMilliseconds d.TimestampUnix
-          Direction = if not d.IsOutgoing then Incoming else Outgoing(match d.Status with 1 -> DeliveryStatus.Delivered | _ -> DeliveryStatus.Sent) }
-
-    let private toMessageDoc convId (m: ChatMessage) : MessageDoc =
-        let isOutgoing, status =
-            match m.Direction with
-            | Incoming -> false, 0
-            | Outgoing DeliveryStatus.Delivered -> true, 1
-            | Outgoing DeliveryStatus.Sent -> true, 0
-        { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds()
-          IsOutgoing = isOutgoing; Status = status }
+    let private profileTable = table'<ProfileRow> "profile"
+    let private contactTable = table'<ContactRow> "contacts"
+    let private messageTable = table'<MessageRow> "messages"
+    let private settingsTable = table'<SettingsRow> "settings"
 
     let private appDataDir =
         let baseDir =
             let appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
+
             if String.IsNullOrEmpty(appData) then
-                // iOS: use the app's Documents directory
                 let personal = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+
                 if String.IsNullOrEmpty(personal) then
                     Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Skrepka")
                 else
                     Path.Combine(personal, "Skrepka")
             else
                 Path.Combine(appData, "Skrepka")
+
         Directory.CreateDirectory(baseDir) |> ignore
         baseDir
 
-    let private openDb () =
-        new LiteDatabase(Path.Combine(appDataDir, "skrepka.db"))
+    let private dbPath = Path.Combine(appDataDir, "skrepka.db")
+
+    let private openConn () =
+        let conn = new SqliteConnection($"Data Source={dbPath}")
+        conn.Open()
+        conn
+
+    type private ByteArrayOptionHandler() =
+        inherit SqlMapper.TypeHandler<byte[] option>()
+        override _.SetValue(p, value) =
+            p.Value <- match value with Some v -> box v | None -> box DBNull.Value
+        override _.Parse(value) =
+            if value = null || value :? DBNull then None else Some(value :?> byte[])
+
+    do
+        OptionTypes.register ()
+        SqlMapper.AddTypeHandler(ByteArrayOptionHandler())
+        use conn = openConn ()
+        conn.Execute("CREATE TABLE IF NOT EXISTS profile (Id TEXT PRIMARY KEY, DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)") |> ignore
+        conn.Execute("CREATE TABLE IF NOT EXISTS contacts (Pubkey TEXT PRIMARY KEY, Nickname TEXT NOT NULL DEFAULT '', DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)") |> ignore
+        conn.Execute("CREATE TABLE IF NOT EXISTS messages (Id TEXT PRIMARY KEY, ConversationId TEXT NOT NULL, Body TEXT NOT NULL DEFAULT '', TimestampUnix INTEGER NOT NULL, IsOutgoing INTEGER NOT NULL DEFAULT 0, Status INTEGER NOT NULL DEFAULT 0)") |> ignore
+        conn.Execute("CREATE TABLE IF NOT EXISTS settings (Id TEXT PRIMARY KEY, ServerUrl TEXT NOT NULL DEFAULT '', PollCursor INTEGER NOT NULL DEFAULT 0)") |> ignore
 
     let private identityPath = Path.Combine(appDataDir, "identity.key")
 
@@ -98,8 +124,7 @@ module Store =
             return
                 try
                     if File.Exists(identityPath) then
-                        let b64 = File.ReadAllText(identityPath)
-                        b64
+                        File.ReadAllText(identityPath)
                         |> Option.ofObj
                         |> Option.filter (fun s -> s <> "")
                         |> Option.map (Convert.FromBase64String >> Crypto.identityFromPrivKey)
@@ -117,77 +142,115 @@ module Store =
 
     let loadProfile () : Profile option =
         try
-            use db = openDb ()
-            db.GetCollection<ProfileDoc>("profile").FindById(BsonValue "me")
-            |> Option.ofObj
-            |> Option.map (fun p ->
-                { DisplayName = orEmpty p.DisplayName
-                  Bio = orEmpty p.Bio
-                  Photo = if p.Photo = null then [||] else p.Photo })
-        with _ -> None
+            use conn = openConn ()
+
+            select { for p in profileTable do where (p.Id = "me") }
+            |> conn.SelectAsync<ProfileRow>
+            |> Async.AwaitTask
+            |> Async.RunSynchronously
+            |> Seq.tryHead
+            |> Option.map (fun p -> { DisplayName = p.DisplayName; Bio = p.Bio; Photo = p.Photo })
+        with _ ->
+            None
 
     let saveProfile (profile: Profile) =
         try
-            use db = openDb ()
-            db.GetCollection<ProfileDoc>("profile").Upsert
-                { Id = "me"
-                  DisplayName = profile.DisplayName
-                  Bio = profile.Bio
-                  Photo = profile.Photo }
+            use conn = openConn ()
+
+            conn.Execute(
+                "INSERT OR REPLACE INTO profile (Id, DisplayName, Bio, Photo) VALUES (@Id, @DisplayName, @Bio, @Photo)",
+                {| Id = "me"; DisplayName = profile.DisplayName; Bio = profile.Bio
+                   Photo = profile.Photo |> Option.defaultValue null |})
             |> ignore
-        with _ -> ()
+        with _ ->
+            ()
 
     let loadData () : Data option =
         try
-            use db = openDb ()
-            let settings = db.GetCollection<SettingsDoc>("settings").FindById(BsonValue "settings")
+            use conn = openConn ()
+
+            let settings =
+                select { for s in settingsTable do where (s.Id = "settings") }
+                |> conn.SelectAsync<SettingsRow>
+                |> Async.AwaitTask
+                |> Async.RunSynchronously
+                |> Seq.tryHead
 
             settings
-            |> Option.ofObj
-            |> Option.map (fun settings ->
+            |> Option.map (fun s ->
                 let contacts =
-                    db.GetCollection<Contact>("contacts").FindAll()
+                    select { for c in contactTable do selectAll }
+                    |> conn.SelectAsync<ContactRow>
+                    |> Async.AwaitTask
+                    |> Async.RunSynchronously
                     |> Seq.map (fun c ->
-                        c.Pubkey,
-                        { c with
-                            DisplayName = orEmpty c.DisplayName
-                            Bio = orEmpty c.Bio
-                            Photo = if c.Photo = null then [||] else c.Photo })
+                        let contact: Contact =
+                            { Pubkey = c.Pubkey
+                              Nickname = c.Nickname
+                              DisplayName = c.DisplayName
+                              Bio = c.Bio
+                              Photo = c.Photo |> Option.defaultValue [||] }
+
+                        c.Pubkey, contact)
                     |> Map.ofSeq
 
                 let messages =
-                    db.GetCollection<MessageDoc>("messages").FindAll()
+                    select { for m in messageTable do selectAll }
+                    |> conn.SelectAsync<MessageRow>
+                    |> Async.AwaitTask
+                    |> Async.RunSynchronously
                     |> Seq.groupBy _.ConversationId
-                    |> Seq.map (fun (convId, docs) ->
-                        convId, docs |> Seq.map toChatMessage |> Seq.sortBy _.Timestamp |> Seq.toList)
+                    |> Seq.map (fun (convId, rows) ->
+                        convId,
+                        rows
+                        |> Seq.map (fun m ->
+                            { Id = m.Id
+                              Body = m.Body
+                              Timestamp = DateTimeOffset.FromUnixTimeMilliseconds m.TimestampUnix
+                              Direction =
+                                if not m.IsOutgoing then Incoming
+                                else Outgoing(if m.Status = 1 then DeliveryStatus.Delivered else DeliveryStatus.Sent) })
+                        |> Seq.sortBy _.Timestamp
+                        |> Seq.toList)
                     |> Map.ofSeq
 
                 { Contacts = contacts
                   Messages = messages
-                  ServerUrl = settings.ServerUrl |> orEmpty
-                  PollCursor = settings.PollCursor })
+                  ServerUrl = s.ServerUrl
+                  PollCursor = s.PollCursor })
         with _ ->
             None
 
     let saveData (data: Data) =
         try
-            use db = openDb ()
-            let contacts = db.GetCollection<Contact>("contacts")
-            let messages = db.GetCollection<MessageDoc>("messages")
-            let settings = db.GetCollection<SettingsDoc>("settings")
+            use conn = openConn ()
 
             for c in data.Contacts.Values do
-                contacts.Upsert c |> ignore
+                conn.Execute(
+                    "INSERT OR REPLACE INTO contacts (Pubkey, Nickname, DisplayName, Bio, Photo) VALUES (@Pubkey, @Nickname, @DisplayName, @Bio, @Photo)",
+                    {| Pubkey = c.Pubkey; Nickname = c.Nickname; DisplayName = c.DisplayName; Bio = c.Bio
+                       Photo = if c.Photo = null || c.Photo.Length = 0 then null else c.Photo |})
+                |> ignore
 
             data.Messages
             |> Map.iter (fun convId msgs ->
                 for m in msgs do
-                    messages.Upsert(toMessageDoc convId m) |> ignore)
+                    let isOutgoing, status =
+                        match m.Direction with
+                        | Incoming -> false, 0
+                        | Outgoing DeliveryStatus.Delivered -> true, 1
+                        | Outgoing DeliveryStatus.Sent -> true, 0
 
-            settings.Upsert
-                { Id = "settings"
-                  ServerUrl = data.ServerUrl
-                  PollCursor = data.PollCursor }
+                    conn.Execute(
+                        "INSERT OR REPLACE INTO messages (Id, ConversationId, Body, TimestampUnix, IsOutgoing, Status) VALUES (@Id, @ConversationId, @Body, @TimestampUnix, @IsOutgoing, @Status)",
+                        {| Id = m.Id; ConversationId = convId; Body = m.Body
+                           TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds()
+                           IsOutgoing = isOutgoing; Status = status |})
+                    |> ignore)
+
+            conn.Execute(
+                "INSERT OR REPLACE INTO settings (Id, ServerUrl, PollCursor) VALUES (@Id, @ServerUrl, @PollCursor)",
+                {| Id = "settings"; ServerUrl = data.ServerUrl; PollCursor = data.PollCursor |})
             |> ignore
         with _ ->
             ()

@@ -25,7 +25,7 @@ module App =
         | Chat of pubkey: string * compose: string
         | AddContact of pubkey: string * nickname: string
         | Settings
-        | EditProfile of displayName: string * bio: string * photo: byte[]
+        | EditProfile of displayName: string * bio: string * photo: byte[] option
 
     type Session =
         { Url: string
@@ -83,7 +83,7 @@ module App =
         | DismissError
         | StateLoaded of Identity option * Data option * Profile option
         | DoPickPhoto
-        | PhotoPicked of byte[]
+        | PhotoPicked of byte[] option
         | DoSaveProfile
 
     // ── CmdMsg ──
@@ -162,7 +162,7 @@ module App =
         { c with
             DisplayName = p.DisplayName
             Bio = p.Bio
-            Photo = p.Photo }
+            Photo = p.Photo |> Option.defaultValue [||] }
 
     let private applyEvent (m: Model) (evt: IncomingEvent) =
         match evt.Envelope with
@@ -242,7 +242,7 @@ module App =
 
             { model with
                 Auth = Identified(identity, Offline)
-                Page = EditProfile("", "", [||]) },
+                Page = EditProfile("", "", None) },
             [ CmdSaveIdentity identity ]
 
         | SetServerUrl url -> { model with ServerUrl = url }, []
@@ -431,7 +431,7 @@ module App =
                 {| ``type`` = "profile"
                    display_name = profile.DisplayName
                    bio = profile.Bio
-                   photo = Convert.ToBase64String profile.Photo |}
+                   photo = profile.Photo |}
             )
 
     let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
@@ -450,6 +450,11 @@ module App =
         | true, v when v.ValueKind <> JsonValueKind.Null -> Some(v.GetString())
         | _ -> None
 
+    let private tryGetJsonBytes (el: JsonElement) (name: string) =
+        match el.TryGetProperty(name) with
+        | true, v when v.ValueKind <> JsonValueKind.Null -> Some(v.GetBytesFromBase64())
+        | _ -> None
+
     let private parseEnvelope (json: string) =
         use doc = JsonDocument.Parse(json)
         let root = doc.RootElement
@@ -466,13 +471,13 @@ module App =
         | "profile" ->
             let displayName = root.GetProperty("display_name").GetString()
             let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
-            let photo = tryGetJsonString root "photo" |> Option.defaultValue ""
+            let photo = tryGetJsonBytes root "photo"
 
             Some(
                 Envelope.ProfileMessage
                     { DisplayName = displayName
                       Bio = bio
-                      Photo = if photo = "" then [||] else Convert.FromBase64String photo }
+                      Photo = photo }
             )
         | _ -> None
 
@@ -650,15 +655,26 @@ module App =
                                 let! files = sp.OpenFilePickerAsync(opts)
 
                                 match files |> Seq.tryHead with
-                                | None -> dispatch (PhotoPicked [||])
+                                | None -> dispatch (PhotoPicked None)
                                 | Some file ->
                                     use! stream = file.OpenReadAsync()
                                     use ms = new MemoryStream()
                                     do! stream.CopyToAsync(ms)
-                                    dispatch (PhotoPicked(ms.ToArray()))
-                            | None -> dispatch (PhotoPicked [||])
+                                    use skBmp = SkiaSharp.SKBitmap.Decode(ms.ToArray())
+                                    let size = min skBmp.Width skBmp.Height
+                                    let x = (skBmp.Width - size) / 2
+                                    let y = (skBmp.Height - size) / 2
+                                    use cropped = new SkiaSharp.SKBitmap(size, size)
+
+                                    skBmp.ExtractSubset(cropped, SkiaSharp.SKRectI(x, y, x + size, y + size))
+                                    |> ignore
+
+                                    use img = SkiaSharp.SKImage.FromBitmap(cropped)
+                                    use data = img.Encode(SkiaSharp.SKEncodedImageFormat.Png, 90)
+                                    dispatch (PhotoPicked(Some(data.ToArray())))
+                            | None -> dispatch (PhotoPicked None)
                         with _ ->
-                            dispatch (PhotoPicked [||])
+                            dispatch (PhotoPicked None)
                     }
                     :> System.Threading.Tasks.Task)
                 |> ignore)
@@ -713,7 +729,7 @@ module App =
                     let displayName, bio, photo =
                         match model.Profile with
                         | Some p -> p.DisplayName, p.Bio, p.Photo
-                        | None -> "", "", [||]
+                        | None -> "", "", None
 
                     if displayName <> "" then
                         TextBlock($"Name: {displayName}").fontSize (14.)
@@ -845,7 +861,7 @@ module App =
         })
             .margin (20.)
 
-    let private viewEditProfile model displayName bio (photo: byte[]) =
+    let private viewEditProfile model displayName bio (photo: byte[] option) =
         ScrollViewer(
             (VStack(16.) {
                 HStack(8.) {
@@ -855,18 +871,7 @@ module App =
 
                 viewErrorBanner model.Error
 
-                if photo.Length > 0 then
-                    Image(
-                        new Avalonia.Media.Imaging.Bitmap(new MemoryStream(photo: byte[])),
-                        Avalonia.Media.Stretch.Uniform
-                    )
-                        .width(120.)
-                        .height(120.)
-                        .centerHorizontal ()
-                else
-                    TextBlock("No Photo").fontSize(16.).centerText().foreground (SolidColorBrush(Colors.Gray))
-
-                Button("Change Photo", DoPickPhoto).centerHorizontal ()
+                imageButton photo DoPickPhoto
 
                 TextBlock("Display Name:")
                 TextBox(displayName, fun text -> SetPage(EditProfile(text, bio, photo))).watermark ("Your name")
