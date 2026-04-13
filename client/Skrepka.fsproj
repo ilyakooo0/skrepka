@@ -2,9 +2,27 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('osx'))">$(TargetFrameworks);net10.0-ios</TargetFrameworks>
     <RootNamespace>Skrepka</RootNamespace>
     <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
+    <NoWarn>MT7091;NETSDK1206</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <AvaloniaPlatform>$([MSBuild]::GetTargetPlatformIdentifier($(TargetFramework)))</AvaloniaPlatform>
+    <AvaloniaPlatform Condition="'$(AvaloniaPlatform)' == ''">Desktop</AvaloniaPlatform>
+    <AvaloniaPlatform Condition="'$(AvaloniaPlatform)' == 'ios'">iOS</AvaloniaPlatform>
+
+    <iOSPlatformFolder>Platform/iOS/</iOSPlatformFolder>
+    <DesktopPlatformFolder>Platform/Desktop/</DesktopPlatformFolder>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(AvaloniaPlatform)' == 'iOS'">
+    <DefineConstants>$(DefineConstants);MOBILE</DefineConstants>
+    <SupportedOSPlatformVersion>15.0</SupportedOSPlatformVersion>
+    <RuntimeIdentifier>iossimulator-arm64</RuntimeIdentifier>
+    <ValidateXcodeVersion>false</ValidateXcodeVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,7 +33,6 @@
     <Compile Include="Store.fs" />
     <Compile Include="Buttons.fs" />
     <Compile Include="App.fs" />
-    <Compile Include="Program.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -23,8 +40,27 @@
     <AvaloniaResource Include="Assets\Images\*" />
   </ItemGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="$(AvaloniaPlatform) == 'Desktop'">
+    <Compile Include="$(DesktopPlatformFolder)Program.fs" />
     <PackageReference Include="Avalonia.Desktop" Version="11.3.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(AvaloniaPlatform) == 'iOS'">
+    <None Include="$(iOSPlatformFolder)Entitlements.plist" />
+    <None Include="$(iOSPlatformFolder)Info.plist" LogicalName="Info.plist" />
+    <InterfaceDefinition Include="$(iOSPlatformFolder)Resources\LaunchScreen.xib" />
+    <Compile Include="$(iOSPlatformFolder)AppDelegate.fs" />
+    <PackageReference Include="Avalonia.iOS" Version="11.3.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(AvaloniaPlatform) == 'iOS' And $(RuntimeIdentifier.StartsWith('iossimulator'))">
+    <NativeReference Include="native/iossimulator-arm64/libsodium.a">
+      <Kind>Static</Kind>
+      <ForceLoad>true</ForceLoad>
+    </NativeReference>
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.0" />
     <PackageReference Include="FSharp.Core" Version="9.0.100" />
     <PackageReference Include="Fabulous" Version="3.0.0-pre22" />

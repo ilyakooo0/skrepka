@@ -883,8 +883,8 @@ module App =
                 .margin(20.)
         )
 
-    let view model =
-        let content =
+    let private pageContent model =
+        let page =
             match model.Page with
             | Setup -> AnyView(viewSetup ())
             | Settings -> AnyView(viewSettings model)
@@ -893,12 +893,19 @@ module App =
             | AddContact(pk, nn) -> AnyView(viewAddContact model pk nn)
             | EditProfile(displayName, bio, photo) -> AnyView(viewEditProfile model displayName bio photo)
 
+        Border(page).background(SolidColorBrush(Colors.White))
+
+    let view model =
+#if MOBILE
+        SingleViewApplication(pageContent model)
+#else
         DesktopApplication() {
-            Window(content)
+            Window(pageContent model)
                 .title("Skrepka")
                 .width(450.)
                 .height(750.)
         }
+#endif
 
     let program = Program.statefulWithCmdMsg init update mapCmd |> Program.withView view
 

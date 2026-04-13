@@ -6,7 +6,7 @@ DEVICE="${1:-iPhone 17 Pro}"
 BUNDLE_ID="com.skrepka.client"
 APP="bin/Debug/net10.0-ios/iossimulator-arm64/Skrepka.app"
 
-dotnet build Skrepka.fsproj -f net10.0-ios -r iossimulator-arm64
+dotnet build Skrepka.fsproj -f net10.0-ios
 
 UDID=$(xcrun simctl list devices available -j | python3 -c "
 import json, sys
