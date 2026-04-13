@@ -3,11 +3,12 @@ namespace Skrepka
 open System
 open System.IO
 open System.Text.Json
+open Avalonia.Media
+open Avalonia.Themes.Fluent
 open Fabulous
-open Fabulous.Maui
-open Microsoft.Maui.Graphics
+open Fabulous.Avalonia
 
-open type Fabulous.Maui.View
+open type Fabulous.Avalonia.View
 
 module App =
 
@@ -492,6 +493,28 @@ module App =
         with ex ->
             Error $"parse: {ex.Message}"
 
+    let private getClipboard () =
+        match Avalonia.Application.Current with
+        | null -> None
+        | app ->
+            match app.ApplicationLifetime with
+            | :? Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime as desktop ->
+                desktop.MainWindow
+                |> Option.ofObj
+                |> Option.bind (fun w -> w.Clipboard |> Option.ofObj)
+            | _ -> None
+
+    let private getStorageProvider () =
+        match Avalonia.Application.Current with
+        | null -> None
+        | app ->
+            match app.ApplicationLifetime with
+            | :? Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime as desktop ->
+                desktop.MainWindow
+                |> Option.ofObj
+                |> Option.map (fun w -> w.StorageProvider)
+            | _ -> None
+
     let mapCmd cmdMsg =
         match cmdMsg with
         | CmdConnect(url, identity) ->
@@ -534,7 +557,6 @@ module App =
                         for e in errors do
                             log $"decrypt error: {e}"
 
-                        // Fire-and-forget: ack server + send delivery acks
                         if not ackIds.IsEmpty || not events.IsEmpty then
                             async {
                                 if not ackIds.IsEmpty then
@@ -590,8 +612,9 @@ module App =
 
         | CmdCopyToClipboard text ->
             Cmd.ofEffect (fun _ ->
-                Microsoft.Maui.ApplicationModel.DataTransfer.Clipboard.Default.SetTextAsync(text)
-                |> ignore)
+                match getClipboard () with
+                | Some clipboard -> clipboard.SetTextAsync(text) |> ignore
+                | None -> ())
 
         | CmdLoadState ->
             Cmd.OfAsync.perform
@@ -610,245 +633,273 @@ module App =
 
         | CmdPickPhoto ->
             Cmd.ofEffect (fun dispatch ->
-                Microsoft.Maui.ApplicationModel.MainThread.BeginInvokeOnMainThread(fun () ->
+                Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(fun () ->
                     task {
                         try
-                            let! results = Microsoft.Maui.Media.MediaPicker.Default.PickPhotosAsync()
-
-                            match results |> Seq.tryHead with
+                            match getStorageProvider () with
+                            | Some sp ->
+                                let opts = Avalonia.Platform.Storage.FilePickerOpenOptions(
+                                    AllowMultiple = false,
+                                    Title = "Pick Photo",
+                                    FileTypeFilter = [
+                                        Avalonia.Platform.Storage.FilePickerFileType("Images",
+                                            Patterns = [ "*.png"; "*.jpg"; "*.jpeg"; "*.gif"; "*.bmp" ])
+                                    ])
+                                let! files = sp.OpenFilePickerAsync(opts)
+                                match files |> Seq.tryHead with
+                                | None -> dispatch (PhotoPicked "")
+                                | Some file ->
+                                    use! stream = file.OpenReadAsync()
+                                    use ms = new MemoryStream()
+                                    do! stream.CopyToAsync(ms)
+                                    dispatch (PhotoPicked(Convert.ToBase64String(ms.ToArray())))
                             | None -> dispatch (PhotoPicked "")
-                            | Some file ->
-                                use! stream = file.OpenReadAsync()
-                                use ms = new MemoryStream()
-                                do! stream.CopyToAsync(ms)
-                                dispatch (PhotoPicked(Convert.ToBase64String(ms.ToArray())))
                         with _ ->
                             dispatch (PhotoPicked "")
-                    }
-                    |> ignore))
+                    } :> System.Threading.Tasks.Task)
+                |> ignore)
 
         | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile)
 
     // ── View ──
 
     let private viewErrorBanner (error: string option) =
-        VStack(spacing = 4.) {
+        VStack(4.) {
             match error with
             | Some err ->
-                Label(err).textColor(Colors.Red).font (size = 12.)
+                TextBlock(err).foreground(SolidColorBrush(Colors.Red)).fontSize(12.)
                 Button("Dismiss", DismissError)
             | None -> ()
         }
 
     let private viewSetup () =
-        ContentPage(
-            (VStack(spacing = 24.) {
-                Image("logo.png").margin(8, 0).maximumWidth (300)
+        (VStack(24.) {
+            Image("avares://Skrepka/Assets/Images/logo.png", Avalonia.Media.Stretch.Uniform)
+                .margin(8., 0., 8., 0.)
+                .maxWidth(300.)
 
-                Label("Skrepka").font(size = 32., fontFamily = "UnboundedBold").centerTextHorizontal ()
-                BoxView(Colors.Transparent).height (50)
+            TextBlock("Skrepka")
+                .fontSize(32.)
+                .fontFamily(FontFamily("avares://Skrepka/Assets/Fonts#Unbounded"))
+                .fontWeight(FontWeight.Bold)
+                .centerText()
 
-                button "Next" GenIdentity
-            })
-                .padding(30.)
-                .centerVertical ()
-        )
+            TextBlock("").height(50.)
+
+            button "Next" GenIdentity
+        })
+            .margin(30.)
+            .centerVertical()
 
     let private viewSettings model =
-        ContentPage(
-            ScrollView(
-                (VStack(spacing = 16.) {
-                    Label("Settings").font(size = 24.).centerTextHorizontal ()
+        ScrollViewer(
+            (VStack(16.) {
+                TextBlock("Settings")
+                    .fontSize(24.)
+                    .centerText()
 
-                    match model.Auth with
-                    | Identified(id, conn) ->
-                        Label("Your Public Key:")
+                match model.Auth with
+                | Identified(id, conn) ->
+                    TextBlock("Your Public Key:")
 
-                        Label(truncKey id.PubKeyHex).font (size = 14.)
+                    TextBlock(truncKey id.PubKeyHex).fontSize(14.)
 
-                        Button("Copy Public Key", CopyPubKey)
+                    Button("Copy Public Key", CopyPubKey)
 
-                        Label("Profile:").font (size = 18.)
+                    TextBlock("Profile:").fontSize(18.)
 
-                        let displayName, bio, photo =
-                            match model.Profile with
-                            | Some p -> p.DisplayName, p.Bio, p.PhotoBase64
-                            | None -> "", "", ""
+                    let displayName, bio, photo =
+                        match model.Profile with
+                        | Some p -> p.DisplayName, p.Bio, p.PhotoBase64
+                        | None -> "", "", ""
 
-                        if displayName <> "" then
-                            Label($"Name: {displayName}").font (size = 14.)
+                    if displayName <> "" then
+                        TextBlock($"Name: {displayName}").fontSize(14.)
 
-                        if bio <> "" then
-                            Label($"Bio: {bio}").font(size = 14.).textColor (Colors.DimGray)
+                    if bio <> "" then
+                        TextBlock($"Bio: {bio}")
+                            .fontSize(14.)
+                            .foreground(SolidColorBrush(Colors.DimGray))
 
-                        Button("Edit Profile", SetPage(EditProfile(displayName, bio, photo)))
+                    Button("Edit Profile", SetPage(EditProfile(displayName, bio, photo)))
 
-                        Label("Server:")
+                    TextBlock("Server:")
 
-                        match conn with
-                        | Online _ -> Label(model.ServerUrl).font (size = 14.)
-                        | _ -> Entry(model.ServerUrl, SetServerUrl)
-
-                        viewErrorBanner model.Error
-
-                        match conn with
-                        | Offline -> Button("Connect", DoConnect)
-                        | Connecting -> Label("Connecting...").centerTextHorizontal ()
-                        | Online _ ->
-                            Button("Disconnect", DoDisconnect)
-                            Button("Go to Conversations", SetPage Conversations)
-                    | NoIdentity -> ()
-                })
-                    .padding (20.)
-            )
-        )
-
-    let private viewConversations model =
-        ContentPage(
-            ScrollView(
-                (VStack(spacing = 8.) {
-                    HStack(spacing = 8.) {
-                        Label("Conversations").font (size = 24.)
-
-                        Button("+", SetPage(AddContact("", "")))
-                        Button("Settings", SetPage Settings)
-                    }
-
-                    let pubPrefix =
-                        match model.Auth with
-                        | Identified(id, _) -> id.PubKeyHex.[..7]
-                        | _ -> "?"
-
-                    let pollInfo =
-                        if model.PollStatus <> "" then
-                            $" | {model.PollStatus}"
-                        else
-                            ""
-
-                    Label($"{connStatusLabel model.Auth} [{pubPrefix}]{pollInfo}")
-                        .font(size = 10.)
-                        .textColor (Colors.DimGray)
+                    match conn with
+                    | Online _ -> TextBlock(model.ServerUrl).fontSize(14.)
+                    | _ -> TextBox(model.ServerUrl, SetServerUrl)
 
                     viewErrorBanner model.Error
 
-                    if model.Contacts.IsEmpty then
-                        Label("No contacts yet. Tap + to add one.").centerTextHorizontal().textColor (Colors.Gray)
+                    match conn with
+                    | Offline -> Button("Connect", DoConnect)
+                    | Connecting -> TextBlock("Connecting...").centerText()
+                    | Online _ ->
+                        Button("Disconnect", DoDisconnect)
+                        Button("Go to Conversations", SetPage Conversations)
+                | NoIdentity -> ()
+            })
+                .margin(20.)
+        )
 
-                    for c in model.Contacts.Values do
-                        let preview =
-                            messagesFor c.Pubkey model.Messages
-                            |> List.tryLast
-                            |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
-                            |> Option.defaultValue ""
+    let private viewConversations model =
+        ScrollViewer(
+            (VStack(8.) {
+                HStack(8.) {
+                    TextBlock("Conversations").fontSize(24.)
 
-                        Button($"{contactName model.Contacts c.Pubkey}\n{preview}", SetPage(Chat(c.Pubkey, "")))
-                })
-                    .padding (20.)
-            )
+                    Button("+", SetPage(AddContact("", "")))
+                    Button("Settings", SetPage Settings)
+                }
+
+                let pubPrefix =
+                    match model.Auth with
+                    | Identified(id, _) -> id.PubKeyHex.[..7]
+                    | _ -> "?"
+
+                let pollInfo =
+                    if model.PollStatus <> "" then
+                        $" | {model.PollStatus}"
+                    else
+                        ""
+
+                TextBlock($"{connStatusLabel model.Auth} [{pubPrefix}]{pollInfo}")
+                    .fontSize(10.)
+                    .foreground(SolidColorBrush(Colors.DimGray))
+
+                viewErrorBanner model.Error
+
+                if model.Contacts.IsEmpty then
+                    TextBlock("No contacts yet. Tap + to add one.")
+                        .centerText()
+                        .foreground(SolidColorBrush(Colors.Gray))
+
+                for c in model.Contacts.Values do
+                    let preview =
+                        messagesFor c.Pubkey model.Messages
+                        |> List.tryLast
+                        |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
+                        |> Option.defaultValue ""
+
+                    Button($"{contactName model.Contacts c.Pubkey}\n{preview}", SetPage(Chat(c.Pubkey, "")))
+            })
+                .margin(20.)
         )
 
     let private viewChat model pk compose =
         let name = contactName model.Contacts pk
         let msgs = messagesFor pk model.Messages
 
-        ContentPage(
-            (VStack(spacing = 8.) {
-                HStack(spacing = 8.) {
-                    Button("< Back", SetPage Conversations)
+        (VStack(8.) {
+            HStack(8.) {
+                Button("< Back", SetPage Conversations)
 
-                    Label(name).font(size = 20.).centerTextHorizontal ()
+                TextBlock(name).fontSize(20.).centerVertical()
+            }
+
+            viewErrorBanner model.Error
+
+            ScrollViewer(
+                VStack(4.) {
+                    if msgs.IsEmpty then
+                        TextBlock("No messages yet").padding(8.).fontSize(14.)
+                    else
+                        for m in msgs do
+                            let prefix, tick =
+                                match m.Direction with
+                                | Outgoing DeliveryStatus.Delivered -> "You: ", " \u2713"
+                                | Outgoing DeliveryStatus.Sent -> "You: ", ""
+                                | Incoming -> "", ""
+
+                            TextBlock($"{prefix}{m.Body}{tick}").padding(8.).fontSize(14.)
                 }
+            )
 
-                viewErrorBanner model.Error
+            HStack(8.) {
+                TextBox(compose, fun text -> SetPage(Chat(pk, text)))
+                    .watermark("Message...")
+                    .horizontalAlignment(Avalonia.Layout.HorizontalAlignment.Stretch)
 
-                if msgs.IsEmpty then
-                    Label("No messages yet").padding(8.).font (size = 14.)
-                else
-                    for m in msgs do
-                        let prefix, tick =
-                            match m.Direction with
-                            | Outgoing DeliveryStatus.Delivered -> "You: ", " \u2713"
-                            | Outgoing DeliveryStatus.Sent -> "You: ", ""
-                            | Incoming -> "", ""
-
-                        Label($"{prefix}{m.Body}{tick}").padding(8.).font (size = 14.)
-
-                HStack(spacing = 8.) {
-                    Entry(compose, fun text -> SetPage(Chat(pk, text))).placeholder ("Message...")
-
-                    Button("Send", DoSend)
-                }
-            })
-                .padding (12.)
-        )
+                Button("Send", DoSend)
+            }
+        })
+            .margin(12.)
 
     let private viewAddContact model cpk cnn =
-        ContentPage(
-            (VStack(spacing = 16.) {
-                HStack(spacing = 8.) {
-                    Button("< Back", SetPage Conversations)
+        (VStack(16.) {
+            HStack(8.) {
+                Button("< Back", SetPage Conversations)
 
-                    Label("Add Contact").font (size = 20.)
+                TextBlock("Add Contact").fontSize(20.)
+            }
+
+            viewErrorBanner model.Error
+
+            TextBlock("Public Key:")
+            TextBox(cpk, fun text -> SetPage(AddContact(text, cnn))).watermark("sampel-palnet-...")
+
+            TextBlock("Nickname:")
+            TextBox(cnn, fun text -> SetPage(AddContact(cpk, text)))
+
+            Button("Save Contact", DoSaveContact).centerHorizontal()
+        })
+            .margin(20.)
+
+    let private viewEditProfile model displayName bio photo =
+        ScrollViewer(
+            (VStack(16.) {
+                HStack(8.) {
+                    Button("< Back", SetPage Settings)
+                    TextBlock("Edit Profile").fontSize(20.)
                 }
 
                 viewErrorBanner model.Error
 
-                Label("Public Key:")
-                Entry(cpk, fun text -> SetPage(AddContact(text, cnn))).placeholder ("sampel-palnet-...")
+                if photo <> "" then
+                    Image(
+                        new Avalonia.Media.Imaging.Bitmap(new MemoryStream(Convert.FromBase64String(photo))),
+                        Avalonia.Media.Stretch.Uniform)
+                        .width(120.)
+                        .height(120.)
+                        .centerHorizontal()
+                else
+                    TextBlock("No Photo")
+                        .fontSize(16.)
+                        .centerText()
+                        .foreground(SolidColorBrush(Colors.Gray))
 
-                Label("Nickname:")
-                Entry(cnn, fun text -> SetPage(AddContact(cpk, text)))
+                Button("Change Photo", DoPickPhoto).centerHorizontal()
 
-                Button("Save Contact", DoSaveContact).centerHorizontal ()
+                TextBlock("Display Name:")
+                TextBox(displayName, fun text -> SetPage(EditProfile(text, bio, photo))).watermark("Your name")
+
+                TextBlock("Bio:")
+
+                TextBox(bio, fun text -> SetPage(EditProfile(displayName, text, photo)))
+                    .watermark("Tell something about yourself")
+
+                Button("Save Profile", DoSaveProfile).centerHorizontal()
             })
-                .padding (20.)
-        )
-
-    let private viewEditProfile model displayName bio photo =
-        ContentPage(
-            ScrollView(
-                (VStack(spacing = 16.) {
-                    HStack(spacing = 8.) {
-                        Button("< Back", SetPage Settings)
-                        Label("Edit Profile").font (size = 20.)
-                    }
-
-                    viewErrorBanner model.Error
-
-                    if photo <> "" then
-                        Image(new MemoryStream(Convert.FromBase64String(photo)) :> Stream)
-                            .width(120.)
-                            .height(120.)
-                            .centerHorizontal ()
-                    else
-                        Label("No Photo").font(size = 16.).centerTextHorizontal().textColor (Colors.Gray)
-
-                    Button("Change Photo", DoPickPhoto).centerHorizontal ()
-
-                    Label("Display Name:")
-                    Entry(displayName, fun text -> SetPage(EditProfile(text, bio, photo))).placeholder ("Your name")
-
-                    Label("Bio:")
-
-                    Entry(bio, fun text -> SetPage(EditProfile(displayName, text, photo)))
-                        .placeholder ("Tell something about yourself")
-
-                    Button("Save Profile", DoSaveProfile).centerHorizontal ()
-                })
-                    .padding (20.)
-            )
+                .margin(20.)
         )
 
     let view model =
-        let page =
+        let content =
             match model.Page with
-            | Setup -> viewSetup ()
-            | Settings -> viewSettings model
-            | Conversations -> viewConversations model
-            | Chat(pk, compose) -> viewChat model pk compose
-            | AddContact(pk, nn) -> viewAddContact model pk nn
-            | EditProfile(displayName, bio, photo) -> viewEditProfile model displayName bio photo
+            | Setup -> AnyView(viewSetup ())
+            | Settings -> AnyView(viewSettings model)
+            | Conversations -> AnyView(viewConversations model)
+            | Chat(pk, compose) -> AnyView(viewChat model pk compose)
+            | AddContact(pk, nn) -> AnyView(viewAddContact model pk nn)
+            | EditProfile(displayName, bio, photo) -> AnyView(viewEditProfile model displayName bio photo)
 
-        Application() { Window(page) }
+        DesktopApplication() {
+            Window(content)
+                .title("Skrepka")
+                .width(450.)
+                .height(750.)
+        }
 
     let program = Program.statefulWithCmdMsg init update mapCmd |> Program.withView view
+
+    let create () = FabulousAppBuilder.Configure(FluentTheme, program)

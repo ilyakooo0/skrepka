@@ -1,7 +1,6 @@
 namespace Skrepka
 
-open Fabulous.Maui
-open Microsoft.Maui.Graphics
+open Avalonia.Media
 
 module Constants =
-    let accentColor = Color.FromRgb(98, 54, 255)
+    let accentColor = Color.FromRgb(98uy, 54uy, 255uy)

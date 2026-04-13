@@ -3,7 +3,6 @@ namespace Skrepka
 open System
 open System.IO
 open LiteDB
-open Microsoft.Maui.Storage
 
 module Store =
 
@@ -74,32 +73,36 @@ module Store =
         { Id = m.Id; ConversationId = convId; Body = m.Body; TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds()
           IsOutgoing = isOutgoing; Status = status }
 
+    let private appDataDir =
+        let dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Skrepka")
+        Directory.CreateDirectory(dir) |> ignore
+        dir
+
     let private openDb () =
-        new LiteDatabase(Path.Combine(FileSystem.AppDataDirectory, "skrepka.db"))
+        new LiteDatabase(Path.Combine(appDataDir, "skrepka.db"))
+
+    let private identityPath = Path.Combine(appDataDir, "identity.key")
 
     let loadIdentity () =
         async {
-            let! privKeyB64 =
-                async {
-                    try
-                        return! SecureStorage.Default.GetAsync("identity_privkey") |> Async.AwaitTask
-                    with _ ->
-                        return Preferences.Default.Get<string>("identity_privkey", null)
-                }
-
             return
-                privKeyB64
-                |> Option.ofObj
-                |> Option.map (Convert.FromBase64String >> Crypto.identityFromPrivKey)
+                try
+                    if File.Exists(identityPath) then
+                        let b64 = File.ReadAllText(identityPath)
+                        b64
+                        |> Option.ofObj
+                        |> Option.filter (fun s -> s <> "")
+                        |> Option.map (Convert.FromBase64String >> Crypto.identityFromPrivKey)
+                    else
+                        None
+                with _ ->
+                    None
         }
 
     let saveIdentity (identity: Crypto.Identity) =
         async {
             let b64 = Convert.ToBase64String identity.PrivKey
-            try
-                do! SecureStorage.Default.SetAsync("identity_privkey", b64) |> Async.AwaitTask
-            with _ ->
-                Preferences.Default.Set("identity_privkey", b64)
+            File.WriteAllText(identityPath, b64)
         }
 
     let loadProfile () : Profile option =
