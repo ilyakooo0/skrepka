@@ -64,6 +64,7 @@
     <None Include="$(iOSPlatformFolder)Entitlements.plist" />
     <None Include="$(iOSPlatformFolder)Info.plist" LogicalName="Info.plist" />
     <InterfaceDefinition Include="$(iOSPlatformFolder)Resources\LaunchScreen.storyboard" />
+    <ImageAsset Include="$(iOSPlatformFolder)Resources\Assets.xcassets\Contents.json" />
     <ImageAsset Include="$(iOSPlatformFolder)Resources\Assets.xcassets\AppIcon.appiconset\Contents.json" />
     <ImageAsset Include="$(iOSPlatformFolder)Resources\Assets.xcassets\AppIcon.appiconset\*.png" />
     <Compile Include="$(iOSPlatformFolder)AppDelegate.fs" />
