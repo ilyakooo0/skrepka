@@ -24,6 +24,7 @@
     <RuntimeIdentifier>iossimulator-arm64</RuntimeIdentifier>
     <ValidateXcodeVersion>false</ValidateXcodeVersion>
     <UseInterpreter>true</UseInterpreter>
+    <UseNativeHttpHandler>true</UseNativeHttpHandler>
   </PropertyGroup>
 
   <ItemGroup>
@@ -111,7 +112,7 @@
     <PackageReference Include="FSharp.Core" Version="11.0.100-preview3.26159.112" />
     <PackageReference Include="Fabulous" Version="3.0.0-pre22" />
     <PackageReference Include="Fabulous.Avalonia" Version="3.0.0-pre13" />
-    <PackageReference Include="Sodium.Core" Version="1.4.1-preview.1" />
+    <PackageReference Include="Sodium.Core" Version="1.4.0" />
     <PackageReference Include="Dapper.FSharp" Version="4.10.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0-preview.2.26159.112" />
   </ItemGroup>
