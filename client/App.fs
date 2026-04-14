@@ -516,7 +516,73 @@ module App =
             match app.ApplicationLifetime with
             | :? Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime as desktop ->
                 desktop.MainWindow |> Option.ofObj |> Option.map (fun w -> w.StorageProvider)
+            | :? Avalonia.Controls.ApplicationLifetimes.ISingleViewApplicationLifetime as singleView ->
+                singleView.MainView
+                |> Option.ofObj
+                |> Option.bind (fun v -> Avalonia.Controls.TopLevel.GetTopLevel(v) |> Option.ofObj)
+                |> Option.map (fun tl -> tl.StorageProvider)
             | _ -> None
+
+    let private cropToSquarePng (imageBytes: byte[]) =
+        use skBmp = SkiaSharp.SKBitmap.Decode(imageBytes)
+        let size = min skBmp.Width skBmp.Height
+        let x = (skBmp.Width - size) / 2
+        let y = (skBmp.Height - size) / 2
+        use cropped = new SkiaSharp.SKBitmap(size, size)
+        skBmp.ExtractSubset(cropped, SkiaSharp.SKRectI(x, y, x + size, y + size)) |> ignore
+        use img = SkiaSharp.SKImage.FromBitmap(cropped)
+        use data = img.Encode(SkiaSharp.SKEncodedImageFormat.Png, 90)
+        data.ToArray()
+
+#if MOBILE
+    let private pickPhotoCmd =
+        Cmd.ofEffect (fun dispatch ->
+            task {
+                try
+                    let! bytes = Skrepka.iOS.PhotoPicker.pick ()
+
+                    match bytes with
+                    | Some b -> dispatch (PhotoPicked(Some(cropToSquarePng b)))
+                    | None -> dispatch (PhotoPicked None)
+                with _ ->
+                    dispatch (PhotoPicked None)
+            }
+            |> ignore)
+#else
+    let private pickPhotoCmd =
+        Cmd.ofEffect (fun dispatch ->
+            Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(fun () ->
+                task {
+                    try
+                        match getStorageProvider () with
+                        | Some sp ->
+                            let opts =
+                                Avalonia.Platform.Storage.FilePickerOpenOptions(
+                                    AllowMultiple = false,
+                                    Title = "Pick Photo",
+                                    FileTypeFilter =
+                                        [ Avalonia.Platform.Storage.FilePickerFileType(
+                                              "Images",
+                                              Patterns = [ "*.png"; "*.jpg"; "*.jpeg"; "*.gif"; "*.bmp" ]
+                                          ) ]
+                                )
+
+                            let! files = sp.OpenFilePickerAsync(opts)
+
+                            match files |> Seq.tryHead with
+                            | None -> dispatch (PhotoPicked None)
+                            | Some file ->
+                                use! stream = file.OpenReadAsync()
+                                use ms = new MemoryStream()
+                                do! stream.CopyToAsync(ms)
+                                dispatch (PhotoPicked(Some(cropToSquarePng (ms.ToArray()))))
+                        | None -> dispatch (PhotoPicked None)
+                    with _ ->
+                        dispatch (PhotoPicked None)
+                }
+                :> System.Threading.Tasks.Task)
+            |> ignore)
+#endif
 
     let mapCmd cmdMsg =
         match cmdMsg with
@@ -634,50 +700,7 @@ module App =
 
         | CmdSaveData data -> Cmd.ofEffect (fun _ -> Store.saveData data)
 
-        | CmdPickPhoto ->
-            Cmd.ofEffect (fun dispatch ->
-                Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(fun () ->
-                    task {
-                        try
-                            match getStorageProvider () with
-                            | Some sp ->
-                                let opts =
-                                    Avalonia.Platform.Storage.FilePickerOpenOptions(
-                                        AllowMultiple = false,
-                                        Title = "Pick Photo",
-                                        FileTypeFilter =
-                                            [ Avalonia.Platform.Storage.FilePickerFileType(
-                                                  "Images",
-                                                  Patterns = [ "*.png"; "*.jpg"; "*.jpeg"; "*.gif"; "*.bmp" ]
-                                              ) ]
-                                    )
-
-                                let! files = sp.OpenFilePickerAsync(opts)
-
-                                match files |> Seq.tryHead with
-                                | None -> dispatch (PhotoPicked None)
-                                | Some file ->
-                                    use! stream = file.OpenReadAsync()
-                                    use ms = new MemoryStream()
-                                    do! stream.CopyToAsync(ms)
-                                    use skBmp = SkiaSharp.SKBitmap.Decode(ms.ToArray())
-                                    let size = min skBmp.Width skBmp.Height
-                                    let x = (skBmp.Width - size) / 2
-                                    let y = (skBmp.Height - size) / 2
-                                    use cropped = new SkiaSharp.SKBitmap(size, size)
-
-                                    skBmp.ExtractSubset(cropped, SkiaSharp.SKRectI(x, y, x + size, y + size))
-                                    |> ignore
-
-                                    use img = SkiaSharp.SKImage.FromBitmap(cropped)
-                                    use data = img.Encode(SkiaSharp.SKEncodedImageFormat.Png, 90)
-                                    dispatch (PhotoPicked(Some(data.ToArray())))
-                            | None -> dispatch (PhotoPicked None)
-                        with _ ->
-                            dispatch (PhotoPicked None)
-                    }
-                    :> System.Threading.Tasks.Task)
-                |> ignore)
+        | CmdPickPhoto -> pickPhotoCmd
 
         | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile)
 

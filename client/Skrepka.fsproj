@@ -33,6 +33,7 @@
     <Compile Include="Phonemic.fs" />
     <Compile Include="Store.fs" />
     <Compile Include="Buttons.fs" />
+    <Compile Include="$(iOSPlatformFolder)PhotoPicker.fs" Condition="$(AvaloniaPlatform) == 'iOS'" />
     <Compile Include="App.fs" />
   </ItemGroup>
 
