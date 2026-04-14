@@ -83,6 +83,7 @@ module Store =
     let private contactTable = table'<ContactRow> "contacts"
     let private messageTable = table'<MessageRow> "messages"
     let private settingsTable = table'<SettingsRow> "settings"
+    let private outboxTable = table'<OutboxRow> "outbox"
 
     let private appDataDir =
         let baseDir =
@@ -265,17 +266,38 @@ module Store =
 
     let enqueueOutbox (recipientHex: string) (envelopeJson: string) =
         use conn = openConn ()
-        conn.Execute(
-            "INSERT INTO outbox (RecipientHex, EnvelopeJson, CreatedAt) VALUES (@RecipientHex, @EnvelopeJson, @CreatedAt)",
-            {| RecipientHex = recipientHex; EnvelopeJson = envelopeJson
-               CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() |})
+        insert {
+            for o in outboxTable do
+            value
+                { Id = 0L
+                  RecipientHex = recipientHex
+                  EnvelopeJson = envelopeJson
+                  CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+            excludeColumn o.Id
+        }
+        |> conn.InsertAsync
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
         |> ignore
 
     let peekOutbox () : OutboxRow option =
         use conn = openConn ()
-        conn.Query<OutboxRow>("SELECT Id, RecipientHex, EnvelopeJson, CreatedAt FROM outbox ORDER BY Id LIMIT 1")
+        select {
+            for o in outboxTable do
+            orderBy o.Id
+        }
+        |> conn.SelectAsync<OutboxRow>
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
         |> Seq.tryHead
 
     let dequeueOutbox (id: int64) =
         use conn = openConn ()
-        conn.Execute("DELETE FROM outbox WHERE Id = @Id", {| Id = id |}) |> ignore
+        delete {
+            for o in outboxTable do
+            where (o.Id = id)
+        }
+        |> conn.DeleteAsync
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+        |> ignore
