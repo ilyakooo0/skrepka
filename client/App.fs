@@ -16,6 +16,7 @@ module App =
     open Crypto
     open ApiClient
     open Buttons
+    open TextFields
 
     // ── Domain Types ──
 
@@ -273,8 +274,7 @@ module App =
                     Error = None
                     PollStatus = "polling..."
                     FlushingOutbox = true },
-                [ CmdPoll(session, model.PollCursor)
-                  CmdFlushOutbox session ]
+                [ CmdPoll(session, model.PollCursor); CmdFlushOutbox session ]
             | _ -> model, []
 
         | AuthErr err ->
@@ -320,9 +320,7 @@ module App =
                 model, []
             else
                 match trySession model with
-                | Some session ->
-                    { model with FlushingOutbox = true },
-                    [ CmdFlushOutbox session ]
+                | Some session -> { model with FlushingOutbox = true }, [ CmdFlushOutbox session ]
                 | None -> model, []
 
         | FlushResult sent ->
@@ -556,7 +554,10 @@ module App =
         let x = (skBmp.Width - size) / 2
         let y = (skBmp.Height - size) / 2
         use cropped = new SkiaSharp.SKBitmap(size, size)
-        skBmp.ExtractSubset(cropped, SkiaSharp.SKRectI(x, y, x + size, y + size)) |> ignore
+
+        skBmp.ExtractSubset(cropped, SkiaSharp.SKRectI(x, y, x + size, y + size))
+        |> ignore
+
         use img = SkiaSharp.SKImage.FromBitmap(cropped)
         use data = img.Encode(SkiaSharp.SKEncodedImageFormat.Png, 90)
         data.ToArray()
@@ -630,7 +631,10 @@ module App =
                     | Some item ->
                         try
                             let blob =
-                                Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex item.RecipientHex) item.EnvelopeJson
+                                Crypto.encrypt
+                                    session.Identity.PrivKey
+                                    (Crypto.fromHex item.RecipientHex)
+                                    item.EnvelopeJson
 
                             let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                             do! sendMessage session.Url session.Token item.RecipientHex (Crypto.toHex blob) ts
@@ -640,8 +644,7 @@ module App =
                             log $"outbox send error: {ex.Message}"
                             do! Async.Sleep 3000
                             dispatch (FlushResult true)
-                    | None ->
-                        dispatch (FlushResult false)
+                    | None -> dispatch (FlushResult false)
                 }
                 |> Async.Start)
 
@@ -780,7 +783,7 @@ module App =
 
             TextBlock("").height (50.)
 
-            button "Next" GenIdentity
+            button Primary "Next" GenIdentity
         })
             .margin(30.)
             .centerVertical ()
@@ -936,29 +939,37 @@ module App =
             .margin (20.)
 
     let private viewEditProfile model displayName bio (photo: byte[] option) =
-        ScrollViewer(
-            (VStack(16.) {
+        (Grid([], [ Dimension.Star; Dimension.Auto ]) {
+            ScrollViewer(
+                (VStack(16.) {
+                    viewErrorBanner model.Error
+
+                    imageButton photo DoPickPhoto
+
+                    TextBlock("Name").fontFamily(Constants.fontFamily).fontWeight(FontWeight.Bold).margin (0, 24, 0, -8)
+                    (textField displayName (fun text -> SetPage(EditProfile(text, bio, photo)))).margin (0, 0, 0, 8)
+
+
+                    TextBlock("Bio").fontFamily(Constants.fontFamily).fontWeight(FontWeight.Bold).margin (0, 0, 0, -8)
+
+                    (multilineTextField bio (fun text -> SetPage(EditProfile(displayName, text, photo))))
+                        .margin (0, 0, 0, 8)
+                })
+                    .margin (20.)
+            )
+                .gridRow (0)
+
+            (Grid() {
+                Rectangle().stroke(SolidColorBrush(Colors.Black)).strokeThickness(4.).fill (Constants.accentColor)
+
                 HStack(8.) {
-                    Button("< Back", SetPage Settings)
-                    TextBlock("Edit Profile").fontSize (20.)
+                    (button Secondary "back" (SetPage Settings)).margin (8.)
+
+                    (button Secondary "save" DoSaveProfile).margin (8.)
                 }
-
-                viewErrorBanner model.Error
-
-                imageButton photo DoPickPhoto
-
-                TextBlock("Display Name:")
-                TextBox(displayName, fun text -> SetPage(EditProfile(text, bio, photo))).watermark ("Your name")
-
-                TextBlock("Bio:")
-
-                TextBox(bio, fun text -> SetPage(EditProfile(displayName, text, photo)))
-                    .watermark ("Tell something about yourself")
-
-                Button("Save Profile", DoSaveProfile).centerHorizontal ()
             })
-                .margin (20.)
-        )
+                .gridRow (1)
+        })
 
     let private pageContent model =
         let page =

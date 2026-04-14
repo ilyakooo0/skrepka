@@ -9,18 +9,17 @@ open type Fabulous.Avalonia.View
 module Buttons =
     open Avalonia.Media.Transformation
     open System
-    open Avalonia.Animation.Easings
 
-    let private animationDuration: int64 = 60
-    let private easing = CubicEaseOut()
-
+    type ButtonPriority =
+        | Primary
+        | Secondary
 
     let private translate x y =
         let b = TransformOperations.CreateBuilder 1
         b.AppendTranslate(x, y)
         b.Build() :> ITransform
 
-    let button (text: string) (msg: 'msg) =
+    let button priority (text: string) (msg: 'msg) =
         Component(text) {
             let! pressed = Context.State(false)
             let offset = if pressed.Current then 4. else 8.
@@ -32,17 +31,27 @@ module Buttons =
                     .transition (
                         TransformOperationsTransition(
                             Avalonia.Visual.RenderTransformProperty,
-                            TimeSpan.FromMilliseconds animationDuration
+                            TimeSpan.FromMilliseconds Constants.animationDuration
                         )
-                            .easing (easing)
+                            .easing (Constants.easing)
                     )
 
-                Rectangle().fill (SolidColorBrush(Constants.accentColor))
+                Rectangle()
+                    .fill (
+                        match priority with
+                        | Primary -> SolidColorBrush(Constants.accentColor)
+                        | Secondary -> SolidColorBrush(Colors.White)
+                    )
 
                 TextBlock(text)
-                    .foreground(SolidColorBrush(Colors.White))
+                    .foreground(
+                        match priority with
+                        | Primary -> SolidColorBrush(Colors.White)
+                        | Secondary -> SolidColorBrush(Colors.Black)
+
+                    )
                     .fontSize(24.)
-                    .fontFamily(FontFamily("avares://Skrepka/Assets/Fonts#Unbounded"))
+                    .fontFamily(FontFamily(Constants.fontFamily))
                     .fontWeight(FontWeight.Bold)
                     .center()
                     .margin (8.)
@@ -53,6 +62,7 @@ module Buttons =
                 .onPointerPressed(fun _ -> pressed.Set true)
                 .onPointerReleased(fun _ -> pressed.Set false)
                 .onPointerExited(fun _ -> pressed.Set false)
+                .margin(16.)
                 .onTapped (fun _ -> msg)
         }
 
@@ -73,9 +83,9 @@ module Buttons =
                     .transition (
                         TransformOperationsTransition(
                             Avalonia.Visual.RenderTransformProperty,
-                            TimeSpan.FromMilliseconds animationDuration
+                            TimeSpan.FromMilliseconds Constants.animationDuration
                         )
-                            .easing (easing)
+                            .easing (Constants.easing)
                     )
 
                 Rectangle().fill (SolidColorBrush(Colors.White))
@@ -89,7 +99,7 @@ module Buttons =
                                 .margin (0., 20., 0., 0.)
 
                             Label("Upload")
-                                .fontFamily(FontFamily("avares://Skrepka/Assets/Fonts#Unbounded"))
+                                .fontFamily(FontFamily(Constants.fontFamily))
                                 .fontWeight(FontWeight.Bold)
                                 .fontSize(24.)
                                 .centerContentHorizontal ()
@@ -109,5 +119,6 @@ module Buttons =
                 .onPointerExited(fun _ -> pressed.Set false)
                 .width(200.)
                 .height(200.)
+                .margin(16.)
                 .onTapped (fun _ -> msg)
         }

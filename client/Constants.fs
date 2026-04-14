@@ -4,3 +4,6 @@ open Avalonia.Media
 
 module Constants =
     let accentColor = Color.FromRgb(98uy, 54uy, 255uy)
+    let animationDuration: int64 = 60
+    let easing = Avalonia.Animation.Easings.CubicEaseOut()
+    let fontFamily = "avares://Skrepka/Assets/Fonts#Unbounded"
