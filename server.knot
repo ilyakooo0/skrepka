@@ -119,7 +119,6 @@ data AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evicte
 data PollResult = PollUnauthorized {} | PollOk {events: [PollEvent], cursor: Timestamp}
 data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
-
 -- ============================================
 -- Persisted State
 -- ============================================
@@ -566,7 +565,6 @@ countMessagesFor = \messages toKey t ->
 hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
 hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey == toKey)
 
-
 validGossipEvents : [GossipEvent] -> Timestamp -> {online: [ValidGossipEntry], offline: [ValidGossipEntry]}
 validGossipEvents = \events t ->
   let validate = \e ->
@@ -686,16 +684,16 @@ mergeGossipPresence = \presence deduped trustedOffline fromServer t ->
    gossipPeerServers: collectPeerServers capResult.finalPresence (\p -> p.server),
    withinCapacity: capResult.withinCapacity}
 
+maybePruneAndBroadcast = \t -> do
+  pruneResult <- atomic do maybePrune t
+  forkBroadcastOffline t pruneResult
+
 withFederationAuth = \authorization t respond precondition action ->
   if not (verifyFederationAuth authorization) || not precondition
     then do
       maybePruneAndBroadcast t
       yield (respond {ok: False {}})
     else action
-
-maybePruneAndBroadcast = \t -> do
-  pruneResult <- atomic do maybePrune t
-  forkBroadcastOffline t pruneResult
 
 withSessionAuth = \authorization t onUnauth onAuth -> do
   sessions <- *sessions

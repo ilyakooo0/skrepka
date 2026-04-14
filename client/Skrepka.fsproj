@@ -63,7 +63,6 @@
   <ItemGroup Condition="$(AvaloniaPlatform) == 'iOS'">
     <None Include="$(iOSPlatformFolder)Entitlements.plist" />
     <None Include="$(iOSPlatformFolder)Info.plist" LogicalName="Info.plist" />
-    <InterfaceDefinition Include="$(iOSPlatformFolder)Resources\LaunchScreen.storyboard" />
     <ImageAsset Include="$(iOSPlatformFolder)Resources\Assets.xcassets\Contents.json" />
     <ImageAsset Include="$(iOSPlatformFolder)Resources\Assets.xcassets\AppIcon.appiconset\Contents.json" />
     <ImageAsset Include="$(iOSPlatformFolder)Resources\Assets.xcassets\AppIcon.appiconset\*.png" />
@@ -71,8 +70,33 @@
     <PackageReference Include="Avalonia.iOS" Version="11.3.0" />
   </ItemGroup>
 
-  <Target Name="AddLaunchScreenToPlist" AfterTargets="_CompileAppManifest" Condition="$(AvaloniaPlatform) == 'iOS'">
-    <Exec Command="/usr/libexec/PlistBuddy -c 'Add :UILaunchStoryboardName string LaunchScreen' '$(AppBundleDir)/Info.plist'" ContinueOnError="true" />
+  <Target Name="FixBundlePlist" AfterTargets="Build" Condition="$(AvaloniaPlatform) == 'iOS'">
+    <PropertyGroup>
+      <_Plist>$(AppBundleDir)/Info.plist</_Plist>
+      <_PB>/usr/libexec/PlistBuddy</_PB>
+    </PropertyGroup>
+    <!-- Launch screen (full-screen, no letterboxing) -->
+    <Exec Command="$(_PB) -c 'Delete :UILaunchStoryboardName' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :UILaunchScreen dict' '$(_Plist)'" ContinueOnError="true" />
+    <!-- Privacy descriptions -->
+    <Exec Command="$(_PB) -c 'Add :NSPhotoLibraryUsageDescription string Skrepka needs access to your photo library to set a profile photo.' '$(_Plist)'" ContinueOnError="true" />
+    <!-- App icon (fallback when actool produces empty output) -->
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons dict' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons:CFBundlePrimaryIcon dict' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles array' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0 string AppIcon60x60' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName string AppIcon' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons~ipad dict' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons~ipad:CFBundlePrimaryIcon dict' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles array' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:0 string AppIcon60x60' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:1 string AppIcon76x76' '$(_Plist)'" ContinueOnError="true" />
+    <Exec Command="$(_PB) -c 'Add :CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconName string AppIcon' '$(_Plist)'" ContinueOnError="true" />
+    <!-- Copy icon PNGs to bundle (fallback when actool doesn't produce Assets.car) -->
+    <Copy SourceFiles="$(iOSPlatformFolder)Resources/Assets.xcassets/AppIcon.appiconset/icon-120.png" DestinationFiles="$(AppBundleDir)/AppIcon60x60@2x.png" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(iOSPlatformFolder)Resources/Assets.xcassets/AppIcon.appiconset/icon-180.png" DestinationFiles="$(AppBundleDir)/AppIcon60x60@3x.png" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(iOSPlatformFolder)Resources/Assets.xcassets/AppIcon.appiconset/icon-152.png" DestinationFiles="$(AppBundleDir)/AppIcon76x76@2x~ipad.png" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(iOSPlatformFolder)Resources/Assets.xcassets/AppIcon.appiconset/icon-167.png" DestinationFiles="$(AppBundleDir)/AppIcon83.5x83.5@2x~ipad.png" SkipUnchangedFiles="true" />
   </Target>
 
   <ItemGroup Condition="$(AvaloniaPlatform) == 'iOS' And $(RuntimeIdentifier.StartsWith('iossimulator'))">
@@ -84,12 +108,12 @@
 
   <ItemGroup>
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.0" />
-    <PackageReference Include="FSharp.Core" Version="9.0.100" />
+    <PackageReference Include="FSharp.Core" Version="11.0.100-preview3.26159.112" />
     <PackageReference Include="Fabulous" Version="3.0.0-pre22" />
     <PackageReference Include="Fabulous.Avalonia" Version="3.0.0-pre13" />
-    <PackageReference Include="Sodium.Core" Version="1.4.0" />
-    <PackageReference Include="Dapper.FSharp" Version="4.5.1" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.5" />
+    <PackageReference Include="Sodium.Core" Version="1.4.1-preview.1" />
+    <PackageReference Include="Dapper.FSharp" Version="4.10.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0-preview.2.26159.112" />
   </ItemGroup>
 
 </Project>

@@ -529,6 +529,11 @@ module App =
                 desktop.MainWindow
                 |> Option.ofObj
                 |> Option.bind (fun w -> w.Clipboard |> Option.ofObj)
+            | :? Avalonia.Controls.ApplicationLifetimes.ISingleViewApplicationLifetime as singleView ->
+                singleView.MainView
+                |> Option.ofObj
+                |> Option.bind (fun v -> Avalonia.Controls.TopLevel.GetTopLevel(v) |> Option.ofObj)
+                |> Option.bind (fun tl -> tl.Clipboard |> Option.ofObj)
             | _ -> None
 
     let private getStorageProvider () =
