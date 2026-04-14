@@ -358,13 +358,14 @@ module App =
 
         | DoPickPhoto -> model, [ CmdPickPhoto ]
 
-        | PhotoPicked photo ->
+        | PhotoPicked(Some _ as photo) ->
             match model.Page with
             | EditProfile(name, bio, _) ->
                 { model with
                     Page = EditProfile(name, bio, photo) },
                 []
             | _ -> model, []
+        | PhotoPicked None -> model, []
 
         | DoSaveProfile ->
             match model.Page with
