@@ -63,7 +63,8 @@ module App =
           Messages: Map<string, ChatMessage list>
           Error: string option
           PollCursor: int64
-          Profile: Profile option }
+          Profile: Profile option
+          FlushingOutbox: bool }
 
     // ── Msg ──
 
@@ -76,7 +77,6 @@ module App =
         | AuthErr of string
         | DoDisconnect
         | DoSend
-        | SendFailed of string
         | DoSaveContact
         | PollResult of events: IncomingEvent list * status: string * cursor: int64
         | CopyPubKey
@@ -85,12 +85,15 @@ module App =
         | DoPickPhoto
         | PhotoPicked of byte[] option
         | DoSaveProfile
+        | StartFlush
+        | FlushResult of sent: bool
 
     // ── CmdMsg ──
 
     type CmdMsg =
         | CmdConnect of url: string * identity: Identity
-        | CmdSend of session: Session * recipientHex: string * envelope: Envelope
+        | CmdEnqueue of recipientHex: string * envelope: Envelope
+        | CmdFlushOutbox of session: Session
         | CmdPoll of session: Session * cursor: int64
         | CmdCopyToClipboard of string
         | CmdLoadState
@@ -228,7 +231,8 @@ module App =
           Messages = Map.empty
           Error = None
           PollCursor = 0L
-          Profile = None },
+          Profile = None
+          FlushingOutbox = false },
         [ CmdLoadState ]
 
     // ── Update ──
@@ -267,23 +271,27 @@ module App =
                     Auth = Identified(id, Online token)
                     Page = Conversations
                     Error = None
-                    PollStatus = "polling..." },
-                [ CmdPoll(session, model.PollCursor) ]
+                    PollStatus = "polling..."
+                    FlushingOutbox = true },
+                [ CmdPoll(session, model.PollCursor)
+                  CmdFlushOutbox session ]
             | _ -> model, []
 
         | AuthErr err ->
             { setConn Offline model with
-                Error = Some err },
+                Error = Some err
+                FlushingOutbox = false },
             []
 
         | DoDisconnect ->
             { setConn Offline model with
-                PollStatus = "" },
+                PollStatus = ""
+                FlushingOutbox = false },
             []
 
         | DoSend ->
-            match model.Page, trySession model with
-            | Chat(pk, compose), Some session when compose <> "" ->
+            match model.Page with
+            | Chat(pk, compose) when compose <> "" ->
                 let id = Guid.NewGuid().ToString()
 
                 let outMsg =
@@ -300,14 +308,30 @@ module App =
                         Messages = model.Messages |> appendMessage pk outMsg }
 
                 model',
-                [ CmdSend(session, pk, Envelope.TextMessage(id, compose))
-                  saveCmdMsg model'
+                [ CmdEnqueue(pk, Envelope.TextMessage(id, compose))
                   match model.Profile with
-                  | Some profile when isFirstInteraction -> CmdSend(session, pk, Envelope.ProfileMessage profile)
-                  | _ -> () ]
+                  | Some profile when isFirstInteraction -> CmdEnqueue(pk, Envelope.ProfileMessage profile)
+                  | _ -> ()
+                  saveCmdMsg model' ]
             | _ -> model, []
 
-        | SendFailed err -> { model with Error = Some err }, []
+        | StartFlush ->
+            if model.FlushingOutbox then
+                model, []
+            else
+                match trySession model with
+                | Some session ->
+                    { model with FlushingOutbox = true },
+                    [ CmdFlushOutbox session ]
+                | None -> model, []
+
+        | FlushResult sent ->
+            if sent then
+                match trySession model with
+                | Some session -> model, [ CmdFlushOutbox session ]
+                | None -> { model with FlushingOutbox = false }, []
+            else
+                { model with FlushingOutbox = false }, []
 
         | PollResult(events, status, newCursor) ->
             let model' =
@@ -379,11 +403,8 @@ module App =
                     Profile = Some profile
                     Page = Settings },
                 [ CmdSaveProfile profile
-                  match trySession model with
-                  | Some session ->
-                      for pk in model.Contacts.Keys do
-                          CmdSend(session, pk, Envelope.ProfileMessage profile)
-                  | None -> () ]
+                  for pk in model.Contacts.Keys do
+                      CmdEnqueue(pk, Envelope.ProfileMessage profile) ]
             | _ -> model, []
 
         | StateLoaded(Some identity, Some data, profile) ->
@@ -591,9 +612,33 @@ module App =
             Cmd.OfAsync.either (fun (url, id) -> authenticate url id) (url, identity) AuthOk (fun ex ->
                 AuthErr ex.Message)
 
-        | CmdSend(session, recipientHex, envelope) ->
-            Cmd.OfAsync.attempt (fun (s, r, e) -> sendEnvelope s r e) (session, recipientHex, envelope) (fun ex ->
-                SendFailed ex.Message)
+        | CmdEnqueue(recipientHex, envelope) ->
+            Cmd.ofEffect (fun dispatch ->
+                let json = serializeEnvelope envelope
+                Store.enqueueOutbox recipientHex json
+                dispatch StartFlush)
+
+        | CmdFlushOutbox session ->
+            Cmd.ofEffect (fun dispatch ->
+                async {
+                    match Store.peekOutbox () with
+                    | Some item ->
+                        try
+                            let blob =
+                                Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex item.RecipientHex) item.EnvelopeJson
+
+                            let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                            do! sendMessage session.Url session.Token item.RecipientHex (Crypto.toHex blob) ts
+                            Store.dequeueOutbox item.Id
+                            dispatch (FlushResult true)
+                        with ex ->
+                            log $"outbox send error: {ex.Message}"
+                            do! Async.Sleep 3000
+                            dispatch (FlushResult true)
+                    | None ->
+                        dispatch (FlushResult false)
+                }
+                |> Async.Start)
 
         | CmdPoll(session, cursor) ->
             Cmd.ofEffect (fun dispatch ->

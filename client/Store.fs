@@ -72,6 +72,13 @@ module Store =
           ServerUrl: string
           PollCursor: int64 }
 
+    [<CLIMutable>]
+    type OutboxRow =
+        { Id: int64
+          RecipientHex: string
+          EnvelopeJson: string
+          CreatedAt: int64 }
+
     let private profileTable = table'<ProfileRow> "profile"
     let private contactTable = table'<ContactRow> "contacts"
     let private messageTable = table'<MessageRow> "messages"
@@ -116,6 +123,7 @@ module Store =
         conn.Execute("CREATE TABLE IF NOT EXISTS contacts (Pubkey TEXT PRIMARY KEY, Nickname TEXT NOT NULL DEFAULT '', DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)") |> ignore
         conn.Execute("CREATE TABLE IF NOT EXISTS messages (Id TEXT PRIMARY KEY, ConversationId TEXT NOT NULL, Body TEXT NOT NULL DEFAULT '', TimestampUnix INTEGER NOT NULL, IsOutgoing INTEGER NOT NULL DEFAULT 0, Status INTEGER NOT NULL DEFAULT 0)") |> ignore
         conn.Execute("CREATE TABLE IF NOT EXISTS settings (Id TEXT PRIMARY KEY, ServerUrl TEXT NOT NULL DEFAULT '', PollCursor INTEGER NOT NULL DEFAULT 0)") |> ignore
+        conn.Execute("CREATE TABLE IF NOT EXISTS outbox (Id INTEGER PRIMARY KEY AUTOINCREMENT, RecipientHex TEXT NOT NULL, EnvelopeJson TEXT NOT NULL, CreatedAt INTEGER NOT NULL)") |> ignore
 
     let private identityPath = Path.Combine(appDataDir, "identity.key")
 
@@ -254,3 +262,20 @@ module Store =
             |> ignore
         with _ ->
             ()
+
+    let enqueueOutbox (recipientHex: string) (envelopeJson: string) =
+        use conn = openConn ()
+        conn.Execute(
+            "INSERT INTO outbox (RecipientHex, EnvelopeJson, CreatedAt) VALUES (@RecipientHex, @EnvelopeJson, @CreatedAt)",
+            {| RecipientHex = recipientHex; EnvelopeJson = envelopeJson
+               CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() |})
+        |> ignore
+
+    let peekOutbox () : OutboxRow option =
+        use conn = openConn ()
+        conn.Query<OutboxRow>("SELECT Id, RecipientHex, EnvelopeJson, CreatedAt FROM outbox ORDER BY Id LIMIT 1")
+        |> Seq.tryHead
+
+    let dequeueOutbox (id: int64) =
+        use conn = openConn ()
+        conn.Execute("DELETE FROM outbox WHERE Id = @Id", {| Id = id |}) |> ignore
