@@ -13,7 +13,7 @@ module Store =
           Nickname: string
           DisplayName: string
           Bio: string
-          Photo: byte[] }
+          Photo: byte[] option }
 
     type Profile =
         { DisplayName: string
@@ -111,20 +111,48 @@ module Store =
 
     type private ByteArrayOptionHandler() =
         inherit SqlMapper.TypeHandler<byte[] option>()
+
         override _.SetValue(p, value) =
-            p.Value <- match value with Some v -> box v | None -> box DBNull.Value
+            p.Value <-
+                match value with
+                | Some v -> box v
+                | None -> box DBNull.Value
+
         override _.Parse(value) =
-            if value = null || value :? DBNull then None else Some(value :?> byte[])
+            if value = null || value :? DBNull then
+                None
+            else
+                Some(value :?> byte[])
 
     do
         OptionTypes.register ()
         SqlMapper.AddTypeHandler(ByteArrayOptionHandler())
         use conn = openConn ()
-        conn.Execute("CREATE TABLE IF NOT EXISTS profile (Id TEXT PRIMARY KEY, DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)") |> ignore
-        conn.Execute("CREATE TABLE IF NOT EXISTS contacts (Pubkey TEXT PRIMARY KEY, Nickname TEXT NOT NULL DEFAULT '', DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)") |> ignore
-        conn.Execute("CREATE TABLE IF NOT EXISTS messages (Id TEXT PRIMARY KEY, ConversationId TEXT NOT NULL, Body TEXT NOT NULL DEFAULT '', TimestampUnix INTEGER NOT NULL, IsOutgoing INTEGER NOT NULL DEFAULT 0, Status INTEGER NOT NULL DEFAULT 0)") |> ignore
-        conn.Execute("CREATE TABLE IF NOT EXISTS settings (Id TEXT PRIMARY KEY, ServerUrl TEXT NOT NULL DEFAULT '', PollCursor INTEGER NOT NULL DEFAULT 0)") |> ignore
-        conn.Execute("CREATE TABLE IF NOT EXISTS outbox (Id INTEGER PRIMARY KEY AUTOINCREMENT, RecipientHex TEXT NOT NULL, EnvelopeJson TEXT NOT NULL, CreatedAt INTEGER NOT NULL)") |> ignore
+
+        conn.Execute(
+            "CREATE TABLE IF NOT EXISTS profile (Id TEXT PRIMARY KEY, DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)"
+        )
+        |> ignore
+
+        conn.Execute(
+            "CREATE TABLE IF NOT EXISTS contacts (Pubkey TEXT PRIMARY KEY, Nickname TEXT NOT NULL DEFAULT '', DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)"
+        )
+        |> ignore
+
+        conn.Execute(
+            "CREATE TABLE IF NOT EXISTS messages (Id TEXT PRIMARY KEY, ConversationId TEXT NOT NULL, Body TEXT NOT NULL DEFAULT '', TimestampUnix INTEGER NOT NULL, IsOutgoing INTEGER NOT NULL DEFAULT 0, Status INTEGER NOT NULL DEFAULT 0)"
+        )
+        |> ignore
+
+        conn.Execute(
+            "CREATE TABLE IF NOT EXISTS settings (Id TEXT PRIMARY KEY, ServerUrl TEXT NOT NULL DEFAULT '', PollCursor INTEGER NOT NULL DEFAULT 0)"
+        )
+        |> ignore
+
+        conn.Execute(
+            "CREATE TABLE IF NOT EXISTS outbox (Id INTEGER PRIMARY KEY AUTOINCREMENT, RecipientHex TEXT NOT NULL, EnvelopeJson TEXT NOT NULL, CreatedAt INTEGER NOT NULL)"
+        )
+        |> ignore
 
     let private identityPath = Path.Combine(appDataDir, "identity.key")
 
@@ -153,12 +181,18 @@ module Store =
         try
             use conn = openConn ()
 
-            select { for p in profileTable do where (p.Id = "me") }
+            select {
+                for p in profileTable do
+                    where (p.Id = "me")
+            }
             |> conn.SelectAsync<ProfileRow>
             |> Async.AwaitTask
             |> Async.RunSynchronously
             |> Seq.tryHead
-            |> Option.map (fun p -> { DisplayName = p.DisplayName; Bio = p.Bio; Photo = p.Photo })
+            |> Option.map (fun p ->
+                { DisplayName = p.DisplayName
+                  Bio = p.Bio
+                  Photo = p.Photo })
         with _ ->
             None
 
@@ -168,8 +202,11 @@ module Store =
 
             conn.Execute(
                 "INSERT OR REPLACE INTO profile (Id, DisplayName, Bio, Photo) VALUES (@Id, @DisplayName, @Bio, @Photo)",
-                {| Id = "me"; DisplayName = profile.DisplayName; Bio = profile.Bio
-                   Photo = profile.Photo |> Option.defaultValue null |})
+                {| Id = "me"
+                   DisplayName = profile.DisplayName
+                   Bio = profile.Bio
+                   Photo = profile.Photo |> Option.defaultValue null |}
+            )
             |> ignore
         with _ ->
             ()
@@ -179,7 +216,10 @@ module Store =
             use conn = openConn ()
 
             let settings =
-                select { for s in settingsTable do where (s.Id = "settings") }
+                select {
+                    for s in settingsTable do
+                        where (s.Id = "settings")
+                }
                 |> conn.SelectAsync<SettingsRow>
                 |> Async.AwaitTask
                 |> Async.RunSynchronously
@@ -188,7 +228,10 @@ module Store =
             settings
             |> Option.map (fun s ->
                 let contacts =
-                    select { for c in contactTable do selectAll }
+                    select {
+                        for c in contactTable do
+                            selectAll
+                    }
                     |> conn.SelectAsync<ContactRow>
                     |> Async.AwaitTask
                     |> Async.RunSynchronously
@@ -198,13 +241,16 @@ module Store =
                               Nickname = c.Nickname
                               DisplayName = c.DisplayName
                               Bio = c.Bio
-                              Photo = c.Photo |> Option.defaultValue [||] }
+                              Photo = c.Photo }
 
                         c.Pubkey, contact)
                     |> Map.ofSeq
 
                 let messages =
-                    select { for m in messageTable do selectAll }
+                    select {
+                        for m in messageTable do
+                            selectAll
+                    }
                     |> conn.SelectAsync<MessageRow>
                     |> Async.AwaitTask
                     |> Async.RunSynchronously
@@ -217,8 +263,15 @@ module Store =
                               Body = m.Body
                               Timestamp = DateTimeOffset.FromUnixTimeMilliseconds m.TimestampUnix
                               Direction =
-                                if not m.IsOutgoing then Incoming
-                                else Outgoing(if m.Status = 1 then DeliveryStatus.Delivered else DeliveryStatus.Sent) })
+                                if not m.IsOutgoing then
+                                    Incoming
+                                else
+                                    Outgoing(
+                                        if m.Status = 1 then
+                                            DeliveryStatus.Delivered
+                                        else
+                                            DeliveryStatus.Sent
+                                    ) })
                         |> Seq.sortBy _.Timestamp
                         |> Seq.toList)
                     |> Map.ofSeq
@@ -237,8 +290,12 @@ module Store =
             for c in data.Contacts.Values do
                 conn.Execute(
                     "INSERT OR REPLACE INTO contacts (Pubkey, Nickname, DisplayName, Bio, Photo) VALUES (@Pubkey, @Nickname, @DisplayName, @Bio, @Photo)",
-                    {| Pubkey = c.Pubkey; Nickname = c.Nickname; DisplayName = c.DisplayName; Bio = c.Bio
-                       Photo = if c.Photo = null || c.Photo.Length = 0 then null else c.Photo |})
+                    {| Pubkey = c.Pubkey
+                       Nickname = c.Nickname
+                       DisplayName = c.DisplayName
+                       Bio = c.Bio
+                       Photo = c.Photo |}
+                )
                 |> ignore
 
             data.Messages
@@ -252,28 +309,37 @@ module Store =
 
                     conn.Execute(
                         "INSERT OR REPLACE INTO messages (Id, ConversationId, Body, TimestampUnix, IsOutgoing, Status) VALUES (@Id, @ConversationId, @Body, @TimestampUnix, @IsOutgoing, @Status)",
-                        {| Id = m.Id; ConversationId = convId; Body = m.Body
+                        {| Id = m.Id
+                           ConversationId = convId
+                           Body = m.Body
                            TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds()
-                           IsOutgoing = isOutgoing; Status = status |})
+                           IsOutgoing = isOutgoing
+                           Status = status |}
+                    )
                     |> ignore)
 
             conn.Execute(
                 "INSERT OR REPLACE INTO settings (Id, ServerUrl, PollCursor) VALUES (@Id, @ServerUrl, @PollCursor)",
-                {| Id = "settings"; ServerUrl = data.ServerUrl; PollCursor = data.PollCursor |})
+                {| Id = "settings"
+                   ServerUrl = data.ServerUrl
+                   PollCursor = data.PollCursor |}
+            )
             |> ignore
         with _ ->
             ()
 
     let enqueueOutbox (recipientHex: string) (envelopeJson: string) =
         use conn = openConn ()
+
         insert {
             for o in outboxTable do
-            value
-                { Id = 0L
-                  RecipientHex = recipientHex
-                  EnvelopeJson = envelopeJson
-                  CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
-            excludeColumn o.Id
+                value
+                    { Id = 0L
+                      RecipientHex = recipientHex
+                      EnvelopeJson = envelopeJson
+                      CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+
+                excludeColumn o.Id
         }
         |> conn.InsertAsync
         |> Async.AwaitTask
@@ -282,9 +348,10 @@ module Store =
 
     let peekOutbox () : OutboxRow option =
         use conn = openConn ()
+
         select {
             for o in outboxTable do
-            orderBy o.Id
+                orderBy o.Id
         }
         |> conn.SelectAsync<OutboxRow>
         |> Async.AwaitTask
@@ -293,9 +360,10 @@ module Store =
 
     let dequeueOutbox (id: int64) =
         use conn = openConn ()
+
         delete {
             for o in outboxTable do
-            where (o.Id = id)
+                where (o.Id = id)
         }
         |> conn.DeleteAsync
         |> Async.AwaitTask

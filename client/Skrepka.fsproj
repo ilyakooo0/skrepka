@@ -29,6 +29,7 @@
 
   <ItemGroup>
     <Compile Include="Constants.fs" />
+    <Compile Include="Styles.fs" />
     <Compile Include="Crypto.fs" />
     <Compile Include="ApiClient.fs" />
     <Compile Include="Phonemic.fs" />

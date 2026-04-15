@@ -17,6 +17,8 @@ module App =
     open ApiClient
     open Buttons
     open TextFields
+    open Styles
+    open Avalonia.Layout
 
     // ── Domain Types ──
 
@@ -88,6 +90,7 @@ module App =
         | DoSaveProfile
         | StartFlush
         | FlushResult of sent: bool
+        | Search of string
 
     // ── CmdMsg ──
 
@@ -160,13 +163,13 @@ module App =
           Nickname = nickname
           DisplayName = ""
           Bio = ""
-          Photo = [||] }
+          Photo = None }
 
     let private withProfile (p: Profile) (c: Contact) =
         { c with
             DisplayName = p.DisplayName
             Bio = p.Bio
-            Photo = p.Photo |> Option.defaultValue [||] }
+            Photo = p.Photo }
 
     let private applyEvent (m: Model) (evt: IncomingEvent) =
         match evt.Envelope with
@@ -836,48 +839,95 @@ module App =
         )
 
     let private viewConversations model =
-        ScrollViewer(
-            (VStack(8.) {
-                HStack(8.) {
-                    TextBlock("Conversations").fontSize (24.)
+        let contacts = model.Contacts.Values |> Seq.toList
 
-                    Button("+", SetPage(AddContact("", "")))
-                    Button("Settings", SetPage Settings)
-                }
+        (Grid([], [ Dimension.Star; Dimension.Auto ]) {
 
-                let pubPrefix =
-                    match model.Auth with
-                    | Identified(id, _) -> id.PubKeyHex.[..7]
-                    | _ -> "?"
+            if contacts.IsEmpty then
+                TextBlock("No contacts yet. Tap + to add one.")
+                    .centerText()
+                    .foreground(SolidColorBrush(Colors.Gray))
+                    .gridRow (1)
 
-                let pollInfo =
-                    if model.PollStatus <> "" then
-                        $" | {model.PollStatus}"
-                    else
-                        ""
+            if not contacts.IsEmpty then
+                ListBox(
+                    contacts,
+                    fun c ->
+                        let name = contactName model.Contacts c.Pubkey
 
-                TextBlock($"{connStatusLabel model.Auth} [{pubPrefix}]{pollInfo}")
-                    .fontSize(10.)
-                    .foreground (SolidColorBrush(Colors.DimGray))
+                        let preview =
+                            messagesFor c.Pubkey model.Messages
+                            |> List.tryLast
+                            |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
+                            |> Option.defaultValue ""
 
-                viewErrorBanner model.Error
+                        Border(
+                            (HStack(8.) {
 
-                if model.Contacts.IsEmpty then
-                    TextBlock("No contacts yet. Tap + to add one.")
-                        .centerText()
-                        .foreground (SolidColorBrush(Colors.Gray))
+                                Grid() {
+                                    (match c.Photo with
+                                     | None -> Image("avares://Skrepka/Assets/Images/user.png", Stretch.Uniform)
+                                     | Some i ->
+                                         Image(
+                                             new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(i)),
+                                             Stretch.UniformToFill
+                                         ))
+                                        .width(16.)
+                                        .height(16.)
+                                        .margin(8.)
+                                        .clipToBounds (true)
 
-                for c in model.Contacts.Values do
-                    let preview =
-                        messagesFor c.Pubkey model.Messages
-                        |> List.tryLast
-                        |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
-                        |> Option.defaultValue ""
+                                    Rectangle().stroke(Colors.Black).strokeThickness (4.)
+                                }
 
-                    Button($"{contactName model.Contacts c.Pubkey}\n{preview}", SetPage(Chat(c.Pubkey, "")))
-            })
-                .margin (20.)
-        )
+                                VStack(2.) {
+                                    TextBlock(name)
+                                        .fontFamily(Constants.fontFamily)
+                                        .fontWeight(FontWeight.Bold)
+                                        .fontSize (16.)
+
+                                    if preview <> "" then
+                                        TextBlock(preview).fontSize(12.).fontWeight (FontWeight.Bold)
+                                }
+
+                            })
+                                .margin (8.)
+                        )
+                            .borderThickness(Avalonia.Thickness(0., 0., 0., 4.))
+                            .borderBrush(SolidColorBrush(Colors.Black))
+                            .background(Colors.Transparent)
+                            .onTapped (fun _ -> SetPage(Chat(c.Pubkey, "")))
+                )
+                    .styles(noListBoxPadding ())
+                    .background(Colors.White)
+                    .gridRow (0)
+
+            Border(
+
+                (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], []) {
+                    // HStack(8.) {
+                    //     TextBlock("Conversations").fontSize (24.)
+
+                    //     Button("+", SetPage(AddContact("", "")))
+                    //     Button("Settings", SetPage Settings)
+                    // }
+
+                    (smallImageButton None (SetPage Settings)).gridColumn (0)
+
+                    (textField "" Search).margin(0.).margin(8.).gridColumn (1)
+                    (smallTextButton "+" (SetPage(AddContact("", "")))).gridColumn (2)
+
+                })
+                    .margin(20.)
+                    .horizontalAlignment (HorizontalAlignment.Stretch)
+            )
+                .borderThickness(Avalonia.Thickness(0., 4., 0., 0.))
+                .borderBrush(SolidColorBrush(Colors.Black))
+                .background(Constants.accentColor)
+                .gridRow (1)
+
+        })
+            .margin (0.)
 
     let private viewChat model pk compose =
         let name = contactName model.Contacts pk
@@ -959,15 +1009,17 @@ module App =
             )
                 .gridRow (0)
 
-            (Grid() {
-                Rectangle().stroke(SolidColorBrush(Colors.Black)).strokeThickness(4.).fill (Constants.accentColor)
+            Border(
 
-                HStack(8.) {
+                (HStack(8.) {
                     (button Secondary "back" (SetPage Settings)).margin (8.)
 
                     (button Secondary "save" DoSaveProfile).margin (8.)
-                }
-            })
+                })
+                    .background (Constants.accentColor)
+            )
+                .borderThickness(Avalonia.Thickness(0., 4., 0., 0.))
+                .borderBrush(SolidColorBrush(Colors.Black))
                 .gridRow (1)
         })
 

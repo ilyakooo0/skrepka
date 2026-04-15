@@ -122,3 +122,90 @@ module Buttons =
                 .margin(16.)
                 .onTapped (fun _ -> msg)
         }
+
+    let smallImageButton (img: byte[] option) (msg: 'msg) =
+        let key =
+            match img with
+            | None -> "img-button"
+            | Some i -> $"img-button-{hash i}"
+
+        Component(key) {
+            let! pressed = Context.State(false)
+            let offset = if pressed.Current then 2. else 4.
+
+            (Grid() {
+                Rectangle()
+                    .fill(SolidColorBrush(Colors.Black))
+                    .renderTransform(translate offset offset)
+                    .transition (
+                        TransformOperationsTransition(
+                            Avalonia.Visual.RenderTransformProperty,
+                            TimeSpan.FromMilliseconds Constants.animationDuration
+                        )
+                            .easing (Constants.easing)
+                    )
+
+                Rectangle().fill (SolidColorBrush(Colors.White))
+
+                match img with
+                | None ->
+                    ViewBox(
+                        Image("avares://Skrepka/Assets/Images/user.png", Stretch.Uniform)
+                            .width(32.)
+                            .height(32.)
+                            .margin (8.)
+                    )
+
+                | Some i ->
+                    Image(new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(i)), Stretch.UniformToFill)
+                        .width(32.)
+                        .height(32.)
+                        .clipToBounds (true)
+
+                Rectangle().stroke(Colors.Black).strokeThickness (4.)
+            })
+                .background(Brushes.Transparent)
+                .onPointerPressed(fun _ -> pressed.Set true)
+                .onPointerReleased(fun _ -> pressed.Set false)
+                .onPointerExited(fun _ -> pressed.Set false)
+                .margin(8.)
+                .onTapped (fun _ -> msg)
+        }
+
+    let smallTextButton (text: string) (msg: 'msg) =
+        Component($"small-button-{text}") {
+            let! pressed = Context.State(false)
+            let offset = if pressed.Current then 2. else 4.
+
+            (Grid() {
+                Rectangle()
+                    .fill(SolidColorBrush(Colors.Black))
+                    .renderTransform(translate offset offset)
+                    .transition (
+                        TransformOperationsTransition(
+                            Avalonia.Visual.RenderTransformProperty,
+                            TimeSpan.FromMilliseconds Constants.animationDuration
+                        )
+                            .easing (Constants.easing)
+                    )
+
+                Rectangle().fill (SolidColorBrush(Colors.White))
+
+                TextBlock(text)
+                    .fontFamily(Constants.fontFamily)
+                    .fontWeight(FontWeight.Bold)
+                    .fontSize(28.)
+                    .textAlignment(TextAlignment.Center)
+                    .center ()
+
+                Rectangle().stroke(Colors.Black).strokeThickness (4.)
+            })
+                .width(48.)
+                .height(48.)
+                .background(Brushes.Transparent)
+                .onPointerPressed(fun _ -> pressed.Set true)
+                .onPointerReleased(fun _ -> pressed.Set false)
+                .onPointerExited(fun _ -> pressed.Set false)
+                .margin(8.)
+                .onTapped (fun _ -> msg)
+        }
