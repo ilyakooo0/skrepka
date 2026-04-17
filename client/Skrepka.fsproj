@@ -125,6 +125,7 @@
     <PackageReference Include="Sodium.Core" Version="1.4.0" />
     <PackageReference Include="Dapper.FSharp" Version="4.10.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0-preview.2.26159.112" />
+    <PackageReference Include="QRCoder" Version="1.6.0" />
   </ItemGroup>
 
 </Project>
