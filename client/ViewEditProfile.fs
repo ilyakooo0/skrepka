@@ -10,9 +10,10 @@ module ViewEditProfile =
     open AppTypes
     open Buttons
     open TextFields
+    open Styles
 
     let viewEditProfile model displayName bio (photo: byte[] option) =
-        (Grid([], [ Dimension.Star; Dimension.Auto ]) {
+        let content =
             ScrollViewer(
                 (VStack(16.) {
                     viewErrorBanner model.Error
@@ -30,18 +31,11 @@ module ViewEditProfile =
                 })
                     .margin (20.)
             )
-                .gridRow (0)
 
-            Border(
+        let bar =
+            HStack(8.) {
+                (button Secondary "back" (SetPage Settings)).margin (8.)
+                (button Secondary "save" DoSaveProfile).margin (8.)
+            }
 
-                (HStack(8.) {
-                    (button Secondary "back" (SetPage Settings)).margin (8.)
-
-                    (button Secondary "save" DoSaveProfile).margin (8.)
-                })
-                    .background (Constants.accentColor)
-            )
-                .borderThickness(Avalonia.Thickness(0., 4., 0., 0.))
-                .borderBrush(SolidColorBrush(Colors.Black))
-                .gridRow (1)
-        })
+        withBottomBar bar content

@@ -16,16 +16,15 @@ module ViewConversations =
     let viewConversations model =
         let contacts = model.Contacts.Values |> Seq.toList
 
-        (Grid([], [ Dimension.Star; Dimension.Auto ]) {
-
+        let content =
             if contacts.IsEmpty then
-                TextBlock("No contacts yet. Tap + to add one.")
-                    .centerText()
-                    .foreground(SolidColorBrush(Colors.Gray))
-                    .gridRow (1)
-
-            if not contacts.IsEmpty then
-                ListBox(
+                AnyView(
+                    TextBlock("No contacts yet. Tap + to add one.")
+                        .centerText()
+                        .foreground(SolidColorBrush(Colors.Gray))
+                )
+            else
+                AnyView(ListBox(
                     contacts,
                     fun c ->
                         let name = contactName model.Contacts c.Pubkey
@@ -74,21 +73,15 @@ module ViewConversations =
                             .onTapped (fun _ -> SetPage(Chat(c.Pubkey, "")))
                 )
                     .styles(noListBoxPadding ())
-                    .background(Colors.White)
-                    .gridRow (0)
+                    .background(Colors.White))
 
-            Border(
-                (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], []) {
-                    (smallImageButton None (SetPage Settings)).gridColumn (0)
-                    (textField "" Search).margin(0.).margin(8.).gridColumn (1)
-                    (smallTextButton "+" (SetPage(AddContact("", "")))).gridColumn (2)
-                })
-                    .margin(20.)
-                    .horizontalAlignment (HorizontalAlignment.Stretch)
-            )
-                .borderThickness(Avalonia.Thickness(0., 4., 0., 0.))
-                .borderBrush(SolidColorBrush(Colors.Black))
-                .background(Constants.accentColor)
-                .gridRow (1)
-        })
-            .margin (0.)
+        let bar =
+            (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], []) {
+                (smallImageButton None (SetPage Settings)).gridColumn (0)
+                (textField "" Search).margin(0.).margin(8.).gridColumn (1)
+                (smallTextButton "+" (SetPage(AddContact("", "")))).gridColumn (2)
+            })
+                .margin(20.)
+                .horizontalAlignment (HorizontalAlignment.Stretch)
+
+        withBottomBar bar content
