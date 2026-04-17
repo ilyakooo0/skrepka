@@ -37,6 +37,13 @@
     <Compile Include="TextFields.fs" />
     <Compile Include="Buttons.fs" />
     <Compile Include="$(iOSPlatformFolder)PhotoPicker.fs" Condition="$(AvaloniaPlatform) == 'iOS'" />
+    <Compile Include="AppTypes.fs" />
+    <Compile Include="ViewSetup.fs" />
+    <Compile Include="ViewSettings.fs" />
+    <Compile Include="ViewConversations.fs" />
+    <Compile Include="ViewChat.fs" />
+    <Compile Include="ViewAddContact.fs" />
+    <Compile Include="ViewEditProfile.fs" />
     <Compile Include="App.fs" />
   </ItemGroup>
 

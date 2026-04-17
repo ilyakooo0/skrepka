@@ -15,109 +15,15 @@ module App =
     open Store
     open Crypto
     open ApiClient
-    open Buttons
-    open TextFields
-    open Styles
-    open Avalonia.Layout
-
-    // ── Domain Types ──
-
-    type Page =
-        | Setup
-        | Conversations
-        | Chat of pubkey: string * compose: string
-        | AddContact of pubkey: string * nickname: string
-        | Settings
-        | EditProfile of displayName: string * bio: string * photo: byte[] option
-
-    type Session =
-        { Url: string
-          Token: string
-          Identity: Identity }
-
-    type ConnStatus =
-        | Offline
-        | Connecting
-        | Online of token: string
-
-    type AuthState =
-        | NoIdentity
-        | Identified of identity: Identity * conn: ConnStatus
-
-    [<RequireQualifiedAccess>]
-    type Envelope =
-        | TextMessage of id: string * body: string
-        | DeliveryAck of ackIds: string list
-        | ProfileMessage of profile: Profile
-
-    type IncomingEvent =
-        { Sender: string
-          Timestamp: DateTimeOffset
-          Envelope: Envelope }
-
-    // ── Model ──
-
-    type Model =
-        { Page: Page
-          Auth: AuthState
-          ServerUrl: string
-          Contacts: Map<string, Contact>
-          PollStatus: string
-          Messages: Map<string, ChatMessage list>
-          Error: string option
-          PollCursor: int64
-          Profile: Profile option
-          FlushingOutbox: bool }
-
-    // ── Msg ──
-
-    type Msg =
-        | SetPage of Page
-        | GenIdentity
-        | SetServerUrl of string
-        | DoConnect
-        | AuthOk of string
-        | AuthErr of string
-        | DoDisconnect
-        | DoSend
-        | DoSaveContact
-        | PollResult of events: IncomingEvent list * status: string * cursor: int64
-        | CopyPubKey
-        | DismissError
-        | StateLoaded of Identity option * Data option * Profile option
-        | DoPickPhoto
-        | PhotoPicked of byte[] option
-        | DoSaveProfile
-        | StartFlush
-        | FlushResult of sent: bool
-        | Search of string
-
-    // ── CmdMsg ──
-
-    type CmdMsg =
-        | CmdConnect of url: string * identity: Identity
-        | CmdEnqueue of recipientHex: string * envelope: Envelope
-        | CmdFlushOutbox of session: Session
-        | CmdPoll of session: Session * cursor: int64
-        | CmdCopyToClipboard of string
-        | CmdLoadState
-        | CmdSaveIdentity of Identity
-        | CmdSaveData of Data
-        | CmdPickPhoto
-        | CmdSaveProfile of Profile
+    open AppTypes
+    open ViewSetup
+    open ViewSettings
+    open ViewConversations
+    open ViewChat
+    open ViewAddContact
+    open ViewEditProfile
 
     // ── Helpers ──
-
-    let private hexToOb (hex: string) = Crypto.fromHex hex |> Phonemic.toOb
-
-    let private truncKey (hex: string) =
-        let ob = hexToOb hex
-        let parts = ob.Split('-')
-
-        if parts.Length <= 4 then
-            ob
-        else
-            $"{parts.[0]}-{parts.[1]}..{parts.[parts.Length - 2]}-{parts.[parts.Length - 1]}"
 
     let private tryParsePubkey (input: string) =
         let input = input.Trim()
@@ -125,15 +31,6 @@ module App =
         Phonemic.fromOb input
         |> Option.orElseWith (fun () -> Crypto.tryFromHex input)
         |> Option.filter (fun bytes -> bytes.Length = 32)
-
-    let private contactName (contacts: Map<string, Contact>) (pk: string) =
-        match Map.tryFind pk contacts with
-        | Some c when c.Nickname <> "" -> c.Nickname
-        | Some c when c.DisplayName <> "" -> c.DisplayName
-        | _ -> truncKey pk
-
-    let private messagesFor (pk: string) (messages: Map<string, ChatMessage list>) =
-        messages |> Map.tryFind pk |> Option.defaultValue []
 
     let private appendMessage (pk: string) (msg: ChatMessage) (messages: Map<string, ChatMessage list>) =
         let existing = messagesFor pk messages
@@ -210,19 +107,12 @@ module App =
                 Auth = Identified(id, status) }
         | NoIdentity -> model
 
-    let private saveCmdMsg model =
+    let private saveCmdMsg model : CmdMsg =
         CmdSaveData
-            { Contacts = model.Contacts
-              Messages = model.Messages
-              ServerUrl = model.ServerUrl
-              PollCursor = model.PollCursor }
-
-    let private connStatusLabel =
-        function
-        | NoIdentity
-        | Identified(_, Offline) -> "OFFLINE"
-        | Identified(_, Connecting) -> "CONNECTING"
-        | Identified(_, Online _) -> "ONLINE"
+            ({ Contacts = model.Contacts
+               Messages = model.Messages
+               ServerUrl = model.ServerUrl
+               PollCursor = model.PollCursor } : Data)
 
     // ── Init ──
 
@@ -762,255 +652,6 @@ module App =
         | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile)
 
     // ── View ──
-
-    let private viewErrorBanner (error: string option) =
-        VStack(4.) {
-            match error with
-            | Some err ->
-                TextBlock(err).foreground(SolidColorBrush(Colors.Red)).fontSize (12.)
-                Button("Dismiss", DismissError)
-            | None -> ()
-        }
-
-    let private viewSetup () =
-        (VStack(24.) {
-            Image("avares://Skrepka/Assets/Images/logo.png", Avalonia.Media.Stretch.Uniform)
-                .margin(8., 0., 8., 0.)
-                .maxWidth (300.)
-
-            TextBlock("Skrepka")
-                .fontSize(32.)
-                .fontFamily(FontFamily("avares://Skrepka/Assets/Fonts#Unbounded"))
-                .fontWeight(FontWeight.Bold)
-                .centerText ()
-
-            TextBlock("").height (50.)
-
-            button Primary "Next" GenIdentity
-        })
-            .margin(30.)
-            .centerVertical ()
-
-    let private viewSettings model =
-        ScrollViewer(
-            (VStack(16.) {
-                TextBlock("Settings").fontSize(24.).centerText ()
-
-                match model.Auth with
-                | Identified(id, conn) ->
-                    TextBlock("Your Public Key:")
-
-                    TextBlock(truncKey id.PubKeyHex).fontSize (14.)
-
-                    Button("Copy Public Key", CopyPubKey)
-
-                    TextBlock("Profile:").fontSize (18.)
-
-                    let displayName, bio, photo =
-                        match model.Profile with
-                        | Some p -> p.DisplayName, p.Bio, p.Photo
-                        | None -> "", "", None
-
-                    if displayName <> "" then
-                        TextBlock($"Name: {displayName}").fontSize (14.)
-
-                    if bio <> "" then
-                        TextBlock($"Bio: {bio}").fontSize(14.).foreground (SolidColorBrush(Colors.DimGray))
-
-                    Button("Edit Profile", SetPage(EditProfile(displayName, bio, photo)))
-
-                    TextBlock("Server:")
-
-                    match conn with
-                    | Online _ -> TextBlock(model.ServerUrl).fontSize (14.)
-                    | _ -> TextBox(model.ServerUrl, SetServerUrl)
-
-                    viewErrorBanner model.Error
-
-                    match conn with
-                    | Offline -> Button("Connect", DoConnect)
-                    | Connecting -> TextBlock("Connecting...").centerText ()
-                    | Online _ ->
-                        Button("Disconnect", DoDisconnect)
-                        Button("Go to Conversations", SetPage Conversations)
-                | NoIdentity -> ()
-            })
-                .margin (20.)
-        )
-
-    let private viewConversations model =
-        let contacts = model.Contacts.Values |> Seq.toList
-
-        (Grid([], [ Dimension.Star; Dimension.Auto ]) {
-
-            if contacts.IsEmpty then
-                TextBlock("No contacts yet. Tap + to add one.")
-                    .centerText()
-                    .foreground(SolidColorBrush(Colors.Gray))
-                    .gridRow (1)
-
-            if not contacts.IsEmpty then
-                ListBox(
-                    contacts,
-                    fun c ->
-                        let name = contactName model.Contacts c.Pubkey
-
-                        let preview =
-                            messagesFor c.Pubkey model.Messages
-                            |> List.tryLast
-                            |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
-                            |> Option.defaultValue ""
-
-                        Border(
-                            (HStack(8.) {
-
-                                Grid() {
-                                    (match c.Photo with
-                                     | None -> Image("avares://Skrepka/Assets/Images/user.png", Stretch.Uniform)
-                                     | Some i ->
-                                         Image(
-                                             new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(i)),
-                                             Stretch.UniformToFill
-                                         ))
-                                        .width(16.)
-                                        .height(16.)
-                                        .margin(8.)
-                                        .clipToBounds (true)
-
-                                    Rectangle().stroke(Colors.Black).strokeThickness (4.)
-                                }
-
-                                VStack(2.) {
-                                    TextBlock(name)
-                                        .fontFamily(Constants.fontFamily)
-                                        .fontWeight(FontWeight.Bold)
-                                        .fontSize (16.)
-
-                                    if preview <> "" then
-                                        TextBlock(preview).fontSize(12.).fontWeight (FontWeight.Bold)
-                                }
-
-                            })
-                                .margin (8.)
-                        )
-                            .borderThickness(Avalonia.Thickness(0., 0., 0., 4.))
-                            .borderBrush(SolidColorBrush(Colors.Black))
-                            .background(Colors.Transparent)
-                            .onTapped (fun _ -> SetPage(Chat(c.Pubkey, "")))
-                )
-                    .styles(noListBoxPadding ())
-                    .background(Colors.White)
-                    .gridRow (0)
-
-            Border(
-                (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], []) {
-                    (smallImageButton None (SetPage Settings)).gridColumn (0)
-                    (textField "" Search).margin(0.).margin(8.).gridColumn (1)
-                    (smallTextButton "+" (SetPage(AddContact("", "")))).gridColumn (2)
-                })
-                    .margin(20.)
-                    .horizontalAlignment (HorizontalAlignment.Stretch)
-            )
-                .borderThickness(Avalonia.Thickness(0., 4., 0., 0.))
-                .borderBrush(SolidColorBrush(Colors.Black))
-                .background(Constants.accentColor)
-                .gridRow (1)
-        })
-            .margin (0.)
-
-    let private viewChat model pk compose =
-        let name = contactName model.Contacts pk
-        let msgs = messagesFor pk model.Messages
-
-        (VStack(8.) {
-            HStack(8.) {
-                Button("< Back", SetPage Conversations)
-
-                TextBlock(name).fontSize(20.).centerVertical ()
-            }
-
-            viewErrorBanner model.Error
-
-            ScrollViewer(
-                VStack(4.) {
-                    if msgs.IsEmpty then
-                        TextBlock("No messages yet").padding(8.).fontSize (14.)
-                    else
-                        for m in msgs do
-                            let prefix, tick =
-                                match m.Direction with
-                                | Outgoing DeliveryStatus.Delivered -> "You: ", " \u2713"
-                                | Outgoing DeliveryStatus.Sent -> "You: ", ""
-                                | Incoming -> "", ""
-
-                            TextBlock($"{prefix}{m.Body}{tick}").padding(8.).fontSize (14.)
-                }
-            )
-
-            HStack(8.) {
-                TextBox(compose, fun text -> SetPage(Chat(pk, text)))
-                    .watermark("Message...")
-                    .horizontalAlignment (Avalonia.Layout.HorizontalAlignment.Stretch)
-
-                Button("Send", DoSend)
-            }
-        })
-            .margin (12.)
-
-    let private viewAddContact model cpk cnn =
-        (VStack(16.) {
-            HStack(8.) {
-                Button("< Back", SetPage Conversations)
-
-                TextBlock("Add Contact").fontSize (20.)
-            }
-
-            viewErrorBanner model.Error
-
-            TextBlock("Public Key:")
-            TextBox(cpk, fun text -> SetPage(AddContact(text, cnn))).watermark ("sampel-palnet-...")
-
-            TextBlock("Nickname:")
-            TextBox(cnn, fun text -> SetPage(AddContact(cpk, text)))
-
-            Button("Save Contact", DoSaveContact).centerHorizontal ()
-        })
-            .margin (20.)
-
-    let private viewEditProfile model displayName bio (photo: byte[] option) =
-        (Grid([], [ Dimension.Star; Dimension.Auto ]) {
-            ScrollViewer(
-                (VStack(16.) {
-                    viewErrorBanner model.Error
-
-                    imageButton photo DoPickPhoto
-
-                    TextBlock("Name").fontFamily(Constants.fontFamily).fontWeight(FontWeight.Bold).margin (0, 24, 0, -8)
-                    (textField displayName (fun text -> SetPage(EditProfile(text, bio, photo)))).margin (0, 0, 0, 8)
-
-
-                    TextBlock("Bio").fontFamily(Constants.fontFamily).fontWeight(FontWeight.Bold).margin (0, 0, 0, -8)
-
-                    (multilineTextField bio (fun text -> SetPage(EditProfile(displayName, text, photo))))
-                        .margin (0, 0, 0, 8)
-                })
-                    .margin (20.)
-            )
-                .gridRow (0)
-
-            Border(
-
-                (HStack(8.) {
-                    (button Secondary "back" (SetPage Settings)).margin (8.)
-
-                    (button Secondary "save" DoSaveProfile).margin (8.)
-                })
-                    .background (Constants.accentColor)
-            )
-                .borderThickness(Avalonia.Thickness(0., 4., 0., 0.))
-                .borderBrush(SolidColorBrush(Colors.Black))
-                .gridRow (1)
-        })
 
     let private pageContent model =
         let page =
