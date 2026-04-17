@@ -903,20 +903,10 @@ module App =
                     .gridRow (0)
 
             Border(
-
                 (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], []) {
-                    // HStack(8.) {
-                    //     TextBlock("Conversations").fontSize (24.)
-
-                    //     Button("+", SetPage(AddContact("", "")))
-                    //     Button("Settings", SetPage Settings)
-                    // }
-
                     (smallImageButton None (SetPage Settings)).gridColumn (0)
-
                     (textField "" Search).margin(0.).margin(8.).gridColumn (1)
                     (smallTextButton "+" (SetPage(AddContact("", "")))).gridColumn (2)
-
                 })
                     .margin(20.)
                     .horizontalAlignment (HorizontalAlignment.Stretch)
@@ -925,7 +915,6 @@ module App =
                 .borderBrush(SolidColorBrush(Colors.Black))
                 .background(Constants.accentColor)
                 .gridRow (1)
-
         })
             .margin (0.)
 
