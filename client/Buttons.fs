@@ -108,7 +108,7 @@ module Buttons =
                         .margin (24.)
 
                 | Some i ->
-                    Image(new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(i)), Stretch.UniformToFill)
+                    Image(Styles.cachedBitmap i, Stretch.UniformToFill)
                         .clipToBounds (true)
 
                 Rectangle().stroke(Colors.Black).strokeThickness (4.)
@@ -157,7 +157,7 @@ module Buttons =
                     )
 
                 | Some i ->
-                    Image(new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(i)), Stretch.UniformToFill)
+                    Image(Styles.cachedBitmap i, Stretch.UniformToFill)
                         .width(32.)
                         .height(32.)
                         .clipToBounds (true)

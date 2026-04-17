@@ -2,7 +2,6 @@ namespace Skrepka
 
 open System
 open System.IO
-open System.Text.Json
 open Avalonia.Media
 open Avalonia.Themes.Fluent
 open Fabulous
@@ -22,6 +21,7 @@ module App =
     open ViewChat
     open ViewAddContact
     open ViewEditProfile
+    open Protocol
 
     // ── Helpers ──
 
@@ -326,91 +326,6 @@ module App =
 
     let private log msg = eprintfn $"[skrepka] {msg}"
 
-    let private serializeEnvelope =
-        function
-        | Envelope.TextMessage(id, body) ->
-            JsonSerializer.Serialize(
-                {| ``type`` = "text"
-                   id = id
-                   body = body |}
-            )
-        | Envelope.DeliveryAck ackIds ->
-            JsonSerializer.Serialize(
-                {| ``type`` = "delivery.ack"
-                   ack_ids = ackIds |}
-            )
-        | Envelope.ProfileMessage profile ->
-            JsonSerializer.Serialize(
-                {| ``type`` = "profile"
-                   display_name = profile.DisplayName
-                   bio = profile.Bio
-                   photo = profile.Photo |}
-            )
-
-    let private sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
-        async {
-            let payload = serializeEnvelope envelope
-
-            let blob =
-                Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload
-
-            let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-            do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
-        }
-
-    let private tryGetJsonString (el: JsonElement) (name: string) =
-        match el.TryGetProperty(name) with
-        | true, v when v.ValueKind <> JsonValueKind.Null -> Some(v.GetString())
-        | _ -> None
-
-    let private tryGetJsonBytes (el: JsonElement) (name: string) =
-        match el.TryGetProperty(name) with
-        | true, v when v.ValueKind <> JsonValueKind.Null -> Some(v.GetBytesFromBase64())
-        | _ -> None
-
-    let private parseEnvelope (json: string) =
-        use doc = JsonDocument.Parse(json)
-        let root = doc.RootElement
-
-        match root.GetProperty("type").GetString() with
-        | "text" -> Some(Envelope.TextMessage(root.GetProperty("id").GetString(), root.GetProperty("body").GetString()))
-        | "delivery.ack" ->
-            let ackIds =
-                root.GetProperty("ack_ids").EnumerateArray()
-                |> Seq.map _.GetString()
-                |> Seq.toList
-
-            Some(Envelope.DeliveryAck ackIds)
-        | "profile" ->
-            let displayName = root.GetProperty("display_name").GetString()
-            let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
-            let photo = tryGetJsonBytes root "photo"
-
-            Some(
-                Envelope.ProfileMessage
-                    { DisplayName = displayName
-                      Bio = bio
-                      Photo = photo }
-            )
-        | _ -> None
-
-    let private decryptEvent (privKey: byte[]) (payload: EventPayload) =
-        try
-            let blob = Crypto.fromHex payload.EncryptedBlob
-
-            match Crypto.decrypt privKey blob with
-            | Some(plaintext, senderHex) ->
-                match parseEnvelope plaintext with
-                | Some envelope ->
-                    Ok
-                        { Sender = senderHex
-                          Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(payload.Timestamp)
-                          Envelope = envelope }
-                | None -> Error "unknown envelope type"
-            | None -> Error "decrypt failed"
-        with ex ->
-            Error $"parse: {ex.Message}"
-
     let private getClipboard () =
         match Avalonia.Application.Current with
         | null -> None
@@ -465,7 +380,8 @@ module App =
                     match bytes with
                     | Some b -> dispatch (PhotoPicked(Some(cropToSquarePng b)))
                     | None -> dispatch (PhotoPicked None)
-                with _ ->
+                with ex ->
+                    log $"photo pick error: {ex.Message}"
                     dispatch (PhotoPicked None)
             }
             |> ignore)
@@ -498,7 +414,8 @@ module App =
                                 do! stream.CopyToAsync(ms)
                                 dispatch (PhotoPicked(Some(cropToSquarePng (ms.ToArray()))))
                         | None -> dispatch (PhotoPicked None)
-                    with _ ->
+                    with ex ->
+                        log $"photo pick error: {ex.Message}"
                         dispatch (PhotoPicked None)
                 }
                 :> System.Threading.Tasks.Task)
@@ -513,14 +430,17 @@ module App =
 
         | CmdEnqueue(recipientHex, envelope) ->
             Cmd.ofEffect (fun dispatch ->
-                let json = serializeEnvelope envelope
-                Store.enqueueOutbox recipientHex json
-                dispatch StartFlush)
+                async {
+                    let json = serializeEnvelope envelope
+                    do! Store.enqueueOutbox recipientHex json
+                    dispatch StartFlush
+                }
+                |> Async.Start)
 
         | CmdFlushOutbox session ->
             Cmd.ofEffect (fun dispatch ->
                 async {
-                    match Store.peekOutbox () with
+                    match! Store.peekOutbox () with
                     | Some item ->
                         try
                             let blob =
@@ -531,7 +451,7 @@ module App =
 
                             let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                             do! sendMessage session.Url session.Token item.RecipientHex (Crypto.toHex blob) ts
-                            Store.dequeueOutbox item.Id
+                            do! Store.dequeueOutbox item.Id
                             dispatch (FlushResult true)
                         with ex ->
                             log $"outbox send error: {ex.Message}"
@@ -578,8 +498,8 @@ module App =
                                 if not ackIds.IsEmpty then
                                     try
                                         do! ackMessages session.Url session.Token ackIds
-                                    with _ ->
-                                        ()
+                                    with ex ->
+                                        log $"ack error: {ex.Message}"
 
                                 let acksBySender =
                                     events
@@ -593,8 +513,8 @@ module App =
                                 for sender, msgIds in acksBySender do
                                     try
                                         do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
-                                    with _ ->
-                                        ()
+                                    with ex ->
+                                        log $"delivery ack error: {ex.Message}"
                             }
                             |> Async.Start
 
@@ -637,7 +557,10 @@ module App =
                 (fun () ->
                     async {
                         match! Store.loadIdentity () with
-                        | Some id -> return (Some id, Store.loadData (), Store.loadProfile ())
+                        | Some id ->
+                            let! data = Store.loadData ()
+                            let! profile = Store.loadProfile ()
+                            return (Some id, data, profile)
                         | None -> return (None, None, None)
                     })
                 ()
@@ -645,11 +568,11 @@ module App =
 
         | CmdSaveIdentity identity -> Cmd.ofEffect (fun _ -> Store.saveIdentity identity |> Async.Start)
 
-        | CmdSaveData data -> Cmd.ofEffect (fun _ -> Store.saveData data)
+        | CmdSaveData data -> Cmd.ofEffect (fun _ -> Store.saveData data |> Async.Start)
 
         | CmdPickPhoto -> pickPhotoCmd
 
-        | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile)
+        | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile |> Async.Start)
 
     // ── View ──
 

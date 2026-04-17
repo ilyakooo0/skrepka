@@ -18,6 +18,8 @@ module Crypto =
         try Some(Convert.FromHexString(hex))
         with :? FormatException -> None
 
+    // ── Platform-specific primitives ──
+
 #if MOBILE
     open System.Runtime.InteropServices
 
@@ -114,30 +116,60 @@ module Crypto =
             failwith "aead decrypt failed"
         pt.[.. int ptlen - 1]
 
+#else
+
+    let private getRandomBytes n =
+        Sodium.SodiumCore.GetRandomBytes(n)
+
+    let private generateSignKeyPair () =
+        let kp = Sodium.PublicKeyAuth.GenerateKeyPair()
+        kp.PublicKey, kp.PrivateKey
+
+    let private signDetached (message: byte[]) (sk: byte[]) =
+        Sodium.PublicKeyAuth.SignDetached(message, sk)
+
+    let private verifyDetached (signature: byte[]) (message: byte[]) (pk: byte[]) =
+        Sodium.PublicKeyAuth.VerifyDetached(signature, message, pk)
+
+    let private ed25519PkToCurve25519 (pk: byte[]) =
+        Sodium.PublicKeyAuth.ConvertEd25519PublicKeyToCurve25519PublicKey(pk)
+
+    let private ed25519SkToCurve25519 (sk: byte[]) =
+        Sodium.PublicKeyAuth.ConvertEd25519SecretKeyToCurve25519SecretKey(sk)
+
+    let private generateBoxKeyPair () =
+        let kp = Sodium.PublicKeyBox.GenerateKeyPair()
+        kp.PublicKey, kp.PrivateKey
+
+    let private scalarMult (n: byte[]) (p: byte[]) =
+        Sodium.ScalarMult.Mult(n, p)
+
+    let private aeadEncrypt (pt: byte[]) (nonce: byte[]) (key: byte[]) =
+        Sodium.SecretAeadXChaCha20Poly1305.Encrypt(pt, nonce, key)
+
+    let private aeadDecrypt (ct: byte[]) (nonce: byte[]) (key: byte[]) =
+        Sodium.SecretAeadXChaCha20Poly1305.Decrypt(ct, nonce, key)
+
 #endif
+
+    // ── Shared algorithm (platform-independent) ──
+
+    let private log msg = eprintfn $"[skrepka] {msg}"
 
     let identityFromPrivKey (privKey: byte[]) : Identity =
         { PrivKey = privKey; PubKeyHex = toHex privKey.[32..63] }
 
     let generateIdentity () : Identity =
-#if MOBILE
         let _, sk = generateSignKeyPair ()
         sk |> identityFromPrivKey
-#else
-        Sodium.PublicKeyAuth.GenerateKeyPair().PrivateKey |> identityFromPrivKey
-#endif
 
     let signChallenge (privKey: byte[]) (challenge: string) : string =
         let message = Encoding.UTF8.GetBytes(challenge)
-#if MOBILE
         signDetached message privKey |> toHex
-#else
-        Sodium.PublicKeyAuth.SignDetached(message, privKey) |> toHex
-#endif
 
     let private deriveKey ephPub recipientX25519Pub rawSecret =
         let salt = Array.append ephPub recipientX25519Pub
-        let info = Encoding.UTF8.GetBytes("skrepka-v1")
+        let info = Encoding.UTF8.GetBytes(Constants.hkdfInfo)
         HKDF.DeriveKey(HashAlgorithmName.SHA256, rawSecret, 32, salt, info)
 
     // Blob layout: [ephPub(32) | nonce(24) | ciphertext | senderPub(32) | signature(64)]
@@ -151,7 +183,6 @@ module Crypto =
 
     let encrypt (senderPrivKey: byte[]) (recipientEd25519Pub: byte[]) (plaintext: string) : byte[] =
         let senderPubKey = senderPrivKey.[32..63]
-#if MOBILE
         let ephPub, ephPriv = generateBoxKeyPair ()
         let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
         let rawSecret = scalarMult ephPriv recipientX25519Pub
@@ -161,18 +192,6 @@ module Crypto =
         let ciphertext = aeadEncrypt ptBytes nonce key
         let signature = signDetached ciphertext senderPrivKey
         Array.concat [| ephPub; nonce; ciphertext; senderPubKey; signature |]
-#else
-        let ephKp = Sodium.PublicKeyBox.GenerateKeyPair()
-        let recipientX25519Pub =
-            Sodium.PublicKeyAuth.ConvertEd25519PublicKeyToCurve25519PublicKey(recipientEd25519Pub)
-        let rawSecret = Sodium.ScalarMult.Mult(ephKp.PrivateKey, recipientX25519Pub)
-        let key = deriveKey ephKp.PublicKey recipientX25519Pub rawSecret
-        let nonce = Sodium.SodiumCore.GetRandomBytes(24)
-        let ptBytes = Encoding.UTF8.GetBytes(plaintext)
-        let ciphertext = Sodium.SecretAeadXChaCha20Poly1305.Encrypt(ptBytes, nonce, key)
-        let signature = Sodium.PublicKeyAuth.SignDetached(ciphertext, senderPrivKey)
-        Array.concat [| ephKp.PublicKey; nonce; ciphertext; senderPubKey; signature |]
-#endif
 
     let decrypt (recipientPrivKey: byte[]) (blob: byte[]) : (string * string) option =
         if blob.Length < minBlobLen then
@@ -185,7 +204,6 @@ module Crypto =
                 let senderPub = blob.[blob.Length - trailerLen .. blob.Length - sigLen - 1]
                 let signature = blob.[blob.Length - sigLen ..]
 
-#if MOBILE
                 if not (verifyDetached signature ciphertext senderPub) then
                     None
                 else
@@ -196,19 +214,6 @@ module Crypto =
                     let key = deriveKey ephPub recipientX25519Pub rawSecret
                     let plaintext = aeadDecrypt ciphertext nonce key
                     Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
-#else
-                if not (Sodium.PublicKeyAuth.VerifyDetached(signature, ciphertext, senderPub)) then
-                    None
-                else
-                    let recipientX25519Priv =
-                        Sodium.PublicKeyAuth.ConvertEd25519SecretKeyToCurve25519SecretKey(recipientPrivKey)
-                    let rawSecret = Sodium.ScalarMult.Mult(recipientX25519Priv, ephPub)
-                    let recipientEd25519Pub = recipientPrivKey.[32..63]
-                    let recipientX25519Pub =
-                        Sodium.PublicKeyAuth.ConvertEd25519PublicKeyToCurve25519PublicKey(recipientEd25519Pub)
-                    let key = deriveKey ephPub recipientX25519Pub rawSecret
-                    let plaintext = Sodium.SecretAeadXChaCha20Poly1305.Decrypt(ciphertext, nonce, key)
-                    Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
-#endif
-            with _ ->
+            with ex ->
+                log $"decrypt error: {ex.Message}"
                 None

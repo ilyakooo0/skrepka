@@ -41,11 +41,7 @@ module ViewConversations =
                                 Grid() {
                                     (match c.Photo with
                                      | None -> Image("avares://Skrepka/Assets/Images/user.png", Stretch.Uniform)
-                                     | Some i ->
-                                         Image(
-                                             new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(i)),
-                                             Stretch.UniformToFill
-                                         ))
+                                     | Some i -> Image(cachedBitmap i, Stretch.UniformToFill))
                                         .width(16.)
                                         .height(16.)
                                         .margin(8.)

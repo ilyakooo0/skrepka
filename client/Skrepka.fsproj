@@ -38,6 +38,7 @@
     <Compile Include="Buttons.fs" />
     <Compile Include="$(iOSPlatformFolder)PhotoPicker.fs" Condition="$(AvaloniaPlatform) == 'iOS'" />
     <Compile Include="AppTypes.fs" />
+    <Compile Include="Protocol.fs" />
     <Compile Include="ViewSetup.fs" />
     <Compile Include="ViewSettings.fs" />
     <Compile Include="ViewConversations.fs" />

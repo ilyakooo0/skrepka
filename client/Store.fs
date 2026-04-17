@@ -85,6 +85,8 @@ module Store =
     let private settingsTable = table'<SettingsRow> "settings"
     let private outboxTable = table'<OutboxRow> "outbox"
 
+    let private log msg = eprintfn $"[skrepka] {msg}"
+
     let private appDataDir =
         let baseDir =
             let appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
@@ -154,6 +156,32 @@ module Store =
         )
         |> ignore
 
+        // Schema versioning
+        conn.Execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        |> ignore
+
+        let dbVersion =
+            try
+                conn.QueryFirstOrDefault<string>("SELECT value FROM schema_meta WHERE key = 'schema_version'")
+                |> Option.ofObj
+                |> Option.map int
+                |> Option.defaultValue 0
+            with ex ->
+                log $"schema version check: {ex.Message}"
+                0
+
+        // Future migrations:
+        // if dbVersion < 2 then
+        //     conn.Execute("ALTER TABLE ...") |> ignore
+
+        ignore dbVersion
+
+        conn.Execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', @v)",
+            {| v = string Constants.schemaVersion |}
+        )
+        |> ignore
+
     let private identityPath = Path.Combine(appDataDir, "identity.key")
 
     let loadIdentity () =
@@ -167,7 +195,8 @@ module Store =
                         |> Option.map (Convert.FromBase64String >> Crypto.identityFromPrivKey)
                     else
                         None
-                with _ ->
+                with ex ->
+                    log $"loadIdentity error: {ex.Message}"
                     None
         }
 
@@ -177,195 +206,237 @@ module Store =
             File.WriteAllText(identityPath, b64)
         }
 
-    let loadProfile () : Profile option =
-        try
-            use conn = openConn ()
+    let loadProfile () =
+        async {
+            try
+                use conn = openConn ()
 
-            select {
-                for p in profileTable do
-                    where (p.Id = "me")
-            }
-            |> conn.SelectAsync<ProfileRow>
-            |> Async.AwaitTask
-            |> Async.RunSynchronously
-            |> Seq.tryHead
-            |> Option.map (fun p ->
-                { DisplayName = p.DisplayName
-                  Bio = p.Bio
-                  Photo = p.Photo })
-        with _ ->
-            None
+                let! rows =
+                    select {
+                        for p in profileTable do
+                            where (p.Id = Constants.profileId)
+                    }
+                    |> conn.SelectAsync<ProfileRow>
+                    |> Async.AwaitTask
+
+                return
+                    rows
+                    |> Seq.tryHead
+                    |> Option.map (fun p ->
+                        { DisplayName = p.DisplayName
+                          Bio = p.Bio
+                          Photo = p.Photo })
+            with ex ->
+                log $"loadProfile error: {ex.Message}"
+                return None
+        }
 
     let saveProfile (profile: Profile) =
-        try
-            use conn = openConn ()
+        async {
+            try
+                use conn = openConn ()
 
-            conn.Execute(
-                "INSERT OR REPLACE INTO profile (Id, DisplayName, Bio, Photo) VALUES (@Id, @DisplayName, @Bio, @Photo)",
-                {| Id = "me"
-                   DisplayName = profile.DisplayName
-                   Bio = profile.Bio
-                   Photo = profile.Photo |> Option.defaultValue null |}
-            )
-            |> ignore
-        with _ ->
-            ()
-
-    let loadData () : Data option =
-        try
-            use conn = openConn ()
-
-            let settings =
-                select {
-                    for s in settingsTable do
-                        where (s.Id = "settings")
-                }
-                |> conn.SelectAsync<SettingsRow>
-                |> Async.AwaitTask
-                |> Async.RunSynchronously
-                |> Seq.tryHead
-
-            settings
-            |> Option.map (fun s ->
-                let contacts =
-                    select {
-                        for c in contactTable do
-                            selectAll
-                    }
-                    |> conn.SelectAsync<ContactRow>
+                do!
+                    conn.ExecuteAsync(
+                        "INSERT OR REPLACE INTO profile (Id, DisplayName, Bio, Photo) VALUES (@Id, @DisplayName, @Bio, @Photo)",
+                        {| Id = Constants.profileId
+                           DisplayName = profile.DisplayName
+                           Bio = profile.Bio
+                           Photo = profile.Photo |> Option.defaultValue null |}
+                    )
                     |> Async.AwaitTask
-                    |> Async.RunSynchronously
-                    |> Seq.map (fun c ->
-                        let contact: Contact =
-                            { Pubkey = c.Pubkey
-                              Nickname = c.Nickname
-                              DisplayName = c.DisplayName
-                              Bio = c.Bio
-                              Photo = c.Photo }
+                    |> Async.Ignore
+            with ex ->
+                log $"saveProfile error: {ex.Message}"
+        }
 
-                        c.Pubkey, contact)
-                    |> Map.ofSeq
+    let loadData () =
+        async {
+            try
+                use conn = openConn ()
 
-                let messages =
+                let! settings =
                     select {
-                        for m in messageTable do
-                            selectAll
+                        for s in settingsTable do
+                            where (s.Id = Constants.settingsId)
                     }
-                    |> conn.SelectAsync<MessageRow>
+                    |> conn.SelectAsync<SettingsRow>
                     |> Async.AwaitTask
-                    |> Async.RunSynchronously
-                    |> Seq.groupBy _.ConversationId
-                    |> Seq.map (fun (convId, rows) ->
-                        convId,
-                        rows
-                        |> Seq.map (fun m ->
-                            { Id = m.Id
-                              Body = m.Body
-                              Timestamp = DateTimeOffset.FromUnixTimeMilliseconds m.TimestampUnix
-                              Direction =
-                                if not m.IsOutgoing then
-                                    Incoming
-                                else
-                                    Outgoing(
-                                        if m.Status = 1 then
-                                            DeliveryStatus.Delivered
-                                        else
-                                            DeliveryStatus.Sent
-                                    ) })
-                        |> Seq.sortBy _.Timestamp
-                        |> Seq.toList)
-                    |> Map.ofSeq
 
-                { Contacts = contacts
-                  Messages = messages
-                  ServerUrl = s.ServerUrl
-                  PollCursor = s.PollCursor })
-        with _ ->
-            None
+                match settings |> Seq.tryHead with
+                | None -> return None
+                | Some s ->
+                    let! contactRows =
+                        select {
+                            for c in contactTable do
+                                selectAll
+                        }
+                        |> conn.SelectAsync<ContactRow>
+                        |> Async.AwaitTask
+
+                    let contacts =
+                        contactRows
+                        |> Seq.map (fun c ->
+                            let contact: Contact =
+                                { Pubkey = c.Pubkey
+                                  Nickname = c.Nickname
+                                  DisplayName = c.DisplayName
+                                  Bio = c.Bio
+                                  Photo = c.Photo }
+
+                            c.Pubkey, contact)
+                        |> Map.ofSeq
+
+                    let! messageRows =
+                        select {
+                            for m in messageTable do
+                                selectAll
+                        }
+                        |> conn.SelectAsync<MessageRow>
+                        |> Async.AwaitTask
+
+                    let messages =
+                        messageRows
+                        |> Seq.groupBy _.ConversationId
+                        |> Seq.map (fun (convId, rows) ->
+                            convId,
+                            rows
+                            |> Seq.map (fun m ->
+                                { Id = m.Id
+                                  Body = m.Body
+                                  Timestamp = DateTimeOffset.FromUnixTimeMilliseconds m.TimestampUnix
+                                  Direction =
+                                    if not m.IsOutgoing then
+                                        Incoming
+                                    else
+                                        Outgoing(
+                                            if m.Status = 1 then
+                                                DeliveryStatus.Delivered
+                                            else
+                                                DeliveryStatus.Sent
+                                        ) })
+                            |> Seq.sortBy _.Timestamp
+                            |> Seq.toList)
+                        |> Map.ofSeq
+
+                    return
+                        Some
+                            { Contacts = contacts
+                              Messages = messages
+                              ServerUrl = s.ServerUrl
+                              PollCursor = s.PollCursor }
+            with ex ->
+                log $"loadData error: {ex.Message}"
+                return None
+        }
 
     let saveData (data: Data) =
-        try
-            use conn = openConn ()
+        async {
+            try
+                use conn = openConn ()
 
-            for c in data.Contacts.Values do
-                conn.Execute(
-                    "INSERT OR REPLACE INTO contacts (Pubkey, Nickname, DisplayName, Bio, Photo) VALUES (@Pubkey, @Nickname, @DisplayName, @Bio, @Photo)",
-                    {| Pubkey = c.Pubkey
-                       Nickname = c.Nickname
-                       DisplayName = c.DisplayName
-                       Bio = c.Bio
-                       Photo = c.Photo |}
-                )
-                |> ignore
+                for c in data.Contacts.Values do
+                    do!
+                        conn.ExecuteAsync(
+                            "INSERT OR REPLACE INTO contacts (Pubkey, Nickname, DisplayName, Bio, Photo) VALUES (@Pubkey, @Nickname, @DisplayName, @Bio, @Photo)",
+                            {| Pubkey = c.Pubkey
+                               Nickname = c.Nickname
+                               DisplayName = c.DisplayName
+                               Bio = c.Bio
+                               Photo = c.Photo |}
+                        )
+                        |> Async.AwaitTask
+                        |> Async.Ignore
 
-            data.Messages
-            |> Map.iter (fun convId msgs ->
-                for m in msgs do
-                    let isOutgoing, status =
-                        match m.Direction with
-                        | Incoming -> false, 0
-                        | Outgoing DeliveryStatus.Delivered -> true, 1
-                        | Outgoing DeliveryStatus.Sent -> true, 0
+                for KeyValue(convId, msgs) in data.Messages do
+                    for m in msgs do
+                        let isOutgoing, status =
+                            match m.Direction with
+                            | Incoming -> false, 0
+                            | Outgoing DeliveryStatus.Delivered -> true, 1
+                            | Outgoing DeliveryStatus.Sent -> true, 0
 
-                    conn.Execute(
-                        "INSERT OR REPLACE INTO messages (Id, ConversationId, Body, TimestampUnix, IsOutgoing, Status) VALUES (@Id, @ConversationId, @Body, @TimestampUnix, @IsOutgoing, @Status)",
-                        {| Id = m.Id
-                           ConversationId = convId
-                           Body = m.Body
-                           TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds()
-                           IsOutgoing = isOutgoing
-                           Status = status |}
+                        do!
+                            conn.ExecuteAsync(
+                                "INSERT OR REPLACE INTO messages (Id, ConversationId, Body, TimestampUnix, IsOutgoing, Status) VALUES (@Id, @ConversationId, @Body, @TimestampUnix, @IsOutgoing, @Status)",
+                                {| Id = m.Id
+                                   ConversationId = convId
+                                   Body = m.Body
+                                   TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds()
+                                   IsOutgoing = isOutgoing
+                                   Status = status |}
+                            )
+                            |> Async.AwaitTask
+                            |> Async.Ignore
+
+                do!
+                    conn.ExecuteAsync(
+                        "INSERT OR REPLACE INTO settings (Id, ServerUrl, PollCursor) VALUES (@Id, @ServerUrl, @PollCursor)",
+                        {| Id = Constants.settingsId
+                           ServerUrl = data.ServerUrl
+                           PollCursor = data.PollCursor |}
                     )
-                    |> ignore)
-
-            conn.Execute(
-                "INSERT OR REPLACE INTO settings (Id, ServerUrl, PollCursor) VALUES (@Id, @ServerUrl, @PollCursor)",
-                {| Id = "settings"
-                   ServerUrl = data.ServerUrl
-                   PollCursor = data.PollCursor |}
-            )
-            |> ignore
-        with _ ->
-            ()
+                    |> Async.AwaitTask
+                    |> Async.Ignore
+            with ex ->
+                log $"saveData error: {ex.Message}"
+        }
 
     let enqueueOutbox (recipientHex: string) (envelopeJson: string) =
-        use conn = openConn ()
+        async {
+            try
+                use conn = openConn ()
 
-        insert {
-            for o in outboxTable do
-                value
-                    { Id = 0L
-                      RecipientHex = recipientHex
-                      EnvelopeJson = envelopeJson
-                      CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+                do!
+                    insert {
+                        for o in outboxTable do
+                            value
+                                { Id = 0L
+                                  RecipientHex = recipientHex
+                                  EnvelopeJson = envelopeJson
+                                  CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
 
-                excludeColumn o.Id
+                            excludeColumn o.Id
+                    }
+                    |> conn.InsertAsync
+                    |> Async.AwaitTask
+                    |> Async.Ignore
+            with ex ->
+                log $"enqueueOutbox error: {ex.Message}"
         }
-        |> conn.InsertAsync
-        |> Async.AwaitTask
-        |> Async.RunSynchronously
-        |> ignore
 
-    let peekOutbox () : OutboxRow option =
-        use conn = openConn ()
+    let peekOutbox () =
+        async {
+            try
+                use conn = openConn ()
 
-        select {
-            for o in outboxTable do
-                orderBy o.Id
+                let! rows =
+                    select {
+                        for o in outboxTable do
+                            orderBy o.Id
+                    }
+                    |> conn.SelectAsync<OutboxRow>
+                    |> Async.AwaitTask
+
+                return rows |> Seq.tryHead
+            with ex ->
+                log $"peekOutbox error: {ex.Message}"
+                return None
         }
-        |> conn.SelectAsync<OutboxRow>
-        |> Async.AwaitTask
-        |> Async.RunSynchronously
-        |> Seq.tryHead
 
     let dequeueOutbox (id: int64) =
-        use conn = openConn ()
+        async {
+            try
+                use conn = openConn ()
 
-        delete {
-            for o in outboxTable do
-                where (o.Id = id)
+                do!
+                    delete {
+                        for o in outboxTable do
+                            where (o.Id = id)
+                    }
+                    |> conn.DeleteAsync
+                    |> Async.AwaitTask
+                    |> Async.Ignore
+            with ex ->
+                log $"dequeueOutbox error: {ex.Message}"
         }
-        |> conn.DeleteAsync
-        |> Async.AwaitTask
-        |> Async.RunSynchronously
-        |> ignore

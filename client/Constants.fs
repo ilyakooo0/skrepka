@@ -7,3 +7,7 @@ module Constants =
     let animationDuration: int64 = 60
     let easing = Avalonia.Animation.Easings.CubicEaseOut()
     let fontFamily = "avares://Skrepka/Assets/Fonts#Unbounded"
+    let hkdfInfo = "skrepka-v1"
+    let profileId = "me"
+    let settingsId = "settings"
+    let schemaVersion = 1
