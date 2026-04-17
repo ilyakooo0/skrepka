@@ -92,9 +92,9 @@ module Protocol =
         async {
             let payload = serializeEnvelope envelope
 
-            let blob =
-                Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload
-
-            let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-            do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
+            match Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload with
+            | Some blob ->
+                let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
+            | None -> log $"encrypt failed for {recipientHex}"
         }

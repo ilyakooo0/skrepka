@@ -58,7 +58,8 @@ module AppTypes =
           Error: string option
           PollCursor: int64
           Profile: Profile option
-          FlushingOutbox: bool }
+          FlushingOutbox: bool
+          PollRetries: int }
 
     // ── Msg ──
 
@@ -89,7 +90,7 @@ module AppTypes =
         | CmdConnect of url: string * identity: Identity
         | CmdEnqueue of recipientHex: string * envelope: Envelope
         | CmdFlushOutbox of session: Session
-        | CmdPoll of session: Session * cursor: int64
+        | CmdPoll of session: Session * cursor: int64 * retries: int
         | CmdCopyToClipboard of string
         | CmdLoadState
         | CmdSaveIdentity of Identity

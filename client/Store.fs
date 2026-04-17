@@ -192,7 +192,7 @@ module Store =
                         File.ReadAllText(identityPath)
                         |> Option.ofObj
                         |> Option.filter (fun s -> s <> "")
-                        |> Option.map (Convert.FromBase64String >> Crypto.identityFromPrivKey)
+                        |> Option.bind (Convert.FromBase64String >> Crypto.identityFromPrivKey)
                     else
                         None
                 with ex ->
@@ -289,7 +289,7 @@ module Store =
 
                     let! messageRows =
                         conn.QueryAsync<MessageRow>(
-                            "SELECT Id, ConversationId, Body, TimestampUnix, IsOutgoing, Status FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY ConversationId ORDER BY TimestampUnix DESC) AS rn FROM messages) WHERE rn <= 200"
+                            $"SELECT Id, ConversationId, Body, TimestampUnix, IsOutgoing, Status FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY ConversationId ORDER BY TimestampUnix DESC) AS rn FROM messages) WHERE rn <= {Constants.maxMessages}"
                         )
                         |> Async.AwaitTask
 
@@ -415,11 +415,9 @@ module Store =
                 use conn = openConn ()
 
                 let! rows =
-                    select {
-                        for o in outboxTable do
-                            orderBy o.Id
-                    }
-                    |> conn.SelectAsync<OutboxRow>
+                    conn.QueryAsync<OutboxRow>(
+                        "SELECT Id, RecipientHex, EnvelopeJson, CreatedAt FROM outbox ORDER BY Id LIMIT 1"
+                    )
                     |> Async.AwaitTask
 
                 return rows |> Seq.tryHead

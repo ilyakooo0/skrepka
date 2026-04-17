@@ -156,16 +156,17 @@ module Crypto =
 
     let private log msg = eprintfn $"[skrepka] {msg}"
 
-    let identityFromPrivKey (privKey: byte[]) : Identity =
+    let identityFromPrivKey (privKey: byte[]) : Identity option =
         if privKey.Length <> 64 then
-            failwith $"Invalid Ed25519 secret key length: expected 64, got {privKey.Length}"
-
-        { PrivKey = privKey
-          PubKeyHex = toHex privKey.[32..63] }
+            None
+        else
+            Some
+                { PrivKey = privKey
+                  PubKeyHex = toHex privKey.[32..63] }
 
     let generateIdentity () : Identity =
         let _, sk = generateSignKeyPair ()
-        sk |> identityFromPrivKey
+        sk |> identityFromPrivKey |> Option.get
 
     let signChallenge (privKey: byte[]) (challenge: string) : string =
         let message = Encoding.UTF8.GetBytes(challenge)
@@ -185,45 +186,65 @@ module Crypto =
     let private trailerLen = pubLen + sigLen
     let private minBlobLen = headerLen + 16 + trailerLen // 16 = AEAD tag
 
-    let encrypt (senderPrivKey: byte[]) (recipientEd25519Pub: byte[]) (plaintext: string) : byte[] =
-        if senderPrivKey.Length <> 64 then
-            failwith $"Invalid sender secret key length: expected 64, got {senderPrivKey.Length}"
+    let encrypt (senderPrivKey: byte[]) (recipientEd25519Pub: byte[]) (plaintext: string) : byte[] option =
+        if senderPrivKey.Length <> 64 || recipientEd25519Pub.Length <> 32 then
+            None
+        else
+            try
+                let senderPubKey = senderPrivKey.[32..63]
+                let ephPub, ephPriv = generateBoxKeyPair ()
+                let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
+                let rawSecret = scalarMult ephPriv recipientX25519Pub
+                let key = deriveKey ephPub recipientX25519Pub rawSecret
+                let nonce = getRandomBytes 24
+                let ptBytes = Encoding.UTF8.GetBytes(plaintext)
+                let ciphertext = aeadEncrypt ptBytes nonce key
+                let signature = signDetached ciphertext senderPrivKey
 
-        if recipientEd25519Pub.Length <> 32 then
-            failwith $"Invalid recipient public key length: expected 32, got {recipientEd25519Pub.Length}"
-
-        let senderPubKey = senderPrivKey.[32..63]
-        let ephPub, ephPriv = generateBoxKeyPair ()
-        let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
-        let rawSecret = scalarMult ephPriv recipientX25519Pub
-        let key = deriveKey ephPub recipientX25519Pub rawSecret
-        let nonce = getRandomBytes 24
-        let ptBytes = Encoding.UTF8.GetBytes(plaintext)
-        let ciphertext = aeadEncrypt ptBytes nonce key
-        let signature = signDetached ciphertext senderPrivKey
-        Array.concat [| ephPub; nonce; ciphertext; senderPubKey; signature |]
+                Some(
+                    Array.concat
+                        [| [| Constants.blobVersion |]
+                           ephPub
+                           nonce
+                           ciphertext
+                           senderPubKey
+                           signature |]
+                )
+            with ex ->
+                log $"encrypt error: {ex.Message}"
+                None
 
     let decrypt (recipientPrivKey: byte[]) (blob: byte[]) : (string * string) option =
         if recipientPrivKey.Length <> 64 || blob.Length < minBlobLen then
             None
         else
-            try
-                let ephPub = blob.[.. ephPubLen - 1]
-                let nonce = blob.[ephPubLen .. headerLen - 1]
-                let ciphertext = blob.[headerLen .. blob.Length - trailerLen - 1]
-                let senderPub = blob.[blob.Length - trailerLen .. blob.Length - sigLen - 1]
-                let signature = blob.[blob.Length - sigLen ..]
-
-                if not (verifyDetached signature ciphertext senderPub) then
+            let tryDecrypt offset =
+                if blob.Length < minBlobLen + offset then
                     None
                 else
-                    let recipientX25519Priv = ed25519SkToCurve25519 recipientPrivKey
-                    let rawSecret = scalarMult recipientX25519Priv ephPub
-                    let recipientEd25519Pub = recipientPrivKey.[32..63]
-                    let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
-                    let key = deriveKey ephPub recipientX25519Pub rawSecret
-                    let plaintext = aeadDecrypt ciphertext nonce key
-                    Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
-            with ex ->
-                log $"decrypt error: {ex.Message}"
-                None
+                    try
+                        let ephPub = blob.[offset .. offset + ephPubLen - 1]
+                        let nonce = blob.[offset + ephPubLen .. offset + headerLen - 1]
+                        let ciphertext = blob.[offset + headerLen .. blob.Length - trailerLen - 1]
+                        let senderPub = blob.[blob.Length - trailerLen .. blob.Length - sigLen - 1]
+                        let signature = blob.[blob.Length - sigLen ..]
+
+                        if not (verifyDetached signature ciphertext senderPub) then
+                            None
+                        else
+                            let recipientX25519Priv = ed25519SkToCurve25519 recipientPrivKey
+                            let rawSecret = scalarMult recipientX25519Priv ephPub
+                            let recipientEd25519Pub = recipientPrivKey.[32..63]
+                            let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
+                            let key = deriveKey ephPub recipientX25519Pub rawSecret
+                            let plaintext = aeadDecrypt ciphertext nonce key
+                            Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
+                    with ex ->
+                        log $"decrypt error: {ex.Message}"
+                        None
+
+            // Try versioned format, fall back to unversioned for backwards compat
+            if blob.[0] = Constants.blobVersion then
+                tryDecrypt 1 |> Option.orElseWith (fun () -> tryDecrypt 0)
+            else
+                tryDecrypt 0

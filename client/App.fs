@@ -126,7 +126,8 @@ module App =
           Error = None
           PollCursor = 0L
           Profile = None
-          FlushingOutbox = false },
+          FlushingOutbox = false
+          PollRetries = 0 },
         [ CmdLoadState ]
 
     // ── Update ──
@@ -167,29 +168,32 @@ module App =
                     Error = None
                     PollStatus = "polling..."
                     FlushingOutbox = true },
-                [ CmdPoll(session, model.PollCursor); CmdFlushOutbox session ]
+                [ CmdPoll(session, model.PollCursor, 0); CmdFlushOutbox session ]
             | _ -> model, []
 
         | AuthErr err ->
             { setConn Offline model with
                 Error = Some err
-                FlushingOutbox = false },
+                FlushingOutbox = false
+                PollRetries = 0 },
             []
 
         | DoDisconnect ->
             { setConn Offline model with
                 PollStatus = ""
-                FlushingOutbox = false },
+                FlushingOutbox = false
+                PollRetries = 0 },
             []
 
         | DoSend ->
             match model.Page with
-            | Chat(pk, compose) when compose <> "" ->
+            | Chat(pk, compose) when compose.Trim() <> "" ->
+                let body = compose.Trim()
                 let id = Guid.NewGuid().ToString()
 
                 let outMsg =
                     { Id = id
-                      Body = compose
+                      Body = body
                       Timestamp = DateTimeOffset.UtcNow
                       Direction = Outgoing DeliveryStatus.Sent }
 
@@ -201,7 +205,7 @@ module App =
                         Messages = model.Messages |> appendMessage pk outMsg }
 
                 model',
-                [ CmdEnqueue(pk, Envelope.TextMessage(id, compose))
+                [ CmdEnqueue(pk, Envelope.TextMessage(id, body))
                   match model.Profile with
                   | Some profile when isFirstInteraction -> CmdEnqueue(pk, Envelope.ProfileMessage profile)
                   | _ -> ()
@@ -225,17 +229,24 @@ module App =
                 { model with FlushingOutbox = false }, []
 
         | PollResult(events, status, newCursor) ->
+            let retries =
+                if events.IsEmpty && status.StartsWith("poll error") then
+                    model.PollRetries + 1
+                else
+                    0
+
             let model' =
                 events
                 |> List.fold
                     applyEvent
                     { model with
                         PollStatus = status
-                        PollCursor = newCursor }
+                        PollCursor = newCursor
+                        PollRetries = retries }
 
             model',
             [ match trySession model' with
-              | Some session -> CmdPoll(session, model'.PollCursor)
+              | Some session -> CmdPoll(session, model'.PollCursor, model'.PollRetries)
               | None -> ()
               if not events.IsEmpty then
                   saveCmdMsg model' ]
@@ -443,25 +454,36 @@ module App =
                     match! Store.peekOutbox () with
                     | Some item ->
                         try
-                            let blob =
+                            let blobOpt =
                                 Crypto.encrypt
                                     session.Identity.PrivKey
                                     (Crypto.fromHex item.RecipientHex)
                                     item.EnvelopeJson
 
-                            let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-                            do! sendMessage session.Url session.Token item.RecipientHex (Crypto.toHex blob) ts
+                            match blobOpt with
+                            | Some blob ->
+                                let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                                do! sendMessage session.Url session.Token item.RecipientHex (Crypto.toHex blob) ts
+                                do! Store.dequeueOutbox item.Id
+                                dispatch (FlushResult true)
+                            | None ->
+                                log $"outbox encrypt failed, dropping message to {item.RecipientHex}"
+                                do! Store.dequeueOutbox item.Id
+                                dispatch (FlushResult true)
+                        with
+                        | ServerRejected msg ->
+                            log $"outbox rejected, dropping: {msg}"
                             do! Store.dequeueOutbox item.Id
                             dispatch (FlushResult true)
-                        with ex ->
+                        | ex ->
                             log $"outbox send error: {ex.Message}"
-                            do! Async.Sleep 3000
+                            do! Async.Sleep Constants.outboxRetryDelayMs
                             dispatch (FlushResult true)
                     | None -> dispatch (FlushResult false)
                 }
                 |> Async.Start)
 
-        | CmdPoll(session, cursor) ->
+        | CmdPoll(session, cursor, retries) ->
             Cmd.ofEffect (fun dispatch ->
                 async {
                     log $"poll start cursor={cursor}"
@@ -493,33 +515,30 @@ module App =
                         for e in errors do
                             log $"decrypt error: {e}"
 
-                        if not ackIds.IsEmpty || not events.IsEmpty then
-                            async {
-                                if not ackIds.IsEmpty then
-                                    try
-                                        do! ackMessages session.Url session.Token ackIds
-                                    with ex ->
-                                        log $"ack error: {ex.Message}"
+                        if not ackIds.IsEmpty then
+                            try
+                                do! ackMessages session.Url session.Token ackIds
+                            with ex ->
+                                log $"ack error: {ex.Message}"
 
-                                let acksBySender =
-                                    events
-                                    |> List.choose (fun evt ->
-                                        match evt.Envelope with
-                                        | Envelope.TextMessage(id, _) -> Some(evt.Sender, id)
-                                        | _ -> None)
-                                    |> List.groupBy fst
-                                    |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
+                        if not events.IsEmpty then
+                            let acksBySender =
+                                events
+                                |> List.choose (fun evt ->
+                                    match evt.Envelope with
+                                    | Envelope.TextMessage(id, _) -> Some(evt.Sender, id)
+                                    | _ -> None)
+                                |> List.groupBy fst
+                                |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
 
-                                for sender, msgIds in acksBySender do
-                                    try
-                                        do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
-                                    with ex ->
-                                        log $"delivery ack error: {ex.Message}"
-                            }
-                            |> Async.Start
+                            for sender, msgIds in acksBySender do
+                                try
+                                    do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
+                                with ex ->
+                                    log $"delivery ack error: {ex.Message}"
 
                         if response.Events.Length = 0 then
-                            do! Async.Sleep 5000
+                            do! Async.Sleep Constants.pollEmptyDelayMs
 
                         let chatCount =
                             events
@@ -541,7 +560,8 @@ module App =
                         dispatch (PollResult([], "polling...", cursor))
                     | ex ->
                         log $"poll error: {ex.Message}"
-                        do! Async.Sleep 3000
+                        let delay = min (Constants.pollRetryBaseMs * (pown 2 retries)) 30000
+                        do! Async.Sleep delay
                         dispatch (PollResult([], $"poll error: {ex.Message}", cursor))
                 }
                 |> Async.Start)

@@ -9,6 +9,9 @@ open System.Threading.Tasks
 
 module ApiClient =
 
+    exception ApiError of string
+    exception ServerRejected of string
+
     [<CLIMutable>]
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
 
@@ -66,7 +69,7 @@ module ApiClient =
             match doc.RootElement.TryGetProperty("error") with
             | true, err ->
                 doc.Dispose()
-                return failwith $"{url}: {err.GetString()}"
+                return raise (ApiError $"{url}: {err.GetString()}")
             | _ -> return doc
         }
 
@@ -85,7 +88,7 @@ module ApiClient =
             let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex; challenge = challenge; signature = sigHex |})
             use! tokenDoc = sendRequest client $"{serverUrl}/auth/verify" body None
             let token = tokenDoc.RootElement.GetProperty("token").GetString()
-            if String.IsNullOrEmpty(token) then failwith "Authentication rejected by server"
+            if String.IsNullOrEmpty(token) then raise (ApiError "Authentication rejected by server")
             return token
         }
 
@@ -95,9 +98,9 @@ module ApiClient =
             use! doc = sendRequest client $"{serverUrl}/messages" body (Some token)
             match doc.RootElement.GetProperty("status").GetString() with
             | "delivered" | "federated" | "queued" -> ()
-            | "rejected" -> failwith "Message rejected by server"
-            | "unauthorized" -> failwith "Not authorized to deliver message"
-            | s -> failwith $"Unexpected status: {s}"
+            | "rejected" -> raise (ServerRejected "Message rejected by server")
+            | "unauthorized" -> raise (ServerRejected "Not authorized to deliver message")
+            | s -> raise (ApiError $"Unexpected status: {s}")
         }
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =
