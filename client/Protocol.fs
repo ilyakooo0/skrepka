@@ -47,17 +47,19 @@ module Protocol =
         use doc = JsonDocument.Parse(json)
         let root = doc.RootElement
 
-        match root.GetProperty("type").GetString() with
-        | "text" -> Some(Envelope.TextMessage(root.GetProperty("id").GetString(), root.GetProperty("body").GetString()))
-        | "delivery.ack" ->
-            let ackIds =
-                root.GetProperty("ack_ids").EnumerateArray()
-                |> Seq.map _.GetString()
-                |> Seq.toList
-
-            Some(Envelope.DeliveryAck ackIds)
-        | "profile" ->
-            let displayName = root.GetProperty("display_name").GetString()
+        match tryGetJsonString root "type" with
+        | Some "text" ->
+            match tryGetJsonString root "id", tryGetJsonString root "body" with
+            | Some id, Some body -> Some(Envelope.TextMessage(id, body))
+            | _ -> None
+        | Some "delivery.ack" ->
+            match root.TryGetProperty("ack_ids") with
+            | true, v ->
+                let ackIds = v.EnumerateArray() |> Seq.map _.GetString() |> Seq.toList
+                Some(Envelope.DeliveryAck ackIds)
+            | _ -> None
+        | Some "profile" ->
+            let displayName = tryGetJsonString root "display_name" |> Option.defaultValue ""
             let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
             let photo = tryGetJsonBytes root "photo"
 

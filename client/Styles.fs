@@ -43,7 +43,10 @@ module Styles =
                   .Name("PART_ContentPresenter"))
               [ Setter(ContentPresenter.MarginProperty, Thickness(0.)) ] ]
 
-    let private bitmapCache = System.Collections.Concurrent.ConcurrentDictionary<int, Avalonia.Media.Imaging.Bitmap>()
+    let private maxBitmapCacheSize = 128
+
+    let private bitmapCache =
+        System.Collections.Concurrent.ConcurrentDictionary<int, Avalonia.Media.Imaging.Bitmap>()
 
     let cachedBitmap (bytes: byte[]) =
         let h =
@@ -52,6 +55,9 @@ module Styles =
                 (if bytes.Length > 3 then System.BitConverter.ToInt32(bytes, 0) else 0),
                 (if bytes.Length > 7 then System.BitConverter.ToInt32(bytes, bytes.Length / 2) else 0),
                 (if bytes.Length > 11 then System.BitConverter.ToInt32(bytes, bytes.Length - 4) else 0))
+
+        if bitmapCache.Count >= maxBitmapCacheSize then
+            bitmapCache.Clear()
 
         bitmapCache.GetOrAdd(h, fun _ ->
             new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(bytes)))

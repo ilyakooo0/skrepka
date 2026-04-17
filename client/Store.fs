@@ -109,6 +109,7 @@ module Store =
     let private openConn () =
         let conn = new SqliteConnection($"Data Source={dbPath}")
         conn.Open()
+        conn.Execute("PRAGMA busy_timeout = 5000") |> ignore
         conn
 
     type private ByteArrayOptionHandler() =
@@ -130,6 +131,7 @@ module Store =
         OptionTypes.register ()
         SqlMapper.AddTypeHandler(ByteArrayOptionHandler())
         use conn = openConn ()
+        conn.Execute("PRAGMA journal_mode=WAL") |> ignore
 
         conn.Execute(
             "CREATE TABLE IF NOT EXISTS profile (Id TEXT PRIMARY KEY, DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)"
@@ -170,11 +172,9 @@ module Store =
                 log $"schema version check: {ex.Message}"
                 0
 
-        // Future migrations:
-        // if dbVersion < 2 then
-        //     conn.Execute("ALTER TABLE ...") |> ignore
-
-        ignore dbVersion
+        if dbVersion < 2 then
+            conn.Execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(ConversationId)")
+            |> ignore
 
         conn.Execute(
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', @v)",
@@ -288,11 +288,9 @@ module Store =
                         |> Map.ofSeq
 
                     let! messageRows =
-                        select {
-                            for m in messageTable do
-                                selectAll
-                        }
-                        |> conn.SelectAsync<MessageRow>
+                        conn.QueryAsync<MessageRow>(
+                            "SELECT Id, ConversationId, Body, TimestampUnix, IsOutgoing, Status FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY ConversationId ORDER BY TimestampUnix DESC) AS rn FROM messages) WHERE rn <= 200"
+                        )
                         |> Async.AwaitTask
 
                     let messages =
@@ -334,6 +332,7 @@ module Store =
         async {
             try
                 use conn = openConn ()
+                use tx = conn.BeginTransaction()
 
                 for c in data.Contacts.Values do
                     do!
@@ -343,7 +342,8 @@ module Store =
                                Nickname = c.Nickname
                                DisplayName = c.DisplayName
                                Bio = c.Bio
-                               Photo = c.Photo |}
+                               Photo = c.Photo |},
+                            tx
                         )
                         |> Async.AwaitTask
                         |> Async.Ignore
@@ -364,7 +364,8 @@ module Store =
                                    Body = m.Body
                                    TimestampUnix = m.Timestamp.ToUnixTimeMilliseconds()
                                    IsOutgoing = isOutgoing
-                                   Status = status |}
+                                   Status = status |},
+                                tx
                             )
                             |> Async.AwaitTask
                             |> Async.Ignore
@@ -374,10 +375,13 @@ module Store =
                         "INSERT OR REPLACE INTO settings (Id, ServerUrl, PollCursor) VALUES (@Id, @ServerUrl, @PollCursor)",
                         {| Id = Constants.settingsId
                            ServerUrl = data.ServerUrl
-                           PollCursor = data.PollCursor |}
+                           PollCursor = data.PollCursor |},
+                        tx
                     )
                     |> Async.AwaitTask
                     |> Async.Ignore
+
+                tx.Commit()
             with ex ->
                 log $"saveData error: {ex.Message}"
         }
@@ -439,4 +443,38 @@ module Store =
                     |> Async.Ignore
             with ex ->
                 log $"dequeueOutbox error: {ex.Message}"
+        }
+
+    let loadMessagesForConversation (conversationId: string) =
+        async {
+            try
+                use conn = openConn ()
+
+                let! rows =
+                    conn.QueryAsync<MessageRow>(
+                        "SELECT Id, ConversationId, Body, TimestampUnix, IsOutgoing, Status FROM messages WHERE ConversationId = @convId ORDER BY TimestampUnix",
+                        {| convId = conversationId |}
+                    )
+                    |> Async.AwaitTask
+
+                return
+                    rows
+                    |> Seq.map (fun m ->
+                        { Id = m.Id
+                          Body = m.Body
+                          Timestamp = DateTimeOffset.FromUnixTimeMilliseconds m.TimestampUnix
+                          Direction =
+                            if not m.IsOutgoing then
+                                Incoming
+                            else
+                                Outgoing(
+                                    if m.Status = 1 then
+                                        DeliveryStatus.Delivered
+                                    else
+                                        DeliveryStatus.Sent
+                                ) })
+                    |> Seq.toList
+            with ex ->
+                log $"loadMessagesForConversation error: {ex.Message}"
+                return []
         }

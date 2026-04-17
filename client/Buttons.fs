@@ -19,22 +19,28 @@ module Buttons =
         b.AppendTranslate(x, y)
         b.Build() :> ITransform
 
+    let private shadowRect offset =
+        Rectangle()
+            .fill(SolidColorBrush(Colors.Black))
+            .renderTransform(translate offset offset)
+            .transition (
+                TransformOperationsTransition(
+                    Avalonia.Visual.RenderTransformProperty,
+                    TimeSpan.FromMilliseconds Constants.animationDuration
+                )
+                    .easing (Constants.easing)
+            )
+
+    let private borderRect () =
+        Rectangle().stroke(Colors.Black).strokeThickness (4.)
+
     let button priority (text: string) (msg: 'msg) =
         Component(text) {
             let! pressed = Context.State(false)
             let offset = if pressed.Current then 4. else 8.
 
             (Grid() {
-                Rectangle()
-                    .fill(SolidColorBrush(Colors.Black))
-                    .renderTransform(translate offset offset)
-                    .transition (
-                        TransformOperationsTransition(
-                            Avalonia.Visual.RenderTransformProperty,
-                            TimeSpan.FromMilliseconds Constants.animationDuration
-                        )
-                            .easing (Constants.easing)
-                    )
+                shadowRect offset
 
                 Rectangle()
                     .fill (
@@ -56,7 +62,7 @@ module Buttons =
                     .center()
                     .margin (8.)
 
-                Rectangle().stroke(Colors.Black).strokeThickness (4.)
+                borderRect ()
             })
                 .background(Brushes.Transparent)
                 .onPointerPressed(fun _ -> pressed.Set true)
@@ -77,16 +83,7 @@ module Buttons =
             let offset = if pressed.Current then 4. else 8.
 
             (Grid() {
-                Rectangle()
-                    .fill(SolidColorBrush(Colors.Black))
-                    .renderTransform(translate offset offset)
-                    .transition (
-                        TransformOperationsTransition(
-                            Avalonia.Visual.RenderTransformProperty,
-                            TimeSpan.FromMilliseconds Constants.animationDuration
-                        )
-                            .easing (Constants.easing)
-                    )
+                shadowRect offset
 
                 Rectangle().fill (SolidColorBrush(Colors.White))
 
@@ -111,7 +108,7 @@ module Buttons =
                     Image(Styles.cachedBitmap i, Stretch.UniformToFill)
                         .clipToBounds (true)
 
-                Rectangle().stroke(Colors.Black).strokeThickness (4.)
+                borderRect ()
             })
                 .background(Brushes.Transparent)
                 .onPointerPressed(fun _ -> pressed.Set true)
@@ -134,16 +131,7 @@ module Buttons =
             let offset = if pressed.Current then 2. else 4.
 
             (Grid() {
-                Rectangle()
-                    .fill(SolidColorBrush(Colors.Black))
-                    .renderTransform(translate offset offset)
-                    .transition (
-                        TransformOperationsTransition(
-                            Avalonia.Visual.RenderTransformProperty,
-                            TimeSpan.FromMilliseconds Constants.animationDuration
-                        )
-                            .easing (Constants.easing)
-                    )
+                shadowRect offset
 
                 Rectangle().fill (SolidColorBrush(Colors.White))
 
@@ -162,7 +150,7 @@ module Buttons =
                         .height(32.)
                         .clipToBounds (true)
 
-                Rectangle().stroke(Colors.Black).strokeThickness (4.)
+                borderRect ()
             })
                 .width(48.)
                 .height(48.)
@@ -180,16 +168,7 @@ module Buttons =
             let offset = if pressed.Current then 2. else 4.
 
             (Grid() {
-                Rectangle()
-                    .fill(SolidColorBrush(Colors.Black))
-                    .renderTransform(translate offset offset)
-                    .transition (
-                        TransformOperationsTransition(
-                            Avalonia.Visual.RenderTransformProperty,
-                            TimeSpan.FromMilliseconds Constants.animationDuration
-                        )
-                            .easing (Constants.easing)
-                    )
+                shadowRect offset
 
                 Rectangle().fill (SolidColorBrush(Colors.White))
 
@@ -200,7 +179,7 @@ module Buttons =
                     .textAlignment(TextAlignment.Center)
                     .center ()
 
-                Rectangle().stroke(Colors.Black).strokeThickness (4.)
+                borderRect ()
             })
                 .width(48.)
                 .height(48.)

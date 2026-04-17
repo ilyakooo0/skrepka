@@ -10,4 +10,4 @@ module Constants =
     let hkdfInfo = "skrepka-v1"
     let profileId = "me"
     let settingsId = "settings"
-    let schemaVersion = 1
+    let schemaVersion = 2

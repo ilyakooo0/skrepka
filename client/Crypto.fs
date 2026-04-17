@@ -157,7 +157,11 @@ module Crypto =
     let private log msg = eprintfn $"[skrepka] {msg}"
 
     let identityFromPrivKey (privKey: byte[]) : Identity =
-        { PrivKey = privKey; PubKeyHex = toHex privKey.[32..63] }
+        if privKey.Length <> 64 then
+            failwith $"Invalid Ed25519 secret key length: expected 64, got {privKey.Length}"
+
+        { PrivKey = privKey
+          PubKeyHex = toHex privKey.[32..63] }
 
     let generateIdentity () : Identity =
         let _, sk = generateSignKeyPair ()
@@ -182,6 +186,12 @@ module Crypto =
     let private minBlobLen = headerLen + 16 + trailerLen // 16 = AEAD tag
 
     let encrypt (senderPrivKey: byte[]) (recipientEd25519Pub: byte[]) (plaintext: string) : byte[] =
+        if senderPrivKey.Length <> 64 then
+            failwith $"Invalid sender secret key length: expected 64, got {senderPrivKey.Length}"
+
+        if recipientEd25519Pub.Length <> 32 then
+            failwith $"Invalid recipient public key length: expected 32, got {recipientEd25519Pub.Length}"
+
         let senderPubKey = senderPrivKey.[32..63]
         let ephPub, ephPriv = generateBoxKeyPair ()
         let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
@@ -194,7 +204,7 @@ module Crypto =
         Array.concat [| ephPub; nonce; ciphertext; senderPubKey; signature |]
 
     let decrypt (recipientPrivKey: byte[]) (blob: byte[]) : (string * string) option =
-        if blob.Length < minBlobLen then
+        if recipientPrivKey.Length <> 64 || blob.Length < minBlobLen then
             None
         else
             try
