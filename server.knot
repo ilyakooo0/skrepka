@@ -733,6 +733,27 @@ retryPendingForwards = \pending -> do
     retryForwardsForServer (do x <- pending; where x.toServer == server; yield x) maxForwardRetriesPerServer)
   yield {}
 
+forwardQueuedMessages = \targets t -> do
+  newForwards <- atomic do
+    messages <- *messages
+    forwards <- *forwards
+    presence <- *presence
+    let localOnline = do p <- presence; where isLocalServer p.server && p.expiresAt > t; yield p.pubkey
+    let remoteTargets = do target <- targets; where none localOnline (\pk -> pk == target.pubkey); yield target
+    let candidates = do
+      target <- remoteTargets
+      m <- messages
+      where m.toKey == target.pubkey
+      where none forwards (\f -> f.messageId == m.messageId && f.toServer == target.server)
+      yield {messageId: m.messageId, toServer: target.server, createdAt: t,
+             toKey: m.toKey, fromKey: m.fromKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp}
+    let capped = takeN candidates (maxForwardsEntries - count forwards)
+    set *forwards = union forwards capped
+    yield capped
+  let servers = collectPeerServers newForwards (\x -> x.toServer)
+  sendToEach servers (\server ->
+    retryForwardsForServer (do x <- newForwards; where x.toServer == server; yield x) maxForwardRetriesPerServer)
+
 fetchFederationAck = \server messageIds ->
   fetch (federationUrl server) (FederationAck {
     authorization: federationAuth,
@@ -1035,6 +1056,11 @@ serve = \req -> case req of
       let effectiveEvents = union (effectiveGossipEvents filteredOnline gossipResult.gm.appliedKeys (GossipOnline {})) (effectiveGossipEvents filteredOffline gossipResult.gm.appliedKeys (GossipOffline {}))
       when (not gossipResult.gm.withinCapacity)
         (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer))
+      let newlyOnlineRemote = do
+        e <- filteredOnline
+        where any gossipResult.gm.appliedKeys (\a -> samePubkeyServer a e)
+        where not (isLocalServer e.server)
+        yield {pubkey: e.pubkey, server: e.server}
       fork (do
         when (cappedHops > 1 && federationEnabled && count effectiveEvents > 0) (
           let targets = do
@@ -1042,7 +1068,9 @@ serve = \req -> case req of
             where s != fromServer
             yield s
           in sendBatchedGossip targets effectiveEvents (cappedHops - 1))
-        broadcastOfflineGossip t gossipResult.pr.peerServers gossipResult.pr.expiredLocal)
+        broadcastOfflineGossip t gossipResult.pr.peerServers gossipResult.pr.expiredLocal
+        when (federationEnabled && count newlyOnlineRemote > 0)
+          (forwardQueuedMessages newlyOnlineRemote t))
       yield (respond {ok: True {}}))
 
   ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
