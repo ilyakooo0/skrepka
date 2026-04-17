@@ -164,6 +164,8 @@ module Buttons =
 
                 Rectangle().stroke(Colors.Black).strokeThickness (4.)
             })
+                .width(48.)
+                .height(48.)
                 .background(Brushes.Transparent)
                 .onPointerPressed(fun _ -> pressed.Set true)
                 .onPointerReleased(fun _ -> pressed.Set false)
