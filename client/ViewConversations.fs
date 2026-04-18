@@ -14,7 +14,14 @@ module ViewConversations =
     open Avalonia.Layout
 
     let viewConversations model =
-        let contacts = model.Contacts.Values |> Seq.toList
+        let contacts =
+            model.Contacts.Values
+            |> Seq.toList
+            |> List.sortBy (fun c ->
+                messagesFor c.Pubkey model.Messages
+                |> List.tryLast
+                |> Option.map (fun m -> m.Timestamp)
+                |> Option.defaultValue System.DateTimeOffset.MinValue)
 
         let content =
             if contacts.IsEmpty then
@@ -70,7 +77,8 @@ module ViewConversations =
                                 .onTapped (fun _ -> SetPage(Chat(c.Pubkey, "")))
                     )
                         .styles(noListBoxPadding ())
-                        .background (Colors.White)
+                        .background(Colors.White)
+                        .verticalAlignment (VerticalAlignment.Bottom)
                 )
 
         let bar =
