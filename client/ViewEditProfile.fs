@@ -34,7 +34,11 @@ module ViewEditProfile =
 
         let bar =
             HStack(8.) {
-                (button Secondary "back" (SetPage Settings)).margin (8.)
+                Image("avares://Skrepka/Assets/Images/left.png", Stretch.Uniform)
+                    .width(24.)
+                    .height(24.)
+                    .margin(8.)
+                    .onTapped (fun _ -> SetPage Settings)
                 (button Secondary "save" DoSaveProfile).margin (8.)
             }
 

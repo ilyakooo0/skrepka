@@ -1,5 +1,6 @@
 namespace Skrepka
 
+open Avalonia.Media
 open Fabulous.Avalonia
 
 open type Fabulous.Avalonia.View
@@ -15,7 +16,10 @@ module ViewChat =
 
         (VStack(8.) {
             HStack(8.) {
-                Button("< Back", SetPage Conversations)
+                Image("avares://Skrepka/Assets/Images/left.png", Stretch.Uniform)
+                    .width(24.)
+                    .height(24.)
+                    .onTapped (fun _ -> SetPage Conversations)
 
                 TextBlock(name).fontSize(20.).centerVertical ()
             }

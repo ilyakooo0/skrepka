@@ -19,7 +19,10 @@ module ViewAddContact =
         ScrollViewer(
             (VStack(16.) {
                 HStack(8.) {
-                    Button("< Back", SetPage Conversations)
+                    Image("avares://Skrepka/Assets/Images/left.png", Stretch.Uniform)
+                        .width(24.)
+                        .height(24.)
+                        .onTapped (fun _ -> SetPage Conversations)
 
                     TextBlock("Add Contact").fontSize (20.)
                 }
