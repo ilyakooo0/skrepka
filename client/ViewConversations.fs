@@ -77,7 +77,7 @@ module ViewConversations =
                 (textField "" Search).margin(8.).verticalAlignment(VerticalAlignment.Stretch).gridColumn (1)
                 (smallTextButton "+" (SetPage(AddContact("", "")))).gridColumn (2)
             })
-                .margin(20.)
+                // .margin(20.)
                 .horizontalAlignment (HorizontalAlignment.Stretch)
 
         withBottomBar bar content
