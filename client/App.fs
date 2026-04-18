@@ -89,7 +89,11 @@ module App =
                 Messages = m.Messages |> markDelivered evt.Sender ackIds }
         | Envelope.ProfileMessage profile ->
             { m with
-                Contacts = m.Contacts |> Map.change evt.Sender (Option.map (withProfile profile)) }
+                Contacts =
+                    m.Contacts
+                    |> Map.change evt.Sender (fun c ->
+                        let contact = c |> Option.defaultWith (fun () -> newContact evt.Sender "")
+                        Some(withProfile profile contact)) }
 
     let private trySession model =
         match model.Auth with
@@ -335,6 +339,8 @@ module App =
                 Page = Settings },
             []
         | StateLoaded(None, _, _) -> model, []
+
+        | Search _ -> model, []
 
         | KeyboardHeightChanged h -> { model with KeyboardHeight = h }, []
 
