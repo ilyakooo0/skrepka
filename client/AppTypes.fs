@@ -59,7 +59,8 @@ module AppTypes =
           PollCursor: int64
           Profile: Profile option
           FlushingOutbox: bool
-          PollRetries: int }
+          PollRetries: int
+          KeyboardHeight: float }
 
     // ── Msg ──
 
@@ -83,6 +84,7 @@ module AppTypes =
         | StartFlush
         | FlushResult of sent: bool
         | Search of string
+        | KeyboardHeightChanged of float
 
     // ── CmdMsg ──
 
@@ -97,6 +99,7 @@ module AppTypes =
         | CmdSaveData of Data
         | CmdPickPhoto
         | CmdSaveProfile of Profile
+        | CmdSubscribeKeyboard
 
     // ── Shared Helpers ──
 

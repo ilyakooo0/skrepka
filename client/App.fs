@@ -127,8 +127,9 @@ module App =
           PollCursor = 0L
           Profile = None
           FlushingOutbox = false
-          PollRetries = 0 },
-        [ CmdLoadState ]
+          PollRetries = 0
+          KeyboardHeight = 0. },
+        [ CmdLoadState; CmdSubscribeKeyboard ]
 
     // ── Update ──
 
@@ -332,6 +333,8 @@ module App =
                 Page = Settings },
             []
         | StateLoaded(None, _, _) -> model, []
+
+        | KeyboardHeightChanged h -> { model with KeyboardHeight = h }, []
 
     // ── mapCmd ──
 
@@ -594,6 +597,10 @@ module App =
 
         | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile |> Async.Start)
 
+        | CmdSubscribeKeyboard ->
+            Cmd.ofEffect (fun dispatch ->
+                Keyboard.heightChanged.Add(fun h -> dispatch (KeyboardHeightChanged h)))
+
     // ── View ──
 
     let private pageContent model =
@@ -606,7 +613,9 @@ module App =
             | AddContact(pk, nn) -> AnyView(viewAddContact model pk nn)
             | EditProfile(displayName, bio, photo) -> AnyView(viewEditProfile model displayName bio photo)
 
-        Border(page).background (SolidColorBrush(Colors.White))
+        Border(page)
+            .background(SolidColorBrush(Colors.White))
+            .padding(Avalonia.Thickness(0., 0., 0., model.KeyboardHeight))
 
     let view model =
 #if MOBILE

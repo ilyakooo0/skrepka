@@ -37,6 +37,7 @@
     <Compile Include="TextFields.fs" />
     <Compile Include="Buttons.fs" />
     <Compile Include="$(iOSPlatformFolder)PhotoPicker.fs" Condition="$(AvaloniaPlatform) == 'iOS'" />
+    <Compile Include="Keyboard.fs" />
     <Compile Include="AppTypes.fs" />
     <Compile Include="Protocol.fs" />
     <Compile Include="ViewSetup.fs" />
