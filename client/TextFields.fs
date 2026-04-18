@@ -35,6 +35,12 @@ module TextFields =
             Rectangle().stroke(Colors.Black).strokeThickness (4.)
         }).styles (whiteBg ())
 
+    let errorTextField value msg =
+        (Grid() {
+            TextBox(value, msg).fontFamily(Constants.fontFamily).verticalAlignment(VerticalAlignment.Stretch).verticalContentAlignment(VerticalAlignment.Center).background(SolidColorBrush(Colors.White))
+            Rectangle().stroke(Colors.Red).strokeThickness (4.)
+        }).styles (whiteBg ())
+
     let multilineTextField value msg =
         Grid() {
             TextBox(value, msg).fontFamily(Constants.fontFamily).acceptsReturn(true).height (150)

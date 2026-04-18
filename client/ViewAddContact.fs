@@ -19,7 +19,7 @@ module ViewAddContact =
         use png = new QRCoder.PngByteQRCode(data)
         png.GetGraphic(8, [| 0uy; 0uy; 0uy |], [| 255uy; 255uy; 255uy |])
 
-    let viewAddContact model cpk =
+    let viewAddContact model (cpk: string) =
         let content =
             ScrollViewer(
                 (VStack(16.) {
@@ -37,11 +37,28 @@ module ViewAddContact =
                         smallButton Primary "Copy Address" CopyPubKey
                     | NoIdentity -> ()
 
-                    h2 "Enter someone else's key"
+                    h2 "Enter someone else's address"
 
-                    textField cpk (fun key -> SetPage(AddContact(key)))
+                    let cpkTrimmed: string = cpk.Trim()
 
-                    smallButton Primary "Add" DoSaveContact
+                    let isValid =
+                        Phonemic.fromOb cpkTrimmed
+                        |> Option.orElseWith (fun () -> Crypto.tryFromHex cpkTrimmed)
+                        |> Option.filter (fun bytes -> bytes.Length = 32)
+                        |> Option.isSome
+
+                    let hasError = cpkTrimmed <> "" && not isValid
+
+                    if hasError then
+                        errorTextField cpk (fun key -> SetPage(AddContact(key)))
+                    else
+                        textField cpk (fun key -> SetPage(AddContact(key)))
+
+
+                    if isValid then
+                        smallButton Primary "Add" DoSaveContact
+                    else
+                        disabledSmallButton Primary "Add" DoSaveContact
                 })
                     .margin (20.)
             )

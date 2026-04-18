@@ -34,13 +34,25 @@ module Buttons =
     let private borderRect () =
         Rectangle().stroke(Colors.Black).strokeThickness (4.)
 
-    let private textButton fontSize pressOffset restOffset margin priority (text: string) (msg: 'msg) =
-        Component(text) {
+    let private textButton fontSize pressOffset restOffset margin priority (text: string) (msg: 'msg) disabled =
+        // Start from the opposite state's offset so the transition animates
+        let initialOffset = if disabled then restOffset else 0.
+
+        Component($"{text}-{disabled}") {
             let! pressed = Context.State(false)
-            let offset = if pressed.Current then pressOffset else restOffset
+            let! animOffset = Context.State(initialOffset)
+
+            let target =
+                if disabled then 0.
+                elif pressed.Current then pressOffset
+                else restOffset
+
+            do
+                if animOffset.Current <> target then
+                    Avalonia.Threading.Dispatcher.UIThread.Post(fun () -> animOffset.Set target)
 
             (Grid() {
-                shadowRect offset
+                shadowRect animOffset.Current
 
                 Rectangle()
                     .fill (
@@ -65,15 +77,17 @@ module Buttons =
                 borderRect ()
             })
                 .background(Brushes.Transparent)
-                .onPointerPressed(fun _ -> pressed.Set true)
+                .onPointerPressed(fun _ -> if not disabled then pressed.Set true)
                 .onPointerReleased(fun _ -> pressed.Set false)
                 .onPointerExited(fun _ -> pressed.Set false)
                 .margin(margin)
                 .onTapped (fun _ -> msg)
         }
 
-    let button priority = textButton 24. 4. 8. 16. priority
-    let smallButton priority = textButton 16. 2. 4. 8. priority
+    let button priority text msg = textButton 24. 4. 8. 16. priority text msg false
+    let smallButton priority text msg = textButton 16. 2. 4. 8. priority text msg false
+    let disabledButton priority text msg = textButton 24. 4. 8. 16. priority text msg true
+    let disabledSmallButton priority text msg = textButton 16. 2. 4. 8. priority text msg true
 
     let imageButton (img: byte[] option) (msg: 'msg) =
         let key =

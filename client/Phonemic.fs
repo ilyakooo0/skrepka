@@ -87,6 +87,39 @@ module Phonemic =
         |> Array.map (fun pair -> $"{prefixes.[int pair.[0]]}{suffixes.[int pair.[1]]}")
         |> String.concat "-"
 
+    type ObValidation =
+        | Empty
+        | Partial of validPairs: int
+        | InvalidSyllable of syllable: string
+        | Valid
+
+    let validateOb (s: string) : ObValidation =
+        let s = s.Trim()
+
+        if s = "" then
+            Empty
+        else
+            let parts = s.Split('-', StringSplitOptions.RemoveEmptyEntries)
+
+            // Don't flag the trailing part if still being typed
+            let completeParts =
+                if parts.Length > 0 && parts.[parts.Length - 1].Length < 6 then
+                    parts.[.. parts.Length - 2]
+                else
+                    parts
+
+            let firstInvalid =
+                completeParts
+                |> Array.tryFind (fun sp ->
+                    sp.Length <> 6
+                    || not (Map.containsKey sp.[0..2] prefixMap)
+                    || not (Map.containsKey sp.[3..5] suffixMap))
+
+            match firstInvalid with
+            | Some s -> InvalidSyllable s
+            | None when completeParts.Length = 16 -> Valid
+            | None -> Partial completeParts.Length
+
     let fromOb (s: string) : byte[] option =
         let pairs = s.Split('-', StringSplitOptions.RemoveEmptyEntries)
 
