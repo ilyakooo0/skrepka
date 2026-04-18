@@ -364,7 +364,6 @@ The client makes a blocking GET request. The server holds the connection open un
 
 | Parameter    | Type   | Description                                      |
 |--------------|--------|--------------------------------------------------|
-| `timeout`    | number | Max seconds to wait (default: 30, max: 60)       |
 | `after`      | string | Cursor from the previous poll response (optional) |
 
 **Response:**
@@ -382,7 +381,7 @@ The client makes a blocking GET request. The server holds the connection open un
 ```
 
 - If events are available immediately, the server responds right away.
-- If no events are available, the server holds the connection until one arrives or `timeout` expires.
+- If no events are available, the server holds the connection for up to 20 seconds.
 - On timeout with no events, the server returns `{ "events": [], "cursor": "..." }`.
 - The client should immediately issue the next poll after receiving a response.
 

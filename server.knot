@@ -44,8 +44,8 @@ offlineGossipMinTtl = 60 -- minimum TTL for offline gossip events
 maxForwardRetriesPerServer = 100
 maxGossipHops = 5
 gossipOriginHops = 2
-maxPollTimeout : Int<Ms>
-maxPollTimeout = 60000 -- 1 minute
+pollTimeout : Int<Ms>
+pollTimeout = 20000 -- 20 seconds
 backgroundPruneInterval : Int<Ms>
 backgroundPruneInterval = 30000 -- 30 seconds
 federationEnabled = federationSecret != ""
@@ -153,7 +153,7 @@ route AuthApi where
       = VerifyAuth
 
 route ClientApi where
-  POST {cursor: Timestamp, timeout: Int<Ms>} /poll headers {authorization: Text}
+  POST {cursor: Timestamp} /poll headers {authorization: Text}
     -> {events: [PollEvent], cursor: Timestamp, authorized: Bool}
     = Poll
   /messages
@@ -916,10 +916,9 @@ serve = \req -> case req of
           broadcastOfflineGossip t result.pr.peerServers expiredLocal)
         yield (respond {token: token, expiresAt: expiry})
 
-  Poll {cursor, timeout, authorization, respond} -> do
+  Poll {cursor, authorization, respond} -> do
     t <- now
-    let clampedTimeout = clamp 0 maxPollTimeout timeout
-    let deadline = t + clampedTimeout
+    let deadline = t + pollTimeout
     result <- case extractToken authorization of
       Nothing {} -> yield (PollUnauthorized {})
       Just {value: token} -> pollLoop token cursor deadline

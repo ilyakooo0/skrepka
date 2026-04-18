@@ -104,7 +104,7 @@ module ApiClient =
         }
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =
-        let body = JsonSerializer.Serialize({| cursor = cursor; timeout = 30000 |})
+        let body = JsonSerializer.Serialize({| cursor = cursor |})
         postJson<PollResponse> pollClient $"{serverUrl}/poll" body (Some token)
 
     let ackMessages (serverUrl: string) (token: string) (messageIds: string list) =
