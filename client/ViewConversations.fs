@@ -72,9 +72,9 @@ module ViewConversations =
                     .background(Colors.White))
 
         let bar =
-            (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], []) {
+            (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], [Dimension.Auto]) {
                 (smallImageButton None (SetPage Settings)).gridColumn (0)
-                (textField "" Search).margin(0.).margin(8.).gridColumn (1)
+                (textField "" Search).margin(8.).verticalAlignment(VerticalAlignment.Stretch).gridColumn (1)
                 (smallTextButton "+" (SetPage(AddContact("", "")))).gridColumn (2)
             })
                 .margin(20.)

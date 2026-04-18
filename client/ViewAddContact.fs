@@ -27,9 +27,7 @@ module ViewAddContact =
 
                         TextBlock("Your key (share with contact):").foreground (SolidColorBrush(Colors.DimGray))
 
-                        Image(Styles.cachedBitmap (qrBytes ob), Stretch.Uniform)
-                            .maxWidth(200.)
-                            .centerHorizontal ()
+                        Image(Styles.cachedBitmap (qrBytes ob), Stretch.Uniform).maxWidth(200.).centerHorizontal ()
 
                         TextBlock(truncKey id.PubKeyHex)
                             .fontSize(12.)
@@ -50,9 +48,6 @@ module ViewAddContact =
                     .margin (20.)
             )
 
-        let bar =
-            HStack(8.) {
-                backButton (SetPage Conversations)
-            }
+        let bar = HStack(8.) { backButton (SetPage Conversations) }
 
         withBottomBar bar content
