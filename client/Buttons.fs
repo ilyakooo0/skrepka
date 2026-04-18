@@ -162,6 +162,33 @@ module Buttons =
                 .onTapped (fun _ -> msg)
         }
 
+    let backButton (msg: 'msg) =
+        Component("back-button") {
+            let! pressed = Context.State(false)
+            let offset = if pressed.Current then 2. else 4.
+
+            (Grid() {
+                shadowRect offset
+
+                Rectangle().fill (SolidColorBrush(Colors.White))
+
+                Image("avares://Skrepka/Assets/Images/left.png", Stretch.Uniform)
+                    .width(24.)
+                    .height(24.)
+                    .center ()
+
+                borderRect ()
+            })
+                .width(48.)
+                .height(48.)
+                .background(Brushes.Transparent)
+                .onPointerPressed(fun _ -> pressed.Set true)
+                .onPointerReleased(fun _ -> pressed.Set false)
+                .onPointerExited(fun _ -> pressed.Set false)
+                .margin(8.)
+                .onTapped (fun _ -> msg)
+        }
+
     let smallTextButton (text: string) (msg: 'msg) =
         Component($"small-button-{text}") {
             let! pressed = Context.State(false)

@@ -8,6 +8,8 @@ open type Fabulous.Avalonia.View
 module ViewAddContact =
 
     open AppTypes
+    open Buttons
+    open Styles
 
     let private qrBytes (text: string) =
         use qr = new QRCoder.QRCodeGenerator()
@@ -16,42 +18,41 @@ module ViewAddContact =
         png.GetGraphic(8, [| 0uy; 0uy; 0uy |], [| 255uy; 255uy; 255uy |])
 
     let viewAddContact model cpk cnn =
-        ScrollViewer(
-            (VStack(16.) {
-                HStack(8.) {
-                    Image("avares://Skrepka/Assets/Images/left.png", Stretch.Uniform)
-                        .width(24.)
-                        .height(24.)
-                        .onTapped (fun _ -> SetPage Conversations)
+        let content =
+            ScrollViewer(
+                (VStack(16.) {
+                    match model.Auth with
+                    | Identified(id, _) ->
+                        let ob = hexToOb id.PubKeyHex
 
-                    TextBlock("Add Contact").fontSize (20.)
-                }
+                        TextBlock("Your key (share with contact):").foreground (SolidColorBrush(Colors.DimGray))
 
-                match model.Auth with
-                | Identified(id, _) ->
-                    let ob = hexToOb id.PubKeyHex
+                        Image(Styles.cachedBitmap (qrBytes ob), Stretch.Uniform)
+                            .maxWidth(200.)
+                            .centerHorizontal ()
 
-                    TextBlock("Your key (share with contact):").foreground (SolidColorBrush(Colors.DimGray))
+                        TextBlock(truncKey id.PubKeyHex)
+                            .fontSize(12.)
+                            .foreground(SolidColorBrush(Colors.DimGray))
+                            .centerText ()
+                    | NoIdentity -> ()
 
-                    Image(Styles.cachedBitmap (qrBytes ob), Stretch.Uniform)
-                        .maxWidth(200.)
-                        .centerHorizontal ()
+                    viewErrorBanner model.Error
 
-                    TextBlock(truncKey id.PubKeyHex)
-                        .fontSize(12.)
-                        .foreground(SolidColorBrush(Colors.DimGray))
-                        .centerText ()
-                | NoIdentity -> ()
+                    TextBlock("Public Key:")
+                    TextBox(cpk, fun text -> SetPage(AddContact(text, cnn))).watermark ("sampel-palnet-...")
 
-                viewErrorBanner model.Error
+                    TextBlock("Nickname:")
+                    TextBox(cnn, fun text -> SetPage(AddContact(cpk, text)))
 
-                TextBlock("Public Key:")
-                TextBox(cpk, fun text -> SetPage(AddContact(text, cnn))).watermark ("sampel-palnet-...")
+                    Button("Save Contact", DoSaveContact).centerHorizontal ()
+                })
+                    .margin (20.)
+            )
 
-                TextBlock("Nickname:")
-                TextBox(cnn, fun text -> SetPage(AddContact(cpk, text)))
+        let bar =
+            HStack(8.) {
+                backButton (SetPage Conversations)
+            }
 
-                Button("Save Contact", DoSaveContact).centerHorizontal ()
-            })
-                .margin (20.)
-        )
+        withBottomBar bar content
