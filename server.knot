@@ -44,8 +44,7 @@ offlineGossipMinTtl = 60 -- minimum TTL for offline gossip events
 maxForwardRetriesPerServer = 100
 maxGossipHops = 5
 gossipOriginHops = 2
-pollTimeout : Int<Ms>
-pollTimeout = 20000 -- 20 seconds
+
 backgroundPruneInterval : Int<Ms>
 backgroundPruneInterval = 30000 -- 30 seconds
 federationEnabled = federationSecret != ""
@@ -824,34 +823,22 @@ pollOnce = \token cursor -> do
         yield (PollUnauthorized {})
       Authorized {pubkey} -> do
         seqCounter <- *seqCounter
-        messages <- *messages
         let clampedCursor = clamp 0 (max seqCounter t) cursor
         let matchingMsgs = do
-          m <- messages
+          m <- *messages
           where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > clampedCursor
           yield m
         let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
-        let evts = do
-          m <- limitedMsgs
-          yield {id: m.messageId, eventType: "message",
-                 payload: {toKey: m.toKey, fromKey: m.fromKey,
-                            encryptedBlob: m.encryptedBlob,
-                            timestamp: m.timestamp}}
-        let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
-        yield (PollOk {events: evts, cursor: lastReceivedAt})
-
-pollLoop : Text -> Int -> Int<Ms> -> IO {clock} PollResult
-pollLoop = \token cursor deadline -> do
-  result <- pollOnce token cursor
-  case result of
-    PollUnauthorized {} -> yield result
-    PollOk {events} -> do
-      t <- now
-      if count events == 0 && t < deadline
-        then do
-          sleep (clamp 1 500 (deadline - t))
-          pollLoop token cursor deadline
-        else yield result
+        if count limitedMsgs == 0 then retry
+        else do
+          let evts = do
+            m <- limitedMsgs
+            yield {id: m.messageId, eventType: "message",
+                   payload: {toKey: m.toKey, fromKey: m.fromKey,
+                              encryptedBlob: m.encryptedBlob,
+                              timestamp: m.timestamp}}
+          let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
+          yield (PollOk {events: evts, cursor: lastReceivedAt})
 
 -- ============================================
 -- Request Handler
@@ -917,11 +904,9 @@ serve = \req -> case req of
         yield (respond {token: token, expiresAt: expiry})
 
   Poll {cursor, authorization, respond} -> do
-    t <- now
-    let deadline = t + pollTimeout
     result <- case extractToken authorization of
       Nothing {} -> yield (PollUnauthorized {})
-      Just {value: token} -> pollLoop token cursor deadline
+      Just {value: token} -> pollOnce token cursor
     tAfterPoll <- now
     maybePruneAndBroadcast tAfterPoll
     yield (respond (case result of

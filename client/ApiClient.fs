@@ -55,7 +55,7 @@ module ApiClient =
 
     let private pollClient =
         let c = new HttpClient()
-        c.Timeout <- TimeSpan.FromSeconds(120.)
+        c.Timeout <- TimeSpan.FromSeconds(30.)
         c
 
     let private sendRequest (httpClient: HttpClient) (url: string) (body: string) (token: string option) =
