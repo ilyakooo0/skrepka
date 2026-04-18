@@ -10,6 +10,8 @@ module ViewAddContact =
     open AppTypes
     open Buttons
     open Styles
+    open Labels
+    open TextFields
 
     let private qrBytes (text: string) =
         use qr = new QRCoder.QRCodeGenerator()
@@ -17,36 +19,29 @@ module ViewAddContact =
         use png = new QRCoder.PngByteQRCode(data)
         png.GetGraphic(8, [| 0uy; 0uy; 0uy |], [| 255uy; 255uy; 255uy |])
 
-    let viewAddContact model cpk cnn =
+    let viewAddContact model cpk =
         let content =
             ScrollViewer(
                 (VStack(16.) {
 
-                    
+                    h2 ("Share your address")
 
                     match model.Auth with
                     | Identified(id, _) ->
                         let ob = hexToOb id.PubKeyHex
 
-                        TextBlock("Your key (share with contact):").foreground (SolidColorBrush(Colors.DimGray))
-
                         Image(Styles.cachedBitmap (qrBytes ob), Stretch.Uniform).maxWidth(200.).centerHorizontal ()
 
-                        TextBlock(truncKey id.PubKeyHex)
-                            .fontSize(12.)
-                            .foreground(SolidColorBrush(Colors.DimGray))
-                            .centerText ()
+                        body(ob).fontSize(12.).centerText ()
+
+                        smallButton Primary "Copy Address" CopyPubKey
                     | NoIdentity -> ()
 
-                    viewErrorBanner model.Error
+                    h2 "Enter someone else's key"
 
-                    TextBlock("Public Key:")
-                    TextBox(cpk, fun text -> SetPage(AddContact(text, cnn))).watermark ("sampel-palnet-...")
+                    textField cpk (fun key -> SetPage(AddContact(key)))
 
-                    TextBlock("Nickname:")
-                    TextBox(cnn, fun text -> SetPage(AddContact(cpk, text)))
-
-                    Button("Save Contact", DoSaveContact).centerHorizontal ()
+                    smallButton Primary "Add" DoSaveContact
                 })
                     .margin (20.)
             )

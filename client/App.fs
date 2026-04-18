@@ -108,11 +108,13 @@ module App =
         | NoIdentity -> model
 
     let private saveCmdMsg model : CmdMsg =
-        CmdSaveData
-            ({ Contacts = model.Contacts
-               Messages = model.Messages
-               ServerUrl = model.ServerUrl
-               PollCursor = model.PollCursor } : Data)
+        CmdSaveData(
+            { Contacts = model.Contacts
+              Messages = model.Messages
+              ServerUrl = model.ServerUrl
+              PollCursor = model.PollCursor }
+            : Data
+        )
 
     // ── Init ──
 
@@ -254,15 +256,15 @@ module App =
 
         | DoSaveContact ->
             match model.Page with
-            | AddContact(cpk, cnn) when cpk <> "" && cnn <> "" ->
+            | AddContact(cpk) when cpk <> "" ->
                 match tryParsePubkey cpk with
                 | Some bytes ->
                     let hex = Crypto.toHex bytes
 
                     let contact =
                         match Map.tryFind hex model.Contacts with
-                        | Some e -> { e with Nickname = cnn }
-                        | None -> newContact hex cnn
+                        | Some e -> { e with Nickname = cpk }
+                        | None -> newContact hex cpk
 
                     let model' =
                         { model with
@@ -598,8 +600,7 @@ module App =
         | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile |> Async.Start)
 
         | CmdSubscribeKeyboard ->
-            Cmd.ofEffect (fun dispatch ->
-                Keyboard.heightChanged.Add(fun h -> dispatch (KeyboardHeightChanged h)))
+            Cmd.ofEffect (fun dispatch -> Keyboard.heightChanged.Add(fun h -> dispatch (KeyboardHeightChanged h)))
 
     // ── View ──
 
@@ -610,12 +611,12 @@ module App =
             | Settings -> AnyView(viewSettings model)
             | Conversations -> AnyView(viewConversations model)
             | Chat(pk, compose) -> AnyView(viewChat model pk compose)
-            | AddContact(pk, nn) -> AnyView(viewAddContact model pk nn)
+            | AddContact(pk) -> AnyView(viewAddContact model pk)
             | EditProfile(displayName, bio, photo) -> AnyView(viewEditProfile model displayName bio photo)
 
         Border(page)
             .background(SolidColorBrush(Colors.White))
-            .padding(Avalonia.Thickness(0., 0., 0., model.KeyboardHeight))
+            .padding (Avalonia.Thickness(0., 0., 0., model.KeyboardHeight))
 
     let view model =
 #if MOBILE

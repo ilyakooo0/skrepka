@@ -34,10 +34,10 @@ module Buttons =
     let private borderRect () =
         Rectangle().stroke(Colors.Black).strokeThickness (4.)
 
-    let button priority (text: string) (msg: 'msg) =
+    let private textButton fontSize pressOffset restOffset margin priority (text: string) (msg: 'msg) =
         Component(text) {
             let! pressed = Context.State(false)
-            let offset = if pressed.Current then 4. else 8.
+            let offset = if pressed.Current then pressOffset else restOffset
 
             (Grid() {
                 shadowRect offset
@@ -56,7 +56,7 @@ module Buttons =
                         | Secondary -> SolidColorBrush(Colors.Black)
 
                     )
-                    .fontSize(24.)
+                    .fontSize(fontSize)
                     .fontFamily(FontFamily(Constants.fontFamily))
                     .fontWeight(FontWeight.Bold)
                     .center()
@@ -68,9 +68,12 @@ module Buttons =
                 .onPointerPressed(fun _ -> pressed.Set true)
                 .onPointerReleased(fun _ -> pressed.Set false)
                 .onPointerExited(fun _ -> pressed.Set false)
-                .margin(16.)
+                .margin(margin)
                 .onTapped (fun _ -> msg)
         }
+
+    let button priority = textButton 24. 4. 8. 16. priority
+    let smallButton priority = textButton 16. 2. 4. 8. priority
 
     let imageButton (img: byte[] option) (msg: 'msg) =
         let key =
@@ -104,9 +107,7 @@ module Buttons =
                     )
                         .margin (24.)
 
-                | Some i ->
-                    Image(Styles.cachedBitmap i, Stretch.UniformToFill)
-                        .clipToBounds (true)
+                | Some i -> Image(Styles.cachedBitmap i, Stretch.UniformToFill).clipToBounds (true)
 
                 borderRect ()
             })
@@ -145,10 +146,7 @@ module Buttons =
                     )
 
                 | Some i ->
-                    Image(Styles.cachedBitmap i, Stretch.UniformToFill)
-                        .width(32.)
-                        .height(32.)
-                        .clipToBounds (true)
+                    Image(Styles.cachedBitmap i, Stretch.UniformToFill).width(32.).height(32.).clipToBounds (true)
 
                 borderRect ()
             })
@@ -172,10 +170,7 @@ module Buttons =
 
                 Rectangle().fill (SolidColorBrush(Colors.White))
 
-                Image("avares://Skrepka/Assets/Images/left.png", Stretch.Uniform)
-                    .width(24.)
-                    .height(24.)
-                    .center ()
+                Image("avares://Skrepka/Assets/Images/left.png", Stretch.Uniform).width(24.).height(24.).center ()
 
                 borderRect ()
             })

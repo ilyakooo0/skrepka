@@ -17,7 +17,7 @@ module AppTypes =
         | Setup
         | Conversations
         | Chat of pubkey: string * compose: string
-        | AddContact of pubkey: string * nickname: string
+        | AddContact of pubkey: string
         | Settings
         | EditProfile of displayName: string * bio: string * photo: byte[] option
 
