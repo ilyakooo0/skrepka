@@ -21,6 +21,9 @@ module ViewAddContact =
         let content =
             ScrollViewer(
                 (VStack(16.) {
+
+                    
+
                     match model.Auth with
                     | Identified(id, _) ->
                         let ob = hexToOb id.PubKeyHex

@@ -10,7 +10,7 @@ module TextFields =
     open Avalonia.Layout
     open Avalonia.Styling
 
-    let private whiteBg =
+    let private whiteBg () =
         let bg = Avalonia.Media.Immutable.ImmutableSolidColorBrush(Colors.White)
         let setter = Setter(Avalonia.Controls.Border.BackgroundProperty, bg)
 
@@ -33,7 +33,7 @@ module TextFields =
         (Grid() {
             TextBox(value, msg).fontFamily(Constants.fontFamily).verticalAlignment(VerticalAlignment.Stretch).verticalContentAlignment(VerticalAlignment.Center).background(SolidColorBrush(Colors.White))
             Rectangle().stroke(Colors.Black).strokeThickness (4.)
-        }).styles (whiteBg)
+        }).styles (whiteBg ())
 
     let multilineTextField value msg =
         Grid() {
