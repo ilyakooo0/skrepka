@@ -84,6 +84,7 @@ module AppTypes =
         | StartFlush
         | FlushResult of sent: bool
         | Search of string
+        | TokenExpired
         | KeyboardHeightChanged of float
 
     // ── CmdMsg ──

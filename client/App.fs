@@ -171,7 +171,7 @@ module App =
 
                 { model with
                     Auth = Identified(id, Online token)
-                    Page = Conversations
+                    Page = match model.Page with Setup -> Conversations | p -> p
                     Error = None
                     PollStatus = "polling..."
                     FlushingOutbox = true },
@@ -184,6 +184,14 @@ module App =
                 FlushingOutbox = false
                 PollRetries = 0 },
             []
+
+        | TokenExpired ->
+            match model.Auth with
+            | Identified(id, Online _) ->
+                let m = setConn Connecting model
+                { m with FlushingOutbox = false; PollRetries = 0 },
+                [ CmdConnect(model.ServerUrl, id) ]
+            | _ -> model, []
 
         | DoDisconnect ->
             { setConn Offline model with
@@ -482,6 +490,9 @@ module App =
                                 do! Store.dequeueOutbox item.Id
                                 dispatch (FlushResult true)
                         with
+                        | Unauthorized ->
+                            log "outbox unauthorized, reauthenticating"
+                            dispatch TokenExpired
                         | ServerRejected msg ->
                             log $"outbox rejected, dropping: {msg}"
                             do! Store.dequeueOutbox item.Id
@@ -502,6 +513,11 @@ module App =
                     try
                         let! response = poll session.Url session.Token cursor
                         log $"poll response: {response.Events.Length} events, cursor={response.Cursor}"
+
+                        if not response.Authorized then
+                            log "poll unauthorized, reauthenticating"
+                            dispatch TokenExpired
+                        else
 
                         let ackIds = response.Events |> Array.map _.Id |> Array.toList
 

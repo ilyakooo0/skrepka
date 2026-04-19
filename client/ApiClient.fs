@@ -11,6 +11,7 @@ module ApiClient =
 
     exception ApiError of string
     exception ServerRejected of string
+    exception Unauthorized
 
     [<CLIMutable>]
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
@@ -33,7 +34,7 @@ module ApiClient =
     type PollEvent = { Id: string; EventType: EventType; Payload: EventPayload }
 
     [<CLIMutable>]
-    type PollResponse = { Cursor: int64; Events: PollEvent array }
+    type PollResponse = { Cursor: int64; Events: PollEvent array; Authorized: bool }
 
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
@@ -99,7 +100,7 @@ module ApiClient =
             match doc.RootElement.GetProperty("status").GetString() with
             | "delivered" | "federated" | "queued" -> ()
             | "rejected" -> raise (ServerRejected "Message rejected by server")
-            | "unauthorized" -> raise (ServerRejected "Not authorized to deliver message")
+            | "unauthorized" -> raise Unauthorized
             | s -> raise (ApiError $"Unexpected status: {s}")
         }
 
