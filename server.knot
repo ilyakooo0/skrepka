@@ -47,6 +47,9 @@ gossipOriginHops = 2
 
 backgroundPruneInterval : Int<Ms>
 backgroundPruneInterval = 30000 -- 30 seconds
+pollSleepInterval : Int<Ms>
+pollSleepInterval = 500 -- 500ms between poll attempts
+maxPollWaitAttempts = 60 -- 60 * 500ms = 30 second max long-poll
 federationEnabled = federationSecret != ""
 federationAuth = "Bearer " ++ federationSecret
 federationUrl = \server -> federationScheme ++ server
@@ -815,15 +818,14 @@ pruneAndRetry = \t -> do
 
 pollOnce = \token cursor -> do
   t <- now
-  atomic do
-    sessions <- *sessions
-    let auth = authenticateSession sessions token t
-    case auth of
-      Unauthorized {} ->
-        yield (PollUnauthorized {})
-      Authorized {pubkey} -> do
-        seqCounter <- *seqCounter
-        let clampedCursor = clamp 0 (max seqCounter t) cursor
+  sessions <- *sessions
+  let auth = authenticateSession sessions token t
+  case auth of
+    Unauthorized {} -> yield (PollUnauthorized {})
+    Authorized {pubkey} -> do
+      seqCounter <- *seqCounter
+      let clampedCursor = clamp 0 (max seqCounter t) cursor
+      atomic do
         matchingMsgs <- do
           m <- *messages
           where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > clampedCursor

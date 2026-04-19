@@ -84,12 +84,18 @@ module ViewConversations =
                 )
 
         let bar =
-            (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], [ Dimension.Auto ]) {
-                (smallImageButton None (SetPage Settings)).gridColumn (0)
-                (textField "" Search).margin(8.).verticalAlignment(VerticalAlignment.Stretch).gridColumn (1)
-                (smallTextButton "+" (SetPage(AddContact("")))).gridColumn (2)
-            })
-                // .margin(20.)
-                .horizontalAlignment (HorizontalAlignment.Stretch)
+            VStack(0.) {
+                TextBlock($"{connStatusLabel model.Auth} | {model.PollStatus}")
+                    .fontSize(10.)
+                    .foreground(SolidColorBrush(Colors.Gray))
+                    .centerText ()
+
+                (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], [ Dimension.Auto ]) {
+                    (smallImageButton None (SetPage Settings)).gridColumn (0)
+                    (textField "" Search).margin(8.).verticalAlignment(VerticalAlignment.Stretch).gridColumn (1)
+                    (smallTextButton "+" (SetPage(AddContact("")))).gridColumn (2)
+                })
+                    .horizontalAlignment (HorizontalAlignment.Stretch)
+            }
 
         withBottomBar bar content
