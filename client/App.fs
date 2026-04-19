@@ -171,7 +171,10 @@ module App =
 
                 { model with
                     Auth = Identified(id, Online token)
-                    Page = match model.Page with Setup -> Conversations | p -> p
+                    Page =
+                        match model.Page with
+                        | Setup -> Conversations
+                        | p -> p
                     Error = None
                     PollStatus = "polling..."
                     FlushingOutbox = true },
@@ -189,7 +192,10 @@ module App =
             match model.Auth with
             | Identified(id, Online _) ->
                 let m = setConn Connecting model
-                { m with FlushingOutbox = false; PollRetries = 0 },
+
+                { m with
+                    FlushingOutbox = false
+                    PollRetries = 0 },
                 [ CmdConnect(model.ServerUrl, id) ]
             | _ -> model, []
 
@@ -273,17 +279,17 @@ module App =
                 | Some bytes ->
                     let hex = Crypto.toHex bytes
 
-                    let contact =
-                        match Map.tryFind hex model.Contacts with
-                        | Some e -> { e with Nickname = cpk }
-                        | None -> newContact hex cpk
+                    match Map.tryFind hex model.Contacts with
+                    | Some e -> model, []
+                    | None ->
+                        let contact = newContact hex cpk
 
-                    let model' =
-                        { model with
-                            Contacts = Map.add hex contact model.Contacts
-                            Page = Conversations }
+                        let model' =
+                            { model with
+                                Contacts = Map.add hex contact model.Contacts
+                                Page = Conversations }
 
-                    model', [ saveCmdMsg model' ]
+                        model', [ saveCmdMsg model' ]
                 | None ->
                     { model with
                         Error = Some "Invalid public key" },
@@ -519,68 +525,68 @@ module App =
                             dispatch TokenExpired
                         else
 
-                        let ackIds = response.Events |> Array.map _.Id |> Array.toList
+                            let ackIds = response.Events |> Array.map _.Id |> Array.toList
 
-                        let results =
-                            response.Events
-                            |> Array.choose (fun evt ->
-                                match evt.EventType with
-                                | Message -> Some(decryptEvent session.Identity.PrivKey evt.Payload)
-                                | UnknownEvent s ->
-                                    log $"unknown event type: {s}"
-                                    None)
+                            let results =
+                                response.Events
+                                |> Array.choose (fun evt ->
+                                    match evt.EventType with
+                                    | Message -> Some(decryptEvent session.Identity.PrivKey evt.Payload)
+                                    | UnknownEvent s ->
+                                        log $"unknown event type: {s}"
+                                        None)
 
-                        let events = results |> Array.choose Result.toOption |> Array.toList
+                            let events = results |> Array.choose Result.toOption |> Array.toList
 
-                        let errors =
-                            results
-                            |> Array.choose (function
-                                | Error e -> Some e
-                                | _ -> None)
-                            |> Array.toList
-
-                        for e in errors do
-                            log $"decrypt error: {e}"
-
-                        if not ackIds.IsEmpty then
-                            try
-                                do! ackMessages session.Url session.Token ackIds
-                            with ex ->
-                                log $"ack error: {ex.Message}"
-
-                        if not events.IsEmpty then
-                            let acksBySender =
-                                events
-                                |> List.choose (fun evt ->
-                                    match evt.Envelope with
-                                    | Envelope.TextMessage(id, _) -> Some(evt.Sender, id)
+                            let errors =
+                                results
+                                |> Array.choose (function
+                                    | Error e -> Some e
                                     | _ -> None)
-                                |> List.groupBy fst
-                                |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
+                                |> Array.toList
 
-                            for sender, msgIds in acksBySender do
+                            for e in errors do
+                                log $"decrypt error: {e}"
+
+                            if not ackIds.IsEmpty then
                                 try
-                                    do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
+                                    do! ackMessages session.Url session.Token ackIds
                                 with ex ->
-                                    log $"delivery ack error: {ex.Message}"
+                                    log $"ack error: {ex.Message}"
 
-                        if response.Events.Length = 0 then
-                            do! Async.Sleep Constants.pollEmptyDelayMs
+                            if not events.IsEmpty then
+                                let acksBySender =
+                                    events
+                                    |> List.choose (fun evt ->
+                                        match evt.Envelope with
+                                        | Envelope.TextMessage(id, _) -> Some(evt.Sender, id)
+                                        | _ -> None)
+                                    |> List.groupBy fst
+                                    |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
 
-                        let chatCount =
-                            events
-                            |> List.sumBy (fun e ->
-                                match e.Envelope with
-                                | Envelope.TextMessage _ -> 1
-                                | _ -> 0)
+                                for sender, msgIds in acksBySender do
+                                    try
+                                        do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
+                                    with ex ->
+                                        log $"delivery ack error: {ex.Message}"
 
-                        let status =
-                            $"evts:{response.Events.Length} msgs:{chatCount} errs:{errors.Length}"
-                            + (match List.tryHead errors with
-                               | Some e -> $" [{e}]"
-                               | None -> "")
+                            if response.Events.Length = 0 then
+                                do! Async.Sleep Constants.pollEmptyDelayMs
 
-                        dispatch (PollResult(events, status, response.Cursor))
+                            let chatCount =
+                                events
+                                |> List.sumBy (fun e ->
+                                    match e.Envelope with
+                                    | Envelope.TextMessage _ -> 1
+                                    | _ -> 0)
+
+                            let status =
+                                $"evts:{response.Events.Length} msgs:{chatCount} errs:{errors.Length}"
+                                + (match List.tryHead errors with
+                                   | Some e -> $" [{e}]"
+                                   | None -> "")
+
+                            dispatch (PollResult(events, status, response.Cursor))
                     with
                     | :? TimeoutException ->
                         log "poll timeout"

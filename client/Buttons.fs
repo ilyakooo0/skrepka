@@ -35,24 +35,16 @@ module Buttons =
         Rectangle().stroke(Colors.Black).strokeThickness (4.)
 
     let private textButton fontSize pressOffset restOffset margin priority (text: string) (msg: 'msg) disabled =
-        // Start from the opposite state's offset so the transition animates
-        let initialOffset = if disabled then restOffset else 0.
-
         Component($"{text}-{disabled}") {
             let! pressed = Context.State(false)
-            let! animOffset = Context.State(initialOffset)
 
-            let target =
+            let offset =
                 if disabled then 0.
                 elif pressed.Current then pressOffset
                 else restOffset
 
-            do
-                if animOffset.Current <> target then
-                    Avalonia.Threading.Dispatcher.UIThread.Post(fun () -> animOffset.Set target)
-
             (Grid() {
-                shadowRect animOffset.Current
+                shadowRect offset
 
                 Rectangle()
                     .fill (

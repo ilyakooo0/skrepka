@@ -117,9 +117,8 @@ module AppTypes =
 
     let contactName (contacts: Map<string, Contact>) (pk: string) =
         match Map.tryFind pk contacts with
-        | Some c when c.Nickname <> "" -> c.Nickname
-        | Some c when c.DisplayName <> "" -> c.DisplayName
-        | _ -> truncKey pk
+        | Some c -> c.DisplayName
+        | _ -> pk
 
     let messagesFor (pk: string) (messages: Map<string, ChatMessage list>) =
         messages |> Map.tryFind pk |> Option.defaultValue []

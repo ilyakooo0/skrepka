@@ -88,7 +88,12 @@ module Store =
             if not isOutgoing then
                 Incoming
             else
-                Outgoing(if status = 1 then DeliveryStatus.Delivered else DeliveryStatus.Sent) }
+                Outgoing(
+                    if status = 1 then
+                        DeliveryStatus.Delivered
+                    else
+                        DeliveryStatus.Sent
+                ) }
 
     // ── Schema ──
 
@@ -142,7 +147,9 @@ module Store =
 
         conn
         |> Db.newCommand "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (@key, @value)"
-        |> Db.setParams [ "key", SqlType.String "schema_version"; "value", SqlType.String(string Constants.schemaVersion) ]
+        |> Db.setParams
+            [ "key", SqlType.String "schema_version"
+              "value", SqlType.String(string Constants.schemaVersion) ]
         |> Db.exec
 
     // ── Identity ──
@@ -203,10 +210,7 @@ module Store =
                     [ "Id", SqlType.String Constants.profileId
                       "DisplayName", SqlType.String profile.DisplayName
                       "Bio", SqlType.String profile.Bio
-                      "Photo",
-                      (match profile.Photo with
-                       | Some bytes -> SqlType.Bytes bytes
-                       | None -> SqlType.Null) ]
+                      "Photo", SqlType.sqlBytesOrNull profile.Photo ]
                 |> Db.exec
             with ex ->
                 log $"saveProfile error: {ex.Message}"
