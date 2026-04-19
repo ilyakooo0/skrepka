@@ -830,15 +830,15 @@ pollOnce = \token cursor -> do
           yield m
         let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
         if count limitedMsgs == 0 then retry
-        else do
+        else
           let evts = do
             m <- limitedMsgs
             yield {id: m.messageId, eventType: "message",
                    payload: {toKey: m.toKey, fromKey: m.fromKey,
                               encryptedBlob: m.encryptedBlob,
                               timestamp: m.timestamp}}
-          let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
-          yield (PollOk {events: evts, cursor: lastReceivedAt})
+          in let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
+          in yield (PollOk {events: evts, cursor: lastReceivedAt})
 
 -- ============================================
 -- Request Handler
