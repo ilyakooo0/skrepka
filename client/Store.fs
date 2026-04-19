@@ -13,7 +13,8 @@ module Store =
           Nickname: string
           DisplayName: string
           Bio: string
-          Photo: byte[] option }
+          Photo: byte[] option
+          AddedDate: DateTimeOffset }
 
     type Profile =
         { DisplayName: string
@@ -75,7 +76,8 @@ module Store =
           Nickname = rd.ReadString "Nickname"
           DisplayName = rd.ReadString "DisplayName"
           Bio = rd.ReadString "Bio"
-          Photo = rd.ReadBytesOption "Photo" }
+          Photo = rd.ReadBytesOption "Photo"
+          AddedDate = rd.ReadInt64 "AddedDateUnix" |> DateTimeOffset.FromUnixTimeMilliseconds }
 
     let private readMessage (rd: IDataReader) : ChatMessage =
         let isOutgoing = rd.ReadBoolean "IsOutgoing"
@@ -108,8 +110,16 @@ module Store =
 
         conn
         |> Db.newCommand
-            "CREATE TABLE IF NOT EXISTS contacts (Pubkey TEXT PRIMARY KEY, Nickname TEXT NOT NULL DEFAULT '', DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB)"
+            "CREATE TABLE IF NOT EXISTS contacts (Pubkey TEXT PRIMARY KEY, Nickname TEXT NOT NULL DEFAULT '', DisplayName TEXT NOT NULL DEFAULT '', Bio TEXT NOT NULL DEFAULT '', Photo BLOB, AddedDateUnix INTEGER NOT NULL DEFAULT 0)"
         |> Db.exec
+
+        // Migration: add AddedDateUnix to existing contacts tables
+        try
+            conn
+            |> Db.newCommand "ALTER TABLE contacts ADD COLUMN AddedDateUnix INTEGER NOT NULL DEFAULT 0"
+            |> Db.exec
+        with _ ->
+            ()
 
         conn
         |> Db.newCommand
@@ -234,7 +244,7 @@ module Store =
                 | Some(serverUrl, pollCursor) ->
                     let contacts =
                         conn
-                        |> Db.newCommand "SELECT Pubkey, Nickname, DisplayName, Bio, Photo FROM contacts"
+                        |> Db.newCommand "SELECT Pubkey, Nickname, DisplayName, Bio, Photo, AddedDateUnix FROM contacts"
                         |> Db.query readContact
                         |> List.map (fun c -> c.Pubkey, c)
                         |> Map.ofList
@@ -268,7 +278,7 @@ module Store =
                 for c in data.Contacts.Values do
                     conn
                     |> Db.newCommand
-                        "INSERT OR REPLACE INTO contacts (Pubkey, Nickname, DisplayName, Bio, Photo) VALUES (@Pubkey, @Nickname, @DisplayName, @Bio, @Photo)"
+                        "INSERT OR REPLACE INTO contacts (Pubkey, Nickname, DisplayName, Bio, Photo, AddedDateUnix) VALUES (@Pubkey, @Nickname, @DisplayName, @Bio, @Photo, @AddedDateUnix)"
                     |> Db.setParams
                         [ "Pubkey", SqlType.String c.Pubkey
                           "Nickname", SqlType.String c.Nickname
@@ -277,7 +287,8 @@ module Store =
                           "Photo",
                           (match c.Photo with
                            | Some bytes -> SqlType.Bytes bytes
-                           | None -> SqlType.Null) ]
+                           | None -> SqlType.Null)
+                          "AddedDateUnix", SqlType.Int64(c.AddedDate.ToUnixTimeMilliseconds()) ]
                     |> Db.exec
 
                 for KeyValue(convId, msgs) in data.Messages do

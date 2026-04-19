@@ -21,7 +21,7 @@ module ViewConversations =
                 messagesFor c.Pubkey model.Messages
                 |> List.tryLast
                 |> Option.map (fun m -> m.Timestamp)
-                |> Option.defaultValue System.DateTimeOffset.MinValue)
+                |> Option.defaultValue c.AddedDate)
 
         let content =
             if contacts.IsEmpty then

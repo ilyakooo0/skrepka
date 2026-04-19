@@ -60,7 +60,8 @@ module App =
           Nickname = nickname
           DisplayName = ""
           Bio = ""
-          Photo = None }
+          Photo = None
+          AddedDate = System.DateTimeOffset.UtcNow }
 
     let private withProfile (p: Profile) (c: Contact) =
         { c with
