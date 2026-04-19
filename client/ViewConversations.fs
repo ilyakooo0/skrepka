@@ -40,23 +40,25 @@ module ViewConversations =
                                 let preview =
                                     messagesFor c.Pubkey model.Messages
                                     |> List.tryLast
-                                    |> Option.map (fun m -> if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
+                                    |> Option.map (fun m ->
+                                        if m.Body.Length > 40 then m.Body.[..39] + "..." else m.Body)
                                     |> Option.defaultValue ""
 
                                 Border(
                                     (HStack(8.) {
 
-                                        Grid() {
+                                        (Grid() {
                                             (match c.Photo with
-                                             | None -> Image("avares://Skrepka/Assets/Images/user.png", Stretch.Uniform)
+                                             | None ->
+                                                 Image("avares://Skrepka/Assets/Images/user.png", Stretch.Uniform)
+                                                     .margin (8.)
                                              | Some i -> Image(cachedBitmap i, Stretch.UniformToFill))
-                                                .width(16.)
-                                                .height(16.)
-                                                .margin(8.)
                                                 .clipToBounds (true)
 
                                             Rectangle().stroke(Colors.Black).strokeThickness (4.)
-                                        }
+                                        })
+                                            .width(40.)
+                                            .height (40.)
 
                                         VStack(2.) {
                                             TextBlock(name)
