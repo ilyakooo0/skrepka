@@ -37,9 +37,13 @@ module Buttons =
     let private textButton fontSize pressOffset restOffset margin priority (text: string) (msg: 'msg) disabled =
         Component($"{text}-{disabled}") {
             let! pressed = Context.State(false)
+            let! animatedIn = Context.State(false)
 
             let offset =
                 if disabled then 0.
+                elif not animatedIn.Current then
+                    Avalonia.Threading.Dispatcher.UIThread.Post(fun () -> animatedIn.Set true)
+                    0.
                 elif pressed.Current then pressOffset
                 else restOffset
 
