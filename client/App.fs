@@ -240,11 +240,16 @@ module App =
 
         | StartFlush ->
             if model.FlushingOutbox then
+                eprintfn "[skrepka] StartFlush: already flushing, skipping"
                 model, []
             else
                 match trySession model with
-                | Some session -> { model with FlushingOutbox = true }, [ CmdFlushOutbox session ]
-                | None -> model, []
+                | Some session ->
+                    eprintfn "[skrepka] StartFlush: dispatching flush"
+                    { model with FlushingOutbox = true }, [ CmdFlushOutbox session ]
+                | None ->
+                    eprintfn "[skrepka] StartFlush: no session"
+                    model, []
 
         | FlushResult sent ->
             if sent then
@@ -483,6 +488,7 @@ module App =
                 async {
                     match! Store.peekOutbox () with
                     | Some item ->
+                        log $"flush: sending to {item.RecipientHex.[..7]}..."
                         try
                             let blobOpt =
                                 Crypto.encrypt
@@ -493,7 +499,9 @@ module App =
                             match blobOpt with
                             | Some blob ->
                                 let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                                log $"flush: encrypted, posting to {session.Url}/messages"
                                 do! sendMessage session.Url session.Token item.RecipientHex (Crypto.toHex blob) ts
+                                log "flush: sent OK"
                                 do! Store.dequeueOutbox item.Id
                                 dispatch (FlushResult true)
                             | None ->
