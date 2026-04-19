@@ -219,7 +219,11 @@ module App =
                       Timestamp = DateTimeOffset.UtcNow
                       Direction = Outgoing DeliveryStatus.Sent }
 
-                let isFirstInteraction = model.Messages |> messagesFor pk |> List.isEmpty
+                let neverSentTo =
+                    model.Messages
+                    |> messagesFor pk
+                    |> List.exists (fun m -> match m.Direction with Outgoing _ -> true | _ -> false)
+                    |> not
 
                 let model' =
                     { model with
@@ -229,7 +233,7 @@ module App =
                 model',
                 [ CmdEnqueue(pk, Envelope.TextMessage(id, body))
                   match model.Profile with
-                  | Some profile when isFirstInteraction -> CmdEnqueue(pk, Envelope.ProfileMessage profile)
+                  | Some profile when neverSentTo -> CmdEnqueue(pk, Envelope.ProfileMessage profile)
                   | _ -> ()
                   saveCmdMsg model' ]
             | _ -> model, []
