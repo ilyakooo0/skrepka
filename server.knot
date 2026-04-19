@@ -823,9 +823,10 @@ pollOnce = \token cursor -> do
         yield (PollUnauthorized {})
       Authorized {pubkey} -> do
         seqCounter <- *seqCounter
+        messages <- *messages
         let clampedCursor = clamp 0 (max seqCounter t) cursor
         let matchingMsgs = do
-          m <- *messages
+          m <- messages
           where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > clampedCursor
           yield m
         let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
