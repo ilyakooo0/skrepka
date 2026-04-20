@@ -13,7 +13,6 @@ module Constants =
     let schemaVersion = 2
     let maxBitmapCacheSize = 128
     let pollRetryBaseMs = 3000
-    let pollEmptyDelayMs = 5000
     let outboxRetryDelayMs = 3000
     let maxMessages = 200
     let blobVersion = 1uy

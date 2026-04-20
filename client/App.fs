@@ -583,9 +583,6 @@ module App =
                                     with ex ->
                                         log $"delivery ack error: {ex.Message}"
 
-                            if response.Events.Length = 0 then
-                                do! Async.Sleep Constants.pollEmptyDelayMs
-
                             let chatCount =
                                 events
                                 |> List.sumBy (fun e ->

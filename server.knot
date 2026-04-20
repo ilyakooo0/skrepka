@@ -47,6 +47,8 @@ gossipOriginHops = 2
 
 backgroundPruneInterval : Int<Ms>
 backgroundPruneInterval = 30000 -- 30 seconds
+pollTimeoutMs : Int<Ms>
+pollTimeoutMs = 25000 -- long-poll heartbeat interval
 federationEnabled = federationSecret != ""
 federationAuth = "Bearer " ++ federationSecret
 federationUrl = \server -> federationScheme ++ server
@@ -136,6 +138,8 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 *ackedIds : [AckedEntry]
 
 *lastPrunedAt : Timestamp
+
+*pollWakeup : Timestamp
 
 -- ============================================
 -- Routes
@@ -816,7 +820,7 @@ pruneAndRetry = \t -> do
     retryPendingForwards result.pendingForwards
     sendAcksAndClean result.pendingAcks)
 
-pollOnce = \token cursor -> do
+pollOnce = \token cursor startWakeup -> do
   t <- now
   sessions <- *sessions
   let auth = authenticateSession sessions token t
@@ -825,23 +829,27 @@ pollOnce = \token cursor -> do
     Authorized {pubkey} -> do
       seqCounter <- *seqCounter
       let clampedCursor = clamp 0 (max seqCounter t) cursor
-      allMessages <- *messages
-      let matchingMsgs = do
-        m <- allMessages
-        where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > clampedCursor
-        yield m
-      let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
-      if count limitedMsgs == 0
-        then yield (PollOk {events: [], cursor: clampedCursor})
-        else
-          let evts = do
-            m <- limitedMsgs
-            yield {id: m.messageId, eventType: "message",
-                   payload: {toKey: m.toKey, fromKey: m.fromKey,
-                              encryptedBlob: m.encryptedBlob,
-                              timestamp: m.timestamp}}
-          in let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
-          in yield (PollOk {events: evts, cursor: lastReceivedAt})
+      atomic do
+        wakeup <- *pollWakeup
+        allMessages <- *messages
+        let matchingMsgs = do
+          m <- allMessages
+          where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > clampedCursor
+          yield m
+        let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
+        if count limitedMsgs > 0
+          then
+            let evts = do
+              m <- limitedMsgs
+              yield {id: m.messageId, eventType: "message",
+                     payload: {toKey: m.toKey, fromKey: m.fromKey,
+                                encryptedBlob: m.encryptedBlob,
+                                timestamp: m.timestamp}}
+            in let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
+            in yield (PollOk {events: evts, cursor: lastReceivedAt})
+          else if wakeup > startWakeup
+            then yield (PollOk {events: [], cursor: clampedCursor})
+            else retry
 
 -- ============================================
 -- Request Handler
@@ -910,9 +918,10 @@ serve = \req -> case req of
         yield (respond {token: token, expiresAt: expiry})
 
   Poll {cursor, authorization, respond} -> do
+    startWakeup <- *pollWakeup
     result <- case extractToken authorization of
       Nothing {} -> yield (PollUnauthorized {})
-      Just {value: token} -> pollOnce token cursor
+      Just {value: token} -> pollOnce token cursor startWakeup
     tAfterPoll <- now
     maybePruneAndBroadcast tAfterPoll
     yield (respond (case result of
@@ -1124,7 +1133,15 @@ backgroundPrune = do
   pruneAndRetry t
   backgroundPrune
 
+pollHeartbeat = do
+  sleep pollTimeoutMs
+  t <- now
+  atomic do
+    set *pollWakeup = t
+  pollHeartbeat
+
 main = do
   println "Skrepka relay server starting on port 8080..."
   fork backgroundPrune
+  fork pollHeartbeat
   listen 8080 serve
