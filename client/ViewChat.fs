@@ -12,6 +12,73 @@ module ViewChat =
     open Buttons
     open TextFields
 
+    let private scrollRef = Fabulous.ViewRef<Avalonia.Controls.ScrollViewer>()
+    let mutable private lastMsgCount = 0
+    let mutable private pageSize = 50
+    let mutable private loadingMore = false
+    let mutable private isAtBottom = true
+
+    let private scrollToEnd () =
+        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(fun () ->
+            match scrollRef.TryValue with
+            | Some sv -> sv.ScrollToEnd()
+            | None -> ()
+        , Avalonia.Threading.DispatcherPriority.Background) |> ignore
+
+    let private messageItem m =
+        let align, cols, col =
+            match m.Direction with
+            | Outgoing _ -> HorizontalAlignment.Right, [ Dimension.Stars 3.; Dimension.Stars 7. ], 1
+            | Incoming -> HorizontalAlignment.Left, [ Dimension.Stars 7.; Dimension.Stars 3. ], 0
+
+        let dashed =
+            match m.Direction with
+            | Outgoing DeliveryStatus.Sent -> true
+            | _ -> false
+
+        let border =
+            if dashed then
+                Rectangle()
+                    .stroke(Avalonia.Media.Colors.Black)
+                    .strokeThickness(4.)
+                    .strokeDashArray([ 4.; 2. ])
+                    .isHitTestVisible(false)
+                    .onLoaded(fun args ->
+                        let rect = args.Source :?> Avalonia.Controls.Shapes.Rectangle
+                        let anim = Avalonia.Animation.Animation()
+                        anim.Duration <- System.TimeSpan.FromSeconds 3.
+                        anim.IterationCount <- Avalonia.Animation.IterationCount.Infinite
+                        anim.Easing <- Avalonia.Animation.Easings.LinearEasing()
+                        let kf1 = Avalonia.Animation.KeyFrame()
+                        kf1.Setters.Add(Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 0.))
+                        kf1.Cue <- Avalonia.Animation.Cue(0.)
+                        let kf2 = Avalonia.Animation.KeyFrame()
+                        kf2.Setters.Add(Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 6.))
+                        kf2.Cue <- Avalonia.Animation.Cue(1.)
+                        anim.Children.Add(kf1)
+                        anim.Children.Add(kf2)
+                        anim.RunAsync(rect) |> ignore
+                        DismissError)
+            else
+                Rectangle().stroke(Avalonia.Media.Colors.Black).strokeThickness(4.).isHitTestVisible (false)
+
+        Grid(cols, [ Dimension.Auto ]) {
+            Border(
+                (Grid() {
+                    TextBlock(m.Body)
+                        .fontSize(14.)
+                        .fontFamily(Constants.fontFamily)
+                        .fontWeight(Avalonia.Media.FontWeight.Bold)
+                        .textWrapping(Avalonia.Media.TextWrapping.Wrap)
+                        .padding (8.)
+
+                    border
+                }))
+                .horizontalAlignment(align)
+                .margin(4.)
+                .gridColumn (col)
+        }
+
     let viewChat model pk compose =
         let name = contactName model.Contacts pk
         let msgs = messagesFor pk model.Messages
@@ -20,8 +87,11 @@ module ViewChat =
             (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], [ Dimension.Auto ]) {
                 (backButton (SetPage Conversations)).gridColumn (0)
 
-                (textField compose (fun text -> SetPage(Chat(pk, text))))
+                TextBox(compose, fun text -> SetPage(Chat(pk, text)))
+                    .watermark("Message...")
+                    .fontFamily(Constants.fontFamily)
                     .verticalAlignment(VerticalAlignment.Stretch)
+                    .verticalContentAlignment(VerticalAlignment.Center)
                     .margin(8.)
                     .gridColumn (1)
 
@@ -35,39 +105,50 @@ module ViewChat =
 
                 (viewErrorBanner model.Error).gridRow (1)
 
-                (if msgs.IsEmpty then
-                     AnyView(TextBlock("No messages yet").padding(8.).fontSize (14.))
-                 else
-                     let layout = Avalonia.Layout.StackLayout()
-                     layout.DisableVirtualization <- true
+                (let msgView =
+                    if msgs.IsEmpty then
+                        lastMsgCount <- 0
+                        pageSize <- 50
+                        AnyView(TextBlock("No messages yet").padding(8.).fontSize (14.))
+                    else
+                        if msgs.Length <> lastMsgCount then
+                            lastMsgCount <- msgs.Length
+                            if isAtBottom then scrollToEnd ()
 
-                     AnyView(
-                         ScrollViewer(
-                             ItemsRepeater(msgs, fun m ->
-                                 let tick =
-                                     match m.Direction with
-                                     | Outgoing DeliveryStatus.Delivered -> " ✓"
-                                     | Outgoing DeliveryStatus.Sent -> ""
-                                     | Incoming -> ""
+                        let skip = max 0 (msgs.Length - pageSize)
+                        let visible = msgs |> List.skip skip
 
-                                 let align =
-                                     match m.Direction with
-                                     | Incoming -> HorizontalAlignment.Right
-                                     | Outgoing _ -> HorizontalAlignment.Left
+                        AnyView(
+                            ScrollViewer(
+                                VStack(0.) {
+                                    for m in visible do
+                                        messageItem m
+                                })
+                                .reference(scrollRef)
+                                .onLoaded(fun _ ->
+                                    pageSize <- 50
+                                    loadingMore <- false
+                                    isAtBottom <- true
+                                    scrollToEnd ()
+                                    DismissError)
+                                .onScrollChanged(fun args ->
+                                    let sv = args.Source :?> Avalonia.Controls.ScrollViewer
+                                    isAtBottom <- sv.Offset.Y + sv.Viewport.Height >= sv.Extent.Height - 20.
+                                    if sv.Offset.Y < 50. && not loadingMore && skip > 0 then
+                                        loadingMore <- true
+                                        let oldHeight = sv.Extent.Height
+                                        pageSize <- min msgs.Length (pageSize + 50)
+                                        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(fun () ->
+                                            match scrollRef.TryValue with
+                                            | Some sv2 ->
+                                                let newHeight = sv2.Extent.Height
+                                                sv2.Offset <- Avalonia.Vector(0., sv2.Offset.Y + (newHeight - oldHeight))
+                                                loadingMore <- false
+                                            | None -> loadingMore <- false
+                                        , Avalonia.Threading.DispatcherPriority.Background) |> ignore
+                                    SetPage(Chat(pk, compose))))
 
-                                 Border(
-                                     TextBlock($"{m.Body}{tick}")
-                                         .fontSize(14.)
-                                         .padding (8.))
-                                     .borderThickness(Avalonia.Thickness(2.))
-                                     .borderBrush(Avalonia.Media.SolidColorBrush(Avalonia.Media.Colors.Black))
-                                     .horizontalAlignment(align)
-                                     .margin (4.))
-                                 .layout(layout)
-                         )
-                             .horizontalScrollBarVisibility(Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled)
-                             .offset(Avalonia.Vector(0., System.Double.MaxValue))))
-                    .gridRow (2)
+                 msgView).gridRow (2)
             })
 
         Styles.withBottomBar bar content

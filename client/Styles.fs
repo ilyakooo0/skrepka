@@ -43,6 +43,22 @@ module Styles =
                   .Name("PART_ContentPresenter"))
               [ Setter(ContentPresenter.MarginProperty, Thickness(0.)) ] ]
 
+    let noListBoxSelection () =
+        [ style
+              (_.OfType<ListBoxItem>()
+                  .Class(":selected")
+                  .Template()
+                  .OfType<ContentPresenter>()
+                  .Name("PART_ContentPresenter"))
+              [ Setter(ContentPresenter.BackgroundProperty, Brushes.Transparent) ]
+          style
+              (_.OfType<ListBoxItem>()
+                  .Class(":pointerover")
+                  .Template()
+                  .OfType<ContentPresenter>()
+                  .Name("PART_ContentPresenter"))
+              [ Setter(ContentPresenter.BackgroundProperty, Brushes.Transparent) ] ]
+
     let private bitmapCache =
         System.Collections.Concurrent.ConcurrentDictionary<int, Avalonia.Media.Imaging.Bitmap>()
 
