@@ -438,9 +438,6 @@ isQueued = \ds -> case ds of DsQueued {} -> True {}; _ -> False {}
 nextSeqTs : Timestamp -> Timestamp -> Timestamp
 nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
 
-takeN : [a] -> Int -> [a]
-takeN = \items n -> (fold (\acc e -> if acc.n >= n then acc else {n: acc.n + 1, items: union acc.items [e]}) {n: 0, items: []} items).items
-
 dedupMessageIds : [MessageIdHex] -> [MessageIdHex]
 dedupMessageIds = \messageIds ->
   fold (\acc mid ->
@@ -448,39 +445,11 @@ dedupMessageIds = \messageIds ->
     else if any acc (\a -> a == mid) then acc
     else union acc [mid]) [] messageIds
 
-boundedSmallest = \items n getKey ->
-  (fold (\acc a ->
-    let k = getKey a in
-    if acc.size < n
-      then
-        let newHeap = union acc.heap [a] in
-        let newSize = count newHeap in
-        if newSize > acc.size
-          then {size: newSize, heap: newHeap, heapMax: Just {value: case acc.heapMax of
-            Nothing {} -> k
-            Just {value: v} -> max k v
-          }}
-          else acc
-      else case acc.heapMax of
-        Nothing {} -> acc
-        Just {value: maxVal} ->
-          if k < maxVal
-            then
-              let removed = fold (\r x ->
-                if not r.done && getKey x == maxVal
-                  then {done: True {}, items: r.items}
-                  else {done: r.done, items: union r.items [x]}) {done: False {}, items: []} acc.heap in
-              let newHeap = union removed.items [a] in
-              let newMax = fold (\best x -> Just {value: case best of
-                Nothing {} -> getKey x
-                Just {value: v} -> max (getKey x) v
-              }) Nothing {} newHeap in
-              {size: acc.size, heap: newHeap, heapMax: newMax}
-            else acc) {size: 0, heap: [], heapMax: Nothing {}} items).heap
-
 evictOldestAckedIds = \items n ->
   if n <= 0 then items
-  else diff items (boundedSmallest items n (\a -> a.ackedAt))
+  else do
+    ii <- items
+    diff items (takeRelation n ( sortBy (\a -> a.ackedAt) items))
 
 safeCompareLoop : Text -> Text -> Int -> Int -> Int
 safeCompareLoop = \s1 s2 n result ->
@@ -553,7 +522,7 @@ capGossipPresence = \args ->
       let updatesOnlyAfterOffline = removeOffline updatesOnlyMerged args.trustedOffline args.t in
       let reclaimSlots = maxPresenceEntries - count updatesOnlyAfterOffline in
       let newEntries = do e <- args.trustedDeduped; where none args.presence (\p -> samePubkeyServer p e); yield e in
-      let reclaimedEntries = takeN newEntries reclaimSlots in
+      let reclaimedEntries = takeRelation reclaimSlots newEntries in
       {finalPresence: union updatesOnlyAfterOffline reclaimedEntries,
        appliedOnline: union
         (do e <- updatesOnly; where none args.presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield (pubkeyServer e))
@@ -751,7 +720,7 @@ forwardQueuedMessages = \targets t -> do
       where none forwards (\f -> f.messageId == m.messageId && f.toServer == target.server)
       yield {messageId: m.messageId, toServer: target.server, createdAt: t,
              toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp}
-    let capped = takeN candidates (maxForwardsEntries - count forwards)
+    let capped = takeRelation (maxForwardsEntries - count forwards) candidates
     let updatedForwards = union forwards capped
     set *forwards = updatedForwards
     yield capped
@@ -832,11 +801,10 @@ pollOnce = \token cursor startWakeup -> do
       atomic do
         wakeup <- *pollWakeup
         allMessages <- *messages
-        let matchingMsgs = do
+        let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (do
           m <- allMessages
           where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > clampedCursor
-          yield m
-        let limitedMsgs = boundedSmallest matchingMsgs maxPollEvents (\m -> m.receivedAt)
+          yield m))
         if count limitedMsgs > 0
           then
             let evts = do
@@ -945,15 +913,14 @@ serve = \req -> case req of
               seqCounter <- *seqCounter
               let seqTs = nextSeqTs t seqCounter
               set *seqCounter = seqTs
-              let updatedMessages = union messages
+              set *messages = union messages
                 [{messageId: msgId, toKey: to,
                   encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
-              set *messages = updatedMessages
               let toPresence = do p <- presence; where p.pubkey == to && p.expiresAt > t; yield p
               let localOnline = any toPresence (\p -> isLocalServer p.server)
               let remoteServers = collectPeerServers toPresence (\p -> p.server)
               forwards <- *forwards
-              let forwardServers = takeN remoteServers (maxForwardsEntries - count forwards)
+              let forwardServers = takeRelation (maxForwardsEntries - count forwards) remoteServers
               let shouldForward = federationEnabled && count forwardServers > 0
               let delivery = if localOnline then DsDelivered {}
                 else if shouldForward then DsFederated {}
@@ -1004,7 +971,7 @@ serve = \req -> case req of
           ackedIds <- *ackedIds
           let combinedAckedIds = union ackedIds ackedFederated
           let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
-            if excessCount <= 0 then [] else boundedSmallest combinedAckedIds excessCount (\a -> a.ackedAt)
+            if excessCount <= 0 then [] else takeRelation excessCount (sortBy (\a -> a.ackedAt) combinedAckedIds)
           let remainingAckedIds = diff combinedAckedIds evictedEntries
           set *ackedIds = remainingAckedIds
           yield {pr: pr, ack: AckDone {pendingAcks: ackedFederated, evictedEntries: evictedEntries}})

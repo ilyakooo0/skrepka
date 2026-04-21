@@ -13,22 +13,34 @@ module ViewChat =
     open Buttons
     open TextFields
 
-    let private marchingAntsStyle =
-        let s = Avalonia.Styling.Style(fun sel -> sel.OfType<Avalonia.Controls.Shapes.Rectangle>())
-        let anim = Avalonia.Animation.Animation()
-        anim.Duration <- System.TimeSpan.FromSeconds 3.
-        anim.IterationCount <- Avalonia.Animation.IterationCount.Infinite
-        anim.Easing <- Avalonia.Animation.Easings.LinearEasing()
-        let kf1 = Avalonia.Animation.KeyFrame()
-        kf1.Setters.Add(Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 0.))
-        kf1.Cue <- Avalonia.Animation.Cue(0.)
-        let kf2 = Avalonia.Animation.KeyFrame()
-        kf2.Setters.Add(Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 6.))
-        kf2.Cue <- Avalonia.Animation.Cue(1.)
-        anim.Children.Add(kf1)
-        anim.Children.Add(kf2)
-        s.Animations.Add(anim)
-        s :> Avalonia.Styling.IStyle
+    let private ensureMarchingAntsStyle =
+        lazy
+            (let s =
+                Avalonia.Styling.Style(fun sel ->
+                    sel.OfType<Avalonia.Controls.Shapes.Rectangle>().Class("marching"))
+
+             let anim = Avalonia.Animation.Animation()
+             anim.Duration <- System.TimeSpan.FromSeconds 3.
+             anim.IterationCount <- Avalonia.Animation.IterationCount.Infinite
+             anim.Easing <- Avalonia.Animation.Easings.LinearEasing()
+             let kf1 = Avalonia.Animation.KeyFrame()
+
+             kf1.Setters.Add(
+                 Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 0.)
+             )
+
+             kf1.Cue <- Avalonia.Animation.Cue(0.)
+             let kf2 = Avalonia.Animation.KeyFrame()
+
+             kf2.Setters.Add(
+                 Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 6.)
+             )
+
+             kf2.Cue <- Avalonia.Animation.Cue(1.)
+             anim.Children.Add(kf1)
+             anim.Children.Add(kf2)
+             s.Animations.Add(anim)
+             Avalonia.Application.Current.Styles.Add(s))
 
     let private scrollRef = Fabulous.ViewRef<Avalonia.Controls.ScrollViewer>()
     let mutable private lastMsgCount = 0
@@ -43,27 +55,14 @@ module ViewChat =
             | None -> ()
         , Avalonia.Threading.DispatcherPriority.Background) |> ignore
 
+    let private opacityTransition =
+        DoubleTransition(Avalonia.Visual.OpacityProperty, System.TimeSpan.FromMilliseconds 500.)
+
     let private messageItem m =
         let align, cols, col =
             match m.Direction with
             | Outgoing _ -> HorizontalAlignment.Right, [ Dimension.Stars 3.; Dimension.Stars 7. ], 1
             | Incoming -> HorizontalAlignment.Left, [ Dimension.Stars 7.; Dimension.Stars 3. ], 0
-
-        let dashed =
-            match m.Direction with
-            | Outgoing DeliveryStatus.Sent -> true
-            | _ -> false
-
-        let border =
-            if dashed then
-                Rectangle()
-                    .stroke(Avalonia.Media.Colors.Black)
-                    .strokeThickness(4.)
-                    .strokeDashArray([ 4.; 2. ])
-                    .isHitTestVisible(false)
-                    .style(marchingAntsStyle)
-            else
-                Rectangle().stroke(Avalonia.Media.Colors.Black).strokeThickness(4.).isHitTestVisible (false)
 
         Grid(cols, [ Dimension.Auto ]) {
             Border(
@@ -75,7 +74,31 @@ module ViewChat =
                         .textWrapping(Avalonia.Media.TextWrapping.Wrap)
                         .padding (8.)
 
-                    border
+                    match m.Direction with
+                    | Outgoing status ->
+                        ensureMarchingAntsStyle.Force()
+                        let isSent = status = DeliveryStatus.Sent
+
+                        Rectangle()
+                            .stroke(Avalonia.Media.Colors.Black)
+                            .strokeThickness(4.)
+                            .isHitTestVisible(false)
+                            .opacity(if isSent then 0. else 1.)
+                            .transition (opacityTransition)
+
+                        Rectangle()
+                            .stroke(Avalonia.Media.Colors.Black)
+                            .strokeThickness(4.)
+                            .strokeDashArray([ 4.; 2. ])
+                            .isHitTestVisible(false)
+                            .opacity(if isSent then 1. else 0.)
+                            .classes("marching")
+                            .transition (opacityTransition)
+                    | Incoming ->
+                        Rectangle()
+                            .stroke(Avalonia.Media.Colors.Black)
+                            .strokeThickness(4.)
+                            .isHitTestVisible (false)
                 }))
                 .horizontalAlignment(align)
                 .margin(4.)
