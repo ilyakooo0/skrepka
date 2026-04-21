@@ -3,6 +3,7 @@ namespace Skrepka
 open System
 open System.Text
 open System.Security.Cryptography
+open K4os.Compression.LZ4
 
 module Crypto =
 
@@ -198,7 +199,8 @@ module Crypto =
                 let key = deriveKey ephPub recipientX25519Pub rawSecret
                 let nonce = getRandomBytes 24
                 let ptBytes = Encoding.UTF8.GetBytes(plaintext)
-                let ciphertext = aeadEncrypt ptBytes nonce key
+                let compressed = LZ4Pickler.Pickle(ptBytes)
+                let ciphertext = aeadEncrypt compressed nonce key
                 let signature = signDetached ciphertext senderPrivKey
 
                 Some(
@@ -218,7 +220,7 @@ module Crypto =
         if recipientPrivKey.Length <> 64 || blob.Length < minBlobLen then
             None
         else
-            let tryDecrypt offset =
+            let tryDecrypt offset decompress =
                 if blob.Length < minBlobLen + offset then
                     None
                 else
@@ -237,14 +239,18 @@ module Crypto =
                             let recipientEd25519Pub = recipientPrivKey.[32..63]
                             let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
                             let key = deriveKey ephPub recipientX25519Pub rawSecret
-                            let plaintext = aeadDecrypt ciphertext nonce key
+                            let decrypted = aeadDecrypt ciphertext nonce key
+                            let plaintext = if decompress then LZ4Pickler.Unpickle(decrypted) else decrypted
                             Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
                     with ex ->
                         log $"decrypt error: {ex.Message}"
                         None
 
-            // Try versioned format, fall back to unversioned for backwards compat
-            if blob.[0] = Constants.blobVersion then
-                tryDecrypt 1 |> Option.orElseWith (fun () -> tryDecrypt 0)
+            let version = blob.[0]
+
+            if version = 2uy then
+                tryDecrypt 1 true
+            elif version = 1uy then
+                tryDecrypt 1 false |> Option.orElseWith (fun () -> tryDecrypt 0 false)
             else
-                tryDecrypt 0
+                tryDecrypt 0 false

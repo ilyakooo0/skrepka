@@ -15,4 +15,4 @@ module Constants =
     let pollRetryBaseMs = 3000
     let outboxRetryDelayMs = 3000
     let maxMessages = 200
-    let blobVersion = 1uy
+    let blobVersion = 2uy

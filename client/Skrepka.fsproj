@@ -128,6 +128,7 @@
     <PackageReference Include="Sodium.Core" Version="1.4.0" />
     <PackageReference Include="Donald" Version="10.0.2" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0-preview.2.26159.112" />
+    <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
     <PackageReference Include="QRCoder" Version="1.6.0" />
   </ItemGroup>
 
