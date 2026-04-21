@@ -205,8 +205,7 @@ module Crypto =
 
                 Some(
                     Array.concat
-                        [| [| Constants.blobVersion |]
-                           ephPub
+                        [| ephPub
                            nonce
                            ciphertext
                            senderPubKey
@@ -220,37 +219,24 @@ module Crypto =
         if recipientPrivKey.Length <> 64 || blob.Length < minBlobLen then
             None
         else
-            let tryDecrypt offset decompress =
-                if blob.Length < minBlobLen + offset then
+            try
+                let ephPub = blob.[.. ephPubLen - 1]
+                let nonce = blob.[ephPubLen .. headerLen - 1]
+                let ciphertext = blob.[headerLen .. blob.Length - trailerLen - 1]
+                let senderPub = blob.[blob.Length - trailerLen .. blob.Length - sigLen - 1]
+                let signature = blob.[blob.Length - sigLen ..]
+
+                if not (verifyDetached signature ciphertext senderPub) then
                     None
                 else
-                    try
-                        let ephPub = blob.[offset .. offset + ephPubLen - 1]
-                        let nonce = blob.[offset + ephPubLen .. offset + headerLen - 1]
-                        let ciphertext = blob.[offset + headerLen .. blob.Length - trailerLen - 1]
-                        let senderPub = blob.[blob.Length - trailerLen .. blob.Length - sigLen - 1]
-                        let signature = blob.[blob.Length - sigLen ..]
-
-                        if not (verifyDetached signature ciphertext senderPub) then
-                            None
-                        else
-                            let recipientX25519Priv = ed25519SkToCurve25519 recipientPrivKey
-                            let rawSecret = scalarMult recipientX25519Priv ephPub
-                            let recipientEd25519Pub = recipientPrivKey.[32..63]
-                            let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
-                            let key = deriveKey ephPub recipientX25519Pub rawSecret
-                            let decrypted = aeadDecrypt ciphertext nonce key
-                            let plaintext = if decompress then LZ4Pickler.Unpickle(decrypted) else decrypted
-                            Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
-                    with ex ->
-                        log $"decrypt error: {ex.Message}"
-                        None
-
-            let version = blob.[0]
-
-            if version = 2uy then
-                tryDecrypt 1 true
-            elif version = 1uy then
-                tryDecrypt 1 false |> Option.orElseWith (fun () -> tryDecrypt 0 false)
-            else
-                tryDecrypt 0 false
+                    let recipientX25519Priv = ed25519SkToCurve25519 recipientPrivKey
+                    let rawSecret = scalarMult recipientX25519Priv ephPub
+                    let recipientEd25519Pub = recipientPrivKey.[32..63]
+                    let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
+                    let key = deriveKey ephPub recipientX25519Pub rawSecret
+                    let decrypted = aeadDecrypt ciphertext nonce key
+                    let plaintext = LZ4Pickler.Unpickle(decrypted)
+                    Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
+            with ex ->
+                log $"decrypt error: {ex.Message}"
+                None
