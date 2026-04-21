@@ -1,6 +1,7 @@
 namespace Skrepka
 
 open Avalonia.Layout
+open Avalonia.Styling
 open Fabulous.Avalonia
 
 open type Fabulous.Avalonia.View
@@ -11,6 +12,23 @@ module ViewChat =
     open AppTypes
     open Buttons
     open TextFields
+
+    let private marchingAntsStyle =
+        let s = Avalonia.Styling.Style(fun sel -> sel.OfType<Avalonia.Controls.Shapes.Rectangle>())
+        let anim = Avalonia.Animation.Animation()
+        anim.Duration <- System.TimeSpan.FromSeconds 3.
+        anim.IterationCount <- Avalonia.Animation.IterationCount.Infinite
+        anim.Easing <- Avalonia.Animation.Easings.LinearEasing()
+        let kf1 = Avalonia.Animation.KeyFrame()
+        kf1.Setters.Add(Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 0.))
+        kf1.Cue <- Avalonia.Animation.Cue(0.)
+        let kf2 = Avalonia.Animation.KeyFrame()
+        kf2.Setters.Add(Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 6.))
+        kf2.Cue <- Avalonia.Animation.Cue(1.)
+        anim.Children.Add(kf1)
+        anim.Children.Add(kf2)
+        s.Animations.Add(anim)
+        s :> Avalonia.Styling.IStyle
 
     let private scrollRef = Fabulous.ViewRef<Avalonia.Controls.ScrollViewer>()
     let mutable private lastMsgCount = 0
@@ -43,22 +61,7 @@ module ViewChat =
                     .strokeThickness(4.)
                     .strokeDashArray([ 4.; 2. ])
                     .isHitTestVisible(false)
-                    .onLoaded(fun args ->
-                        let rect = args.Source :?> Avalonia.Controls.Shapes.Rectangle
-                        let anim = Avalonia.Animation.Animation()
-                        anim.Duration <- System.TimeSpan.FromSeconds 3.
-                        anim.IterationCount <- Avalonia.Animation.IterationCount.Infinite
-                        anim.Easing <- Avalonia.Animation.Easings.LinearEasing()
-                        let kf1 = Avalonia.Animation.KeyFrame()
-                        kf1.Setters.Add(Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 0.))
-                        kf1.Cue <- Avalonia.Animation.Cue(0.)
-                        let kf2 = Avalonia.Animation.KeyFrame()
-                        kf2.Setters.Add(Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 6.))
-                        kf2.Cue <- Avalonia.Animation.Cue(1.)
-                        anim.Children.Add(kf1)
-                        anim.Children.Add(kf2)
-                        anim.RunAsync(rect) |> ignore
-                        DismissError)
+                    .style(marchingAntsStyle)
             else
                 Rectangle().stroke(Avalonia.Media.Colors.Black).strokeThickness(4.).isHitTestVisible (false)
 
