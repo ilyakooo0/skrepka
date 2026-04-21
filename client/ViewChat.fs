@@ -10,47 +10,64 @@ module ViewChat =
     open Store
     open AppTypes
     open Buttons
+    open TextFields
 
     let viewChat model pk compose =
         let name = contactName model.Contacts pk
         let msgs = messagesFor pk model.Messages
 
-        (Grid([ Dimension.Auto; Dimension.Auto; Dimension.Star; Dimension.Auto ], [ Dimension.Star ]) {
-            (HStack(8.) {
-                backButton (SetPage Conversations)
+        let bar =
+            (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], [ Dimension.Auto ]) {
+                (backButton (SetPage Conversations)).gridColumn (0)
 
-                TextBlock(name).fontSize(20.).centerVertical ()
+                (textField compose (fun text -> SetPage(Chat(pk, text))))
+                    .verticalAlignment(VerticalAlignment.Stretch)
+                    .margin(8.)
+                    .gridColumn (1)
+
+                (smallButton Primary "Send" DoSend).gridColumn (2)
             })
-                .gridRow (0)
+                .horizontalAlignment (HorizontalAlignment.Stretch)
 
-            (viewErrorBanner model.Error).gridRow (1)
+        let content =
+            (Grid([ Dimension.Star ], [ Dimension.Auto; Dimension.Auto; Dimension.Star ]) {
+                TextBlock(name).fontSize(20.).padding(8.).gridRow (0)
 
-            (if msgs.IsEmpty then
-                 AnyView(TextBlock("No messages yet").padding(8.).fontSize (14.))
-             else
-                 let reversed = List.rev msgs
+                (viewErrorBanner model.Error).gridRow (1)
 
-                 AnyView(
-                     ScrollViewer(
-                         ItemsRepeater(reversed, fun m ->
-                             let prefix, tick =
-                                 match m.Direction with
-                                 | Outgoing DeliveryStatus.Delivered -> "You: ", " \u2713"
-                                 | Outgoing DeliveryStatus.Sent -> "You: ", ""
-                                 | Incoming -> "", ""
+                (if msgs.IsEmpty then
+                     AnyView(TextBlock("No messages yet").padding(8.).fontSize (14.))
+                 else
+                     let layout = Avalonia.Layout.StackLayout()
+                     layout.DisableVirtualization <- true
 
-                             TextBlock($"{prefix}{m.Body}{tick}").padding(8.).fontSize (14.))
-                     )
-                 ))
-                .gridRow (2)
+                     AnyView(
+                         ScrollViewer(
+                             ItemsRepeater(msgs, fun m ->
+                                 let tick =
+                                     match m.Direction with
+                                     | Outgoing DeliveryStatus.Delivered -> " ✓"
+                                     | Outgoing DeliveryStatus.Sent -> ""
+                                     | Incoming -> ""
 
-            (HStack(8.) {
-                TextBox(compose, fun text -> SetPage(Chat(pk, text)))
-                    .watermark("Message...")
-                    .horizontalAlignment (HorizontalAlignment.Stretch)
+                                 let align =
+                                     match m.Direction with
+                                     | Incoming -> HorizontalAlignment.Right
+                                     | Outgoing _ -> HorizontalAlignment.Left
 
-                Button("Send", DoSend)
+                                 Border(
+                                     TextBlock($"{m.Body}{tick}")
+                                         .fontSize(14.)
+                                         .padding (8.))
+                                     .borderThickness(Avalonia.Thickness(2.))
+                                     .borderBrush(Avalonia.Media.SolidColorBrush(Avalonia.Media.Colors.Black))
+                                     .horizontalAlignment(align)
+                                     .margin (4.))
+                                 .layout(layout)
+                         )
+                             .horizontalScrollBarVisibility(Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled)
+                             .offset(Avalonia.Vector(0., System.Double.MaxValue))))
+                    .gridRow (2)
             })
-                .gridRow (3)
-        })
-            .margin (12.)
+
+        Styles.withBottomBar bar content
