@@ -57,7 +57,7 @@ federationUrl = \server -> federationScheme ++ server
 -- Types
 -- ============================================
 
-type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, fromKey: PubkeyHex, timestamp: Timestamp, toKey: PubkeyHex}}
+type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
 data GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
 
@@ -108,12 +108,12 @@ type Timestamp = Int<Ms>
 
 type Challenge = {pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp}
 type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp}
-type Message = {messageId: MessageIdHex, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, receivedAt: Timestamp}
+type Message = {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, receivedAt: Timestamp}
 type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Timestamp, timestamp: Timestamp}
-type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
+type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 data AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
-data SendResult = SendFailed {status: MessageStatus} | SendDone {delivery: DeliveryStatus, remoteServers: [ServerName], forwardServers: [ServerName], fromKey: PubkeyHex}
+data SendResult = SendFailed {status: MessageStatus} | SendDone {delivery: DeliveryStatus, remoteServers: [ServerName], forwardServers: [ServerName]}
 data VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
 data AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 data PollResult = PollUnauthorized {} | PollOk {events: [PollEvent], cursor: Timestamp}
@@ -174,7 +174,7 @@ route FederationApi where
     POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName} /gossip headers {authorization: Text}
       -> {ok: Bool}
       = RecvGossip
-    POST {toKey: PubkeyHex, fromKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex} /forward headers {authorization: Text}
+    POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex} /forward headers {authorization: Text}
       -> {ok: Bool}
       = ForwardMessage
     POST {messageIds: [MessageIdHex], originServer: ServerName, fromServer: ServerName} /ack headers {authorization: Text}
@@ -724,7 +724,7 @@ retryForwardsForServer = \entries remaining ->
       Just {value: f} -> do
         let rest = do x <- entries; where x.messageId != f.messageId; yield x
         result <- fetch (federationUrl f.toServer) (ForwardMessage {
-          toKey: f.toKey, fromKey: f.fromKey, encryptedBlob: f.encryptedBlob,
+          toKey: f.toKey, encryptedBlob: f.encryptedBlob,
           timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
           authorization: federationAuth})
         whenOk result (removeForward f.messageId f.toServer)
@@ -750,7 +750,7 @@ forwardQueuedMessages = \targets t -> do
       where m.toKey == target.pubkey
       where none forwards (\f -> f.messageId == m.messageId && f.toServer == target.server)
       yield {messageId: m.messageId, toServer: target.server, createdAt: t,
-             toKey: m.toKey, fromKey: m.fromKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp}
+             toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp}
     let capped = takeN candidates (maxForwardsEntries - count forwards)
     let updatedForwards = union forwards capped
     set *forwards = updatedForwards
@@ -842,7 +842,7 @@ pollOnce = \token cursor startWakeup -> do
             let evts = do
               m <- limitedMsgs
               yield {id: m.messageId, eventType: "message",
-                     payload: {toKey: m.toKey, fromKey: m.fromKey,
+                     payload: {toKey: m.toKey,
                                 encryptedBlob: m.encryptedBlob,
                                 timestamp: m.timestamp}}
             in let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
@@ -936,7 +936,7 @@ serve = \req -> case req of
       pr <- maybePrune t
       withSessionAuth authorization t
         (yield {pr: pr, send: SendFailed {status: MsUnauthorized {}}})
-        (\fromKey -> do
+        (\_ -> do
           messages <- *messages
           if countMessagesFor messages to t >= maxMessagesPerRecipient
             then yield {pr: pr, send: SendFailed {status: MsRejected {}}}
@@ -946,7 +946,7 @@ serve = \req -> case req of
               let seqTs = nextSeqTs t seqCounter
               set *seqCounter = seqTs
               let updatedMessages = union messages
-                [{messageId: msgId, toKey: to, fromKey: fromKey,
+                [{messageId: msgId, toKey: to,
                   encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
               set *messages = updatedMessages
               let toPresence = do p <- presence; where p.pubkey == to && p.expiresAt > t; yield p
@@ -959,17 +959,17 @@ serve = \req -> case req of
                 else if shouldForward then DsFederated {}
                 else DsQueued {}
               let updatedForwards = if shouldForward
-                then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob, timestamp: clampedTs})
+                then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs})
                 else forwards
               set *forwards = updatedForwards
-              yield {pr: pr, send: SendDone {delivery: delivery, remoteServers: remoteServers, forwardServers: forwardServers, fromKey: fromKey}})
+              yield {pr: pr, send: SendDone {delivery: delivery, remoteServers: remoteServers, forwardServers: forwardServers}})
     case result.send of
-      SendDone {delivery, remoteServers, forwardServers, fromKey} ->
+      SendDone {delivery, remoteServers, forwardServers} ->
         fork (do
           when (count remoteServers > 0 && federationEnabled) (do
             sendToEach remoteServers (\server -> do
               fwdResult <- fetch (federationUrl server) (ForwardMessage {
-                toKey: to, fromKey: fromKey, encryptedBlob: encryptedBlob,
+                toKey: to, encryptedBlob: encryptedBlob,
                 timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
                 authorization: federationAuth})
               when (any forwardServers (\s -> s == server))
@@ -1075,7 +1075,7 @@ serve = \req -> case req of
           (forwardQueuedMessages newlyOnlineRemote t))
       yield (respond {ok: True {}}))
 
-  ForwardMessage {toKey, fromKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
+  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, authorization, respond} -> do
     t <- now
     withFederationAuth authorization t respond (not (isLocalServer originServer)) (do
       let clampedTs = clampTimestamp timestamp t
@@ -1092,7 +1092,7 @@ serve = \req -> case req of
               let seqTs = nextSeqTs t seqCounter
               set *seqCounter = seqTs
               let updatedMessages = union messages
-                [{messageId: messageId, toKey: toKey, fromKey: fromKey,
+                [{messageId: messageId, toKey: toKey,
                   encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
               set *messages = updatedMessages
               yield {pr: pr, forward: ForwardStored {}}
