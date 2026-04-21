@@ -368,6 +368,15 @@ module App =
 
         | KeyboardHeightChanged h -> { model with KeyboardHeight = h }, []
 
+        | DoScanQR -> model, [ CmdScanQR ]
+
+        | QRScanned(Some text) ->
+            match model.Page with
+            | AddContact _ -> { model with Page = AddContact(text) }, []
+            | _ -> model, []
+
+        | QRScanned None -> model, []
+
     // ── mapCmd ──
 
     let private log msg = eprintfn $"[skrepka] {msg}"
@@ -417,6 +426,18 @@ module App =
         data.ToArray()
 
 #if MOBILE
+    let private scanQRCmd =
+        Cmd.ofEffect (fun dispatch ->
+            task {
+                try
+                    let! result = Skrepka.iOS.QRScanner.scan ()
+                    dispatch (QRScanned result)
+                with ex ->
+                    log $"QR scan error: {ex.Message}"
+                    dispatch (QRScanned None)
+            }
+            |> ignore)
+
     let private pickPhotoCmd =
         Cmd.ofEffect (fun dispatch ->
             task {
@@ -432,6 +453,49 @@ module App =
             }
             |> ignore)
 #else
+    let private scanQRCmd =
+        Cmd.ofEffect (fun dispatch ->
+            Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(fun () ->
+                task {
+                    try
+                        match getStorageProvider () with
+                        | Some sp ->
+                            let opts =
+                                Avalonia.Platform.Storage.FilePickerOpenOptions(
+                                    AllowMultiple = false,
+                                    Title = "Select QR Code Image",
+                                    FileTypeFilter =
+                                        [ Avalonia.Platform.Storage.FilePickerFileType(
+                                              "Images",
+                                              Patterns = [ "*.png"; "*.jpg"; "*.jpeg"; "*.gif"; "*.bmp" ]
+                                          ) ]
+                                )
+
+                            let! files = sp.OpenFilePickerAsync(opts)
+
+                            match files |> Seq.tryHead with
+                            | None -> dispatch (QRScanned None)
+                            | Some file ->
+                                use! stream = file.OpenReadAsync()
+                                use ms = new MemoryStream()
+                                do! stream.CopyToAsync(ms)
+
+                                use bitmap = SkiaSharp.SKBitmap.Decode(ms.ToArray())
+                                let reader = ZXing.SkiaSharp.BarcodeReader()
+                                let result = reader.Decode(bitmap)
+
+                                if isNull result then
+                                    dispatch (QRScanned None)
+                                else
+                                    dispatch (QRScanned(Some result.Text))
+                        | None -> dispatch (QRScanned None)
+                    with ex ->
+                        log $"QR scan error: {ex.Message}"
+                        dispatch (QRScanned None)
+                }
+                :> System.Threading.Tasks.Task)
+            |> ignore)
+
     let private pickPhotoCmd =
         Cmd.ofEffect (fun dispatch ->
             Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(fun () ->
@@ -634,6 +698,8 @@ module App =
         | CmdSaveData data -> Cmd.ofEffect (fun _ -> Store.saveData data |> Async.Start)
 
         | CmdPickPhoto -> pickPhotoCmd
+
+        | CmdScanQR -> scanQRCmd
 
         | CmdSaveProfile profile -> Cmd.ofEffect (fun _ -> Store.saveProfile profile |> Async.Start)
 

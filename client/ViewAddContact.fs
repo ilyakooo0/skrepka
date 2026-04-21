@@ -39,6 +39,8 @@ module ViewAddContact =
 
                     h2 "Enter someone else's address"
 
+                    smallButton Secondary "Scan QR Code" DoScanQR
+
                     let cpkTrimmed: string = cpk.Trim()
 
                     let isValid =

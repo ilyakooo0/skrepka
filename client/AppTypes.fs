@@ -86,6 +86,8 @@ module AppTypes =
         | Search of string
         | TokenExpired
         | KeyboardHeightChanged of float
+        | DoScanQR
+        | QRScanned of string option
 
     // ── CmdMsg ──
 
@@ -101,6 +103,7 @@ module AppTypes =
         | CmdPickPhoto
         | CmdSaveProfile of Profile
         | CmdSubscribeKeyboard
+        | CmdScanQR
 
     // ── Shared Helpers ──
 

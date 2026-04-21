@@ -38,6 +38,7 @@
     <Compile Include="Labels.fs" />
     <Compile Include="Buttons.fs" />
     <Compile Include="$(iOSPlatformFolder)PhotoPicker.fs" Condition="$(AvaloniaPlatform) == 'iOS'" />
+    <Compile Include="$(iOSPlatformFolder)QRScanner.fs" Condition="$(AvaloniaPlatform) == 'iOS'" />
     <Compile Include="Keyboard.fs" />
     <Compile Include="AppTypes.fs" />
     <Compile Include="Protocol.fs" />
@@ -92,6 +93,7 @@
     <Exec Command="$(_PB) -c 'Delete :UILaunchStoryboardName' '$(_Plist)'" ContinueOnError="true" />
     <Exec Command="$(_PB) -c 'Add :UILaunchScreen dict' '$(_Plist)'" ContinueOnError="true" />
     <!-- Privacy descriptions -->
+    <Exec Command="$(_PB) -c 'Add :NSCameraUsageDescription string Skrepka needs access to your camera to scan QR codes.' '$(_Plist)'" ContinueOnError="true" />
     <Exec Command="$(_PB) -c 'Add :NSPhotoLibraryUsageDescription string Skrepka needs access to your photo library to set a profile photo.' '$(_Plist)'" ContinueOnError="true" />
     <!-- App icon (fallback when actool produces empty output) -->
     <Exec Command="$(_PB) -c 'Add :CFBundleIcons dict' '$(_Plist)'" ContinueOnError="true" />
@@ -130,6 +132,7 @@
     <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0-preview.2.26159.112" />
     <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
     <PackageReference Include="QRCoder" Version="1.6.0" />
+    <PackageReference Include="ZXing.Net.Bindings.SkiaSharp" Version="0.16.22" Condition="$(AvaloniaPlatform) == 'Desktop'" />
   </ItemGroup>
 
 </Project>
