@@ -1,7 +1,7 @@
 # Skrepka
 
 <p align="center">
-  <img src="client/Resources/Images/logo.png" width="300px" align="center">
+  <img src="client/Assets/Images/logo.png" width="300px" align="center">
 </p>
 
 Decentralized, end-to-end encrypted messaging with no accounts and no home servers. See [PROTOCOL.md](PROTOCOL.md) for the full specification.
