@@ -52,7 +52,7 @@ module ViewAddContact =
                     if hasError then
                         errorTextField cpk (fun key -> SetPage(AddContact(key)))
                     else
-                        textField cpk (fun key -> SetPage(AddContact(key)))
+                        textField "" cpk (fun key -> SetPage(AddContact(key)))
 
 
                     if isValid then

@@ -21,7 +21,7 @@ module ViewEditProfile =
                     imageButton photo DoPickPhoto
 
                     TextBlock("Name").fontFamily(Constants.fontFamily).fontWeight(FontWeight.Bold).margin (0, 24, 0, -8)
-                    (textField displayName (fun text -> SetPage(EditProfile(text, bio, photo)))).margin (0, 0, 0, 8)
+                    (textField "" displayName (fun text -> SetPage(EditProfile(text, bio, photo)))).margin (0, 0, 0, 8)
 
 
                     TextBlock("Bio").fontFamily(Constants.fontFamily).fontWeight(FontWeight.Bold).margin (0, 0, 0, -8)

@@ -91,8 +91,8 @@ module ViewConversations =
                     .centerText ()
 
                 (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], [ Dimension.Auto ]) {
-                    (smallImageButton None (SetPage Settings)).gridColumn (0)
-                    (textField "" Search).margin(8.).verticalAlignment(VerticalAlignment.Stretch).gridColumn (1)
+                    (smallImageButton "avares://Skrepka/Assets/Images/user.png" (SetPage Settings)).gridColumn (0)
+                    (textField "" "" Search).margin(8.).verticalAlignment(VerticalAlignment.Stretch).gridColumn (1)
                     (smallTextButton "+" (SetPage(AddContact("")))).gridColumn (2)
                 })
                     .horizontalAlignment (HorizontalAlignment.Stretch)

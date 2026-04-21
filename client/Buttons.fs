@@ -131,13 +131,8 @@ module Buttons =
                 .onTapped (fun _ -> msg)
         }
 
-    let smallImageButton (img: byte[] option) (msg: 'msg) =
-        let key =
-            match img with
-            | None -> "img-button"
-            | Some i -> $"img-button-{hash i}"
-
-        Component(key) {
+    let smallImageButton (asset: string) (msg: 'msg) =
+        Component($"img-button-{asset}") {
             let! pressed = Context.State(false)
             let offset = if pressed.Current then 2. else 4.
 
@@ -146,17 +141,7 @@ module Buttons =
 
                 Rectangle().fill (SolidColorBrush(Colors.White))
 
-                match img with
-                | None ->
-                    ViewBox(
-                        Image("avares://Skrepka/Assets/Images/user.png", Stretch.Uniform)
-                            .width(32.)
-                            .height(32.)
-                            .margin (8.)
-                    )
-
-                | Some i ->
-                    Image(Styles.cachedBitmap i, Stretch.UniformToFill).width(32.).height(32.).clipToBounds (true)
+                Image(asset, Stretch.Uniform).width(24.).height(24.).center ()
 
                 borderRect ()
             })

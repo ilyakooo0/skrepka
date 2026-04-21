@@ -29,9 +29,9 @@ module TextFields =
                   .Name("PART_BorderElement"))
               [ setter ] ]
 
-    let textField value msg =
+    let textField watermark value msg =
         (Grid() {
-            TextBox(value, msg).fontFamily(Constants.fontFamily).verticalAlignment(VerticalAlignment.Stretch).verticalContentAlignment(VerticalAlignment.Center).background(SolidColorBrush(Colors.White))
+            TextBox(value, msg).watermark(watermark).fontFamily(Constants.fontFamily).verticalAlignment(VerticalAlignment.Stretch).verticalContentAlignment(VerticalAlignment.Center).background(SolidColorBrush(Colors.White))
             Rectangle().stroke(Colors.Black).strokeThickness (4.)
         }).styles (whiteBg ())
 

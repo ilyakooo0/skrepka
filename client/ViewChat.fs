@@ -87,15 +87,11 @@ module ViewChat =
             (Grid([ Dimension.Auto; Dimension.Star; Dimension.Auto ], [ Dimension.Auto ]) {
                 (backButton (SetPage Conversations)).gridColumn (0)
 
-                TextBox(compose, fun text -> SetPage(Chat(pk, text)))
-                    .watermark("Message...")
-                    .fontFamily(Constants.fontFamily)
-                    .verticalAlignment(VerticalAlignment.Stretch)
-                    .verticalContentAlignment(VerticalAlignment.Center)
+                (textField "Message..." compose (fun text -> SetPage(Chat(pk, text))))
                     .margin(8.)
                     .gridColumn (1)
 
-                (smallButton Primary "Send" DoSend).gridColumn (2)
+                (smallImageButton "avares://Skrepka/Assets/Images/send.png" DoSend).gridColumn (2)
             })
                 .horizontalAlignment (HorizontalAlignment.Stretch)
 
