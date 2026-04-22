@@ -114,8 +114,7 @@ type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: T
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 data AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 data SendResult = SendFailed {status: MessageStatus} | SendDone {delivery: DeliveryStatus, remoteServers: [ServerName], forwardServers: [ServerName]} | SendDuplicate {}
-data AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
-data PollResult = PollUnauthorized {} | PollOk {events: [PollEvent], cursor: Timestamp}
+data PollResult = PollUnauthorized {} | PollOk {events: [PollEvent], cursor: Timestamp, pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 -- ============================================
@@ -166,9 +165,6 @@ route ClientApi where
     POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId} / headers {authorization: Text}
       -> {status: MessageStatus, messageId: OptionalMessageId}
       = SendMessage
-    POST {messageIds: [MessageIdHex]} /ack headers {authorization: Text}
-      -> {ok: Bool}
-      = AckMessages
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text}
     -> {server: AnyServerName, authorized: Bool}
     = LookupPresence
@@ -793,19 +789,30 @@ readMessageSignal = \pubkey ->
   else if b == 2 then do s <- *messageSignal2; yield s
   else do s <- *messageSignal3; yield s
 
-pollEvents = \allMessages pubkey clampedCursor t ->
-  let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages allMessages pubkey clampedCursor t)) in
+pollEventsAndDelete = \pubkey clampedCursor t -> do
+  messages <- *messages
+  let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages messages pubkey clampedCursor t))
   if count limitedMsgs > 0
-    then
+    then do
+      set *messages = diff messages limitedMsgs
+      let polledMsgIds = do m <- limitedMsgs; yield m.messageId
+      forwards <- *forwards
+      set *forwards = do f <- forwards; where none polledMsgIds (\mid -> f.messageId == mid && f.toKey == pubkey); yield f
+      let ackedFederated = federatedAckEntries limitedMsgs t
+      ackedIds <- *ackedIds
+      let combinedAckedIds = union ackedIds ackedFederated
+      let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
+        if excessCount <= 0 then [] else takeRelation excessCount (sortBy (\a -> a.ackedAt) combinedAckedIds)
+      set *ackedIds = diff combinedAckedIds evictedEntries
       let evts = do
         m <- limitedMsgs
         yield {id: m.messageId, eventType: "message",
                payload: {toKey: m.toKey,
                           encryptedBlob: m.encryptedBlob,
                           timestamp: m.timestamp}}
-      in let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
-      in PollOk {events: evts, cursor: lastReceivedAt}
-    else PollOk {events: [], cursor: clampedCursor}
+      let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
+      yield (PollOk {events: evts, cursor: lastReceivedAt, pendingAcks: ackedFederated, evictedEntries: evictedEntries})
+    else yield (PollOk {events: [], cursor: clampedCursor, pendingAcks: [], evictedEntries: []})
 
 pollOnce = \token cursor -> do
   t <- now
@@ -822,7 +829,7 @@ pollOnce = \token cursor -> do
       initialMessages <- *messages
       let initial = pollableMessages initialMessages pubkey clampedCursor t
       if count initial > 0
-        then yield (pollEvents initialMessages pubkey clampedCursor t)
+        then atomic do pollEventsAndDelete pubkey clampedCursor t
         else do
           -- Phase 2: wait for signal or heartbeat (no *messages dependency)
           atomic do
@@ -831,9 +838,8 @@ pollOnce = \token cursor -> do
             if wakeup > startWakeup || signal > startSignal
               then yield {}
               else retry
-          -- Phase 3: read messages after waking
-          newMessages <- *messages
-          yield (pollEvents newMessages pubkey clampedCursor t)
+          -- Phase 3: read messages after waking, delete atomically
+          atomic do pollEventsAndDelete pubkey clampedCursor t
 
 -- ============================================
 -- Derived Relations
@@ -859,9 +865,6 @@ bestServerForKey = \entries ->
 
 pollableMessages = \messages pubkey cursor t ->
   do m <- messages; where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > cursor; yield m
-
-matchingAckMessages = \messages pubkey messageIds ->
-  do m <- messages; where m.toKey == pubkey && any messageIds (\mid -> m.messageId == mid); yield m
 
 federatedAckEntries = \ackedMessages t ->
   do m <- ackedMessages; where m.originServer != ""; yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
@@ -998,6 +1001,12 @@ serve = \req -> case req of
       Just {value: token} -> pollOnce token cursor
     tAfterPoll <- now
     maybePruneAndBroadcast tAfterPoll
+    case result of
+      PollOk {pendingAcks, evictedEntries} ->
+        fork (when federationEnabled (do
+          sendAcksAndClean pendingAcks
+          retryEvictedAcks evictedEntries pendingAcks))
+      PollUnauthorized {} -> yield {}
     yield (respond (case result of
       PollUnauthorized {} -> {events: [], cursor: 0, authorized: False {}}
       PollOk {events: evts, cursor: c} -> {events: evts, cursor: c, authorized: True {}}))
@@ -1062,38 +1071,6 @@ serve = \req -> case req of
       SendDuplicate {} -> respond {status: MsDelivered {}, messageId: effectiveMsgId}
       SendDone {delivery} -> respond {status: deliveryToMessageStatus delivery, messageId: effectiveMsgId})
 
-  AckMessages {messageIds, authorization, respond} -> do
-    t <- now
-    let dedupedIds = dedupMessageIds messageIds
-    result <- atomic do
-      pr <- maybePrune t
-      withSessionAuth authorization t
-        (yield {pr: pr, ack: AckUnauthorized {}})
-        (\pubkey -> do
-          messages <- *messages
-          let ackedMessages = matchingAckMessages messages pubkey dedupedIds
-          let remainingMessages = diff messages ackedMessages
-          set *messages = remainingMessages
-          forwards <- *forwards
-          let ackedMsgIds = do m <- ackedMessages; yield m.messageId
-          set *forwards = do f <- forwards; where none ackedMsgIds (\mid -> f.messageId == mid && f.toKey == pubkey); yield f
-          let ackedFederated = federatedAckEntries ackedMessages t
-          ackedIds <- *ackedIds
-          let combinedAckedIds = union ackedIds ackedFederated
-          let evictedEntries = let excessCount = count combinedAckedIds - maxAckedIds in
-            if excessCount <= 0 then [] else takeRelation excessCount (sortBy (\a -> a.ackedAt) combinedAckedIds)
-          let remainingAckedIds = diff combinedAckedIds evictedEntries
-          set *ackedIds = remainingAckedIds
-          yield {pr: pr, ack: AckDone {pendingAcks: ackedFederated, evictedEntries: evictedEntries}})
-    fork (do
-      case result.ack of
-        AckDone {pendingAcks, evictedEntries} ->
-          when federationEnabled (do
-            sendAcksAndClean pendingAcks
-            retryEvictedAcks evictedEntries pendingAcks)
-        AckUnauthorized {} -> yield {}
-      broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
-    yield (respond {ok: case result.ack of AckDone _ -> True {}; _ -> False {}})
 
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now

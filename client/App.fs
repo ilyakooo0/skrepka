@@ -602,8 +602,6 @@ module App =
                             dispatch TokenExpired
                         else
 
-                            let ackIds = response.Events |> Array.map _.Id |> Array.toList
-
                             let results =
                                 response.Events
                                 |> Array.choose (fun evt ->
@@ -624,12 +622,6 @@ module App =
 
                             for e in errors do
                                 log $"decrypt error: {e}"
-
-                            if not ackIds.IsEmpty then
-                                try
-                                    do! ackMessages session.Url session.Token ackIds
-                                with ex ->
-                                    log $"ack error: {ex.Message}"
 
                             if not events.IsEmpty then
                                 let acksBySender =
