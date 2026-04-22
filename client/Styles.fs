@@ -38,10 +38,7 @@ module Styles =
               [ Setter(ListBoxItem.PaddingProperty, Thickness(0.))
                 Setter(ListBoxItem.MinHeightProperty, box 0.) ]
           style
-              (_.OfType<ListBoxItem>()
-                  .Template()
-                  .OfType<ContentPresenter>()
-                  .Name("PART_ContentPresenter"))
+              (_.OfType<ListBoxItem>().Template().OfType<ContentPresenter>().Name("PART_ContentPresenter"))
               [ Setter(ContentPresenter.MarginProperty, Thickness(0.)) ] ]
 
     let noListBoxSelection () =
@@ -69,9 +66,19 @@ module Styles =
         let h =
             System.HashCode.Combine(
                 bytes.Length,
-                (if bytes.Length > 3 then System.BitConverter.ToInt32(bytes, 0) else 0),
-                (if bytes.Length > 7 then System.BitConverter.ToInt32(bytes, bytes.Length / 2) else 0),
-                (if bytes.Length > 11 then System.BitConverter.ToInt32(bytes, bytes.Length - 4) else 0))
+                (if bytes.Length > 3 then
+                     System.BitConverter.ToInt32(bytes, 0)
+                 else
+                     0),
+                (if bytes.Length > 7 then
+                     System.BitConverter.ToInt32(bytes, bytes.Length / 2)
+                 else
+                     0),
+                (if bytes.Length > 11 then
+                     System.BitConverter.ToInt32(bytes, bytes.Length - 4)
+                 else
+                     0)
+            )
 
         while bitmapCache.Count >= Constants.maxBitmapCacheSize do
             match bitmapInsertOrder.TryDequeue() with
@@ -81,6 +88,9 @@ module Styles =
                 | _ -> ()
             | _ -> bitmapCache.Clear()
 
-        bitmapCache.GetOrAdd(h, fun _ ->
-            bitmapInsertOrder.Enqueue(h)
-            new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(bytes)))
+        bitmapCache.GetOrAdd(
+            h,
+            fun _ ->
+                bitmapInsertOrder.Enqueue(h)
+                new Avalonia.Media.Imaging.Bitmap(new System.IO.MemoryStream(bytes))
+        )
