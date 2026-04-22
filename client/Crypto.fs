@@ -178,14 +178,24 @@ module Crypto =
         let info = Encoding.UTF8.GetBytes(Constants.hkdfInfo)
         HKDF.DeriveKey(HashAlgorithmName.SHA256, rawSecret, 32, salt, info)
 
-    // Blob layout: [ephPub(32) | nonce(24) | ciphertext | senderPub(32) | signature(64)]
+    // Blob layout v2: [ephPub(32) | nonce(24) | ciphertext]
+    //   encrypted payload: [senderPub(32) | signature(64) | compressed]
+    //   signature signs (recipientPub ++ compressed) — prevents forwarding
+    // Legacy layout:  [ephPub(32) | nonce(24) | ciphertext | senderPub(32) | signature(64)]
     let private ephPubLen = 32
     let private nonceLen = 24
     let private pubLen = 32
     let private sigLen = 64
     let private headerLen = ephPubLen + nonceLen
-    let private trailerLen = pubLen + sigLen
-    let private minBlobLen = headerLen + 16 + trailerLen // 16 = AEAD tag
+    let private legacyTrailerLen = pubLen + sigLen
+    let private minBlobLen = headerLen + pubLen + sigLen + 16 // inner fields + AEAD tag
+
+    let private deriveSymKey recipientPrivKey ephPub =
+        let recipientX25519Priv = ed25519SkToCurve25519 recipientPrivKey
+        let rawSecret = scalarMult recipientX25519Priv ephPub
+        let recipientEd25519Pub = recipientPrivKey.[32..63]
+        let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
+        deriveKey ephPub recipientX25519Pub rawSecret
 
     let encrypt (senderPrivKey: byte[]) (recipientEd25519Pub: byte[]) (plaintext: string) : byte[] option =
         if senderPrivKey.Length <> 64 || recipientEd25519Pub.Length <> 32 then
@@ -200,17 +210,12 @@ module Crypto =
                 let nonce = getRandomBytes 24
                 let ptBytes = Encoding.UTF8.GetBytes(plaintext)
                 let compressed = LZ4Pickler.Pickle(ptBytes)
-                let ciphertext = aeadEncrypt compressed nonce key
-                let signature = signDetached ciphertext senderPrivKey
+                let signedData = Array.append recipientEd25519Pub compressed
+                let signature = signDetached signedData senderPrivKey
+                let inner = Array.concat [| senderPubKey; signature; compressed |]
+                let ciphertext = aeadEncrypt inner nonce key
 
-                Some(
-                    Array.concat
-                        [| ephPub
-                           nonce
-                           ciphertext
-                           senderPubKey
-                           signature |]
-                )
+                Some(Array.concat [| ephPub; nonce; ciphertext |])
             with ex ->
                 log $"encrypt error: {ex.Message}"
                 None
@@ -219,24 +224,52 @@ module Crypto =
         if recipientPrivKey.Length <> 64 || blob.Length < minBlobLen then
             None
         else
-            try
-                let ephPub = blob.[.. ephPubLen - 1]
-                let nonce = blob.[ephPubLen .. headerLen - 1]
-                let ciphertext = blob.[headerLen .. blob.Length - trailerLen - 1]
-                let senderPub = blob.[blob.Length - trailerLen .. blob.Length - sigLen - 1]
-                let signature = blob.[blob.Length - sigLen ..]
+            let ephPub = blob.[.. ephPubLen - 1]
+            let nonce = blob.[ephPubLen .. headerLen - 1]
 
-                if not (verifyDetached signature ciphertext senderPub) then
-                    None
-                else
-                    let recipientX25519Priv = ed25519SkToCurve25519 recipientPrivKey
-                    let rawSecret = scalarMult recipientX25519Priv ephPub
-                    let recipientEd25519Pub = recipientPrivKey.[32..63]
-                    let recipientX25519Pub = ed25519PkToCurve25519 recipientEd25519Pub
-                    let key = deriveKey ephPub recipientX25519Pub rawSecret
+            // Try v2 format: entire payload after header is ciphertext
+            let v2Result =
+                try
+                    let ciphertext = blob.[headerLen ..]
+                    let key = deriveSymKey recipientPrivKey ephPub
                     let decrypted = aeadDecrypt ciphertext nonce key
-                    let plaintext = LZ4Pickler.Unpickle(decrypted)
-                    Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
-            with ex ->
-                log $"decrypt error: {ex.Message}"
-                None
+
+                    if decrypted.Length < pubLen + sigLen then
+                        None
+                    else
+                        let senderPub = decrypted.[.. pubLen - 1]
+                        let signature = decrypted.[pubLen .. pubLen + sigLen - 1]
+                        let compressed = decrypted.[pubLen + sigLen ..]
+
+                        let recipientPub = recipientPrivKey.[32..63]
+                        let signedData = Array.append recipientPub compressed
+
+                        if verifyDetached signature signedData senderPub then
+                            let plaintext = LZ4Pickler.Unpickle(compressed)
+                            Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
+                        else
+                            None
+                with _ -> None
+
+            match v2Result with
+            | Some _ -> v2Result
+            | None ->
+                // Fall back to legacy format: trailer has senderPub + signature in plaintext
+                try
+                    if blob.Length < headerLen + 16 + legacyTrailerLen then
+                        None
+                    else
+                        let ciphertext = blob.[headerLen .. blob.Length - legacyTrailerLen - 1]
+                        let senderPub = blob.[blob.Length - legacyTrailerLen .. blob.Length - sigLen - 1]
+                        let signature = blob.[blob.Length - sigLen ..]
+
+                        if not (verifyDetached signature ciphertext senderPub) then
+                            None
+                        else
+                            let key = deriveSymKey recipientPrivKey ephPub
+                            let decrypted = aeadDecrypt ciphertext nonce key
+                            let plaintext = LZ4Pickler.Unpickle(decrypted)
+                            Some(Encoding.UTF8.GetString(plaintext), toHex senderPub)
+                with ex ->
+                    log $"decrypt error: {ex.Message}"
+                    None
