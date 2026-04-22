@@ -141,6 +141,8 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 *pollWakeup : Timestamp
 
+*messageSignal : Timestamp
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -396,7 +398,7 @@ isBadServerName = \sn ->
 
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
-  case headOf (do s <- sessions; where s.expiresAt > t && s.token == token; yield s) of
+  case headOf (do s <- sessions; where s.expiresAt > t && safeCompare s.token token; yield s) of
     Nothing {} -> Unauthorized {}
     Just {value: s} -> Authorized {pubkey: s.pubkey}
 
@@ -771,6 +773,7 @@ pollOnce = \token cursor -> do
       startWakeup <- *pollWakeup
       atomic do
         wakeup <- *pollWakeup
+        messageSignal <- *messageSignal
         allMessages <- *messages
         let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages allMessages pubkey clampedCursor t))
         if count limitedMsgs > 0
@@ -978,6 +981,7 @@ serve = \req -> case req of
                 set *messages = union messages
                   [{messageId: effectiveMsgId, toKey: to,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
+                set *messageSignal = seqTs
                 let toPresence = presenceForKey presence to t
                 let localOnline = hasLocalPresence toPresence
                 let remoteServers = collectPeerServers toPresence (\p -> p.server)
@@ -1105,6 +1109,7 @@ serve = \req -> case req of
                 [{messageId: messageId, toKey: toKey,
                   encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
               set *messages = updatedMessages
+              set *messageSignal = seqTs
               yield {pr: pr, forward: ForwardStored {}}
       forkBroadcastOffline t result.pr
       yield (respond {ok: case result.forward of
