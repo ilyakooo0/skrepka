@@ -141,7 +141,10 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 *pollWakeup : Timestamp
 
-*messageSignal : Timestamp
+*messageSignal0 : Timestamp
+*messageSignal1 : Timestamp
+*messageSignal2 : Timestamp
+*messageSignal3 : Timestamp
 
 -- ============================================
 -- Routes
@@ -150,7 +153,7 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 route AuthApi where
   /auth
     POST {pubkey: PubkeyHex} /challenge
-      -> {challenge: Text}
+      -> {challenge: Text, ok: Bool}
       = ReqChallenge
     POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex} /verify
       -> {token: Text, expiresAt: Timestamp}
@@ -188,7 +191,10 @@ route MaintenanceApi where
     -> {ok: Bool}
     = Prune
 
-route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi
+route HealthApi where
+  GET /health -> {ok: Bool} = Health
+
+route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi | HealthApi
 
 -- ============================================
 -- Helpers
@@ -761,6 +767,28 @@ pruneAndRetry = \t -> do
     retryPendingForwards result.pendingForwards
     sendAcksAndClean result.pendingAcks)
 
+pubkeyBucket : PubkeyHex -> Int
+pubkeyBucket = \pubkey ->
+  let c = take 1 pubkey in
+  if contains c "0123" then 0
+  else if contains c "4567" then 1
+  else if contains c "89ab" then 2
+  else 3
+
+signalMessageForKey = \pubkey ts ->
+  let b = pubkeyBucket pubkey in
+  if b == 0 then set *messageSignal0 = ts
+  else if b == 1 then set *messageSignal1 = ts
+  else if b == 2 then set *messageSignal2 = ts
+  else set *messageSignal3 = ts
+
+readMessageSignal = \pubkey ->
+  let b = pubkeyBucket pubkey in
+  if b == 0 then do s <- *messageSignal0; yield s
+  else if b == 1 then do s <- *messageSignal1; yield s
+  else if b == 2 then do s <- *messageSignal2; yield s
+  else do s <- *messageSignal3; yield s
+
 pollOnce = \token cursor -> do
   t <- now
   sessions <- *sessions
@@ -773,7 +801,7 @@ pollOnce = \token cursor -> do
       startWakeup <- *pollWakeup
       atomic do
         wakeup <- *pollWakeup
-        messageSignal <- *messageSignal
+        messageSignal <- readMessageSignal pubkey
         allMessages <- *messages
         let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages allMessages pubkey clampedCursor t))
         if count limitedMsgs > 0
@@ -907,46 +935,45 @@ serve = \req -> case req of
     when (not result.accepted)
       (println ("challenge: at capacity (" ++ show maxChallenges ++ "), rejecting for " ++ pubkey))
     forkBroadcastOffline t result.pr
-    yield (respond {challenge: if result.accepted then challenge else ""})
+    yield (respond {challenge: if result.accepted then challenge else "", ok: result.accepted})
 
   VerifyAuth {pubkey, challenge, signature, respond} -> do
     t <- now
-    token <- genToken
     let expiry = t + sessionExpiry
-    result <- atomic do
+    validation <- atomic do
       pr <- maybePrune t
       challenges <- *challenges
-      sessions <- *sessions
-      presence <- *presence
       let hasMatch = challengeMatch challenges pubkey challenge t
       let sigValid = hasMatch && verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
       if not sigValid
-        then yield {pr: pr, verify: VerifyFailed {}}
+        then yield {pr: pr, valid: False {}}
         else do
-          let remainingChallenges = challengesExcluding challenges pubkey challenge
-          set *challenges = remainingChallenges
+          set *challenges = challengesExcluding challenges pubkey challenge
+          yield {pr: pr, valid: True {}}
+    if validation.valid
+      then do
+        token <- genToken
+        peerServers <- atomic do
+          sessions <- *sessions
+          presence <- *presence
           let capped = capPerKeyAndGlobal sessions (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t maxSessions
-          let updatedSessions = union capped [{token: token, pubkey: pubkey, expiresAt: expiry}]
-          set *sessions = updatedSessions
+          set *sessions = union capped [{token: token, pubkey: pubkey, expiresAt: expiry}]
           let presenceWithout = presenceWithoutLocalKey presence pubkey
           let presenceEvicted = capGlobal presenceWithout maxPresenceEntries (\p -> p.expiresAt)
           let updatedPresence = union presenceEvicted [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]
           set *presence = updatedPresence
-          let peerServers = if federationEnabled
+          yield (if federationEnabled
             then collectPeerServers updatedPresence (\p -> p.server)
-            else []
-          yield {pr: pr, verify: VerifyOk {peerServers: peerServers}}
-    case result.verify of
-      VerifyFailed {} -> do
-        forkBroadcastOffline t result.pr
-        yield (respond {token: "", expiresAt: 0})
-      VerifyOk {peerServers} -> do
-        let expiredLocal = do p <- result.pr.expiredLocal; where p.pubkey != pubkey; yield p
+            else [])
+        let expiredLocal = do p <- validation.pr.expiredLocal; where p.pubkey != pubkey; yield p
         fork (do
           when federationEnabled
             (sendBatchedGossip peerServers [{eventType: GossipOnline {}, pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}] gossipOriginHops)
-          broadcastOfflineGossip t result.pr.peerServers expiredLocal)
+          broadcastOfflineGossip t validation.pr.peerServers expiredLocal)
         yield (respond {token: token, expiresAt: expiry})
+      else do
+        forkBroadcastOffline t validation.pr
+        yield (respond {token: "", expiresAt: 0})
 
   Poll {cursor, authorization, respond} -> do
     result <- case extractToken authorization of
@@ -981,7 +1008,7 @@ serve = \req -> case req of
                 set *messages = union messages
                   [{messageId: effectiveMsgId, toKey: to,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
-                set *messageSignal = seqTs
+                signalMessageForKey to seqTs
                 let toPresence = presenceForKey presence to t
                 let localOnline = hasLocalPresence toPresence
                 let remoteServers = collectPeerServers toPresence (\p -> p.server)
@@ -1109,8 +1136,11 @@ serve = \req -> case req of
                 [{messageId: messageId, toKey: toKey,
                   encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
               set *messages = updatedMessages
-              set *messageSignal = seqTs
+              signalMessageForKey toKey seqTs
               yield {pr: pr, forward: ForwardStored {}}
+      case result.forward of
+        ForwardRejected {} -> println ("forward: rejected for " ++ toKey ++ " (mailbox full, max " ++ show maxMessagesPerRecipient ++ ")")
+        _ -> yield {}
       forkBroadcastOffline t result.pr
       yield (respond {ok: case result.forward of
         ForwardRejected {} -> False {}
@@ -1134,18 +1164,22 @@ serve = \req -> case req of
     when authorized (fork (pruneAndRetry t))
     yield (respond {ok: authorized})
 
+  Health {respond} -> yield (respond {ok: True {}})
+
 -- ============================================
 -- Entry Point
 -- ============================================
 
 backgroundPrune = do
-  sleep backgroundPruneInterval
+  jitter <- randomInt 5000
+  sleep (backgroundPruneInterval + jitter)
   t <- now
   pruneAndRetry t
   backgroundPrune
 
 pollHeartbeat = do
-  sleep pollTimeoutMs
+  jitter <- randomInt 2000
+  sleep (pollTimeoutMs + jitter)
   t <- now
   atomic do
     set *pollWakeup = t
