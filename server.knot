@@ -571,12 +571,12 @@ sendToEach = \servers action ->
 
 pruneExpired = \t -> do
   challenges <- *challenges
-  set *challenges = activeByExpiry challenges t
+  set *challenges = do x <- challenges; where x.expiresAt > t; yield x
   sessions <- *sessions
-  set *sessions = activeByExpiry sessions t
+  set *sessions = do x <- sessions; where x.expiresAt > t; yield x
   presenceBefore <- *presence
   let peerServersBefore = collectPeerServers presenceBefore (\p -> p.server)
-  let presenceAfter = activeByExpiry presenceBefore t
+  let presenceAfter = do x <- presenceBefore; where x.expiresAt > t; yield x
   set *presence = presenceAfter
   let messageCutoff = t - messageMaxAge
   messages <- *messages
@@ -760,7 +760,8 @@ pruneAndRetry = \t -> do
     set *lastPrunedAt = t
     pr <- pruneExpired t
     forwards <- *forwards
-    pendingAcks <- &pendingRemoteAcks
+    ackedIds2 <- *ackedIds
+    let pendingAcks = do a <- ackedIds2; where not (isLocalServer a.originServer); yield a
     yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: forwards, pendingAcks: pendingAcks}
   broadcastOfflineGossip t result.peerServers result.expiredLocal
   when federationEnabled (do
@@ -881,7 +882,6 @@ forwardCandidates = \targets messages forwards t ->
     yield {messageId: m.messageId, toServer: target.server, createdAt: t,
            toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp}
 
-activeByExpiry = \items t -> do x <- items; where x.expiresAt > t; yield x
 
 challengeMatch = \challenges pubkey challenge t ->
   any challenges (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t)
@@ -890,10 +890,6 @@ challengesExcluding = \challenges pubkey challenge ->
   do c <- challenges; where c.pubkey != pubkey || c.challenge != challenge; yield c
 
 hasLocalPresence = \entries -> any entries (\p -> isLocalServer p.server)
-
-&pendingRemoteAcks = do
-  ackedIds <- *ackedIds
-  yield (do a <- ackedIds; where not (isLocalServer a.originServer); yield a)
 
 ackedIdsExcludingBatch = \ackedIds server batch ->
   do a <- ackedIds; where not (a.originServer == server && hasMessage a.messageId a.toKey batch); yield a
