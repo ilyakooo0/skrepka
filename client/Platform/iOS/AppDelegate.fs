@@ -12,10 +12,23 @@ open Skrepka
 type AppDelegate() =
     inherit AvaloniaAppDelegate<FabApplication>()
 
+    let readSafeArea () =
+        let w = UIApplication.SharedApplication.KeyWindow
+        if not (isNull w) then
+            SafeArea.triggerInsetsChanged(float w.SafeAreaInsets.Top, float w.SafeAreaInsets.Bottom)
+
     override this.CreateAppBuilder() =
-        NSTimer.CreateScheduledTimer(0.0, false, fun _ ->
+        NSTimer.CreateScheduledTimer(0.1, false, fun _ ->
             if this.Window <> null then
-                this.Window.BackgroundColor <- UIColor.White)
+                this.Window.BackgroundColor <- UIColor.White
+            readSafeArea())
+        |> ignore
+
+        UIDevice.CurrentDevice.BeginGeneratingDeviceOrientationNotifications()
+        NSNotificationCenter.DefaultCenter.AddObserver(
+            UIDevice.OrientationDidChangeNotification,
+            Action<NSNotification>(fun _ ->
+                NSTimer.CreateScheduledTimer(0.1, false, fun _ -> readSafeArea()) |> ignore))
         |> ignore
 
         NSNotificationCenter.DefaultCenter.AddObserver(

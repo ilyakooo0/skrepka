@@ -135,8 +135,10 @@ module App =
           Profile = None
           FlushingOutbox = false
           PollRetries = 0
-          KeyboardHeight = 0. },
-        [ CmdLoadState; CmdSubscribeKeyboard ]
+          KeyboardHeight = 0.
+          SafeAreaTop = 0.
+          SafeAreaBottom = 0. },
+        [ CmdLoadState; CmdSubscribeKeyboard; CmdSubscribeSafeArea ]
 
     // ── Update ──
 
@@ -367,6 +369,7 @@ module App =
         | Search _ -> model, []
 
         | KeyboardHeightChanged h -> { model with KeyboardHeight = h }, []
+        | SafeAreaChanged(top, bottom) -> { model with SafeAreaTop = top; SafeAreaBottom = bottom }, []
 
         | DoScanQR -> model, [ CmdScanQR ]
 
@@ -698,6 +701,9 @@ module App =
         | CmdSubscribeKeyboard ->
             Cmd.ofEffect (fun dispatch -> Keyboard.heightChanged.Add(fun h -> dispatch (KeyboardHeightChanged h)))
 
+        | CmdSubscribeSafeArea ->
+            Cmd.ofEffect (fun dispatch -> SafeArea.insetsChanged.Add(fun (t, b) -> dispatch (SafeAreaChanged(t, b))))
+
     // ── View ──
 
     let private pageContent model =
@@ -712,7 +718,7 @@ module App =
 
         Border(page)
             .background(SolidColorBrush(Colors.White))
-            .padding (Avalonia.Thickness(0., 0., 0., model.KeyboardHeight))
+            .padding (Avalonia.Thickness(0., model.SafeAreaTop, 0., model.KeyboardHeight))
 
     let view model =
 #if MOBILE

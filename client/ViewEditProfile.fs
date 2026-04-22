@@ -38,4 +38,4 @@ module ViewEditProfile =
                 (button Secondary "save" DoSaveProfile).margin (8.)
             }
 
-        withBottomBar bar content
+        withBottomBar model.SafeAreaBottom bar content

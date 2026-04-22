@@ -60,7 +60,9 @@ module AppTypes =
           Profile: Profile option
           FlushingOutbox: bool
           PollRetries: int
-          KeyboardHeight: float }
+          KeyboardHeight: float
+          SafeAreaTop: float
+          SafeAreaBottom: float }
 
     // ── Msg ──
 
@@ -86,6 +88,7 @@ module AppTypes =
         | Search of string
         | TokenExpired
         | KeyboardHeightChanged of float
+        | SafeAreaChanged of top: float * bottom: float
         | DoScanQR
         | QRScanned of string option
 
@@ -103,6 +106,7 @@ module AppTypes =
         | CmdPickPhoto
         | CmdSaveProfile of Profile
         | CmdSubscribeKeyboard
+        | CmdSubscribeSafeArea
         | CmdScanQR
 
     // ── Shared Helpers ──

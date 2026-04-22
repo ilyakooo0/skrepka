@@ -67,4 +67,4 @@ module ViewAddContact =
 
         let bar = HStack(8.) { backButton (SetPage Conversations) }
 
-        withBottomBar bar content
+        withBottomBar model.SafeAreaBottom bar content

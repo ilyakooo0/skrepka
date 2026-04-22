@@ -98,4 +98,4 @@ module ViewConversations =
                     .horizontalAlignment (HorizontalAlignment.Stretch)
             }
 
-        withBottomBar bar content
+        withBottomBar model.SafeAreaBottom bar content

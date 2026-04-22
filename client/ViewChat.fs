@@ -168,4 +168,5 @@ module ViewChat =
                  msgView).gridRow (2)
             })
 
-        Styles.withBottomBar bar content
+        let barInset = if model.KeyboardHeight > 0. then 0. else model.SafeAreaBottom
+        Styles.withBottomBar barInset bar content

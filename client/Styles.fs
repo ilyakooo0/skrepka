@@ -20,7 +20,7 @@ module Styles =
 
         s :> IStyle
 
-    let withBottomBar (bar: WidgetBuilder<'msg, 'a>) (content: WidgetBuilder<'msg, 'b>) =
+    let withBottomBar safeAreaBottom (bar: WidgetBuilder<'msg, 'a>) (content: WidgetBuilder<'msg, 'b>) =
         Grid([], [ Dimension.Star; Dimension.Auto ]) {
             AnyView(content).gridRow (0)
 
@@ -28,6 +28,7 @@ module Styles =
                 .borderThickness(Avalonia.Thickness(0., 4., 0., 0.))
                 .borderBrush(SolidColorBrush(Colors.Black))
                 .background(Constants.accentColor)
+                .padding(Avalonia.Thickness(0., 0., 0., safeAreaBottom))
                 .gridRow (1)
         }
 
