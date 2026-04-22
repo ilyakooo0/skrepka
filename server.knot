@@ -517,15 +517,15 @@ capGossipPresence = \args ->
   if count args.afterOffline <= maxPresenceEntries
     then {finalPresence: args.afterOffline, appliedOnline: args.appliedOnline, withinCapacity: True {}}
     else
-      let updatesOnly = do e <- args.trustedDeduped; where any args.presence (\p -> samePubkeyServer p e); yield e in
+      let updatesOnly = existingPresenceUpdates args.trustedDeduped args.presence in
       let updatesOnlyMerged = mergeByPubkeyServer args.presence updatesOnly in
       let updatesOnlyAfterOffline = removeOffline updatesOnlyMerged args.trustedOffline args.t in
       let reclaimSlots = maxPresenceEntries - count updatesOnlyAfterOffline in
-      let newEntries = do e <- args.trustedDeduped; where none args.presence (\p -> samePubkeyServer p e); yield e in
+      let newEntries = newPresenceEntries args.trustedDeduped args.presence in
       let reclaimedEntries = takeRelation reclaimSlots newEntries in
       {finalPresence: union updatesOnlyAfterOffline reclaimedEntries,
        appliedOnline: union
-        (do e <- updatesOnly; where none args.presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield (pubkeyServer e))
+        (appliedOnlineKeys updatesOnly args.presence)
         (do e <- reclaimedEntries; yield (pubkeyServer e)),
        withinCapacity: False {}}
 
@@ -562,34 +562,21 @@ sendToEach = \servers action ->
       sendToEach rest action
 
 pruneExpired = \t -> do
-  set *challenges = do
-    c <- *challenges
-    where c.expiresAt > t
-    yield c
-  set *sessions = do
-    s <- *sessions
-    where s.expiresAt > t
-    yield s
+  challenges <- *challenges
+  set *challenges = activeByExpiry challenges t
+  sessions <- *sessions
+  set *sessions = activeByExpiry sessions t
   presenceBefore <- *presence
   let peerServersBefore = collectPeerServers presenceBefore (\p -> p.server)
-  let presenceAfter = do
-    p <- presenceBefore
-    where p.expiresAt > t
-    yield p
+  let presenceAfter = activeByExpiry presenceBefore t
   set *presence = presenceAfter
   let messageCutoff = t - messageMaxAge
-  set *messages = do
-    m <- *messages
-    where m.receivedAt > messageCutoff
-    yield m
-  set *forwards = do
-    f <- *forwards
-    where f.createdAt > messageCutoff
-    yield f
-  set *ackedIds = do
-    a <- *ackedIds
-    where a.ackedAt > messageCutoff
-    yield a
+  messages <- *messages
+  set *messages = do m <- messages; where m.receivedAt > messageCutoff; yield m
+  forwards <- *forwards
+  set *forwards = do f <- forwards; where f.createdAt > messageCutoff; yield f
+  ackedIds <- *ackedIds
+  set *ackedIds = do a <- ackedIds; where a.ackedAt > messageCutoff; yield a
   yield {expiredLocal: expiredLocalPresence presenceBefore presenceAfter t, peerServers: peerServersBefore}
 
 maybePrune = \t -> do
@@ -627,10 +614,7 @@ sendBatchedGossip = \peerServers allEvents hops ->
 
 broadcastOfflineGossip = \t peerServers expiredLocal ->
   when (federationEnabled && count peerServers > 0 && count expiredLocal > 0) (do
-    let gossipEvents = mergeByKey (\a b -> a.pubkey == b.pubkey) (\x -> x.timestamp) [] (do
-      p <- expiredLocal
-      let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
-      yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: p.expiresAt, ttl: ttl})
+    let gossipEvents = mergeByKey (\a b -> a.pubkey == b.pubkey) (\x -> x.timestamp) [] (offlineGossipEvents expiredLocal)
     sendBatchedGossip peerServers gossipEvents gossipOriginHops)
 
 forkBroadcastOffline = \t result ->
@@ -642,8 +626,8 @@ effectiveGossipEvents = \entries appliedKeys eventType -> do
   yield {eventType: eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl}
 
 mergeGossipPresence = \presence deduped trustedOffline fromServer t ->
-  let trustedDeduped = do e <- deduped; where e.server == fromServer || any presence (\p -> p.server == e.server && p.expiresAt > t); yield {expiresAt: e.expiresAt, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp} in
-  let appliedOnline = do e <- trustedDeduped; where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield (pubkeyServer e) in
+  let trustedDeduped = trustedGossipEntries deduped presence fromServer t in
+  let appliedOnline = appliedOnlineKeys trustedDeduped presence in
   let merged = mergeByPubkeyServer presence trustedDeduped in
   let afterOffline = removeOffline merged trustedOffline t in
   let appliedOffline = do p <- diff merged afterOffline; yield (pubkeyServer p) in
@@ -696,7 +680,7 @@ retryPendingForwards : [ForwardEntry] -> IO {network} {}
 retryPendingForwards = \pending -> do
   let servers = collectPeerServers pending (\x -> x.toServer)
   sendToEach servers (\server ->
-    retryForwardsForServer (do x <- pending; where x.toServer == server; yield x) maxForwardRetriesPerServer)
+    retryForwardsForServer (forwardsForServer pending server) maxForwardRetriesPerServer)
   yield {}
 
 forwardQueuedMessages = \targets t -> do
@@ -705,7 +689,7 @@ forwardQueuedMessages = \targets t -> do
     forwards <- *forwards
     presence <- *presence
     let localOnline = localOnlineKeys presence t
-    let remoteTargets = do target <- targets; where none localOnline (\pk -> pk == target.pubkey); yield target
+    let remoteTargets = remoteOnlyTargets targets localOnline
     let candidates = forwardCandidates remoteTargets messages forwards t
     let capped = takeRelation (maxForwardsEntries - count forwards) candidates
     let updatedForwards = union forwards capped
@@ -713,7 +697,7 @@ forwardQueuedMessages = \targets t -> do
     yield capped
   let servers = collectPeerServers newForwards (\x -> x.toServer)
   sendToEach servers (\server ->
-    retryForwardsForServer (do x <- newForwards; where x.toServer == server; yield x) maxForwardRetriesPerServer)
+    retryForwardsForServer (forwardsForServer newForwards server) maxForwardRetriesPerServer)
 
 fetchFederationAck = \server messageIds ->
   fetch (federationUrl server) (FederationAck {
@@ -727,32 +711,26 @@ sendBatchedAcksToServer = \serverAcks server ->
     result <- fetchFederationAck server (do a <- batch; yield a.messageId)
     whenOk result (atomic do
       ackedIds <- *ackedIds
-      let updatedAckedIds = do
-        a <- ackedIds
-        where not (a.originServer == server && hasMessage a.messageId a.toKey batch)
-        yield a
+      let updatedAckedIds = ackedIdsExcludingBatch ackedIds server batch
       set *ackedIds = updatedAckedIds))
 
 sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> IO {network} {}
 sendAcksAndClean = \pendingAcks ->
   let servers = collectPeerServers pendingAcks (\a -> a.originServer) in
   sendToEach servers (\server ->
-    sendBatchedAcksToServer (do a <- pendingAcks; where a.originServer == server; yield a) server)
+    sendBatchedAcksToServer (acksForServer pendingAcks server) server)
 
 retryEvictedAcks = \evictedEntries pendingAcks ->
-  let evictedToRetry = do
-    a <- evictedEntries
-    where not (hasMessage a.messageId a.toKey pendingAcks)
-    yield a
+  let evictedToRetry = retriableEvictedAcks evictedEntries pendingAcks
   in do
     let evictedOriginServers = collectPeerServers evictedToRetry (\a -> a.originServer)
     sendToEach evictedOriginServers (\server -> do
-      fetchResult <- fetchFederationAck server (do a <- evictedToRetry; where a.originServer == server; yield a.messageId)
+      fetchResult <- fetchFederationAck server (do a <- acksForServer evictedToRetry server; yield a.messageId)
       case fetchResult of
         Err _ -> do
           dropped <- atomic do
             ackedIds <- *ackedIds
-            let reinsert = do a <- evictedToRetry; where a.originServer == server; yield a
+            let reinsert = acksForServer evictedToRetry server
             let combined = union ackedIds reinsert
             let excess = count combined - maxAckedIds
             let afterEviction = if excess <= 0 then combined
@@ -768,8 +746,7 @@ pruneAndRetry = \t -> do
     set *lastPrunedAt = t
     pr <- pruneExpired t
     forwards <- *forwards
-    ackedIds <- *ackedIds
-    let pendingAcks = do a <- ackedIds; where not (isLocalServer a.originServer); yield a
+    pendingAcks <- &pendingRemoteAcks
     yield {expiredLocal: pr.expiredLocal, peerServers: pr.peerServers, pendingForwards: forwards, pendingAcks: pendingAcks}
   broadcastOfflineGossip t result.peerServers result.expiredLocal
   when federationEnabled (do
@@ -846,6 +823,59 @@ forwardCandidates = \targets messages forwards t ->
     yield {messageId: m.messageId, toServer: target.server, createdAt: t,
            toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp}
 
+activeByExpiry = \items t -> do x <- items; where x.expiresAt > t; yield x
+
+challengeMatch = \challenges pubkey challenge t ->
+  any challenges (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t)
+
+challengesExcluding = \challenges pubkey challenge ->
+  do c <- challenges; where c.pubkey != pubkey || c.challenge != challenge; yield c
+
+hasLocalPresence = \entries -> any entries (\p -> isLocalServer p.server)
+
+&pendingRemoteAcks = do
+  ackedIds <- *ackedIds
+  yield (do a <- ackedIds; where not (isLocalServer a.originServer); yield a)
+
+ackedIdsExcludingBatch = \ackedIds server batch ->
+  do a <- ackedIds; where not (a.originServer == server && hasMessage a.messageId a.toKey batch); yield a
+
+retriableEvictedAcks = \evictedEntries pendingAcks ->
+  do a <- evictedEntries; where not (hasMessage a.messageId a.toKey pendingAcks); yield a
+
+acksForServer = \acks server -> do a <- acks; where a.originServer == server; yield a
+
+forwardsForServer = \forwards server -> do f <- forwards; where f.toServer == server; yield f
+
+trustedOfflineEvents = \events fromServer ->
+  do e <- events; where e.server == fromServer; yield e
+
+gossipTargets = \peerServers fromServer ->
+  do s <- peerServers; where s != fromServer; yield s
+
+newlyOnlineRemoteKeys = \events appliedKeys ->
+  do e <- events; where any appliedKeys (\a -> samePubkeyServer a e); where not (isLocalServer e.server); yield {pubkey: e.pubkey, server: e.server}
+
+trustedGossipEntries = \deduped presence fromServer t ->
+  do e <- deduped; where e.server == fromServer || any presence (\p -> p.server == e.server && p.expiresAt > t); yield {expiresAt: e.expiresAt, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp}
+
+appliedOnlineKeys = \entries presence ->
+  do e <- entries; where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield (pubkeyServer e)
+
+existingPresenceUpdates = \entries presence ->
+  do e <- entries; where any presence (\p -> samePubkeyServer p e); yield e
+
+newPresenceEntries = \entries presence ->
+  do e <- entries; where none presence (\p -> samePubkeyServer p e); yield e
+
+offlineGossipEvents = \expiredLocal -> do
+  p <- expiredLocal
+  let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
+  yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: p.expiresAt, ttl: ttl}
+
+remoteOnlyTargets = \targets localOnline ->
+  do target <- targets; where none localOnline (\pk -> pk == target.pubkey); yield target
+
 -- ============================================
 -- Request Handler
 -- ============================================
@@ -876,15 +906,12 @@ serve = \req -> case req of
       challenges <- *challenges
       sessions <- *sessions
       presence <- *presence
-      let hasMatch = any challenges (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t)
+      let hasMatch = challengeMatch challenges pubkey challenge t
       let sigValid = hasMatch && verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
       if not sigValid
         then yield {pr: pr, verify: VerifyFailed {}}
         else do
-          let remainingChallenges = do
-            c <- challenges
-            where c.pubkey != pubkey || c.challenge != challenge
-            yield c
+          let remainingChallenges = challengesExcluding challenges pubkey challenge
           set *challenges = remainingChallenges
           let capped = capPerKeyAndGlobal sessions (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t maxSessions
           let updatedSessions = union capped [{token: token, pubkey: pubkey, expiresAt: expiry}]
@@ -941,7 +968,7 @@ serve = \req -> case req of
                 [{messageId: msgId, toKey: to,
                   encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
               let toPresence = presenceForKey presence to t
-              let localOnline = any toPresence (\p -> isLocalServer p.server)
+              let localOnline = hasLocalPresence toPresence
               let remoteServers = collectPeerServers toPresence (\p -> p.server)
               forwards <- *forwards
               let forwardServers = takeRelation (maxForwardsEntries - count forwards) remoteServers
@@ -1022,7 +1049,7 @@ serve = \req -> case req of
     withFederationAuth authorization t respond (cappedHops >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (do
       let validated = validGossipEvents events t
       let onlineEntries = validated.online
-      let trustedOffline = do e <- validated.offline; where e.server == fromServer; yield e
+      let trustedOffline = trustedOfflineEvents validated.offline fromServer
       let filteredOnline = resolveByTimestamp onlineEntries trustedOffline
       let filteredOffline = resolveByTimestamp trustedOffline onlineEntries
       let deduped = mergeByPubkeyServer [] filteredOnline
@@ -1035,18 +1062,10 @@ serve = \req -> case req of
       let effectiveEvents = union (effectiveGossipEvents filteredOnline gossipResult.gm.appliedKeys (GossipOnline {})) (effectiveGossipEvents filteredOffline gossipResult.gm.appliedKeys (GossipOffline {}))
       when (not gossipResult.gm.withinCapacity)
         (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer))
-      let newlyOnlineRemote = do
-        e <- filteredOnline
-        where any gossipResult.gm.appliedKeys (\a -> samePubkeyServer a e)
-        where not (isLocalServer e.server)
-        yield {pubkey: e.pubkey, server: e.server}
+      let newlyOnlineRemote = newlyOnlineRemoteKeys filteredOnline gossipResult.gm.appliedKeys
       fork (do
         when (cappedHops > 1 && federationEnabled && count effectiveEvents > 0) (
-          let targets = do
-            s <- gossipResult.gm.gossipPeerServers
-            where s != fromServer
-            yield s
-          in sendBatchedGossip targets effectiveEvents (cappedHops - 1))
+          sendBatchedGossip (gossipTargets gossipResult.gm.gossipPeerServers fromServer) effectiveEvents (cappedHops - 1))
         broadcastOfflineGossip t gossipResult.pr.peerServers gossipResult.pr.expiredLocal
         when (federationEnabled && count newlyOnlineRemote > 0)
           (forwardQueuedMessages newlyOnlineRemote t))
