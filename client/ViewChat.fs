@@ -55,8 +55,8 @@ module ViewChat =
             | None -> ()
         , Avalonia.Threading.DispatcherPriority.Background) |> ignore
 
-    let private opacityTransition =
-        DoubleTransition(Avalonia.Visual.OpacityProperty, System.TimeSpan.FromMilliseconds 500.)
+    let private strokeTransition =
+        DoubleTransition(Avalonia.Controls.Shapes.Shape.StrokeThicknessProperty, System.TimeSpan.FromMilliseconds 800.)
 
     let private messageItem m =
         let align, cols, col =
@@ -82,18 +82,15 @@ module ViewChat =
                         Rectangle()
                             .stroke(Avalonia.Media.Colors.Black)
                             .strokeThickness(4.)
+                            .strokeDashArray([ 4.; 2. ])
                             .isHitTestVisible(false)
-                            .opacity(if isSent then 0. else 1.)
-                            .transition (opacityTransition)
+                            .classes("marching")
 
                         Rectangle()
                             .stroke(Avalonia.Media.Colors.Black)
-                            .strokeThickness(4.)
-                            .strokeDashArray([ 4.; 2. ])
+                            .strokeThickness(if isSent then 0. else 4.)
                             .isHitTestVisible(false)
-                            .opacity(if isSent then 1. else 0.)
-                            .classes("marching")
-                            .transition (opacityTransition)
+                            .transition (strokeTransition)
                     | Incoming ->
                         Rectangle()
                             .stroke(Avalonia.Media.Colors.Black)

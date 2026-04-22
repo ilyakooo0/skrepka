@@ -350,6 +350,7 @@ isHighOctetPrefix = \sn ->
   && let d2 = take 1 (drop 1 sn) in
   let d3 = take 1 (drop 2 sn) in
   take 1 (drop 3 sn) == "."
+  && isDigitChar (take 1 (drop 4 sn))
   && ((d2 == "2" && contains d3 "456789")
     || (contains d2 "34" && isDigitChar d3)
     || (d2 == "5" && contains d3 "012345"))
@@ -447,9 +448,7 @@ dedupMessageIds = \messageIds ->
 
 evictOldestAckedIds = \items n ->
   if n <= 0 then items
-  else do
-    ii <- items
-    diff items (takeRelation n ( sortBy (\a -> a.ackedAt) items))
+  else diff items (takeRelation n (sortBy (\a -> a.ackedAt) items))
 
 safeCompareLoop : Text -> Text -> Int -> Int -> Int
 safeCompareLoop = \s1 s2 n result ->
