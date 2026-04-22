@@ -55,8 +55,36 @@ module ViewChat =
             | None -> ()
         , Avalonia.Threading.DispatcherPriority.Background) |> ignore
 
-    let private strokeTransition =
-        DoubleTransition(Avalonia.Controls.Shapes.Shape.StrokeThicknessProperty, System.TimeSpan.FromMilliseconds 800.)
+    let private ensureSolidifyStyle =
+        lazy
+            (let s =
+                Avalonia.Styling.Style(fun sel ->
+                    sel.OfType<Avalonia.Controls.Shapes.Rectangle>().Class("solidifying"))
+
+             let anim = Avalonia.Animation.Animation()
+             anim.Duration <- System.TimeSpan.FromMilliseconds 600.
+             anim.IterationCount <- Avalonia.Animation.IterationCount(1UL)
+             anim.FillMode <- Avalonia.Animation.FillMode.Forward
+
+             for i in 0..10 do
+                 let t = float i / 10.
+                 let dash = 4. + 2. * t
+                 let gap = 2. - 2. * t
+                 let kf = Avalonia.Animation.KeyFrame()
+                 kf.Cue <- Avalonia.Animation.Cue(float32 t)
+
+                 kf.Setters.Add(
+                     Avalonia.Styling.Setter(
+                         Avalonia.Controls.Shapes.Shape.StrokeDashArrayProperty,
+                         box (Avalonia.Collections.AvaloniaList<float>([| dash; gap |]))))
+
+                 kf.Setters.Add(
+                     Avalonia.Styling.Setter(Avalonia.Controls.Shapes.Shape.StrokeDashOffsetProperty, box 0.))
+
+                 anim.Children.Add(kf)
+
+             s.Animations.Add(anim)
+             Avalonia.Application.Current.Styles.Add(s))
 
     let private messageItem m =
         let align, cols, col =
@@ -76,21 +104,25 @@ module ViewChat =
 
                     match m.Direction with
                     | Outgoing status ->
-                        ensureMarchingAntsStyle.Force()
                         let isSent = status = DeliveryStatus.Sent
 
-                        Rectangle()
-                            .stroke(Avalonia.Media.Colors.Black)
-                            .strokeThickness(4.)
-                            .strokeDashArray([ 4.; 2. ])
-                            .isHitTestVisible(false)
-                            .classes("marching")
+                        if isSent then
+                            ensureMarchingAntsStyle.Force()
 
-                        Rectangle()
-                            .stroke(Avalonia.Media.Colors.Black)
-                            .strokeThickness(if isSent then 0. else 4.)
-                            .isHitTestVisible(false)
-                            .transition (strokeTransition)
+                            Rectangle()
+                                .stroke(Avalonia.Media.Colors.Black)
+                                .strokeThickness(4.)
+                                .strokeDashArray([ 4.; 2. ])
+                                .isHitTestVisible(false)
+                                .classes("marching")
+                        else
+                            ensureSolidifyStyle.Force()
+
+                            Rectangle()
+                                .stroke(Avalonia.Media.Colors.Black)
+                                .strokeThickness(4.)
+                                .isHitTestVisible(false)
+                                .classes("solidifying")
                     | Incoming ->
                         Rectangle()
                             .stroke(Avalonia.Media.Colors.Black)

@@ -340,6 +340,7 @@ is172Private = \sn ->
   && let d1 = take 1 (drop 4 sn) in
   let d2 = take 1 (drop 5 sn) in
   take 1 (drop 6 sn) == "."
+  && isDigitChar (take 1 (drop 7 sn))
   && ((d1 == "1" && contains d2 "6789")
     || (d1 == "2" && isDigitChar d2)
     || (d1 == "3" && contains d2 "01"))
@@ -395,7 +396,7 @@ isBadServerName = \sn ->
 
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
-  case headOf (do s <- sessions; where safeCompare s.token token && s.expiresAt > t; yield s) of
+  case headOf (do s <- sessions; where s.expiresAt > t && safeCompare s.token token; yield s) of
     Nothing {} -> Unauthorized {}
     Just {value: s} -> Authorized {pubkey: s.pubkey}
 
