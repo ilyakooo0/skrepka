@@ -114,7 +114,6 @@ type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: T
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 data AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 data SendResult = SendFailed {status: MessageStatus} | SendDone {delivery: DeliveryStatus, remoteServers: [ServerName], forwardServers: [ServerName]} | SendDuplicate {}
-data VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
 data AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 data PollResult = PollUnauthorized {} | PollOk {events: [PollEvent], cursor: Timestamp}
 data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
@@ -153,7 +152,7 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 route AuthApi where
   /auth
     POST {pubkey: PubkeyHex} /challenge
-      -> {challenge: Text, ok: Bool}
+      -> {challenge: Text, ok: Bool, expiresAt: Timestamp}
       = ReqChallenge
     POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex} /verify
       -> {token: Text, expiresAt: Timestamp}
@@ -194,7 +193,12 @@ route MaintenanceApi where
 route HealthApi where
   GET /health -> {ok: Bool} = Health
 
-route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi | HealthApi
+route StatsApi where
+  GET /stats headers {authorization: Text}
+    -> {sessions: Int, messages: Int, presence: Int, forwards: Int, challenges: Int, ackedIds: Int, ok: Bool}
+    = Stats
+
+route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi | HealthApi | StatsApi
 
 -- ============================================
 -- Helpers
@@ -789,6 +793,20 @@ readMessageSignal = \pubkey ->
   else if b == 2 then do s <- *messageSignal2; yield s
   else do s <- *messageSignal3; yield s
 
+pollEvents = \allMessages pubkey clampedCursor t ->
+  let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages allMessages pubkey clampedCursor t)) in
+  if count limitedMsgs > 0
+    then
+      let evts = do
+        m <- limitedMsgs
+        yield {id: m.messageId, eventType: "message",
+               payload: {toKey: m.toKey,
+                          encryptedBlob: m.encryptedBlob,
+                          timestamp: m.timestamp}}
+      in let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
+      in PollOk {events: evts, cursor: lastReceivedAt}
+    else PollOk {events: [], cursor: clampedCursor}
+
 pollOnce = \token cursor -> do
   t <- now
   sessions <- *sessions
@@ -799,24 +817,23 @@ pollOnce = \token cursor -> do
       seqCounter <- *seqCounter
       let clampedCursor = clamp 0 (max seqCounter t) cursor
       startWakeup <- *pollWakeup
-      atomic do
-        wakeup <- *pollWakeup
-        messageSignal <- readMessageSignal pubkey
-        allMessages <- *messages
-        let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages allMessages pubkey clampedCursor t))
-        if count limitedMsgs > 0
-          then
-            let evts = do
-              m <- limitedMsgs
-              yield {id: m.messageId, eventType: "message",
-                     payload: {toKey: m.toKey,
-                                encryptedBlob: m.encryptedBlob,
-                                timestamp: m.timestamp}}
-            in let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
-            in yield (PollOk {events: evts, cursor: lastReceivedAt})
-          else if wakeup > startWakeup
-            then yield (PollOk {events: [], cursor: clampedCursor})
-            else retry
+      startSignal <- readMessageSignal pubkey
+      -- Phase 1: check for existing messages (no blocking)
+      initialMessages <- *messages
+      let initial = pollableMessages initialMessages pubkey clampedCursor t
+      if count initial > 0
+        then yield (pollEvents initialMessages pubkey clampedCursor t)
+        else do
+          -- Phase 2: wait for signal or heartbeat (no *messages dependency)
+          atomic do
+            wakeup <- *pollWakeup
+            signal <- readMessageSignal pubkey
+            if wakeup > startWakeup || signal > startSignal
+              then yield {}
+              else retry
+          -- Phase 3: read messages after waking
+          newMessages <- *messages
+          yield (pollEvents newMessages pubkey clampedCursor t)
 
 -- ============================================
 -- Derived Relations
@@ -935,7 +952,7 @@ serve = \req -> case req of
     when (not result.accepted)
       (println ("challenge: at capacity (" ++ show maxChallenges ++ "), rejecting for " ++ pubkey))
     forkBroadcastOffline t result.pr
-    yield (respond {challenge: if result.accepted then challenge else "", ok: result.accepted})
+    yield (respond {challenge: if result.accepted then challenge else "", ok: result.accepted, expiresAt: if result.accepted then t + challengeExpiry else 0})
 
   VerifyAuth {pubkey, challenge, signature, respond} -> do
     t <- now
@@ -1057,6 +1074,9 @@ serve = \req -> case req of
           let ackedMessages = matchingAckMessages messages pubkey dedupedIds
           let remainingMessages = diff messages ackedMessages
           set *messages = remainingMessages
+          forwards <- *forwards
+          let ackedMsgIds = do m <- ackedMessages; yield m.messageId
+          set *forwards = do f <- forwards; where none ackedMsgIds (\mid -> f.messageId == mid && f.toKey == pubkey); yield f
           let ackedFederated = federatedAckEntries ackedMessages t
           ackedIds <- *ackedIds
           let combinedAckedIds = union ackedIds ackedFederated
@@ -1165,6 +1185,21 @@ serve = \req -> case req of
     yield (respond {ok: authorized})
 
   Health {respond} -> yield (respond {ok: True {}})
+
+  Stats {authorization, respond} -> do
+    let authorized = verifyMaintenanceAuth authorization
+    if authorized
+      then do
+        result <- atomic do
+          s <- *sessions
+          m <- *messages
+          p <- *presence
+          f <- *forwards
+          c <- *challenges
+          a <- *ackedIds
+          yield {sessions: count s, messages: count m, presence: count p, forwards: count f, challenges: count c, ackedIds: count a}
+        yield (respond {sessions: result.sessions, messages: result.messages, presence: result.presence, forwards: result.forwards, challenges: result.challenges, ackedIds: result.ackedIds, ok: True {}})
+      else yield (respond {sessions: 0, messages: 0, presence: 0, forwards: 0, challenges: 0, ackedIds: 0, ok: False {}})
 
 -- ============================================
 -- Entry Point
