@@ -10,7 +10,6 @@ module Constants =
     let hkdfInfo = "skrepka-v1"
     let profileId = "me"
     let settingsId = "settings"
-    let schemaVersion = 2
     let maxBitmapCacheSize = 128
     let pollRetryBaseMs = 3000
     let outboxRetryDelayMs = 3000

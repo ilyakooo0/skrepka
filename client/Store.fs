@@ -137,29 +137,7 @@ module Store =
         |> Db.exec
 
         conn
-        |> Db.newCommand "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        |> Db.exec
-
-        let dbVersion =
-            try
-                conn
-                |> Db.newCommand "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-                |> Db.querySingle (fun rd -> rd.ReadString "value" |> int)
-                |> Option.defaultValue 0
-            with ex ->
-                log $"schema version check: {ex.Message}"
-                0
-
-        if dbVersion < 2 then
-            conn
-            |> Db.newCommand "CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(ConversationId)"
-            |> Db.exec
-
-        conn
-        |> Db.newCommand "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (@key, @value)"
-        |> Db.setParams
-            [ "key", SqlType.String "schema_version"
-              "value", SqlType.String(string Constants.schemaVersion) ]
+        |> Db.newCommand "CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(ConversationId)"
         |> Db.exec
 
     // ── Identity ──
