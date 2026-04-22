@@ -113,7 +113,7 @@ type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Times
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
 data AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
-data SendResult = SendFailed {status: MessageStatus} | SendDone {delivery: DeliveryStatus, remoteServers: [ServerName], forwardServers: [ServerName]}
+data SendResult = SendFailed {status: MessageStatus} | SendDone {delivery: DeliveryStatus, remoteServers: [ServerName], forwardServers: [ServerName]} | SendDuplicate {}
 data VerifyResult = VerifyFailed {} | VerifyOk {peerServers: [ServerName]}
 data AckResult = AckUnauthorized {} | AckDone {pendingAcks: [AckedEntry], evictedEntries: [AckedEntry]}
 data PollResult = PollUnauthorized {} | PollOk {events: [PollEvent], cursor: Timestamp}
@@ -159,7 +159,7 @@ route ClientApi where
     -> {events: [PollEvent], cursor: Timestamp, authorized: Bool}
     = Poll
   /messages
-    POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp} / headers {authorization: Text}
+    POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId} / headers {authorization: Text}
       -> {status: MessageStatus, messageId: OptionalMessageId}
       = SendMessage
     POST {messageIds: [MessageIdHex]} /ack headers {authorization: Text}
@@ -396,7 +396,7 @@ isBadServerName = \sn ->
 
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
-  case headOf (do s <- sessions; where s.expiresAt > t && safeCompare s.token token; yield s) of
+  case headOf (do s <- sessions; where s.expiresAt > t && s.token == token; yield s) of
     Nothing {} -> Unauthorized {}
     Just {value: s} -> Authorized {pubkey: s.pubkey}
 
@@ -603,10 +603,12 @@ forEachBatch = \items batchSize process ->
 sendBatchedGossipToServer : ServerName -> [GossipEvent] -> Int -> IO {network} {}
 sendBatchedGossipToServer = \server allEvents hops ->
   forEachBatch allEvents maxGossipEvents (\batch -> do
-    _ <- fetch (federationUrl server) (RecvGossip {
+    result <- fetch (federationUrl server) (RecvGossip {
       authorization: federationAuth,
       events: batch, hopsRemaining: hops, fromServer: serverHostN})
-    yield {})
+    case result of
+      Err _ -> println ("federation: gossip to " ++ server ++ " failed")
+      Ok _ -> yield {})
 
 sendBatchedGossip : [ServerName] -> [GossipEvent] -> Int -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents hops ->
@@ -673,7 +675,9 @@ retryForwardsForServer = \entries remaining ->
           toKey: f.toKey, encryptedBlob: f.encryptedBlob,
           timestamp: f.timestamp, originServer: serverHostN, messageId: f.messageId,
           authorization: federationAuth})
-        whenOk result (removeForward f.messageId f.toServer)
+        case result of
+          Err _ -> println ("federation: forward to " ++ f.toServer ++ " failed for " ++ f.messageId)
+          Ok _ -> removeForward f.messageId f.toServer
         retryForwardsForServer rest (remaining - 1)
 
 retryPendingForwards : [ForwardEntry] -> IO {network} {}
@@ -709,10 +713,12 @@ sendBatchedAcksToServer : [{messageId: MessageIdHex, toKey: PubkeyHex, originSer
 sendBatchedAcksToServer = \serverAcks server ->
   forEachBatch serverAcks maxMessageIds (\batch -> do
     result <- fetchFederationAck server (do a <- batch; yield a.messageId)
-    whenOk result (atomic do
-      ackedIds <- *ackedIds
-      let updatedAckedIds = ackedIdsExcludingBatch ackedIds server batch
-      set *ackedIds = updatedAckedIds))
+    case result of
+      Err _ -> println ("federation: ack to " ++ server ++ " failed")
+      Ok _ -> atomic do
+        ackedIds <- *ackedIds
+        let updatedAckedIds = ackedIdsExcludingBatch ackedIds server batch
+        set *ackedIds = updatedAckedIds)
 
 sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> IO {network} {}
 sendAcksAndClean = \pendingAcks ->
@@ -753,7 +759,7 @@ pruneAndRetry = \t -> do
     retryPendingForwards result.pendingForwards
     sendAcksAndClean result.pendingAcks)
 
-pollOnce = \token cursor startWakeup -> do
+pollOnce = \token cursor -> do
   t <- now
   sessions <- *sessions
   let auth = authenticateSession sessions token t
@@ -762,6 +768,7 @@ pollOnce = \token cursor startWakeup -> do
     Authorized {pubkey} -> do
       seqCounter <- *seqCounter
       let clampedCursor = clamp 0 (max seqCounter t) cursor
+      startWakeup <- *pollWakeup
       atomic do
         wakeup <- *pollWakeup
         allMessages <- *messages
@@ -885,17 +892,19 @@ serve = \req -> case req of
   ReqChallenge {pubkey, respond} -> do
     challenge <- genToken
     t <- now
-    pruneResult <- atomic do
+    result <- atomic do
       pr <- maybePrune t
       challenges <- *challenges
-      let capped = capPerKeyAndGlobal challenges (\c -> c.pubkey == pubkey) maxChallengesPerKey (\c -> c.expiresAt) t maxChallenges
-      let updatedChallenges = union
-        capped
-        [{pubkey: pubkey, challenge: challenge, expiresAt: t + challengeExpiry}]
-      set *challenges = updatedChallenges
-      yield pr
-    forkBroadcastOffline t pruneResult
-    yield (respond {challenge: challenge})
+      let perKeyCapped = capPerKey challenges (\c -> c.pubkey == pubkey) maxChallengesPerKey (\c -> c.expiresAt) t
+      if count perKeyCapped >= maxChallenges
+        then yield {pr: pr, accepted: False {}}
+        else do
+          set *challenges = union perKeyCapped [{pubkey: pubkey, challenge: challenge, expiresAt: t + challengeExpiry}]
+          yield {pr: pr, accepted: True {}}
+    when (not result.accepted)
+      (println ("challenge: at capacity (" ++ show maxChallenges ++ "), rejecting for " ++ pubkey))
+    forkBroadcastOffline t result.pr
+    yield (respond {challenge: if result.accepted then challenge else ""})
 
   VerifyAuth {pubkey, challenge, signature, respond} -> do
     t <- now
@@ -937,19 +946,18 @@ serve = \req -> case req of
         yield (respond {token: token, expiresAt: expiry})
 
   Poll {cursor, authorization, respond} -> do
-    startWakeup <- *pollWakeup
     result <- case extractToken authorization of
       Nothing {} -> yield (PollUnauthorized {})
-      Just {value: token} -> pollOnce token cursor startWakeup
+      Just {value: token} -> pollOnce token cursor
     tAfterPoll <- now
     maybePruneAndBroadcast tAfterPoll
     yield (respond (case result of
       PollUnauthorized {} -> {events: [], cursor: 0, authorized: False {}}
       PollOk {events: evts, cursor: c} -> {events: evts, cursor: c, authorized: True {}}))
 
-  SendMessage {to, encryptedBlob, timestamp, authorization, respond} -> do
+  SendMessage {to, encryptedBlob, timestamp, messageId, authorization, respond} -> do
     t <- now
-    msgId <- genToken
+    effectiveMsgId <- if messageId != "" then yield messageId else genToken
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       pr <- maybePrune t
@@ -957,30 +965,33 @@ serve = \req -> case req of
         (yield {pr: pr, send: SendFailed {status: MsUnauthorized {}}})
         (\_ -> do
           messages <- *messages
-          if countMessagesFor messages to t >= maxMessagesPerRecipient
-            then yield {pr: pr, send: SendFailed {status: MsRejected {}}}
-            else do
-              presence <- *presence
-              seqCounter <- *seqCounter
-              let seqTs = nextSeqTs t seqCounter
-              set *seqCounter = seqTs
-              set *messages = union messages
-                [{messageId: msgId, toKey: to,
-                  encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
-              let toPresence = presenceForKey presence to t
-              let localOnline = hasLocalPresence toPresence
-              let remoteServers = collectPeerServers toPresence (\p -> p.server)
-              forwards <- *forwards
-              let forwardServers = takeRelation (maxForwardsEntries - count forwards) remoteServers
-              let shouldForward = federationEnabled && count forwardServers > 0
-              let delivery = if localOnline then DsDelivered {}
-                else if shouldForward then DsFederated {}
-                else DsQueued {}
-              let updatedForwards = if shouldForward
-                then union forwards (do s <- forwardServers; yield {messageId: msgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs})
-                else forwards
-              set *forwards = updatedForwards
-              yield {pr: pr, send: SendDone {delivery: delivery, remoteServers: remoteServers, forwardServers: forwardServers}})
+          ackedIds <- *ackedIds
+          if messageId != "" && (hasMessage messageId to messages || hasMessage messageId to ackedIds)
+            then yield {pr: pr, send: SendDuplicate {}}
+            else if countMessagesFor messages to t >= maxMessagesPerRecipient
+              then yield {pr: pr, send: SendFailed {status: MsRejected {}}}
+              else do
+                presence <- *presence
+                seqCounter <- *seqCounter
+                let seqTs = nextSeqTs t seqCounter
+                set *seqCounter = seqTs
+                set *messages = union messages
+                  [{messageId: effectiveMsgId, toKey: to,
+                    encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
+                let toPresence = presenceForKey presence to t
+                let localOnline = hasLocalPresence toPresence
+                let remoteServers = collectPeerServers toPresence (\p -> p.server)
+                forwards <- *forwards
+                let forwardServers = takeRelation (maxForwardsEntries - count forwards) remoteServers
+                let shouldForward = federationEnabled && count forwardServers > 0
+                let delivery = if localOnline then DsDelivered {}
+                  else if shouldForward then DsFederated {}
+                  else DsQueued {}
+                let updatedForwards = if shouldForward
+                  then union forwards (do s <- forwardServers; yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs})
+                  else forwards
+                set *forwards = updatedForwards
+                yield {pr: pr, send: SendDone {delivery: delivery, remoteServers: remoteServers, forwardServers: forwardServers}})
     case result.send of
       SendDone {delivery, remoteServers, forwardServers} ->
         fork (do
@@ -988,17 +999,20 @@ serve = \req -> case req of
             sendToEach remoteServers (\server -> do
               fwdResult <- fetch (federationUrl server) (ForwardMessage {
                 toKey: to, encryptedBlob: encryptedBlob,
-                timestamp: clampedTs, originServer: serverHostN, messageId: msgId,
+                timestamp: clampedTs, originServer: serverHostN, messageId: effectiveMsgId,
                 authorization: federationAuth})
-              when (any forwardServers (\s -> s == server))
-                (whenOk fwdResult (removeForward msgId server)))
+              case fwdResult of
+                Err _ -> println ("federation: send forward to " ++ server ++ " failed for " ++ effectiveMsgId)
+                Ok _ -> when (any forwardServers (\s -> s == server))
+                  (removeForward effectiveMsgId server))
             when (isQueued delivery)
               (println ("sendMessage: forwards at capacity (" ++ show maxForwardsEntries ++ "), skipping forward tracking")))
           broadcastOfflineGossip t result.pr.peerServers result.pr.expiredLocal)
       _ -> forkBroadcastOffline t result.pr
     yield (case result.send of
       SendFailed {status} -> respond {status: status, messageId: ""}
-      SendDone {delivery} -> respond {status: deliveryToMessageStatus delivery, messageId: msgId})
+      SendDuplicate {} -> respond {status: MsDelivered {}, messageId: effectiveMsgId}
+      SendDone {delivery} -> respond {status: deliveryToMessageStatus delivery, messageId: effectiveMsgId})
 
   AckMessages {messageIds, authorization, respond} -> do
     t <- now

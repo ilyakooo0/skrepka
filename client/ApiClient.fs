@@ -94,7 +94,7 @@ module ApiClient =
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
-        let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
+        let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp; messageId = "" |})
         async {
             use! doc = sendRequest client $"{serverUrl}/messages" body (Some token)
             match doc.RootElement.GetProperty("status").GetString() with
