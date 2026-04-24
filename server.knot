@@ -129,7 +129,7 @@ type ValidGossipEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Times
 -- Status returned to the sender after SendMessage
 -- Delivered: recipient is online locally; Federated: forwarded to remote server;
 -- Queued: stored but recipient location unknown; Unauthorized/Rejected: not accepted
-data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {} | MsUnauthorized {} | MsRejected {} | MsRateLimited {}
+data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {} | MsUnauthorized {} | MsRejected {} | MsRateLimited {} | MsDuplicate {}
 
 impl ToJSON MessageStatus where
   toJson ms = toJson (case ms of
@@ -138,7 +138,8 @@ impl ToJSON MessageStatus where
     MsQueued {} -> "queued"
     MsUnauthorized {} -> "unauthorized"
     MsRejected {} -> "rejected"
-    MsRateLimited {} -> "rate_limited")
+    MsRateLimited {} -> "rate_limited"
+    MsDuplicate {} -> "duplicate")
 
 -- Internal delivery status (same as MessageStatus but without error variants)
 data DeliveryStatus = DsDelivered {} | DsFederated {} | DsQueued {}
@@ -258,6 +259,11 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 *globalRateWindowStart : Timestamp
 
+-- Background task cycle counters (exposed via /stats for health monitoring)
+*pruneCount : Int
+
+*heartbeatCount : Int
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -312,6 +318,9 @@ route MaintenanceApi where
   POST {} /maintenance/prune headers {authorization: Text}
     -> {ok: Bool}
     = Prune
+  POST {} /maintenance/drain headers {authorization: Text}
+    -> {ok: Bool, drained: Int}
+    = Drain
 
 route HealthApi where
   GET /health -> {ok: Bool} = Health
@@ -319,7 +328,7 @@ route HealthApi where
 -- Returns counts of in-memory collections (requires federation or maintenance secret)
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {sessions: Int, messages: Int, presence: Int, forwards: Int, challenges: Int, ackedIds: Int, ackOverflow: Int, deliveredIds: Int, forwardFailures: Int, activePolls: Int, ok: Bool}
+    -> {sessions: Int, messages: Int, presence: Int, forwards: Int, challenges: Int, ackedIds: Int, ackOverflow: Int, deliveredIds: Int, forwardFailures: Int, activePolls: Int, sendRates: Int, challengeRates: Int, federationRates: Int, pruneCount: Int, heartbeatCount: Int, ok: Bool}
     = Stats
 
 route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi | HealthApi | StatsApi
@@ -901,13 +910,20 @@ withFederationAuth = \authorization t respond fromServer precondition action ->
       maybePruneAndBroadcast t
       yield (respond {ok: False {}})
     else do
-      rateLimited <- checkFederationRate fromServer t
-      if rateLimited
+      globalLimited <- checkGlobalRate t
+      if globalLimited
         then do
-          println ("federation: rate limited (" ++ show maxFederationRatePerServer ++ "/s per server), rejecting for " ++ fromServer)
+          println ("federation: global rate limited (" ++ show maxGlobalRequestRate ++ "/s), rejecting for " ++ fromServer)
           maybePruneAndBroadcast t
           yield (respond {ok: False {}})
-        else action
+        else do
+          rateLimited <- checkFederationRate fromServer t
+          if rateLimited
+            then do
+              println ("federation: rate limited (" ++ show maxFederationRatePerServer ++ "/s per server), rejecting for " ++ fromServer)
+              maybePruneAndBroadcast t
+              yield (respond {ok: False {}})
+            else action
 
 withSessionAuth = \authorization t onUnauth onAuth -> do
   sessions <- *sessions
@@ -1458,16 +1474,13 @@ verifyAuthInner = \pubkey challenge signature respond t -> do
   let sigValid = verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
   validation <- atomic do
     pr <- maybePrune t
-    if not sigValid
+    challenges <- *challenges
+    let hasMatch = challengeMatch challenges pubkey challenge t
+    -- Consume challenge on any verify attempt (prevents signature brute-force)
+    when hasMatch (set *challenges = challengesExcluding challenges pubkey challenge)
+    if not hasMatch || not sigValid
       then yield {pr: pr, valid: False {}}
-      else do
-        challenges <- *challenges
-        let hasMatch = challengeMatch challenges pubkey challenge t
-        if not hasMatch
-          then yield {pr: pr, valid: False {}}
-          else do
-            set *challenges = challengesExcluding challenges pubkey challenge
-            yield {pr: pr, valid: True {}}
+      else yield {pr: pr, valid: True {}}
   if validation.valid
     then do
       token <- genToken
@@ -1561,7 +1574,7 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization respond 
                       -- Create forward entries atomically with message storage (prevents race with ack)
                       when (federationEnabled && count remoteServers > 0) (do
                         forwards <- *forwards
-                        let newFwds = do s <- remoteServers; yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs}
+                        let newFwds = do s <- remoteServers; where none forwards (\f -> f.messageId == effectiveMsgId && f.toServer == s); yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs}
                         let cappedFwds = takeRelation (maxForwardsEntries - count forwards) newFwds
                         set *forwards = union forwards cappedFwds)
                       yield {pr: pr, send: SendDone {delivery: delivery, remoteServers: remoteServers}})
@@ -1585,7 +1598,7 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization respond 
       _ -> forkBroadcastOffline t result.pr
     yield (case result.send of
       SendFailed {status} -> respond {status: status, messageId: ""}
-      SendDuplicate {} -> respond {status: MsDelivered {}, messageId: effectiveMsgId}
+      SendDuplicate {} -> respond {status: MsDuplicate {}, messageId: effectiveMsgId}
       SendDone {delivery} -> respond {status: deliveryToMessageStatus delivery, messageId: effectiveMsgId})
 
 -- GET /lookup/:pubkey: Look up the best known server for a pubkey.
@@ -1697,6 +1710,26 @@ handleFederationAck = \messageIds originServer fromServer authorization respond 
     forkBroadcastOffline t pruneResult
     yield (respond {ok: True {}}))
 
+-- POST /maintenance/drain: Broadcast offline gossip for all local keys (graceful shutdown).
+-- Call before stopping the server so peers learn keys went offline immediately.
+-- Gossip is sent via fork; allow a few seconds after response before process exit.
+handleDrain = \authorization respond -> do
+  t <- now
+  let authorized = verifyMaintenanceAuth authorization
+  if not authorized then yield (respond {ok: False {}, drained: 0})
+  else do
+    drainResult <- atomic do
+      presence <- *presence
+      let localEntries = do p <- presence; where isLocalServer p.server && p.expiresAt > t; yield p
+      set *presence = do p <- presence; where not (isLocalServer p.server) || p.expiresAt <= t; yield p
+      yield {localEntries: localEntries, peerServers: collectPeerServers presence (\p -> p.server)}
+    let drainedCount = count drainResult.localEntries
+    when (federationEnabled && drainedCount > 0 && count drainResult.peerServers > 0) (do
+      let gossipEvents = do p <- drainResult.localEntries; yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl}
+      sendBatchedGossip drainResult.peerServers gossipEvents gossipOriginHops)
+    println ("drain: broadcast offline for " ++ show drainedCount ++ " local keys")
+    yield (respond {ok: True {}, drained: drainedCount})
+
 -- POST /maintenance/prune: Trigger a full maintenance cycle (prune + retry all pending ops).
 -- Accepts either federation or maintenance secret.
 handlePrune = \authorization respond -> do
@@ -1722,9 +1755,14 @@ handleStats = \authorization respond -> do
         d <- *deliveredIds
         ff <- *forwardFailures
         ap <- *activePolls
-        yield {sessions: count s, messages: count m, presence: count p, forwards: count f, challenges: count c, ackedIds: count a, ackOverflow: count ao, deliveredIds: count d, forwardFailures: count ff, activePolls: count ap}
-      yield (respond {sessions: result.sessions, messages: result.messages, presence: result.presence, forwards: result.forwards, challenges: result.challenges, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, ok: True {}})
-    else yield (respond {sessions: 0, messages: 0, presence: 0, forwards: 0, challenges: 0, ackedIds: 0, ackOverflow: 0, deliveredIds: 0, forwardFailures: 0, activePolls: 0, ok: False {}})
+        sr <- *sendRates
+        cr <- *challengeRates
+        fr <- *federationRates
+        pc <- *pruneCount
+        hc <- *heartbeatCount
+        yield {sessions: count s, messages: count m, presence: count p, forwards: count f, challenges: count c, ackedIds: count a, ackOverflow: count ao, deliveredIds: count d, forwardFailures: count ff, activePolls: count ap, sendRates: count sr, challengeRates: count cr, federationRates: count fr, pruneCount: pc, heartbeatCount: hc}
+      yield (respond {sessions: result.sessions, messages: result.messages, presence: result.presence, forwards: result.forwards, challenges: result.challenges, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, pruneCount: result.pruneCount, heartbeatCount: result.heartbeatCount, ok: True {}})
+    else yield (respond {sessions: 0, messages: 0, presence: 0, forwards: 0, challenges: 0, ackedIds: 0, ackOverflow: 0, deliveredIds: 0, forwardFailures: 0, activePolls: 0, sendRates: 0, challengeRates: 0, federationRates: 0, pruneCount: 0, heartbeatCount: 0, ok: False {}})
 
 serve = \req -> case req of
   ReqChallenge {pubkey, respond} -> handleChallenge pubkey respond
@@ -1736,6 +1774,7 @@ serve = \req -> case req of
   ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer authorization respond
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> handleFederationAck messageIds originServer fromServer authorization respond
   Prune {authorization, respond} -> handlePrune authorization respond
+  Drain {authorization, respond} -> handleDrain authorization respond
   Health {respond} -> handleHealth respond
   Stats {authorization, respond} -> handleStats authorization respond
 
@@ -1749,6 +1788,9 @@ backgroundPrune = do
   jitter <- randomInt 5000
   sleep (backgroundPruneInterval + jitter)
   t <- now
+  atomic do
+    pc <- *pruneCount
+    set *pruneCount = pc + 1
   fork (pruneAndRetry t)
   backgroundPrune
 
@@ -1760,6 +1802,8 @@ pollHeartbeat = do
   t <- now
   atomic do
     set *pollWakeup = t
+    hc <- *heartbeatCount
+    set *heartbeatCount = hc + 1
   pollHeartbeat
 
 main = do
