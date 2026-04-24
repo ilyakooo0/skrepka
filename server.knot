@@ -1189,14 +1189,21 @@ uniqueBucketsFor = \items getKey ->
     let b = pubkeyBucket (getKey x) in
     if any acc (\i -> i == b) then acc else union acc [b]) [] items
 
--- Prune a single message bucket and return kept count + per-recipient counts.
--- Since messages are sharded by recipient pubkey, each bucket's recipient counts
--- are disjoint from other buckets — simple union merges them.
-pruneMessageBucketCounting = \b messageCutoff -> atomic do
+-- Prune a single message bucket and atomically adjust shared counters.
+-- Each bucket prune decrements totalMessageCount and recipientMsgCounts by exactly
+-- what was removed, preserving concurrent modifications from poll-ack or send.
+pruneMessageBucket = \b messageCutoff -> atomic do
   bucket <- readMessageBucket b
   let kept = do m <- bucket; where m.receivedAt > messageCutoff; yield m
+  let removedCount = count bucket - count kept
   writeMessageBucket b kept
-  yield {count: count kept, recipients: recomputeRecipientCounts kept}
+  if removedCount > 0 then do
+    tc <- *totalMessageCount
+    set *totalMessageCount = max 0 (tc - removedCount)
+    rc <- *recipientMsgCounts
+    let removed = do m <- bucket; where m.receivedAt <= messageCutoff; yield m
+    set *recipientMsgCounts = batchDecrementRecipientCounts rc (countByRecipient removed)
+  else yield {}
 
 -- ============================================
 -- Recipient Count Helpers
@@ -1222,9 +1229,6 @@ countByRecipient = \items ->
     if any acc (\c -> c.pubkey == x.toKey)
       then do c <- acc; yield (if c.pubkey == x.toKey then {pubkey: c.pubkey, count: c.count + 1} else c)
       else union acc [{pubkey: x.toKey, count: 1}]) [] items
-
-recomputeRecipientCounts : [Message] -> [RecipientCount]
-recomputeRecipientCounts = countByRecipient
 
 -- Batch-decrement recipient counts: subtract per-key removal counts in a single pass
 -- instead of calling adjustRecipientCount in a loop.
@@ -1329,6 +1333,12 @@ safeCompare : Text -> Text -> Bool
 safeCompare = \a b ->
   if take 1 a == "" || take 1 b == "" then False {}
   else safeCompareLoop a b maxTokenLen 0 0 == 0
+
+-- Constant-time IP binding check: returns True if IPs match or either is empty (no binding).
+-- Uses safeCompareLoop to prevent timing side-channels on IP comparison.
+matchIp : Text -> Text -> Bool
+matchIp = \clientIp sessionIp ->
+  clientIp == "" || sessionIp == "" || safeCompareLoop clientIp sessionIp maxServerNameLen 0 0 == 0
 
 -- Generic sliding-window rate limiter. Returns whether the request is rate-limited
 -- and the updated entries list. Callers provide match/create/update functions for their entry type.
@@ -1509,31 +1519,26 @@ pruneExpired = \t -> do
     transformAllSessionBuckets (\bucket -> do x <- bucket; where x.expiresAt > t; yield x)
     sessionCount <- countAllSessions
     set *totalSessionCount = sessionCount
-  -- Prune messages across all 16 buckets. Each bucket prune is atomic (short lock).
-  -- Recipient counts are rebuilt incrementally per-bucket — since messages are sharded
-  -- by recipient pubkey, each bucket's counts are disjoint, so simple union merges them.
+  -- Prune messages across all 16 buckets. Each bucket prune is atomic and adjusts
+  -- shared counters (totalMessageCount, recipientMsgCounts) by delta, preserving
+  -- concurrent modifications from poll-ack or send-message operations.
   let messageCutoff = t - unackedMessageMaxAge
-  r0 <- pruneMessageBucketCounting 0 messageCutoff
-  r1 <- pruneMessageBucketCounting 1 messageCutoff
-  r2 <- pruneMessageBucketCounting 2 messageCutoff
-  r3 <- pruneMessageBucketCounting 3 messageCutoff
-  r4 <- pruneMessageBucketCounting 4 messageCutoff
-  r5 <- pruneMessageBucketCounting 5 messageCutoff
-  r6 <- pruneMessageBucketCounting 6 messageCutoff
-  r7 <- pruneMessageBucketCounting 7 messageCutoff
-  r8 <- pruneMessageBucketCounting 8 messageCutoff
-  r9 <- pruneMessageBucketCounting 9 messageCutoff
-  r10 <- pruneMessageBucketCounting 10 messageCutoff
-  r11 <- pruneMessageBucketCounting 11 messageCutoff
-  r12 <- pruneMessageBucketCounting 12 messageCutoff
-  r13 <- pruneMessageBucketCounting 13 messageCutoff
-  r14 <- pruneMessageBucketCounting 14 messageCutoff
-  r15 <- pruneMessageBucketCounting 15 messageCutoff
-  let prunedTotal = r0.count + r1.count + r2.count + r3.count + r4.count + r5.count + r6.count + r7.count + r8.count + r9.count + r10.count + r11.count + r12.count + r13.count + r14.count + r15.count
-  let prunedRecipients = union r0.recipients (union r1.recipients (union r2.recipients (union r3.recipients (union r4.recipients (union r5.recipients (union r6.recipients (union r7.recipients (union r8.recipients (union r9.recipients (union r10.recipients (union r11.recipients (union r12.recipients (union r13.recipients (union r14.recipients r15.recipients))))))))))))))
-  atomic do
-    set *totalMessageCount = prunedTotal
-    set *recipientMsgCounts = prunedRecipients
+  pruneMessageBucket 0 messageCutoff
+  pruneMessageBucket 1 messageCutoff
+  pruneMessageBucket 2 messageCutoff
+  pruneMessageBucket 3 messageCutoff
+  pruneMessageBucket 4 messageCutoff
+  pruneMessageBucket 5 messageCutoff
+  pruneMessageBucket 6 messageCutoff
+  pruneMessageBucket 7 messageCutoff
+  pruneMessageBucket 8 messageCutoff
+  pruneMessageBucket 9 messageCutoff
+  pruneMessageBucket 10 messageCutoff
+  pruneMessageBucket 11 messageCutoff
+  pruneMessageBucket 12 messageCutoff
+  pruneMessageBucket 13 messageCutoff
+  pruneMessageBucket 14 messageCutoff
+  pruneMessageBucket 15 messageCutoff
   -- Prune federation state
   atomic do
     let retainCutoff = t - messageMaxAge
@@ -1768,7 +1773,7 @@ withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
       case authenticateSession sessions token t of
         Unauthorized {} -> onUnauth
         Authorized {pubkey, ip} ->
-          if clientIp != "" && ip != "" && clientIp != ip
+          if not (matchIp clientIp ip)
             then onUnauth
             else onAuth pubkey
 
@@ -2219,7 +2224,7 @@ pollOnce = \token cursor clientIp -> do
     case authenticateSession sessions token t of
       Unauthorized {} -> yield (Nothing {})
       Authorized {pubkey, ip} ->
-        if clientIp != "" && ip != "" && clientIp != ip
+        if not (matchIp clientIp ip)
           then yield (Nothing {})
           else do
         -- Refresh session expiry (sliding window keeps active sessions alive)
@@ -2831,6 +2836,9 @@ handleLogout = \authorization clientIp respond -> do
   t <- now
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {ok: False {}, authorized: False {}})
+  else do
+  authLimited <- checkAuthGlobalRate t
+  if authLimited then yield (respond {ok: False {}, authorized: False {}})
   else
     case extractToken authorization of
       Nothing {} -> yield (respond {ok: False {}, authorized: False {}})
@@ -2933,6 +2941,13 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
   withFederationAuth authorization t respond fromServer requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
     when (fromServer != originServer)
       (println ("forward: relay from " ++ fromServer ++ " (origin: " ++ originServer ++ ") for " ++ toKey))
+    -- Relay origin validation: when per-peer secrets are configured, only accept
+    -- relays claiming an origin that is also a configured peer
+    if fromServer != originServer && count federationPeerSecrets > 0 && none federationPeerSecrets (\p -> normalizeServerName p.server == originServer)
+      then do
+        println ("forward: rejecting relay with unknown origin " ++ originServer ++ " from " ++ fromServer)
+        yield (respond {ok: False {}, error: "unknown_origin"})
+      else do
     -- Replay protection: reject forwards with timestamps older than messageMaxAge.
     -- Legitimate queued messages have timestamps within this window. Replayed captures
     -- become stale once dedup state (messages + ackedIds + deliveredIds) is pruned (~30 days).
@@ -3408,6 +3423,8 @@ main = do
         && maxSessions > 0 && maxChallenges > 0 && backgroundPruneInterval > 0
         && pollTimeoutMs > 0 && challengeExpiry > 0 && sessionExpiry > 0
         && maxPresenceTtl > 0 && maxForwardsEntries > 0 && maxAckedIds > 0
+        && maxForwardRetries > 0 && maxGossipHops > 0 && maxPollsPerKey > 0
+        && gossipOriginHops > 0
   -- Relationship invariants: these misconfigurations cause subtle bugs
   -- (e.g., messages pruned before their stated max age, backoff that never increases)
   let configRelationsOk = unackedMessageMaxAge <= messageMaxAge
@@ -3424,11 +3441,12 @@ main = do
         && gossipDedupWindow < presenceRefreshInterval
         && federationFetchTimeoutMs <= backgroundPruneInterval
         && maxAckOverflow <= maxAckedIds
+        && gossipOriginHops <= maxGossipHops
   let peerSecretsOk = none federationPeerSecrets (\p -> isBadServerName (normalizeServerName p.server) || p.secret == "")
   if not configOk
     then println "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
     else if not configRelationsOk
-    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, per-key limits <= global limits), server not started"
+    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, per-key limits <= global limits), server not started"
     else if not peerSecretsOk
     then println "FATAL: invalid federationPeerSecrets — server names must pass validation and secrets must be non-empty"
     else do
