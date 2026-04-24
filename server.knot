@@ -18,6 +18,10 @@ serverHost = "localhost:8080"
 federationSecret = "" -- must be set to enable federation
 maintenanceSecret = "" -- set to enable /maintenance/prune independently of federation
 federationScheme = "https://" -- scheme for federation HTTP calls
+-- NOTE: Outbound federation HTTP calls have no timeout. A slow/unresponsive peer can hold
+-- a concurrency slot (maxFederationConcurrency) indefinitely. Add a fetch timeout if the
+-- Knot runtime supports it; until then, exponential backoff on failed fetches mitigates
+-- but does not fully prevent resource exhaustion from hung connections.
 -- Per-peer federation secrets (overrides global federationSecret for specific peers)
 -- Format: [{server: "peer.example.com", secret: "peer-specific-secret"}]
 federationPeerSecrets : [{server: Text, secret: Text}]
@@ -125,6 +129,9 @@ maxLookupRateEntries = 1000
 -- Unacked message aging (messages pruned after this regardless of ack status)
 unackedMessageMaxAge : Int<Ms>
 unackedMessageMaxAge = 604800000 -- 7 days
+-- Grace period before federation ack can delete the original message (allows local client to poll)
+ackGracePeriod : Int<Ms>
+ackGracePeriod = 30000 -- 30 seconds
 -- Health check thresholds (background task freshness)
 healthPruneMaxAge : Int<Ms>
 healthPruneMaxAge = backgroundPruneInterval * 3
@@ -163,7 +170,7 @@ type ValidGossipEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Times
 -- Status returned to the sender after SendMessage
 -- Delivered: recipient is online locally; Federated: forwarded to remote server;
 -- Queued: stored but recipient location unknown; Unauthorized/Rejected: not accepted
-data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {} | MsUnauthorized {} | MsRejected {} | MsRateLimited {} | MsDuplicate {}
+data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {} | MsUnauthorized {} | MsRejected {} | MsRateLimited {} | MsDuplicate {} | MsDraining {}
 
 impl ToJSON MessageStatus where
   toJson ms = toJson (case ms of
@@ -173,7 +180,8 @@ impl ToJSON MessageStatus where
     MsUnauthorized {} -> "unauthorized"
     MsRejected {} -> "rejected"
     MsRateLimited {} -> "rate_limited"
-    MsDuplicate {} -> "duplicate")
+    MsDuplicate {} -> "duplicate"
+    MsDraining {} -> "draining")
 
 -- Internal delivery status (same as MessageStatus but without error variants)
 data DeliveryStatus = DsDelivered {} | DsFederated {} | DsQueued {}
@@ -243,6 +251,8 @@ type KeyPresenceEntry = {server: Text, expiresAt: Timestamp}
 *sessions : [Session]
 
 *messages : [Message]
+
+*totalMessageCount : Int
 
 *presence : [PresenceEntry]
 
@@ -314,6 +324,8 @@ type KeyPresenceEntry = {server: Text, expiresAt: Timestamp}
 
 *pruneRunning : Timestamp
 
+*pruneGeneration : Int
+
 *ipRates : [IpRateEntry]
 
 *lookupRates : [LookupRateEntry]
@@ -345,7 +357,7 @@ route AuthApi where
 route ClientApi where
   -- Long-poll for new messages; cursor tracks last-seen receivedAt timestamp
   POST {cursor: Timestamp} /poll headers {authorization: Text}
-    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool}
+    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool}
     = Poll
   /messages
     -- Send an E2E encrypted message to a recipient pubkey
@@ -894,12 +906,16 @@ pruneExpired = \t -> do
   atomic do
     let messageCutoff = t - unackedMessageMaxAge
     messages <- *messages
-    set *messages = do m <- messages; where m.receivedAt > messageCutoff; yield m
+    let prunedMessages = do m <- messages; where m.receivedAt > messageCutoff; yield m
+    set *messages = prunedMessages
+    set *totalMessageCount = count prunedMessages
   -- Prune federation state
   atomic do
     let retainCutoff = t - messageMaxAge
     forwards <- *forwards
-    set *forwards = do f <- forwards; where f.createdAt > retainCutoff; yield f
+    -- Clear all forwards when federation is disabled (they can never be retried)
+    set *forwards = if not federationEnabled then []
+      else do f <- forwards; where f.createdAt > retainCutoff; yield f
     ackedIds <- *ackedIds
     set *ackedIds = do a <- ackedIds; where a.ackedAt > retainCutoff; yield a
     forwardFailures <- *forwardFailures
@@ -1269,10 +1285,10 @@ pruneAndRetry = \t -> do
       retryPendingForwards result.pendingForwards
       sendAcksAndClean result.pendingAcks
       retryOverflowAcks result.pendingOverflow))
+  -- Only gossip extended sessions; keys nearing expiry without active sessions will naturally
+  -- trigger offline gossip when they expire (avoids wasted federation traffic)
   when result.shouldRefresh (do
-    let extendedEvents = do p <- result.extendedActive; yield {eventType: GossipOnline {}, pubkey: p.pubkey, server: serverHostN, timestamp: t, ttl: clampTtl (sessionExpiry / 1000)}
-    let nearExpiryEvents = do p <- result.nearExpiryActive; yield {eventType: GossipOnline {}, pubkey: p.pubkey, server: serverHostN, timestamp: p.timestamp, ttl: clampTtl ((p.expiresAt - p.timestamp) / 1000)}
-    let refreshEvents = union extendedEvents nearExpiryEvents
+    let refreshEvents = do p <- result.extendedActive; yield {eventType: GossipOnline {}, pubkey: p.pubkey, server: serverHostN, timestamp: t, ttl: clampTtl (sessionExpiry / 1000)}
     when (count result.refreshPeers > 0 && count refreshEvents > 0)
       (fork (sendBatchedGossip result.refreshPeers refreshEvents gossipOriginHops)))
 
@@ -1338,6 +1354,8 @@ ackPolledMessages = \pubkey cursor t -> do
   if count toAck > 0
     then do
       set *messages = diff messages toAck
+      totalCount <- *totalMessageCount
+      set *totalMessageCount = totalCount - count toAck
       let ackedMsgIds = do m <- toAck; yield m.messageId
       forwards <- *forwards
       set *forwards = do f <- forwards; where none ackedMsgIds (\mid -> f.messageId == mid && f.toKey == pubkey); yield f
@@ -1635,6 +1653,10 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
       else yield {valid: True {}}
   if validation.valid
     then do
+      -- Reject if server started draining after challenge was issued
+      isDraining <- *draining
+      if isDraining then yield (respond {token: "", expiresAt: 0})
+      else do
       token <- genToken
       peerServers <- atomic do
         sessions <- *sessions
@@ -1660,10 +1682,10 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
 handlePoll = \cursor authorization respond -> do
   t <- now
   draining <- *draining
-  if draining then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: False {}})
+  if draining then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}})
   else do
   globalRateLimited <- checkGlobalRate t
-  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}})
+  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}})
   else do
     result <- case extractToken authorization of
       Nothing {} -> yield {authorized: False {}, events: [], cursor: 0, pendingAcks: [], evictedEntries: []}
@@ -1671,7 +1693,7 @@ handlePoll = \cursor authorization respond -> do
     fork (when federationEnabled (do
       sendAcksAndClean result.pendingAcks
       retryEvictedAcks result.evictedEntries result.pendingAcks))
-    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: False {}})
+    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: False {}, draining: False {}})
 
 -- POST /messages: Send an encrypted message to a recipient.
 -- Deduplicates by messageId across messages, ackedIds, and deliveredIds.
@@ -1679,7 +1701,7 @@ handlePoll = \cursor authorization respond -> do
 handleSendMessage = \to encryptedBlob timestamp messageId authorization respond -> do
   t <- now
   draining <- *draining
-  if draining then yield (respond {status: MsRejected {}, messageId: ""})
+  if draining then yield (respond {status: MsDraining {}, messageId: ""})
   else do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {status: MsRateLimited {}, messageId: ""})
@@ -1690,6 +1712,9 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization respond 
       withSessionAuth authorization t
         (yield {send: SendFailed {status: MsUnauthorized {}}, senderRateLimited: False {}, globalCapReached: False {}})
         (\senderKey -> do
+          -- Reject self-sends (sender == recipient wastes a mailbox slot)
+          if senderKey == to then yield {send: SendFailed {status: MsRejected {}}, senderRateLimited: False {}, globalCapReached: False {}}
+          else do
           messages <- *messages
           ackedIds <- *ackedIds
           deliveredIds <- *deliveredIds
@@ -1714,10 +1739,10 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization respond 
                     then yield {send: SendFailed {status: MsRateLimited {}}, senderRateLimited: False {}, globalCapReached: False {}}
                     else do
                       set *recvRates = recvResult.entries
-                      let msgStats = messageCounts messages to t
-                      if msgStats.total >= maxMessages
+                      totalMsgCount <- *totalMessageCount
+                      if totalMsgCount >= maxMessages
                         then yield {send: SendFailed {status: MsRejected {}}, senderRateLimited: False {}, globalCapReached: True {}}
-                      else if msgStats.forKey >= maxMessagesPerRecipient
+                      else if countMessagesFor messages to t >= maxMessagesPerRecipient
                         then yield {send: SendFailed {status: MsRejected {}}, senderRateLimited: False {}, globalCapReached: False {}}
                         else do
                           presence <- *presence
@@ -1727,6 +1752,7 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization respond 
                           set *messages = union messages
                             [{messageId: effectiveMsgId, toKey: to,
                               encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
+                          set *totalMessageCount = totalMsgCount + 1
                           signalMessageForKey to seqTs
                           let toPresence = presenceForKey presence to t
                           let localOnline = hasLocalPresence toPresence
@@ -1855,10 +1881,10 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
       if hasMessage messageId toKey messages || hasMessage messageId toKey ackedIds || hasMessage messageId toKey deliveredIds
         then yield {forward: ForwardDuplicate {}, globalCapReached: False {}}
         else do
-          let msgStats = messageCounts messages toKey t
-          if msgStats.total >= maxMessages
+          totalMsgCount <- *totalMessageCount
+          if totalMsgCount >= maxMessages
             then yield {forward: ForwardRejected {}, globalCapReached: True {}}
-          else if msgStats.forKey >= maxMessagesPerRecipient
+          else if countMessagesFor messages toKey t >= maxMessagesPerRecipient
             then yield {forward: ForwardRejected {}, globalCapReached: False {}}
             else do
               recvRates <- *recvRates
@@ -1877,6 +1903,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                     [{messageId: messageId, toKey: toKey,
                       encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
                   set *messages = updatedMessages
+                  set *totalMessageCount = totalMsgCount + 1
                   signalMessageForKey toKey seqTs
                   yield {forward: ForwardStored {}, globalCapReached: False {}}
     case result.forward of
@@ -1908,7 +1935,11 @@ handleFederationAck = \messageIds originServer fromServer authorization respond 
         where none updatedForwards (\rf -> rf.messageId == f.messageId && rf.toKey == f.toKey)
         where none presence (\p -> p.pubkey == f.toKey && isLocalServer p.server && p.expiresAt > t)
         yield f
-      set *messages = do m <- messages; where none removable (\f -> m.messageId == f.messageId && m.toKey == f.toKey); yield m
+      -- Only remove messages stored long enough for local clients to have polled them (grace period)
+      let pastGrace = do f <- removable; where any messages (\m -> m.messageId == f.messageId && m.toKey == f.toKey && t - m.receivedAt >= ackGracePeriod); yield f
+      let updatedMessages = do m <- messages; where none pastGrace (\f -> m.messageId == f.messageId && m.toKey == f.toKey); yield m
+      set *messages = updatedMessages
+      set *totalMessageCount = count updatedMessages
     yield (respond {ok: True {}, error: ""}))
 
 -- POST /maintenance/drain: Broadcast offline gossip for all local keys (graceful shutdown).
@@ -1953,40 +1984,38 @@ handlePrune = \authorization respond -> do
 
 handleHealth = \respond -> do
   t <- now
-  globalLimited <- checkGlobalRate t
-  if globalLimited then yield (respond {ok: False {}, pruneHealthy: False {}, heartbeatHealthy: False {}, capacityHealthy: False {}, federationHealthy: False {}})
-  else do
-    result <- atomic do
-      lastPrune <- *lastPrunedAt
-      lastHb <- *lastHeartbeatAt
-      sa <- *startedAt
-      presence <- *presence
-      forwards <- *forwards
-      sessions <- *sessions
-      activePolls <- *activePolls
-      messages <- *messages
-      lastFedSuccess <- *lastFederationSuccessAt
-      forwardFailures <- *forwardFailures
-      let warmup = t - sa < healthPruneMaxAge
-      -- Capacity pressure: flag when any capped collection exceeds 90% full
-      let capacityOk = count messages * 10 <= maxMessages * 9
-        && count presence * 10 <= maxPresenceEntries * 9
-        && count forwards * 10 <= maxForwardsEntries * 9
-        && count sessions * 10 <= maxSessions * 9
-        && count activePolls * 10 <= maxActivePolls * 9
-      -- Federation: healthy if disabled, in warmup, no peer issues, or recent success
-      let fedOk = not federationEnabled || warmup
-        || count forwardFailures == 0
-        || (lastFedSuccess > 0 && t - lastFedSuccess < backgroundPruneInterval * 5)
-      yield {pruneOk: warmup || t - lastPrune < healthPruneMaxAge,
-             heartbeatOk: warmup || t - lastHb < healthHeartbeatMaxAge,
-             capacityOk: capacityOk,
-             federationOk: fedOk}
-    yield (respond {ok: result.pruneOk && result.heartbeatOk && result.capacityOk && result.federationOk,
-                    pruneHealthy: result.pruneOk,
-                    heartbeatHealthy: result.heartbeatOk,
-                    capacityHealthy: result.capacityOk,
-                    federationHealthy: result.federationOk})
+  -- Health checks exempt from global rate limiting (monitoring traffic shouldn't starve real requests)
+  result <- atomic do
+    lastPrune <- *lastPrunedAt
+    lastHb <- *lastHeartbeatAt
+    sa <- *startedAt
+    presence <- *presence
+    forwards <- *forwards
+    sessions <- *sessions
+    activePolls <- *activePolls
+    messages <- *messages
+    lastFedSuccess <- *lastFederationSuccessAt
+    forwardFailures <- *forwardFailures
+    let warmup = t - sa < healthPruneMaxAge
+    -- Capacity pressure: flag when any capped collection exceeds 90% full
+    let capacityOk = count messages * 10 <= maxMessages * 9
+      && count presence * 10 <= maxPresenceEntries * 9
+      && count forwards * 10 <= maxForwardsEntries * 9
+      && count sessions * 10 <= maxSessions * 9
+      && count activePolls * 10 <= maxActivePolls * 9
+    -- Federation: healthy if disabled, in warmup, no peer issues, or recent success
+    let fedOk = not federationEnabled || warmup
+      || count forwardFailures == 0
+      || (lastFedSuccess > 0 && t - lastFedSuccess < backgroundPruneInterval * 5)
+    yield {pruneOk: warmup || t - lastPrune < healthPruneMaxAge,
+           heartbeatOk: warmup || t - lastHb < healthHeartbeatMaxAge,
+           capacityOk: capacityOk,
+           federationOk: fedOk}
+  yield (respond {ok: result.pruneOk && result.heartbeatOk && result.capacityOk && result.federationOk,
+                  pruneHealthy: result.pruneOk,
+                  heartbeatHealthy: result.heartbeatOk,
+                  capacityHealthy: result.capacityOk,
+                  federationHealthy: result.federationOk})
 
 handleStats = \authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
@@ -2092,18 +2121,25 @@ backgroundPrune = do
   status <- atomic do
     running <- *pruneRunning
     if running > 0 && t - running < backgroundPruneInterval * 3
-      then yield {canRun: False {}, recovered: False {}}
+      then yield {canRun: False {}, recovered: False {}, gen: 0}
       else do
         set *pruneRunning = t
+        gen <- *pruneGeneration
+        let newGen = gen + 1
+        set *pruneGeneration = newGen
         pc <- *pruneCount
         set *pruneCount = pc + 1
-        yield {canRun: True {}, recovered: running > 0}
+        yield {canRun: True {}, recovered: running > 0, gen: newGen}
   when status.recovered
     (println "backgroundPrune: previous cycle appears stuck, forcing new cycle")
   if status.canRun
     then fork (do
       pruneAndRetry t
-      atomic do set *pruneRunning = 0)
+      -- Only clear running flag if this is still the latest generation
+      -- (prevents a stuck old fork from clearing the flag after a recovery cycle started)
+      atomic do
+        currentGen <- *pruneGeneration
+        when (currentGen == status.gen) (set *pruneRunning = 0))
     else println "backgroundPrune: skipping (previous cycle still running)"
   backgroundPrune
 
