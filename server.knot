@@ -107,6 +107,10 @@ federationFetchTimeoutMs : Int<Ms>
 federationFetchTimeoutMs = 30000 -- 30 seconds; consider server unresponsive if fetch hasn't returned
 maxFederationInFlight = 100
 
+-- Federation latency metric window
+federationLatencyWindowMs : Int<Ms>
+federationLatencyWindowMs = 300000 -- 5 minutes; reset latency metrics after this interval
+
 -- Background task intervals
 backgroundPruneInterval : Int<Ms>
 backgroundPruneInterval = 30000 -- 30 seconds; also retries failed forwards/acks
@@ -274,7 +278,24 @@ type FederationInFlightEntry = {server: Text, count: Int, firstStartedAt: Timest
 *sessionBucket14 : [Session]
 *sessionBucket15 : [Session]
 
-*messages : [Message]
+-- Messages sharded into 16 buckets by first hex char of recipient pubkey (toKey).
+-- Hot-path operations (poll, send, ack) scan only one bucket (~1/16 of messages).
+*messageBucket0 : [Message]
+*messageBucket1 : [Message]
+*messageBucket2 : [Message]
+*messageBucket3 : [Message]
+*messageBucket4 : [Message]
+*messageBucket5 : [Message]
+*messageBucket6 : [Message]
+*messageBucket7 : [Message]
+*messageBucket8 : [Message]
+*messageBucket9 : [Message]
+*messageBucket10 : [Message]
+*messageBucket11 : [Message]
+*messageBucket12 : [Message]
+*messageBucket13 : [Message]
+*messageBucket14 : [Message]
+*messageBucket15 : [Message]
 
 *totalMessageCount : Int
 
@@ -374,6 +395,12 @@ type FederationInFlightEntry = {server: Text, count: Int, firstStartedAt: Timest
 -- Server instance generation (epoch timestamp, for cursor staleness detection)
 *serverGeneration : Int
 
+-- Timestamp when drain federation ops completed (0 if in progress or not draining)
+*drainCompletedAt : Timestamp
+
+-- Last time federation latency metrics were reset (for windowed averages)
+*federationLatencyResetAt : Timestamp
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -444,7 +471,7 @@ route HealthApi where
 -- Returns counts of in-memory collections (requires federation or maintenance secret)
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {sessions: Int, sessionsMax: Int, messages: Int, messagesMax: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pruneCount: Int, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, federationEnabled: Bool, recentGossip: Int, totalMessageCount: Int, recipientCounts: Int, federationInFlight: Int, messagesPct: Int, presencePct: Int, forwardsPct: Int, sessionsPct: Int, federationAvgLatencyMs: Int, federationMaxLatencyMs: Int, federationCallCount: Int, ok: Bool}
+    -> {sessions: Int, sessionsMax: Int, messages: Int, messagesMax: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pruneCount: Int, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, federationEnabled: Bool, recentGossip: Int, totalMessageCount: Int, recipientCounts: Int, federationInFlight: Int, messagesPct: Int, presencePct: Int, forwardsPct: Int, sessionsPct: Int, federationAvgLatencyMs: Int, federationMaxLatencyMs: Int, federationCallCount: Int, drainCompletedAt: Timestamp, ok: Bool}
     = Stats
   GET /stats/peers headers {authorization: Text}
     -> {peers: [PeerStatus], ok: Bool}
@@ -683,6 +710,9 @@ isBadServerName = \sn ->
   || containsSuffix ".home" sn
   || containsSuffix ".lan" sn
   || containsSuffix ".intranet" sn
+  || containsSuffix ".test" sn
+  || containsSuffix ".example" sn
+  || containsSuffix ".invalid" sn
 
 -- Look up a non-expired session matching the given token (constant-time comparison).
 -- Caller passes the appropriate session bucket (sharded by token prefix).
@@ -840,6 +870,100 @@ transformAllSessionBuckets = \f -> do
   b13 <- *sessionBucket13; set *sessionBucket13 = f b13
   b14 <- *sessionBucket14; set *sessionBucket14 = f b14
   b15 <- *sessionBucket15; set *sessionBucket15 = f b15
+
+-- ============================================
+-- Message Bucket Helpers
+-- ============================================
+-- Messages are sharded into 16 buckets by the first hex char of the recipient pubkey.
+-- This reduces poll/send/ack scans from O(n) to O(n/16) on the hot path.
+
+readMessageBucket : Int -> IO [Message]
+readMessageBucket = \b ->
+  if b == 0 then do s <- *messageBucket0; yield s
+  else if b == 1 then do s <- *messageBucket1; yield s
+  else if b == 2 then do s <- *messageBucket2; yield s
+  else if b == 3 then do s <- *messageBucket3; yield s
+  else if b == 4 then do s <- *messageBucket4; yield s
+  else if b == 5 then do s <- *messageBucket5; yield s
+  else if b == 6 then do s <- *messageBucket6; yield s
+  else if b == 7 then do s <- *messageBucket7; yield s
+  else if b == 8 then do s <- *messageBucket8; yield s
+  else if b == 9 then do s <- *messageBucket9; yield s
+  else if b == 10 then do s <- *messageBucket10; yield s
+  else if b == 11 then do s <- *messageBucket11; yield s
+  else if b == 12 then do s <- *messageBucket12; yield s
+  else if b == 13 then do s <- *messageBucket13; yield s
+  else if b == 14 then do s <- *messageBucket14; yield s
+  else do s <- *messageBucket15; yield s
+
+writeMessageBucket : Int -> [Message] -> IO ()
+writeMessageBucket = \b msgs ->
+  if b == 0 then set *messageBucket0 = msgs
+  else if b == 1 then set *messageBucket1 = msgs
+  else if b == 2 then set *messageBucket2 = msgs
+  else if b == 3 then set *messageBucket3 = msgs
+  else if b == 4 then set *messageBucket4 = msgs
+  else if b == 5 then set *messageBucket5 = msgs
+  else if b == 6 then set *messageBucket6 = msgs
+  else if b == 7 then set *messageBucket7 = msgs
+  else if b == 8 then set *messageBucket8 = msgs
+  else if b == 9 then set *messageBucket9 = msgs
+  else if b == 10 then set *messageBucket10 = msgs
+  else if b == 11 then set *messageBucket11 = msgs
+  else if b == 12 then set *messageBucket12 = msgs
+  else if b == 13 then set *messageBucket13 = msgs
+  else if b == 14 then set *messageBucket14 = msgs
+  else set *messageBucket15 = msgs
+
+-- Read all 16 message buckets (for cold-path operations: federation ack, forward candidates, stats)
+readAllMessages : IO [Message]
+readAllMessages = do
+  m0 <- *messageBucket0
+  m1 <- *messageBucket1
+  m2 <- *messageBucket2
+  m3 <- *messageBucket3
+  m4 <- *messageBucket4
+  m5 <- *messageBucket5
+  m6 <- *messageBucket6
+  m7 <- *messageBucket7
+  m8 <- *messageBucket8
+  m9 <- *messageBucket9
+  m10 <- *messageBucket10
+  m11 <- *messageBucket11
+  m12 <- *messageBucket12
+  m13 <- *messageBucket13
+  m14 <- *messageBucket14
+  m15 <- *messageBucket15
+  yield (union m0 (union m1 (union m2 (union m3 (union m4 (union m5 (union m6 (union m7 (union m8 (union m9 (union m10 (union m11 (union m12 (union m13 (union m14 m15)))))))))))))))
+
+-- Apply a filter/transform to every message bucket
+transformAllMessageBuckets : ([Message] -> [Message]) -> IO ()
+transformAllMessageBuckets = \f -> do
+  b0 <- *messageBucket0; set *messageBucket0 = f b0
+  b1 <- *messageBucket1; set *messageBucket1 = f b1
+  b2 <- *messageBucket2; set *messageBucket2 = f b2
+  b3 <- *messageBucket3; set *messageBucket3 = f b3
+  b4 <- *messageBucket4; set *messageBucket4 = f b4
+  b5 <- *messageBucket5; set *messageBucket5 = f b5
+  b6 <- *messageBucket6; set *messageBucket6 = f b6
+  b7 <- *messageBucket7; set *messageBucket7 = f b7
+  b8 <- *messageBucket8; set *messageBucket8 = f b8
+  b9 <- *messageBucket9; set *messageBucket9 = f b9
+  b10 <- *messageBucket10; set *messageBucket10 = f b10
+  b11 <- *messageBucket11; set *messageBucket11 = f b11
+  b12 <- *messageBucket12; set *messageBucket12 = f b12
+  b13 <- *messageBucket13; set *messageBucket13 = f b13
+  b14 <- *messageBucket14; set *messageBucket14 = f b14
+  b15 <- *messageBucket15; set *messageBucket15 = f b15
+
+-- Prune a single message bucket and return kept count + per-recipient counts.
+-- Since messages are sharded by recipient pubkey, each bucket's recipient counts
+-- are disjoint from other buckets — simple union merges them.
+pruneMessageBucketCounting = \b messageCutoff -> atomic do
+  bucket <- readMessageBucket b
+  let kept = do m <- bucket; where m.receivedAt > messageCutoff; yield m
+  writeMessageBucket b kept
+  yield {count: count kept, recipients: recomputeRecipientCounts kept}
 
 -- ============================================
 -- Recipient Count Helpers
@@ -1140,16 +1264,31 @@ pruneExpired = \t -> do
     challenges <- *challenges
     set *challenges = do x <- challenges; where x.expiresAt > t; yield x
     transformAllSessionBuckets (\bucket -> do x <- bucket; where x.expiresAt > t; yield x)
-  -- Prune messages (largest collection, isolated for minimal lock time)
-  prunedMessages <- atomic do
-    let messageCutoff = t - unackedMessageMaxAge
-    messages <- *messages
-    let prunedMessages = do m <- messages; where m.receivedAt > messageCutoff; yield m
-    set *messages = prunedMessages
-    set *totalMessageCount = count prunedMessages
-    yield prunedMessages
-  -- Recompute recipient counts from pruned messages (outside main message lock)
-  atomic do set *recipientMsgCounts = recomputeRecipientCounts prunedMessages
+  -- Prune messages across all 16 buckets. Each bucket prune is atomic (short lock).
+  -- Recipient counts are rebuilt incrementally per-bucket — since messages are sharded
+  -- by recipient pubkey, each bucket's counts are disjoint, so simple union merges them.
+  let messageCutoff = t - unackedMessageMaxAge
+  r0 <- pruneMessageBucketCounting 0 messageCutoff
+  r1 <- pruneMessageBucketCounting 1 messageCutoff
+  r2 <- pruneMessageBucketCounting 2 messageCutoff
+  r3 <- pruneMessageBucketCounting 3 messageCutoff
+  r4 <- pruneMessageBucketCounting 4 messageCutoff
+  r5 <- pruneMessageBucketCounting 5 messageCutoff
+  r6 <- pruneMessageBucketCounting 6 messageCutoff
+  r7 <- pruneMessageBucketCounting 7 messageCutoff
+  r8 <- pruneMessageBucketCounting 8 messageCutoff
+  r9 <- pruneMessageBucketCounting 9 messageCutoff
+  r10 <- pruneMessageBucketCounting 10 messageCutoff
+  r11 <- pruneMessageBucketCounting 11 messageCutoff
+  r12 <- pruneMessageBucketCounting 12 messageCutoff
+  r13 <- pruneMessageBucketCounting 13 messageCutoff
+  r14 <- pruneMessageBucketCounting 14 messageCutoff
+  r15 <- pruneMessageBucketCounting 15 messageCutoff
+  let prunedTotal = r0.count + r1.count + r2.count + r3.count + r4.count + r5.count + r6.count + r7.count + r8.count + r9.count + r10.count + r11.count + r12.count + r13.count + r14.count + r15.count
+  let prunedRecipients = union r0.recipients (union r1.recipients (union r2.recipients (union r3.recipients (union r4.recipients (union r5.recipients (union r6.recipients (union r7.recipients (union r8.recipients (union r9.recipients (union r10.recipients (union r11.recipients (union r12.recipients (union r13.recipients (union r14.recipients r15.recipients))))))))))))))
+  atomic do
+    set *totalMessageCount = prunedTotal
+    set *recipientMsgCounts = prunedRecipients
   -- Prune federation state
   atomic do
     let retainCutoff = t - messageMaxAge
@@ -1183,9 +1322,11 @@ pruneExpired = \t -> do
     set *recvRates = do r <- recvRates; where t - r.windowStart < recvRateWindowMs; yield r
     recentGossip <- *recentGossip
     set *recentGossip = do r <- recentGossip; where t - r.seenAt < gossipDedupWindow; yield r
-    -- Clean up stale in-flight entries (hung fetches that never completed)
+    -- Clean up stale in-flight entries: remove zeroed entries and reset leaked slots
+    -- where the forked task died without calling clearFederationInFlight.
+    -- Uses 3x timeout threshold to allow the skip-hung-server logic to take effect first.
     inFlight <- *federationInFlight
-    set *federationInFlight = do r <- inFlight; where r.count > 0; yield r
+    set *federationInFlight = do r <- inFlight; where r.count > 0 && (r.firstStartedAt == 0 || t - r.firstStartedAt < federationFetchTimeoutMs * 3); yield r
   yield presenceResult
 
 
@@ -1407,12 +1548,12 @@ retryPendingForwards = \pending -> do
 -- When a remote key comes online, create forward entries for queued messages and send them
 forwardQueuedMessages = \targets t -> do
   newForwards <- atomic do
-    messages <- *messages
+    allMessages <- readAllMessages
     forwards <- *forwards
     presence <- *presence
     let localOnline = localOnlineKeys presence t
     let remoteTargets = remoteOnlyTargets targets localOnline
-    let candidates = forwardCandidates remoteTargets messages forwards t
+    let candidates = forwardCandidates remoteTargets allMessages forwards t
     let capped = takeRelation (maxForwardsEntries - count forwards) candidates
     let updatedForwards = union forwards capped
     set *forwards = updatedForwards
@@ -1549,6 +1690,15 @@ pruneAndRetry = \t -> do
     let refreshPeers = if shouldRefresh then collectPeerServers presence (\p -> p.server) else []
     when shouldRefresh (set *lastPresenceRefresh = t)
     yield {extendedActive: toExtend, nearExpiryActive: notExtended, refreshPeers: refreshPeers, shouldRefresh: shouldRefresh}
+  -- Reset federation latency metrics periodically for windowed averages (prevents
+  -- lifetime-cumulative average from masking current conditions)
+  atomic do
+    resetAt <- *federationLatencyResetAt
+    when (t - resetAt >= federationLatencyWindowMs) (do
+      set *federationLatencyTotal = 0
+      set *federationLatencyCount = 0
+      set *federationLatencyMax = 0
+      set *federationLatencyResetAt = t)
   let result = {pendingForwards: pendingForwards, pendingAcks: ackState.pendingAcks, pendingOverflow: ackState.pendingOverflow, extendedActive: refreshResult.extendedActive, nearExpiryActive: refreshResult.nearExpiryActive, refreshPeers: refreshResult.refreshPeers, shouldRefresh: refreshResult.shouldRefresh}
   -- Fork federation I/O so hung peers don't block next prune cycle
   fork (do
@@ -1621,12 +1771,13 @@ readMessageSignal = \pubkey ->
 -- and create ack entries for federated messages (to notify origin servers).
 -- Returns pending acks and any evicted entries that exceeded ackedIds capacity.
 ackPolledMessages = \pubkey cursor t -> do
-  messages <- *messages
-  let toAck = do m <- messages; where m.toKey == pubkey && m.receivedAt <= cursor; yield m
+  let b = pubkeyBucket pubkey
+  bucket <- readMessageBucket b
+  let toAck = do m <- bucket; where m.toKey == pubkey && m.receivedAt <= cursor; yield m
   let ackCount = count toAck
   if ackCount > 0
     then do
-      set *messages = diff messages toAck
+      writeMessageBucket b (diff bucket toAck)
       totalCount <- *totalMessageCount
       set *totalMessageCount = totalCount - ackCount
       recipientCounts <- *recipientMsgCounts
@@ -1644,8 +1795,8 @@ ackPolledMessages = \pubkey cursor t -> do
     else yield {pendingAcks: [], evictedEntries: []}
 
 pollNewEvents = \pubkey clampedCursor t -> do
-  messages <- *messages
-  let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages messages pubkey clampedCursor t))
+  bucket <- readMessageBucket (pubkeyBucket pubkey)
+  let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages bucket pubkey clampedCursor t))
   let evts = do
     m <- limitedMsgs
     yield {id: m.messageId, eventType: "message",
@@ -1704,8 +1855,8 @@ pollOnce = \token cursor clientIp -> do
           pollResult <- do
             -- Phase 1: check for existing messages (atomic read)
             initialResult <- atomic do
-              messages <- *messages
-              if count (pollableMessages messages s.pubkey s.clampedCursor t) > 0
+              bucket <- readMessageBucket (pubkeyBucket s.pubkey)
+              if count (pollableMessages bucket s.pubkey s.clampedCursor t) > 0
                 then do
                   r <- pollNewEvents s.pubkey s.clampedCursor t
                   yield (Just {value: {events: r.events, cursor: r.cursor}})
@@ -1923,9 +2074,10 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
   validation <- atomic do
     challenges <- *challenges
     let hasMatch = challengeMatch challenges pubkey challenge clientIp t
-    -- Only consume challenge on IP match (rate limiter handles brute-force from same IP;
-    -- not consuming on IP mismatch prevents remote attackers from burning challenges)
-    when hasMatch (set *challenges = do c <- challenges; where c.pubkey != pubkey; yield c)
+    -- Consume only the matched challenge on IP match (rate limiter handles brute-force from same IP;
+    -- not consuming on IP mismatch prevents remote attackers from burning challenges).
+    -- Other challenges for the same pubkey are preserved (concurrent auth from multiple devices).
+    when hasMatch (set *challenges = challengesExcluding challenges pubkey challenge)
     if not hasMatch || not sigValid
       then yield {valid: False {}}
       else yield {valid: True {}}
@@ -2020,11 +2172,12 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp
           -- Reject self-sends (sender == recipient wastes a mailbox slot)
           if senderKey == to then yield {send: SendFailed {status: MsRejected {}}, senderRateLimited: False {}, globalCapReached: False {}}
           else do
-          messages <- *messages
+          let msgBucket = pubkeyBucket to
+          bucket <- readMessageBucket msgBucket
           ackedIds <- *ackedIds
           deliveredIds <- *deliveredIds
-          -- Dedup check (only when messageId is non-empty; skips O(n) scan otherwise)
-          let isDup = checkMessageDup messages messageId to || (messageId != "" && (hasMessage messageId to ackedIds || hasMessage messageId to deliveredIds))
+          -- Dedup check (only when messageId is non-empty; scans only the recipient's bucket)
+          let isDup = checkMessageDup bucket messageId to || (messageId != "" && (hasMessage messageId to ackedIds || hasMessage messageId to deliveredIds))
           if isDup
             then yield {send: SendDuplicate {}, senderRateLimited: False {}, globalCapReached: False {}}
             else do
@@ -2060,9 +2213,9 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp
                               seqCounter <- *seqCounter
                               let seqTs = nextSeqTs t seqCounter
                               set *seqCounter = seqTs
-                              set *messages = union messages
+                              writeMessageBucket msgBucket (union bucket
                                 [{messageId: effectiveMsgId, toKey: to,
-                                  encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}]
+                                  encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}])
                               set *totalMessageCount = totalMsgCount + 1
                               set *recipientMsgCounts = adjustRecipientCount recipientCounts to 1
                               signalMessageForKey to seqTs
@@ -2150,6 +2303,16 @@ handleRevoke = \targetToken authorization clientIp respond -> do
     withSessionAuth authorization t clientIp
       (yield (respond {ok: False {}, authorized: False {}}))
       (\callerPubkey -> do
+        revokeLimited <- atomic do
+          challengeRates <- *challengeRates
+          let rateResult = checkRateWindow challengeRates (\r -> r.pubkey == callerPubkey)
+            (\ts -> {pubkey: callerPubkey, windowStart: ts, count: 1})
+            (\r -> {pubkey: r.pubkey, windowStart: r.windowStart, count: r.count + 1})
+            maxChallengeRatePerKey challengeRateWindowMs maxChallengeRateEntries t
+          set *challengeRates = rateResult.entries
+          yield rateResult.limited
+        if revokeLimited then yield (respond {ok: False {}, authorized: True {}})
+        else do
         let targetBucket = tokenBucket targetToken
         removed <- atomic do
           sessions <- readSessionBucket targetBucket
@@ -2210,12 +2373,19 @@ handleRecvGossip = \events hopsRemaining fromServer authorization respond -> do
 handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer authorization respond -> do
   t <- now
   withFederationAuth authorization t respond fromServer (not (isLocalServer originServer) && fromServer == originServer) (do
+    -- Replay protection: reject forwards with timestamps older than messageMaxAge.
+    -- Legitimate queued messages have timestamps within this window. Replayed captures
+    -- become stale once dedup state (messages + ackedIds + deliveredIds) is pruned (~30 days).
+    if t - timestamp > messageMaxAge
+      then yield (respond {ok: False {}, error: "stale_timestamp"})
+      else do
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
-      messages <- *messages
+      let msgBucket = pubkeyBucket toKey
+      bucket <- readMessageBucket msgBucket
       ackedIds <- *ackedIds
       deliveredIds <- *deliveredIds
-      let isDup = checkMessageDup messages messageId toKey || hasMessage messageId toKey ackedIds || hasMessage messageId toKey deliveredIds
+      let isDup = checkMessageDup bucket messageId toKey || hasMessage messageId toKey ackedIds || hasMessage messageId toKey deliveredIds
       if isDup
         then yield {forward: ForwardDuplicate {}, globalCapReached: False {}, recvRateLimited: False {}}
         else do
@@ -2240,10 +2410,9 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                       seqCounter <- *seqCounter
                       let seqTs = nextSeqTs t seqCounter
                       set *seqCounter = seqTs
-                      let updatedMessages = union messages
+                      writeMessageBucket msgBucket (union bucket
                         [{messageId: messageId, toKey: toKey,
-                          encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
-                      set *messages = updatedMessages
+                          encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}])
                       set *totalMessageCount = totalMsgCount + 1
                       set *recipientMsgCounts = adjustRecipientCount recipientCounts toKey 1
                       signalMessageForKey toKey seqTs
@@ -2272,7 +2441,8 @@ handleFederationAck = \messageIds originServer fromServer authorization respond 
       let ackedForwards = do f <- forwards; where f.toServer == fromServer && any dedupedIds (\mid -> f.messageId == mid); yield f
       let updatedForwards = forwardsExcluding forwards fromServer dedupedIds
       set *forwards = updatedForwards
-      messages <- *messages
+      -- Read all message buckets (cold path: federation ack handles at most maxMessageIds entries)
+      allMessages <- readAllMessages
       presence <- *presence
       let removable = do
         f <- ackedForwards
@@ -2280,20 +2450,18 @@ handleFederationAck = \messageIds originServer fromServer authorization respond 
         where none presence (\p -> p.pubkey == f.toKey && isLocalServer p.server && p.expiresAt > t)
         yield f
       -- Only remove messages stored long enough for local clients to have polled them (grace period)
-      let pastGrace = do f <- removable; where any messages (\m -> m.messageId == f.messageId && m.toKey == f.toKey && t - m.receivedAt >= ackGracePeriod); yield f
-      -- Single-pass fold: filter messages and count removals together
-      let msgResult = fold (\acc m ->
-        if none pastGrace (\f -> m.messageId == f.messageId && m.toKey == f.toKey)
-          then {kept: union acc.kept [m], removed: acc.removed}
-          else {kept: acc.kept, removed: acc.removed + 1}
-        ) {kept: [], removed: 0} messages
-      set *messages = msgResult.kept
-      totalMsgCount <- *totalMessageCount
-      set *totalMessageCount = totalMsgCount - msgResult.removed
-      -- Adjust per-recipient counts for removed messages
-      recipientCounts <- *recipientMsgCounts
-      let adjustedCounts = fold (\acc f -> adjustRecipientCount acc f.toKey (0 - 1)) recipientCounts pastGrace
-      set *recipientMsgCounts = adjustedCounts
+      let pastGrace = do f <- removable; where any allMessages (\m -> m.messageId == f.messageId && m.toKey == f.toKey && t - m.receivedAt >= ackGracePeriod); yield f
+      let removed = count pastGrace
+      -- Remove matched messages from their buckets (pastGrace is small, so scanning all 16 buckets is fast)
+      when (removed > 0) (do
+        transformAllMessageBuckets (\bucket ->
+          do m <- bucket; where none pastGrace (\f -> m.messageId == f.messageId && m.toKey == f.toKey); yield m)
+        totalMsgCount <- *totalMessageCount
+        set *totalMessageCount = totalMsgCount - removed
+        -- Adjust per-recipient counts for removed messages
+        recipientCounts <- *recipientMsgCounts
+        let adjustedCounts = fold (\acc f -> adjustRecipientCount acc f.toKey (0 - 1)) recipientCounts pastGrace
+        set *recipientMsgCounts = adjustedCounts)
     yield (respond {ok: True {}, error: ""}))
 
 -- POST /maintenance/drain: Broadcast offline gossip for all local keys (graceful shutdown).
@@ -2317,10 +2485,14 @@ handleDrain = \authorization respond -> do
     let pendingForwardCount = count forwards
     let pendingAckCount = count ackedIds
     -- Fork gossip so drain responds immediately (hung peers can't block the response).
-    -- Operator should allow a few seconds after response before killing the process.
-    fork (when (federationEnabled && drainedCount > 0 && count drainResult.peerServers > 0) (do
-      let gossipEvents = do p <- drainResult.localEntries; yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl}
-      sendBatchedGossip drainResult.peerServers gossipEvents gossipOriginHops))
+    -- Operator can poll /stats for drainCompletedAt > 0 to know when it's safe to stop.
+    atomic do set *drainCompletedAt = 0
+    fork (do
+      when (federationEnabled && drainedCount > 0 && count drainResult.peerServers > 0) (do
+        let gossipEvents = do p <- drainResult.localEntries; yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl}
+        sendBatchedGossip drainResult.peerServers gossipEvents gossipOriginHops)
+      t2 <- now
+      atomic do set *drainCompletedAt = t2)
     println ("drain: broadcast offline for " ++ show drainedCount ++ " local keys")
     when (pendingForwardCount > 0)
       (println ("drain: warning: " ++ show pendingForwardCount ++ " pending forwards will not be retried"))
@@ -2362,12 +2534,12 @@ handleHealth = \respond -> do
     forwards <- *forwards
     sessionCount <- countAllSessions
     activePolls <- *activePolls
-    messages <- *messages
+    tmc <- *totalMessageCount
     lastFedSuccess <- *lastFederationSuccessAt
     forwardFailures <- *forwardFailures
     let warmup = t - sa < healthPruneMaxAge
     -- Capacity pressure: flag when any capped collection exceeds 90% full
-    let capacityOk = count messages * 10 <= maxMessages * 9
+    let capacityOk = tmc * 10 <= maxMessages * 9
       && count presence * 10 <= maxPresenceEntries * 9
       && count forwards * 10 <= maxForwardsEntries * 9
       && sessionCount * 10 <= maxSessions * 9
@@ -2386,7 +2558,7 @@ handleHealth = \respond -> do
                   capacityHealthy: result.capacityOk,
                   federationHealthy: result.federationOk})
 
-zeroStats = {sessions: 0, sessionsMax: 0, messages: 0, messagesMax: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pruneCount: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, federationEnabled: False {}, recentGossip: 0, totalMessageCount: 0, recipientCounts: 0, federationInFlight: 0, messagesPct: 0, presencePct: 0, forwardsPct: 0, sessionsPct: 0, federationAvgLatencyMs: 0, federationMaxLatencyMs: 0, federationCallCount: 0, ok: False {}}
+zeroStats = {sessions: 0, sessionsMax: 0, messages: 0, messagesMax: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pruneCount: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, federationEnabled: False {}, recentGossip: 0, totalMessageCount: 0, recipientCounts: 0, federationInFlight: 0, messagesPct: 0, presencePct: 0, forwardsPct: 0, sessionsPct: 0, federationAvgLatencyMs: 0, federationMaxLatencyMs: 0, federationCallCount: 0, drainCompletedAt: 0, ok: False {}}
 
 handleStats = \authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
@@ -2394,9 +2566,10 @@ handleStats = \authorization respond -> do
     then do
       t <- now
       -- Read all refs atomically for a consistent snapshot, count outside to minimize lock time
+      -- Read all refs atomically for a consistent snapshot. Messages use totalMessageCount
+      -- (maintained counter) instead of scanning all 16 message buckets.
       snapshot <- atomic do
         sc <- countAllSessions
-        m <- *messages
         p <- *presence
         f <- *forwards
         c <- *challenges
@@ -2425,14 +2598,15 @@ handleStats = \authorization respond -> do
         flt <- *federationLatencyTotal
         flc <- *federationLatencyCount
         flm <- *federationLatencyMax
-        yield {sc: sc, m: m, p: p, f: f, c: c, a: a, ao: ao, d: d, ff: ff, ap: ap, sr: sr, cr: cr, fr: fr, grc: grc, ir: ir, lr: lr, rr: rr, pc: pc, hc: hc, sa: sa, lp: lp, lh: lh, dr: dr, rg: rg, tmc: tmc, rc: rc, fi: fi, flt: flt, flc: flc, flm: flm}
-      let result = {sessions: snapshot.sc, messages: count snapshot.m, presence: count snapshot.p, forwards: count snapshot.f, challenges: count snapshot.c, ackedIds: count snapshot.a, ackOverflow: count snapshot.ao, deliveredIds: count snapshot.d, forwardFailures: count snapshot.ff, activePolls: count snapshot.ap, sendRates: count snapshot.sr, challengeRates: count snapshot.cr, federationRates: count snapshot.fr, globalRateCount: snapshot.grc, ipRates: count snapshot.ir, lookupRates: count snapshot.lr, recvRates: count snapshot.rr, pruneCount: snapshot.pc, heartbeatCount: snapshot.hc, uptime: t - snapshot.sa, lastPruneAt: snapshot.lp, lastHeartbeatAt: snapshot.lh, draining: snapshot.dr, recentGossip: count snapshot.rg, totalMessageCount: snapshot.tmc, recipientCounts: count snapshot.rc, federationInFlight: count snapshot.fi, federationLatencyTotal: snapshot.flt, federationLatencyCount: snapshot.flc, federationLatencyMax: snapshot.flm}
+        dca <- *drainCompletedAt
+        yield {sc: sc, p: p, f: f, c: c, a: a, ao: ao, d: d, ff: ff, ap: ap, sr: sr, cr: cr, fr: fr, grc: grc, ir: ir, lr: lr, rr: rr, pc: pc, hc: hc, sa: sa, lp: lp, lh: lh, dr: dr, rg: rg, tmc: tmc, rc: rc, fi: fi, flt: flt, flc: flc, flm: flm, dca: dca}
+      let result = {sessions: snapshot.sc, messages: snapshot.tmc, presence: count snapshot.p, forwards: count snapshot.f, challenges: count snapshot.c, ackedIds: count snapshot.a, ackOverflow: count snapshot.ao, deliveredIds: count snapshot.d, forwardFailures: count snapshot.ff, activePolls: count snapshot.ap, sendRates: count snapshot.sr, challengeRates: count snapshot.cr, federationRates: count snapshot.fr, globalRateCount: snapshot.grc, ipRates: count snapshot.ir, lookupRates: count snapshot.lr, recvRates: count snapshot.rr, pruneCount: snapshot.pc, heartbeatCount: snapshot.hc, uptime: t - snapshot.sa, lastPruneAt: snapshot.lp, lastHeartbeatAt: snapshot.lh, draining: snapshot.dr, recentGossip: count snapshot.rg, totalMessageCount: snapshot.tmc, recipientCounts: count snapshot.rc, federationInFlight: count snapshot.fi, federationLatencyTotal: snapshot.flt, federationLatencyCount: snapshot.flc, federationLatencyMax: snapshot.flm, drainCompletedAt: snapshot.dca}
       let msgPct = if maxMessages > 0 then result.messages * 100 / maxMessages else 0
       let presPct = if maxPresenceEntries > 0 then result.presence * 100 / maxPresenceEntries else 0
       let fwdPct = if maxForwardsEntries > 0 then result.forwards * 100 / maxForwardsEntries else 0
       let sessPct = if maxSessions > 0 then result.sessions * 100 / maxSessions else 0
       let fedAvg = if result.federationLatencyCount > 0 then result.federationLatencyTotal / result.federationLatencyCount else 0
-      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pruneCount: result.pruneCount, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, draining: result.draining, federationEnabled: federationEnabled, recentGossip: result.recentGossip, totalMessageCount: result.totalMessageCount, recipientCounts: result.recipientCounts, federationInFlight: result.federationInFlight, messagesPct: msgPct, presencePct: presPct, forwardsPct: fwdPct, sessionsPct: sessPct, federationAvgLatencyMs: fedAvg, federationMaxLatencyMs: result.federationLatencyMax, federationCallCount: result.federationLatencyCount, ok: True {}})
+      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pruneCount: result.pruneCount, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, draining: result.draining, federationEnabled: federationEnabled, recentGossip: result.recentGossip, totalMessageCount: result.totalMessageCount, recipientCounts: result.recipientCounts, federationInFlight: result.federationInFlight, messagesPct: msgPct, presencePct: presPct, forwardsPct: fwdPct, sessionsPct: sessPct, federationAvgLatencyMs: fedAvg, federationMaxLatencyMs: result.federationLatencyMax, federationCallCount: result.federationLatencyCount, drainCompletedAt: result.drainCompletedAt, ok: True {}})
     else yield (respond zeroStats)
 
 handleStatsPeers = \authorization respond -> do
@@ -2451,12 +2625,12 @@ handleStatsKey = \pubkey authorization respond -> do
     then do
       t <- now
       result <- atomic do
-        messages <- *messages
+        keyBucket <- readMessageBucket (pubkeyBucket pubkey)
         presence <- *presence
         allSessions <- readAllSessions
         forwards <- *forwards
         activePolls <- *activePolls
-        let keyMessages = count (do m <- messages; where m.toKey == pubkey; yield m)
+        let keyMessages = count (do m <- keyBucket; where m.toKey == pubkey; yield m)
         let keyPresence = do p <- presence; where p.pubkey == pubkey && p.expiresAt > t; yield {server: p.server, expiresAt: p.expiresAt}
         let keySessions = count (do s <- allSessions; where s.pubkey == pubkey; yield s)
         let keyForwards = count (do f <- forwards; where f.toKey == pubkey; yield f)
