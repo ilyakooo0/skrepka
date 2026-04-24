@@ -1,15 +1,24 @@
 -- Skrepka Relay Server
 -- Single-server implementation of the Skrepka protocol (v0.1)
 -- Binary data (keys, signatures, blobs) uses hex encoding (bytesToHex/bytesFromHex)
+--
+-- Architecture:
+--   Clients authenticate via Ed25519 challenge-response, then poll for messages via long-polling.
+--   Messages are E2E encrypted blobs routed by recipient pubkey.
+--   Federation: servers gossip presence info and forward messages for keys homed elsewhere.
+--   Presence tracks which server a pubkey was last seen on (online/offline via gossip).
+--   All state is in-memory; background tasks handle pruning and retry of failed federation ops.
 
 -- ============================================
 -- Configuration
 -- ============================================
 
+-- Server identity and federation credentials
 serverHost = "localhost:8080"
 federationSecret = "" -- must be set to enable federation
 maintenanceSecret = "" -- set to enable /maintenance/prune independently of federation
 federationScheme = "https://" -- scheme for federation HTTP calls
+-- Message and data size limits
 messageMaxAge : Int<Ms>
 messageMaxAge = 2592000000 -- 30 days
 maxPresenceTtl : Int<S>
@@ -22,6 +31,7 @@ maxGossipEvents = 100
 maxPollEvents = 50
 maxPresenceEntries = 10000
 maxMessagesPerRecipient = 500
+-- Global capacity limits for in-memory collections
 clockSkewTolerance : Int<Ms>
 clockSkewTolerance = 5000 -- 5 seconds tolerance for clock skew between federated servers
 maxForwardsEntries = 10000
@@ -31,40 +41,44 @@ maxTokenLen = 256
 maxChallenges = 10000
 maxSessions = 10000
 maxAckedIds = 10000
-maxAckOverflow = 200
+maxAckOverflow = 200 -- overflow buffer for acks that couldn't be sent yet
 maxDeliveredIds = 10000
+-- Per-key limits and rate limiting
 maxChallengesPerKey = 5
 maxSessionsPerKey = 10
 challengeExpiry : Int<Ms>
 challengeExpiry = 60000 -- 1 minute
-maxChallengeRatePerKey = 5
+maxChallengeRatePerKey = 5 -- max challenge requests per key per window
 maxChallengeRateEntries = 1000
 challengeRateWindowMs : Int<Ms>
 challengeRateWindowMs = 1000
-maxSendRatePerKey = 20
+maxSendRatePerKey = 20 -- max messages sent per key per window
 sendRateWindowMs : Int<Ms>
 sendRateWindowMs = 1000
 maxSendRateEntries = 1000
+-- Session and gossip timing
 sessionExpiry : Int<Ms>
 sessionExpiry = 3600000 -- 1 hour
 onlineGossipTtl : Int<S>
-onlineGossipTtl = 3600 -- 1 hour
+onlineGossipTtl = 3600 -- 1 hour; TTL announced when a key authenticates
 offlineGossipMinTtl : Int<S>
 offlineGossipMinTtl = 60 -- minimum TTL for offline gossip events
 maxForwardRetriesPerServer = 100
-maxGossipHops = 5
-gossipOriginHops = 2
+maxGossipHops = 5 -- max hops a gossip event can propagate across servers
+gossipOriginHops = 2 -- hops set when this server originates a gossip event
+-- Exponential backoff for failed federation forwards
 retryBackoffBase : Int<Ms>
 retryBackoffBase = 30000 -- 30 seconds
 retryBackoffMax : Int<Ms>
 retryBackoffMax = 480000 -- 8 minutes
-maxForwardFailures = 1000
+maxForwardFailures = 1000 -- max tracked server failure records
 
+-- Background task intervals
 backgroundPruneInterval : Int<Ms>
-backgroundPruneInterval = 30000 -- 30 seconds
+backgroundPruneInterval = 30000 -- 30 seconds; also retries failed forwards/acks
 pollTimeoutMs : Int<Ms>
-pollTimeoutMs = 25000 -- long-poll heartbeat interval
-maxPollsPerKey = 3
+pollTimeoutMs = 25000 -- long-poll heartbeat interval (how long a poll blocks before returning empty)
+maxPollsPerKey = 3 -- max concurrent long-poll connections per pubkey
 maxActivePolls = 5000
 presenceRefreshInterval : Int<Ms>
 presenceRefreshInterval = 300000 -- 5 minutes
@@ -78,8 +92,10 @@ federationUrl = \server -> federationScheme ++ server
 -- Types
 -- ============================================
 
+-- Event delivered to a polling client: an encrypted message blob
 type PollEvent = {id: MessageIdHex, eventType: Text, payload: {encryptedBlob: BlobHex, timestamp: Timestamp, toKey: PubkeyHex}}
 
+-- Gossip events propagate presence changes between federated servers
 data GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
 
 impl ToJSON GossipEventType where
@@ -95,10 +111,15 @@ impl FromJSON GossipEventType where
     else if s == "offline" then GossipOffline {}
     else GossipUnknown {}
 
+-- Wire format for gossip events sent between servers
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex, server: ServerName, timestamp: Timestamp, ttl: Int<S>}
 
+-- A gossip event that passed validation (timestamp not in future, TTL > 0, not expired)
 type ValidGossipEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp, timestamp: Timestamp, ttl: Int<S>}
 
+-- Status returned to the sender after SendMessage
+-- Delivered: recipient is online locally; Federated: forwarded to remote server;
+-- Queued: stored but recipient location unknown; Unauthorized/Rejected: not accepted
 data MessageStatus = MsDelivered {} | MsFederated {} | MsQueued {} | MsUnauthorized {} | MsRejected {}
 
 impl ToJSON MessageStatus where
@@ -109,8 +130,10 @@ impl ToJSON MessageStatus where
     MsUnauthorized {} -> "unauthorized"
     MsRejected {} -> "rejected")
 
+-- Internal delivery status (same as MessageStatus but without error variants)
 data DeliveryStatus = DsDelivered {} | DsFederated {} | DsQueued {}
 
+-- Validated hex-encoded types with maximum length constraints
 isValidBoundedHex : Int -> Text -> Bool
 isValidBoundedHex = \maxLen s -> isValidHex s && not (tooLong s maxLen) && s == normalizeHex s
 type PubkeyHex = Text where isValidBoundedHex maxPubkeyLen
@@ -120,6 +143,8 @@ isValidMessageId : Text -> Bool
 isValidMessageId = isValidBoundedHex maxMessageIdLen
 type MessageIdHex = Text where isValidMessageId
 type OptionalMessageId = Text where \s -> s == "" || isValidMessageId s
+-- ServerName: validated server hostname (rejects private IPs, localhost, etc.)
+-- AnyServerName: normalized server name without the security checks (used in presence lookups)
 isValidServerName : Text -> Bool
 isValidServerName = \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
 type ServerName = Text where isValidServerName
@@ -127,16 +152,26 @@ type AnyServerName = Text where \s -> not (tooLong s maxServerNameLen) && s == n
 
 type Timestamp = Int<Ms>
 
+-- Pending challenge for Ed25519 challenge-response auth
 type Challenge = {pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp}
+-- Authenticated session; token is a random hex string
 type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp}
+-- Stored message; originServer is "" for locally-originated messages, set to sender server for federated forwards
 type Message = {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, receivedAt: Timestamp}
+-- Presence: tracks that a pubkey is online at a given server, with expiry
 type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Timestamp, timestamp: Timestamp}
+-- Queued federation forward: message waiting to be delivered to a remote server
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
+-- Tracks message IDs that were acked by a polling client, pending federation ack back to origin
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
+-- Terminal state: message delivered and ack confirmed (used for dedup after ack overflow)
 type DeliveredEntry = {messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}
+-- Tracks consecutive failures per federation peer for exponential backoff
 type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
+-- Sliding-window rate limit state per pubkey
 type SendRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
 type ChallengeRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
+-- Tracks active long-poll connections to enforce per-key concurrency limits
 type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 data AuthResult = Authorized {pubkey: PubkeyHex} | Unauthorized {}
 data SendResult = SendFailed {status: MessageStatus} | SendDone {delivery: DeliveryStatus, remoteServers: [ServerName]} | SendDuplicate {}
@@ -145,6 +180,8 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 -- ============================================
 -- Persisted State
 -- ============================================
+-- All state is in-memory (no disk persistence). Prefixed with * (mutable refs).
+-- Atomic blocks provide transactional consistency for reads + writes.
 
 *challenges : [Challenge]
 
@@ -154,10 +191,12 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 *presence : [PresenceEntry]
 
+-- Monotonic counter ensuring unique receivedAt ordering even within the same millisecond
 *seqCounter : Timestamp
 
 *forwards : [ForwardEntry]
 
+-- Messages acked by local recipients, pending federation ack to origin server
 *ackedIds : [AckedEntry]
 
 *lastPrunedAt : Timestamp
@@ -170,8 +209,12 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 *challengeRates : [ChallengeRateEntry]
 
+-- Heartbeat signal: incremented periodically to wake all blocking long-polls
 *pollWakeup : Timestamp
 
+-- Per-bucket message signals (16 buckets, keyed by first hex digit of pubkey).
+-- Updated when a message is stored for a recipient; polls for that pubkey's
+-- bucket watch for changes to avoid waking unrelated polls.
 *messageSignal0 : Timestamp
 *messageSignal1 : Timestamp
 *messageSignal2 : Timestamp
@@ -191,14 +234,20 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 *activePolls : [ActivePoll]
 
+-- Overflow buffer: acks evicted from ackedIds before they could be sent to origin
 *ackOverflow : [AckedEntry]
 
+-- Final dedup set: messages confirmed delivered (ack sent or overflow drained)
 *deliveredIds : [DeliveredEntry]
 
 -- ============================================
 -- Routes
 -- ============================================
 
+-- Authentication: Ed25519 challenge-response flow
+-- 1. Client POSTs pubkey to /auth/challenge, gets a random challenge string
+-- 2. Client signs the challenge with their private key and POSTs to /auth/verify
+-- 3. Server verifies signature, returns a session token
 route AuthApi where
   /auth
     POST {pubkey: PubkeyHex} /challenge
@@ -208,30 +257,39 @@ route AuthApi where
       -> {token: Text, expiresAt: Timestamp}
       = VerifyAuth
 
+-- Client-facing API (requires session token in Authorization header)
 route ClientApi where
+  -- Long-poll for new messages; cursor tracks last-seen receivedAt timestamp
   POST {cursor: Timestamp} /poll headers {authorization: Text}
     -> {events: [PollEvent], cursor: Timestamp, authorized: Bool}
     = Poll
   /messages
+    -- Send an E2E encrypted message to a recipient pubkey
     POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId} / headers {authorization: Text}
       -> {status: MessageStatus, messageId: OptionalMessageId}
       = SendMessage
+  -- Look up which server a pubkey is present on (for federation routing)
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text}
     -> {server: AnyServerName, authorized: Bool}
     = LookupPresence
 
+-- Server-to-server federation API (requires federation secret)
 route FederationApi where
   /federation
+    -- Receive presence gossip events from a peer server
     POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName} /gossip headers {authorization: Text}
       -> {ok: Bool}
       = RecvGossip
+    -- Receive a forwarded message from a peer server on behalf of a sender
     POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName} /forward headers {authorization: Text}
       -> {ok: Bool}
       = ForwardMessage
+    -- Acknowledge delivery of messages back to the origin server
     POST {messageIds: [MessageIdHex], originServer: ServerName, fromServer: ServerName} /ack headers {authorization: Text}
       -> {ok: Bool}
       = FederationAck
 
+-- Triggers pruning of expired state and retry of pending federation ops
 route MaintenanceApi where
   POST {} /maintenance/prune headers {authorization: Text}
     -> {ok: Bool}
@@ -240,6 +298,7 @@ route MaintenanceApi where
 route HealthApi where
   GET /health -> {ok: Bool} = Health
 
+-- Returns counts of in-memory collections (requires federation or maintenance secret)
 route StatsApi where
   GET /stats headers {authorization: Text}
     -> {sessions: Int, messages: Int, presence: Int, forwards: Int, challenges: Int, ackedIds: Int, ok: Bool}
@@ -274,12 +333,14 @@ minBy = \items getKey -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
   Just {value: v} -> if getKey x < getKey v then Just {value: x} else acc) Nothing {} items
 
+-- Hex encoding utilities for token generation
 hexDigit : Int -> Text
 hexDigit = \n -> take 1 (drop (clamp 0 15 n) "0123456789abcdef")
 
 byteToHex : Int -> Text
 byteToHex = \n -> hexDigit (n / 16) ++ hexDigit (n - (n / 16) * 16)
 
+-- Encode a 24-bit integer as 6 hex characters (3 bytes)
 intTo3Hex : Int -> Text
 intTo3Hex = \n ->
   let b0 = n / 65536 in
@@ -288,11 +349,13 @@ intTo3Hex = \n ->
   let b2 = r0 - b1 * 256 in
   byteToHex b0 ++ byteToHex b1 ++ byteToHex b2
 
+-- Generate a random hex token (n chunks of 3 bytes each = 6n hex chars)
 genTokenN = \n -> if n <= 0 then yield "" else do
   chunk <- randomInt 16777216
   rest <- genTokenN (n - 1)
   yield (intTo3Hex chunk ++ rest)
 
+-- Default token: 8 chunks = 48 hex chars = 24 bytes of randomness
 genToken = genTokenN 8
 
 tooLong : Text -> Int -> Bool
@@ -323,6 +386,7 @@ isAllowedServerChar = \c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:"
 containsBadUrlChar : Text -> Bool
 containsBadUrlChar = \s -> any (chars s) (\c -> not (isAllowedServerChar c))
 
+-- Carrier-grade NAT range: 100.64.0.0/10 (RFC 6598)
 isCgnatRange : Text -> Bool
 isCgnatRange = \s ->
   take 4 s == "100."
@@ -431,6 +495,9 @@ hasDotBeforePort = \s ->
   else if take 1 s == "." then True {}
   else hasDotBeforePort (drop 1 s)
 
+-- DNS rebinding / SSRF protection: reject server names that resolve to private/reserved addresses.
+-- Blocks localhost, private RFC1918 ranges, link-local, loopback, CGNAT, documentation ranges,
+-- IPv6 shorthand, octal/hex IP tricks, bare IPs without dots, and .arpa domains.
 isBadServerName : Text -> Bool
 isBadServerName = \sn ->
   sn == ""
@@ -462,18 +529,21 @@ isBadServerName = \sn ->
   || not (hasDotBeforePort sn)
   || containsSuffix ".arpa" sn
 
+-- Look up a non-expired session matching the given token (constant-time comparison)
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
   case headOf (do s <- sessions; where s.expiresAt > t && safeCompare s.token token; yield s) of
     Nothing {} -> Unauthorized {}
     Just {value: s} -> Authorized {pubkey: s.pubkey}
 
+-- Extract bearer token from "Authorization: Bearer <token>" header
 extractToken = \authHeader ->
   let token = drop 7 authHeader in
   if toLower (take 7 authHeader) == "bearer " && not (tooLong token maxTokenLen)
     then Just {value: token}
     else Nothing {}
 
+-- Constant-time secret comparison (prevents timing attacks on federation/maintenance secrets)
 verifySecret : Text -> Text -> Bool
 verifySecret = \token secret ->
   secret != "" && safeCompare token secret
@@ -505,9 +575,11 @@ deliveryToMessageStatus = \ds -> case ds of
 isQueued : DeliveryStatus -> Bool
 isQueued = \ds -> case ds of DsQueued {} -> True {}; _ -> False {}
 
+-- Ensure strictly monotonic timestamps for message ordering
 nextSeqTs : Timestamp -> Timestamp -> Timestamp
 nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
 
+-- Deduplicate message IDs, preserving order, capped at maxMessageIds
 dedupMessageIds : [MessageIdHex] -> [MessageIdHex]
 dedupMessageIds = \messageIds ->
   fold (\acc mid ->
@@ -515,10 +587,14 @@ dedupMessageIds = \messageIds ->
     else if any acc (\a -> a == mid) then acc
     else union acc [mid]) [] messageIds
 
+-- Remove the N oldest acked entries (by ackedAt timestamp)
 evictOldestAckedIds = \items n ->
   if n <= 0 then items
   else diff items (takeRelation n (sortBy (\a -> a.ackedAt) items))
 
+-- Constant-time string comparison to prevent timing side-channels.
+-- Always iterates maxTokenLen characters regardless of input length;
+-- rejects empty strings to avoid vacuous equality.
 safeCompareLoop : Text -> Text -> Int -> Int -> Int
 safeCompareLoop = \s1 s2 n result ->
   if n <= 0 && s1 == "" && s2 == ""
@@ -529,6 +605,7 @@ safeCompare : Text -> Text -> Bool
 safeCompare = \a b ->
   safeCompareLoop a b maxTokenLen 0 + (if a == "" then 1 else 0) + (if b == "" then 1 else 0) == 0
 
+-- Remove the single item with the smallest key value (LRU-style eviction)
 evictOneOldest = \items getKey ->
   let result = fold (\acc x ->
     case acc.candidate of
@@ -542,6 +619,8 @@ evictOneOldest = \items getKey ->
     Nothing {} -> items
     Just {} -> result.items
 
+-- Enforce per-key capacity: if a key has >= maxPerKey items, evict the oldest for that key.
+-- Also prunes expired items.
 capPerKey = \items matchKey maxPerKey getExpiry t ->
   let active = do x <- items; where getExpiry x > t; yield x in
   let forKey = do x <- active; where matchKey x; yield x in
@@ -550,11 +629,13 @@ capPerKey = \items matchKey maxPerKey getExpiry t ->
          union others (evictOneOldest forKey getExpiry)
     else active
 
+-- Enforce global capacity: if at maxCount, evict the single oldest item
 capGlobal = \items maxCount getKey ->
   if count items >= maxCount
     then evictOneOldest items getKey
     else items
 
+-- Two-tier capacity enforcement: per-key first, then global
 capPerKeyAndGlobal = \items matchKey maxPerKey getExpiry t maxGlobal ->
   capGlobal (capPerKey items matchKey maxPerKey getExpiry t) maxGlobal getExpiry
 
@@ -566,6 +647,7 @@ removeOneForKey = \items pubkey ->
     ) {removed: False {}, items: []} items
   in result.items
 
+-- Extract unique remote (non-local) server names from a list of items
 collectPeerServers : [a] -> (a -> Text) -> [Text]
 collectPeerServers = \items getServer ->
   fold (\acc item ->
@@ -577,6 +659,7 @@ collectPeerServers = \items getServer ->
 samePubkeyServer = \a b -> a.pubkey == b.pubkey && a.server == b.server
 pubkeyServer = \e -> {pubkey: e.pubkey, server: e.server}
 
+-- Upsert items by key, keeping the fresher entry on conflict (last-write-wins by freshness)
 mergeByKey = \sameKey getFreshness initial items ->
   fold (\acc e ->
     if any acc (\a -> sameKey a e && getFreshness a >= getFreshness e)
@@ -585,11 +668,14 @@ mergeByKey = \sameKey getFreshness initial items ->
         (do a <- acc; where not (sameKey a e); yield a)
         [e]) initial items
 
+-- Merge presence entries by (pubkey, server), keeping the one with the latest expiresAt
 mergeByPubkeyServer = mergeByKey samePubkeyServer (\x -> x.expiresAt)
 
+-- Keep entries from setA that are not superseded by a newer-timestamped entry in setB
 resolveByTimestamp = \setA setB ->
   do e <- setA; where none setB (\o -> samePubkeyServer o e && o.timestamp > e.timestamp); yield e
 
+-- Remove presence entries that have a corresponding offline event with a newer timestamp
 removeOffline = \presenceSet trustedOffline t ->
   diff presenceSet (do
     p <- presenceSet
@@ -597,6 +683,8 @@ removeOffline = \presenceSet trustedOffline t ->
     where samePubkeyServer p o && min o.timestamp t > p.timestamp
     yield p)
 
+-- Cap presence table after gossip merge. If over capacity, only allow updates to
+-- existing entries and reclaim slots from expired ones for new entries.
 capGossipPresence = \args ->
   if count args.afterOffline <= maxPresenceEntries
     then {finalPresence: args.afterOffline, appliedOnline: args.appliedOnline, withinCapacity: True {}}
@@ -620,6 +708,8 @@ countMessagesFor = \messages toKey t ->
 hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
 hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey == toKey)
 
+-- Validate incoming gossip events: reject local-server events, future timestamps,
+-- and already-expired entries. Clamp TTLs and split into online/offline buckets.
 validGossipEvents : [GossipEvent] -> Timestamp -> {online: [ValidGossipEntry], offline: [ValidGossipEntry]}
 validGossipEvents = \events t ->
   let validate = \e ->
@@ -636,6 +726,7 @@ validGossipEvents = \events t ->
       GossipOffline {} -> {online: acc.online, offline: union acc.offline (validate e)}
       _ -> acc) {online: [], offline: []} events
 
+-- Execute an action for each server in parallel (fork per server)
 sendToEach : [ServerName] -> (ServerName -> (a {})) -> a {}
 sendToEach = \servers action ->
   case headOf servers of
@@ -645,6 +736,8 @@ sendToEach = \servers action ->
       fork (action server)
       sendToEach rest action
 
+-- Remove all expired entries from every collection. Returns expired local presence
+-- entries (for broadcasting offline gossip) and the set of peer servers known before pruning.
 pruneExpired = \t -> do
   challenges <- *challenges
   set *challenges = do x <- challenges; where x.expiresAt > t; yield x
@@ -675,6 +768,7 @@ pruneExpired = \t -> do
   set *deliveredIds = do d <- deliveredIds; where d.deliveredAt > messageCutoff; yield d
   yield {expiredLocal: expiredLocalPresence presenceBefore presenceAfter t, peerServers: peerServersBefore}
 
+-- Opportunistic pruning: runs at most once per second, triggered by request handlers
 maybePrune = \t -> do
   lastPruned <- *lastPrunedAt
   if t - lastPruned < 1000
@@ -759,6 +853,7 @@ removeForward = \mid srv -> atomic do
   forwards <- *forwards
   set *forwards = forwardsExcluding forwards srv [mid]
 
+-- Exponential backoff: 30s -> 60s -> 120s -> 240s -> 480s (capped)
 retryBackoff : Int -> Int<Ms>
 retryBackoff = \failures ->
   if failures <= 1 then retryBackoffBase
@@ -808,6 +903,7 @@ retryForwardsForServer = \entries remaining ->
             clearFailure f.toServer
         retryForwardsForServer rest (remaining - 1)
 
+-- Retry all pending forwards, respecting per-server backoff. Skips servers that failed recently.
 retryPendingForwards : [ForwardEntry] -> IO {network} {}
 retryPendingForwards = \pending -> do
   let servers = collectPeerServers pending (\x -> x.toServer)
@@ -818,6 +914,7 @@ retryPendingForwards = \pending -> do
     retryForwardsForServer (forwardsForServer pending server) maxForwardRetriesPerServer)
   yield {}
 
+-- When a remote key comes online, create forward entries for queued messages and send them
 forwardQueuedMessages = \targets t -> do
   newForwards <- atomic do
     messages <- *messages
@@ -851,12 +948,16 @@ sendBatchedAcksToServer = \serverAcks server ->
         let updatedAckedIds = ackedIdsExcludingBatch ackedIds server batch
         set *ackedIds = updatedAckedIds)
 
+-- Send delivery acknowledgments back to origin servers and remove acked entries on success
 sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> IO {network} {}
 sendAcksAndClean = \pendingAcks ->
   let servers = collectPeerServers pendingAcks (\a -> a.originServer) in
   sendToEach servers (\server ->
     sendBatchedAcksToServer (acksForServer pendingAcks server) server)
 
+-- Retry sending acks that were evicted from ackedIds due to capacity limits.
+-- On failure, re-insert into ackedIds or overflow buffer; overflow entries eventually
+-- move to deliveredIds (terminal dedup state) if the buffer is also full.
 retryEvictedAcks = \evictedEntries pendingAcks ->
   let evictedToRetry = retriableEvictedAcks evictedEntries pendingAcks
   in do
@@ -897,6 +998,7 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
               (println ("ackMessages: overflow at capacity (" ++ show maxAckOverflow ++ "), " ++ show dropped ++ " ack entries moved to delivered set for " ++ server)))
         Ok _ -> yield {})
 
+-- Retry acks sitting in the overflow buffer (last chance before they become deliveredIds)
 retryOverflowAcks = \overflow ->
   let servers = collectPeerServers overflow (\a -> a.originServer) in
   sendToEach servers (\server ->
@@ -908,6 +1010,9 @@ retryOverflowAcks = \overflow ->
           ackOverflow <- *ackOverflow
           set *ackOverflow = do a <- ackOverflow; where not (a.originServer == server && hasMessage a.messageId a.toKey batch); yield a))
 
+-- Full maintenance cycle: prune expired state, retry pending forwards and acks,
+-- retry overflow acks, broadcast offline gossip, and refresh presence for local keys
+-- nearing expiry. Called by both the background task and the /maintenance/prune endpoint.
 pruneAndRetry = \t -> do
   result <- atomic do
     set *lastPrunedAt = t
@@ -941,9 +1046,13 @@ hexCharIndex = \c ->
   else if c == "8" then 8 else if c == "9" then 9 else if c == "a" then 10 else if c == "b" then 11
   else if c == "c" then 12 else if c == "d" then 13 else if c == "e" then 14 else 15
 
+-- Map pubkey to one of 16 signal buckets based on first hex digit.
+-- This partitions the signal space so storing a message for one pubkey
+-- only wakes polls in the same bucket, not all active polls.
 pubkeyBucket : PubkeyHex -> Int
 pubkeyBucket = \pubkey -> hexCharIndex (take 1 pubkey)
 
+-- Update the signal timestamp for a pubkey's bucket, waking any blocked polls in that bucket
 signalMessageForKey = \pubkey ts ->
   let b = pubkeyBucket pubkey in
   if b == 0 then set *messageSignal0 = ts
@@ -982,6 +1091,9 @@ readMessageSignal = \pubkey ->
   else if b == 14 then do s <- *messageSignal14; yield s
   else do s <- *messageSignal15; yield s
 
+-- Acknowledge messages up to the given cursor: remove from messages, cancel pending forwards,
+-- and create ack entries for federated messages (to notify origin servers).
+-- Returns pending acks and any evicted entries that exceeded ackedIds capacity.
 ackPolledMessages = \pubkey cursor t -> do
   messages <- *messages
   let toAck = do m <- messages; where m.toKey == pubkey && m.receivedAt <= cursor; yield m
@@ -1012,6 +1124,12 @@ pollNewEvents = \pubkey clampedCursor t -> do
   let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
   yield {events: evts, cursor: lastReceivedAt}
 
+-- Execute a single long-poll cycle:
+-- 1. Authenticate and ack messages up to cursor (atomic)
+-- 2. Acquire a poll slot (limit concurrent polls per key)
+-- 3. Check for existing messages; if none, block on signal/heartbeat (retry-based wait)
+-- 4. Re-authenticate after waking (session may have expired during wait)
+-- 5. Return new events and release the poll slot
 pollOnce = \token cursor -> do
   t <- now
   setup <- atomic do
@@ -1079,41 +1197,51 @@ pollOnce = \token cursor -> do
 -- ============================================
 -- Derived Relations
 -- ============================================
+-- Pure query functions over in-memory state. No side effects.
 
+-- All non-expired presence entries for a given pubkey
 presenceForKey = \presence pubkey t ->
   do p <- presence; where p.pubkey == pubkey && p.expiresAt > t; yield p
 
+-- Pubkeys that are online on this server
 localOnlineKeys = \presence t ->
   do p <- presence; where isLocalServer p.server && p.expiresAt > t; yield p.pubkey
 
+-- Remove the local presence entry for a pubkey (used before re-inserting on auth)
 presenceWithoutLocalKey = \presence pubkey ->
   do p <- presence; where p.pubkey != pubkey || not (isLocalServer p.server); yield p
 
+-- Local presence entries that expired during this prune cycle (for offline gossip)
 expiredLocalPresence = \before after t ->
   do p <- before; where p.expiresAt <= t && isLocalServer p.server && none after (\q -> q.pubkey == p.pubkey && isLocalServer q.server); yield p
 
+-- Resolve the best server for a pubkey: prefer local, otherwise pick the remote with latest expiry
 bestServerForKey = \entries ->
   if any entries (\p -> isLocalServer p.server) then serverHostN
   else case maxBy (do p <- entries; where not (isLocalServer p.server); yield p) (\p -> p.expiresAt) of
     Just {value: p} -> p.server
     Nothing {} -> ""
 
+-- Messages for a pubkey newer than cursor and within messageMaxAge
 pollableMessages = \messages pubkey cursor t ->
   do m <- messages; where m.toKey == pubkey && m.receivedAt >= t - messageMaxAge && m.receivedAt > cursor; yield m
 
+-- Build ack entries for messages that came from a remote origin server (need federation ack)
 federatedAckEntries = \ackedMessages t ->
   do m <- ackedMessages; where m.originServer != ""; yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
 
+-- Remove forwards for specific message IDs destined to a given server
 forwardsExcluding = \forwards server messageIds ->
   do f <- forwards; where not (f.toServer == server && any messageIds (\mid -> f.messageId == mid)); yield f
 
+-- Find locally-originated messages that haven't been forwarded yet to each target's server
 forwardCandidates = \targets messages forwards t ->
   fold (\acc target ->
     let serverFwdIds = do f <- forwards; where f.toServer == target.server; yield f.messageId in
     union acc (do
       m <- messages
       where m.toKey == target.pubkey
-      where m.originServer == ""
+      where m.originServer == "" -- only forward locally-originated messages
       where none serverFwdIds (\fid -> fid == m.messageId)
       yield {messageId: m.messageId, toServer: target.server, createdAt: t,
              toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp})) [] targets
@@ -1137,32 +1265,41 @@ acksForServer = \acks server -> do a <- acks; where a.originServer == server; yi
 
 forwardsForServer = \forwards server -> do f <- forwards; where f.toServer == server; yield f
 
+-- Only trust offline events that claim to be from the sending server itself
 trustedOfflineEvents = \events fromServer ->
   do e <- events; where e.server == fromServer; yield e
 
+-- Peer servers to re-gossip to, excluding the server that sent us the gossip
 gossipTargets = \peerServers fromServer ->
   do s <- peerServers; where s != fromServer; yield s
 
+-- Remote keys that just came online (triggers forwarding of queued messages)
 newlyOnlineRemoteKeys = \events appliedKeys ->
   do e <- events; where any appliedKeys (\a -> samePubkeyServer a e); where not (isLocalServer e.server); yield {pubkey: e.pubkey, server: e.server}
 
+-- Trust gossip entries if they're from the sender or about a server we already know about
 trustedGossipEntries = \deduped presence fromServer t ->
   do e <- deduped; where e.server == fromServer || any presence (\p -> p.server == e.server && p.expiresAt > t); yield {expiresAt: e.expiresAt, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp}
 
+-- Keys whose presence was actually updated (new or extended expiry)
 appliedOnlineKeys = \entries presence ->
   do e <- entries; where none presence (\p -> samePubkeyServer p e && p.expiresAt >= e.expiresAt); yield (pubkeyServer e)
 
+-- Gossip entries that update existing presence (vs. creating new entries)
 existingPresenceUpdates = \entries presence ->
   do e <- entries; where any presence (\p -> samePubkeyServer p e); yield e
 
+-- Gossip entries for keys not yet in the presence table
 newPresenceEntries = \entries presence ->
   do e <- entries; where none presence (\p -> samePubkeyServer p e); yield e
 
+-- Generate offline gossip events for locally-expired presence entries
 offlineGossipEvents = \expiredLocal -> do
   p <- expiredLocal
   let ttl = clamp offlineGossipMinTtl maxPresenceTtl ((p.expiresAt - p.timestamp) / 1000)
   yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: p.expiresAt, ttl: ttl}
 
+-- Filter targets to only those not locally online (avoid forwarding to keys that can poll directly)
 remoteOnlyTargets = \targets localOnline ->
   do target <- targets; where none localOnline (\pk -> pk == target.pubkey); yield target
 
@@ -1172,6 +1309,8 @@ remoteOnlyTargets = \targets localOnline ->
 
 serve = \req -> case req of
 
+  -- POST /auth/challenge: Generate a random challenge for Ed25519 authentication.
+  -- Rate-limited per key; globally capped. Challenge expires in 1 minute.
   ReqChallenge {pubkey, respond} -> do
     challenge <- genToken
     t <- now
@@ -1208,6 +1347,8 @@ serve = \req -> case req of
     forkBroadcastOffline t result.pr
     yield (respond {challenge: if result.accepted then challenge else "", ok: result.accepted, expiresAt: if result.accepted then t + challengeExpiry else 0})
 
+  -- POST /auth/verify: Verify Ed25519 signature over challenge string.
+  -- On success: creates a session, registers local presence, and gossips online status.
   VerifyAuth {pubkey, challenge, signature, respond} -> do
     t <- now
     let expiry = t + sessionExpiry
@@ -1249,6 +1390,9 @@ serve = \req -> case req of
         forkBroadcastOffline t validation.pr
         yield (respond {token: "", expiresAt: 0})
 
+  -- POST /poll: Long-poll for new messages. Cursor-based: messages at or before cursor
+  -- are acked (removed from mailbox). Blocks until new messages arrive or heartbeat fires.
+  -- Acks for federated messages are sent to origin servers in the background.
   Poll {cursor, authorization, respond} -> do
     result <- case extractToken authorization of
       Nothing {} -> yield {authorized: False {}, events: [], cursor: 0, pendingAcks: [], evictedEntries: []}
@@ -1260,6 +1404,9 @@ serve = \req -> case req of
       retryEvictedAcks result.evictedEntries result.pendingAcks))
     yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized})
 
+  -- POST /messages: Send an encrypted message to a recipient.
+  -- Deduplicates by messageId across messages, ackedIds, and deliveredIds.
+  -- Rate-limited per sender key. If recipient is known on a remote server, forwards via federation.
   SendMessage {to, encryptedBlob, timestamp, messageId, authorization, respond} -> do
     t <- now
     effectiveMsgId <- if messageId != "" then yield messageId else genToken
@@ -1329,6 +1476,8 @@ serve = \req -> case req of
       SendDone {delivery} -> respond {status: deliveryToMessageStatus delivery, messageId: effectiveMsgId})
 
 
+  -- GET /lookup/:pubkey: Look up the best known server for a pubkey.
+  -- Returns local server if key is online locally, otherwise the remote with latest expiry.
   LookupPresence {pubkey, authorization, respond} -> do
     t <- now
     result <- atomic do
@@ -1342,6 +1491,10 @@ serve = \req -> case req of
     forkBroadcastOffline t result.pr
     yield (respond {server: result.server, authorized: result.authorized})
 
+  -- POST /federation/gossip: Receive presence gossip from a peer server.
+  -- Validates events, merges into presence table (last-write-wins), and re-gossips
+  -- to other known peers with decremented hop count. Triggers message forwarding
+  -- when a remote key comes online.
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> do
     t <- now
     let cappedHops = clamp 0 maxGossipHops hopsRemaining
@@ -1370,6 +1523,9 @@ serve = \req -> case req of
           (forwardQueuedMessages newlyOnlineRemote t))
       yield (respond {ok: True {}}))
 
+  -- POST /federation/forward: Receive a message forwarded from a peer server.
+  -- Only accepts messages where fromServer == originServer (no cascade forwarding).
+  -- Deduplicates and stores; rejects if recipient mailbox is full.
   ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, authorization, respond} -> do
     t <- now
     withFederationAuth authorization t respond (not (isLocalServer originServer) && fromServer == originServer) (do
@@ -1401,6 +1557,9 @@ serve = \req -> case req of
         ForwardRejected {} -> False {}
         _ -> True {}}))
 
+  -- POST /federation/ack: Peer server confirms delivery of messages we originated.
+  -- Removes corresponding forward entries. Also cleans up the original message if the
+  -- recipient has no local presence and no other pending forwards for that message.
   FederationAck {messageIds, originServer, fromServer, authorization, respond} -> do
     t <- now
     withFederationAuth authorization t respond (isLocalServer originServer && not (isLocalServer fromServer)) (do
@@ -1423,6 +1582,8 @@ serve = \req -> case req of
       forkBroadcastOffline t pruneResult
       yield (respond {ok: True {}}))
 
+  -- POST /maintenance/prune: Trigger a full maintenance cycle (prune + retry all pending ops).
+  -- Accepts either federation or maintenance secret.
   Prune {authorization, respond} -> do
     t <- now
     let authorized = verifyMaintenanceAuth authorization
@@ -1450,6 +1611,8 @@ serve = \req -> case req of
 -- Entry Point
 -- ============================================
 
+-- Background loop: periodically prunes expired state and retries pending federation ops.
+-- Jitter prevents thundering herd when multiple servers restart simultaneously.
 backgroundPrune = do
   jitter <- randomInt 5000
   sleep (backgroundPruneInterval + jitter)
@@ -1457,6 +1620,8 @@ backgroundPrune = do
   fork (pruneAndRetry t)
   backgroundPrune
 
+-- Background loop: periodically bumps pollWakeup to unblock long-polls that have been
+-- waiting too long (heartbeat). Ensures polls return within pollTimeoutMs even if no messages arrive.
 pollHeartbeat = do
   jitter <- randomInt 2000
   sleep (pollTimeoutMs + jitter)
