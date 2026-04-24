@@ -32,6 +32,7 @@ maxChallenges = 10000
 maxSessions = 10000
 maxAckedIds = 10000
 maxAckOverflow = 200
+maxDeliveredIds = 10000
 maxChallengesPerKey = 5
 maxSessionsPerKey = 10
 challengeExpiry : Int<Ms>
@@ -132,6 +133,7 @@ type Message = {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHe
 type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Timestamp, timestamp: Timestamp}
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
+type DeliveredEntry = {messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}
 type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 type SendRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
 type ChallengeRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
@@ -190,6 +192,8 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 *activePolls : [ActivePoll]
 
 *ackOverflow : [AckedEntry]
+
+*deliveredIds : [DeliveredEntry]
 
 -- ============================================
 -- Routes
@@ -420,6 +424,13 @@ matchesHostnameOrSubdomain : Text -> Text -> Bool
 matchesHostnameOrSubdomain = \sn name ->
   matchesHostname sn name || containsSuffix ("." ++ name) sn
 
+hasDotBeforePort : Text -> Bool
+hasDotBeforePort = \s ->
+  if s == "" then False {}
+  else if take 1 s == ":" then False {}
+  else if take 1 s == "." then True {}
+  else hasDotBeforePort (drop 1 s)
+
 isBadServerName : Text -> Bool
 isBadServerName = \sn ->
   sn == ""
@@ -448,6 +459,8 @@ isBadServerName = \sn ->
   || hasHexPrefix sn
   || (isDigitChar (take 1 sn) && isAllDigitsOrDotsUntilColonOrEnd sn)
   || isHighOctetPrefix sn
+  || not (hasDotBeforePort sn)
+  || containsSuffix ".arpa" sn
 
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
@@ -658,6 +671,8 @@ pruneExpired = \t -> do
   set *activePolls = do p <- activePolls; where t - p.startedAt < pollTimeoutMs * 3; yield p
   ackOverflow <- *ackOverflow
   set *ackOverflow = do a <- ackOverflow; where a.ackedAt > messageCutoff; yield a
+  deliveredIds <- *deliveredIds
+  set *deliveredIds = do d <- deliveredIds; where d.deliveredAt > messageCutoff; yield d
   yield {expiredLocal: expiredLocalPresence presenceBefore presenceAfter t, peerServers: peerServersBefore}
 
 maybePrune = \t -> do
@@ -868,9 +883,18 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
               let overflowExcess = count updated - maxAckOverflow
               if overflowExcess <= 0
                 then do set *ackOverflow = updated; yield 0
-                else do set *ackOverflow = evictOldestAckedIds updated overflowExcess; yield overflowExcess
+                else do
+                  let oldest = takeRelation overflowExcess (sortBy (\a -> a.ackedAt) updated)
+                  set *ackOverflow = diff updated oldest
+                  deliveredIds <- *deliveredIds
+                  let newDelivered = do a <- oldest; yield {messageId: a.messageId, toKey: a.toKey, deliveredAt: a.ackedAt}
+                  let combinedDelivered = union deliveredIds newDelivered
+                  let deliveredExcess = count combinedDelivered - maxDeliveredIds
+                  set *deliveredIds = if deliveredExcess <= 0 then combinedDelivered
+                    else diff combinedDelivered (takeRelation deliveredExcess (sortBy (\d -> d.deliveredAt) combinedDelivered))
+                  yield overflowExcess
             when (dropped > 0)
-              (println ("ackMessages: overflow at capacity (" ++ show maxAckOverflow ++ "), " ++ show dropped ++ " ack entries permanently lost for " ++ server)))
+              (println ("ackMessages: overflow at capacity (" ++ show maxAckOverflow ++ "), " ++ show dropped ++ " ack entries moved to delivered set for " ++ server)))
         Ok _ -> yield {})
 
 retryOverflowAcks = \overflow ->
@@ -1089,6 +1113,7 @@ forwardCandidates = \targets messages forwards t ->
     union acc (do
       m <- messages
       where m.toKey == target.pubkey
+      where m.originServer == ""
       where none serverFwdIds (\fid -> fid == m.messageId)
       yield {messageId: m.messageId, toServer: target.server, createdAt: t,
              toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp})) [] targets
@@ -1155,24 +1180,27 @@ serve = \req -> case req of
       challenges <- *challenges
       let active = do c <- challenges; where c.expiresAt > t; yield c
       let activeForKey = count (do c <- active; where c.pubkey == pubkey; yield c)
-      if activeForKey >= maxChallengesPerKey
+      let cappedActive = if activeForKey >= maxChallengesPerKey
+        then let forKey = do c <- active; where c.pubkey == pubkey; yield c in
+             let others = do c <- active; where c.pubkey != pubkey; yield c in
+             union others (evictOneOldest forKey (\c -> c.expiresAt))
+        else active
+      if count cappedActive >= maxChallenges
         then yield {pr: pr, accepted: False {}, rateLimited: False {}}
-        else if count active >= maxChallenges
-          then yield {pr: pr, accepted: False {}, rateLimited: False {}}
-          else do
-            challengeRates <- *challengeRates
-            let senderEntry = headOf (do r <- challengeRates; where r.pubkey == pubkey; yield r)
-            let isNewWindow = case senderEntry of Nothing {} -> True {}; Just {value: r} -> t - r.windowStart >= challengeRateWindowMs
-            let rateCount = case senderEntry of Nothing {} -> 0; Just {value: r} -> if isNewWindow then 0 else r.count
-            if rateCount >= maxChallengeRatePerKey
-              then yield {pr: pr, accepted: False {}, rateLimited: True {}}
-              else do
-                let newRates = if isNewWindow
-                  then union (do r <- challengeRates; where r.pubkey != pubkey; yield r) [{pubkey: pubkey, windowStart: t, count: 1}]
-                  else do r <- challengeRates; yield (if r.pubkey == pubkey then {pubkey: r.pubkey, windowStart: r.windowStart, count: r.count + 1} else r)
-                set *challengeRates = if count newRates > maxChallengeRateEntries then (do r <- newRates; where t - r.windowStart < challengeRateWindowMs; yield r) else newRates
-                set *challenges = union active [{pubkey: pubkey, challenge: challenge, expiresAt: t + challengeExpiry}]
-                yield {pr: pr, accepted: True {}, rateLimited: False {}}
+        else do
+          challengeRates <- *challengeRates
+          let senderEntry = headOf (do r <- challengeRates; where r.pubkey == pubkey; yield r)
+          let isNewWindow = case senderEntry of Nothing {} -> True {}; Just {value: r} -> t - r.windowStart >= challengeRateWindowMs
+          let rateCount = case senderEntry of Nothing {} -> 0; Just {value: r} -> if isNewWindow then 0 else r.count
+          if rateCount >= maxChallengeRatePerKey
+            then yield {pr: pr, accepted: False {}, rateLimited: True {}}
+            else do
+              let newRates = if isNewWindow
+                then union (do r <- challengeRates; where r.pubkey != pubkey; yield r) [{pubkey: pubkey, windowStart: t, count: 1}]
+                else do r <- challengeRates; yield (if r.pubkey == pubkey then {pubkey: r.pubkey, windowStart: r.windowStart, count: r.count + 1} else r)
+              set *challengeRates = if count newRates > maxChallengeRateEntries then (do r <- newRates; where t - r.windowStart < challengeRateWindowMs; yield r) else newRates
+              set *challenges = union cappedActive [{pubkey: pubkey, challenge: challenge, expiresAt: t + challengeExpiry}]
+              yield {pr: pr, accepted: True {}, rateLimited: False {}}
     when result.rateLimited
       (println ("challenge: rate limited (" ++ show maxChallengeRatePerKey ++ "/s per key), rejecting for " ++ pubkey))
     when (not result.accepted && not result.rateLimited)
@@ -1183,16 +1211,19 @@ serve = \req -> case req of
   VerifyAuth {pubkey, challenge, signature, respond} -> do
     t <- now
     let expiry = t + sessionExpiry
+    let sigValid = verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
     validation <- atomic do
       pr <- maybePrune t
-      challenges <- *challenges
-      let hasMatch = challengeMatch challenges pubkey challenge t
-      let sigValid = hasMatch && verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
       if not sigValid
         then yield {pr: pr, valid: False {}}
         else do
-          set *challenges = challengesExcluding challenges pubkey challenge
-          yield {pr: pr, valid: True {}}
+          challenges <- *challenges
+          let hasMatch = challengeMatch challenges pubkey challenge t
+          if not hasMatch
+            then yield {pr: pr, valid: False {}}
+            else do
+              set *challenges = challengesExcluding challenges pubkey challenge
+              yield {pr: pr, valid: True {}}
     if validation.valid
       then do
         token <- genToken
@@ -1240,7 +1271,8 @@ serve = \req -> case req of
         (\senderKey -> do
           messages <- *messages
           ackedIds <- *ackedIds
-          if messageId != "" && (hasMessage messageId to messages || hasMessage messageId to ackedIds)
+          deliveredIds <- *deliveredIds
+          if messageId != "" && (hasMessage messageId to messages || hasMessage messageId to ackedIds || hasMessage messageId to deliveredIds)
             then yield {pr: pr, send: SendDuplicate {}}
             else do
               sendRates <- *sendRates
@@ -1346,7 +1378,8 @@ serve = \req -> case req of
         pr <- maybePrune t
         messages <- *messages
         ackedIds <- *ackedIds
-        if hasMessage messageId toKey messages || hasMessage messageId toKey ackedIds
+        deliveredIds <- *deliveredIds
+        if hasMessage messageId toKey messages || hasMessage messageId toKey ackedIds || hasMessage messageId toKey deliveredIds
           then yield {pr: pr, forward: ForwardDuplicate {}}
           else if countMessagesFor messages toKey t >= maxMessagesPerRecipient
             then yield {pr: pr, forward: ForwardRejected {}}
@@ -1375,7 +1408,17 @@ serve = \req -> case req of
       pruneResult <- atomic do
         pr <- maybePrune t
         forwards <- *forwards
-        set *forwards = forwardsExcluding forwards fromServer dedupedIds
+        let ackedForwards = do f <- forwards; where f.toServer == fromServer && any dedupedIds (\mid -> f.messageId == mid); yield f
+        let updatedForwards = forwardsExcluding forwards fromServer dedupedIds
+        set *forwards = updatedForwards
+        messages <- *messages
+        presence <- *presence
+        let removable = do
+          f <- ackedForwards
+          where none updatedForwards (\rf -> rf.messageId == f.messageId && rf.toKey == f.toKey)
+          where none presence (\p -> p.pubkey == f.toKey && isLocalServer p.server && p.expiresAt > t)
+          yield f
+        set *messages = do m <- messages; where none removable (\f -> m.messageId == f.messageId && m.toKey == f.toKey); yield m
         yield pr
       forkBroadcastOffline t pruneResult
       yield (respond {ok: True {}}))
