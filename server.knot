@@ -81,6 +81,8 @@ retryBackoffBase = 30000 -- 30 seconds
 retryBackoffMax : Int<Ms>
 retryBackoffMax = 480000 -- 8 minutes
 maxForwardFailures = 1000 -- max tracked server failure records
+maxServerDowntime : Int<Ms>
+maxServerDowntime = 86400000 -- 24 hours; stop retrying a server after this duration of consecutive failures
 
 -- Background task intervals
 backgroundPruneInterval : Int<Ms>
@@ -178,7 +180,7 @@ type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp
 -- Terminal state: message delivered and ack confirmed (used for dedup after ack overflow)
 type DeliveredEntry = {messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}
 -- Tracks consecutive failures per federation peer for exponential backoff
-type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
+type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFailedAt: Timestamp}
 -- Sliding-window rate limit state per pubkey
 type SendRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
 type ChallengeRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
@@ -264,6 +266,10 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 *heartbeatCount : Int
 
+*startedAt : Timestamp
+
+*lastHeartbeatAt : Timestamp
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -285,7 +291,7 @@ route AuthApi where
 route ClientApi where
   -- Long-poll for new messages; cursor tracks last-seen receivedAt timestamp
   POST {cursor: Timestamp} /poll headers {authorization: Text}
-    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool}
+    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool}
     = Poll
   /messages
     -- Send an E2E encrypted message to a recipient pubkey
@@ -328,7 +334,7 @@ route HealthApi where
 -- Returns counts of in-memory collections (requires federation or maintenance secret)
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {sessions: Int, messages: Int, presence: Int, forwards: Int, challenges: Int, ackedIds: Int, ackOverflow: Int, deliveredIds: Int, forwardFailures: Int, activePolls: Int, sendRates: Int, challengeRates: Int, federationRates: Int, pruneCount: Int, heartbeatCount: Int, ok: Bool}
+    -> {sessions: Int, messages: Int, presence: Int, forwards: Int, challenges: Int, ackedIds: Int, ackOverflow: Int, deliveredIds: Int, forwardFailures: Int, activePolls: Int, sendRates: Int, challengeRates: Int, federationRates: Int, pruneCount: Int, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, ok: Bool}
     = Stats
 
 route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi | HealthApi | StatsApi
@@ -803,7 +809,7 @@ pruneExpired = \t -> do
   sendRates <- *sendRates
   set *sendRates = do r <- sendRates; where t - r.windowStart < sendRateWindowMs; yield r
   forwardFailures <- *forwardFailures
-  set *forwardFailures = do f <- forwardFailures; where t - f.failedAt < retryBackoffMax * 2; yield f
+  set *forwardFailures = do f <- forwardFailures; where t - f.failedAt < maxServerDowntime; yield f
   challengeRates <- *challengeRates
   set *challengeRates = do r <- challengeRates; where t - r.windowStart < challengeRateWindowMs; yield r
   federationRates <- *federationRates
@@ -950,7 +956,7 @@ shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
 shouldRetryServer = \server t failures ->
   case headOf (do f <- failures; where f.server == server; yield f) of
     Nothing {} -> True {}
-    Just {value: f} -> t - f.failedAt >= retryBackoff f.failures
+    Just {value: f} -> t - f.firstFailedAt < maxServerDowntime && t - f.failedAt >= retryBackoff f.failures
 
 recordFailure = \server -> do
   t <- now
@@ -958,8 +964,8 @@ recordFailure = \server -> do
     failures <- *forwardFailures
     let existing = headOf (do f <- failures; where f.server == server; yield f)
     let updated = case existing of
-      Nothing {} -> union failures [{server: server, failedAt: t, failures: 1}]
-      Just {value: f} -> union (do x <- failures; where x.server != server; yield x) [{server: server, failedAt: t, failures: min (f.failures + 1) 10}]
+      Nothing {} -> union failures [{server: server, failedAt: t, failures: 1, firstFailedAt: t}]
+      Just {value: f} -> union (do x <- failures; where x.server != server; yield x) [{server: server, failedAt: t, failures: min (f.failures + 1) 10, firstFailedAt: f.firstFailedAt}]
     set *forwardFailures = if count updated > maxForwardFailures then evictOneOldest updated (\x -> x.failedAt) else updated
 
 clearFailure = \server -> atomic do
@@ -1012,7 +1018,9 @@ forwardQueuedMessages = \targets t -> do
     set *forwards = updatedForwards
     yield capped
   let servers = collectPeerServers newForwards (\x -> x.toServer)
-  sendToEach servers (\server ->
+  failures <- *forwardFailures
+  let eligibleServers = do s <- servers; where shouldRetryServer s t failures; yield s
+  sendToEach eligibleServers (\server ->
     retryForwardsForServer (forwardsForServer newForwards server) maxForwardRetriesPerServer)
 
 fetchFederationAck = \origin messageIds ->
@@ -1512,7 +1520,7 @@ verifyAuthInner = \pubkey challenge signature respond t -> do
 handlePoll = \cursor authorization respond -> do
   t <- now
   globalRateLimited <- checkGlobalRate t
-  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}})
+  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}})
   else do
     result <- case extractToken authorization of
       Nothing {} -> yield {authorized: False {}, events: [], cursor: 0, pendingAcks: [], evictedEntries: []}
@@ -1522,7 +1530,7 @@ handlePoll = \cursor authorization respond -> do
     fork (when federationEnabled (do
       sendAcksAndClean result.pendingAcks
       retryEvictedAcks result.evictedEntries result.pendingAcks))
-    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized})
+    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: False {}})
 
 -- POST /messages: Send an encrypted message to a recipient.
 -- Deduplicates by messageId across messages, ackedIds, and deliveredIds.
@@ -1722,6 +1730,7 @@ handleDrain = \authorization respond -> do
       presence <- *presence
       let localEntries = do p <- presence; where isLocalServer p.server && p.expiresAt > t; yield p
       set *presence = do p <- presence; where not (isLocalServer p.server) || p.expiresAt <= t; yield p
+      set *pollWakeup = t
       yield {localEntries: localEntries, peerServers: collectPeerServers presence (\p -> p.server)}
     let drainedCount = count drainResult.localEntries
     when (federationEnabled && drainedCount > 0 && count drainResult.peerServers > 0) (do
@@ -1744,6 +1753,7 @@ handleStats = \authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
   if authorized
     then do
+      t <- now
       result <- atomic do
         s <- *sessions
         m <- *messages
@@ -1760,9 +1770,12 @@ handleStats = \authorization respond -> do
         fr <- *federationRates
         pc <- *pruneCount
         hc <- *heartbeatCount
-        yield {sessions: count s, messages: count m, presence: count p, forwards: count f, challenges: count c, ackedIds: count a, ackOverflow: count ao, deliveredIds: count d, forwardFailures: count ff, activePolls: count ap, sendRates: count sr, challengeRates: count cr, federationRates: count fr, pruneCount: pc, heartbeatCount: hc}
-      yield (respond {sessions: result.sessions, messages: result.messages, presence: result.presence, forwards: result.forwards, challenges: result.challenges, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, pruneCount: result.pruneCount, heartbeatCount: result.heartbeatCount, ok: True {}})
-    else yield (respond {sessions: 0, messages: 0, presence: 0, forwards: 0, challenges: 0, ackedIds: 0, ackOverflow: 0, deliveredIds: 0, forwardFailures: 0, activePolls: 0, sendRates: 0, challengeRates: 0, federationRates: 0, pruneCount: 0, heartbeatCount: 0, ok: False {}})
+        sa <- *startedAt
+        lp <- *lastPrunedAt
+        lh <- *lastHeartbeatAt
+        yield {sessions: count s, messages: count m, presence: count p, forwards: count f, challenges: count c, ackedIds: count a, ackOverflow: count ao, deliveredIds: count d, forwardFailures: count ff, activePolls: count ap, sendRates: count sr, challengeRates: count cr, federationRates: count fr, pruneCount: pc, heartbeatCount: hc, uptime: t - sa, lastPruneAt: lp, lastHeartbeatAt: lh}
+      yield (respond {sessions: result.sessions, messages: result.messages, presence: result.presence, forwards: result.forwards, challenges: result.challenges, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, pruneCount: result.pruneCount, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, ok: True {}})
+    else yield (respond {sessions: 0, messages: 0, presence: 0, forwards: 0, challenges: 0, ackedIds: 0, ackOverflow: 0, deliveredIds: 0, forwardFailures: 0, activePolls: 0, sendRates: 0, challengeRates: 0, federationRates: 0, pruneCount: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, ok: False {}})
 
 serve = \req -> case req of
   ReqChallenge {pubkey, respond} -> handleChallenge pubkey respond
@@ -1802,11 +1815,14 @@ pollHeartbeat = do
   t <- now
   atomic do
     set *pollWakeup = t
+    set *lastHeartbeatAt = t
     hc <- *heartbeatCount
     set *heartbeatCount = hc + 1
   pollHeartbeat
 
 main = do
+  t <- now
+  atomic do set *startedAt = t
   println "Skrepka relay server starting on port 8080..."
   println ("  federation: " ++ if federationEnabled then "enabled" else "disabled")
   println ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")
