@@ -77,9 +77,13 @@ onlineGossipTtl : Int<S>
 onlineGossipTtl = 3600 -- 1 hour; TTL announced when a key authenticates
 offlineGossipMinTtl : Int<S>
 offlineGossipMinTtl = 60 -- minimum TTL for offline gossip events
+maxFederationConcurrency = 10 -- max concurrent outbound federation requests per cycle
 maxForwardRetriesPerServer = 100
 maxGossipHops = 5 -- max hops a gossip event can propagate across servers
 gossipOriginHops = 2 -- hops set when this server originates a gossip event
+gossipDedupWindow : Int<Ms>
+gossipDedupWindow = 60000 -- suppress re-broadcast of identical gossip events within this window
+maxRecentGossip = 1000
 -- Exponential backoff for failed federation forwards
 retryBackoffBase : Int<Ms>
 retryBackoffBase = 30000 -- 30 seconds
@@ -218,6 +222,8 @@ data ForwardResult = ForwardDuplicate {} | ForwardRejected {} | ForwardStored {}
 
 type IpRateEntry = {ip: Text, windowStart: Timestamp, count: Int}
 type LookupRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
+-- Tracks recently re-broadcast gossip events to suppress amplification from duplicate cycles
+type RecentGossipEntry = {pubkey: PubkeyHex, server: Text, timestamp: Timestamp, seenAt: Timestamp}
 type PeerStatus = {server: Text, failures: Int, lastFailedAt: Timestamp, firstFailedAt: Timestamp, backoffMs: Int, retriable: Bool}
 
 -- ============================================
@@ -308,6 +314,8 @@ type PeerStatus = {server: Text, failures: Int, lastFailedAt: Timestamp, firstFa
 
 *recvRates : [RecvRateEntry]
 
+*recentGossip : [RecentGossipEntry]
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -367,7 +375,7 @@ route MaintenanceApi where
     = Drain
 
 route HealthApi where
-  GET /health -> {ok: Bool, pruneHealthy: Bool, heartbeatHealthy: Bool} = Health
+  GET /health -> {ok: Bool, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool} = Health
 
 -- Returns counts of in-memory collections (requires federation or maintenance secret)
 route StatsApi where
@@ -669,9 +677,12 @@ evictOldestAckedIds = \items n ->
 -- Constant-time string comparison to prevent timing side-channels.
 -- Always iterates maxTokenLen characters regardless of input length;
 -- rejects empty strings to avoid vacuous equality.
+-- Loop terminates strictly on counter (n starts at max of both lengths and maxTokenLen,
+-- so both strings are exhausted by the time n reaches 0). Avoiding s1/s2 emptiness
+-- checks in the branch prevents a potential timing side-channel from branch prediction.
 safeCompareLoop : Text -> Text -> Int -> Int -> Int
 safeCompareLoop = \s1 s2 n result ->
-  if n <= 0 && s1 == "" && s2 == ""
+  if n <= 0
     then result
     else safeCompareLoop (drop 1 s1) (drop 1 s2) (n - 1) (result + (if take 1 s1 == take 1 s2 then 0 else 1))
 
@@ -816,15 +827,23 @@ validGossipEvents = \events t ->
       GossipOffline {} -> {online: acc.online, offline: union acc.offline (validate e)}
       _ -> acc) {online: [], offline: []} events
 
--- Execute an action for each server in parallel (fork per server)
+-- Execute an action for each server, forking up to maxFederationConcurrency
+-- and processing the remainder sequentially to bound resource usage.
 sendToEach : [ServerName] -> (ServerName -> (a {})) -> a {}
-sendToEach = \servers action ->
+sendToEach = \servers action -> sendToEachN servers action maxFederationConcurrency
+
+sendToEachN = \servers action remaining ->
   case headOf servers of
     Nothing {} -> yield {}
     Just {value: server} -> do
       let rest = do s <- servers; where s != server; yield s
-      fork (action server)
-      sendToEach rest action
+      if remaining > 0
+        then do
+          fork (action server)
+          sendToEachN rest action (remaining - 1)
+        else do
+          action server
+          sendToEachN rest action 0
 
 -- Remove all expired entries from every collection. Returns expired local presence
 -- entries (for broadcasting offline gossip) and the set of peer servers known before pruning.
@@ -861,6 +880,8 @@ pruneExpired = \t -> do
   set *lookupRates = do r <- lookupRates; where t - r.windowStart < lookupRateWindowMs; yield r
   recvRates <- *recvRates
   set *recvRates = do r <- recvRates; where t - r.windowStart < recvRateWindowMs; yield r
+  recentGossip <- *recentGossip
+  set *recentGossip = do r <- recentGossip; where t - r.seenAt < gossipDedupWindow; yield r
   ackOverflow <- *ackOverflow
   set *ackOverflow = do a <- ackOverflow; where a.ackedAt > retainCutoff; yield a
   deliveredIds <- *deliveredIds
@@ -1601,6 +1622,9 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
 -- Acks for federated messages are sent to origin servers in the background.
 handlePoll = \cursor authorization respond -> do
   t <- now
+  draining <- *draining
+  if draining then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: False {}})
+  else do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}})
   else do
@@ -1619,6 +1643,9 @@ handlePoll = \cursor authorization respond -> do
 -- Rate-limited per sender key. If recipient is known on a remote server, forwards via federation.
 handleSendMessage = \to encryptedBlob timestamp messageId authorization respond -> do
   t <- now
+  draining <- *draining
+  if draining then yield (respond {status: MsRejected {}, messageId: ""})
+  else do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {status: MsRateLimited {}, messageId: ""})
   else do
@@ -1706,6 +1733,9 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization respond 
 -- Returns local server if key is online locally, otherwise the remote with latest expiry.
 handleLookupPresence = \pubkey authorization respond -> do
   t <- now
+  draining <- *draining
+  if draining then yield (respond {server: "", authorized: False {}})
+  else do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {server: "", authorized: False {}})
   else do
@@ -1725,7 +1755,10 @@ handleLookupPresence = \pubkey authorization respond -> do
             else do
               presence <- *presence
               let foundServer = bestServerForKey (presenceForKey presence pubkey t)
-              yield {pr: pr, server: foundServer, authorized: True {}})
+              -- Mask remote server names: clients only need to know local/remote/unknown,
+              -- not which specific peer server a key is homed on (prevents metadata leakage)
+              let maskedServer = if foundServer == "" then "" else if isLocalServer foundServer then foundServer else "remote"
+              yield {pr: pr, server: maskedServer, authorized: True {}})
     forkBroadcastOffline t result.pr
     yield (respond {server: result.server, authorized: result.authorized})
 
@@ -1752,10 +1785,19 @@ handleRecvGossip = \events hopsRemaining fromServer authorization respond -> do
     let effectiveEvents = union (effectiveGossipEvents filteredOnline gossipResult.gm.appliedKeys (GossipOnline {})) (effectiveGossipEvents filteredOffline gossipResult.gm.appliedKeys (GossipOffline {}))
     when (not gossipResult.gm.withinCapacity)
       (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer))
+    -- Suppress re-broadcast of events we've already gossiped recently (prevents amplification)
+    freshEvents <- atomic do
+      recentGossip <- *recentGossip
+      let active = do r <- recentGossip; where t - r.seenAt < gossipDedupWindow; yield r
+      let fresh = do e <- effectiveEvents; where none active (\r -> r.pubkey == e.pubkey && r.server == e.server && r.timestamp == e.timestamp); yield e
+      let newRecent = do e <- fresh; yield {pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, seenAt: t}
+      let updated = union active newRecent
+      set *recentGossip = if count updated > maxRecentGossip then do r <- updated; where t - r.seenAt < gossipDedupWindow; yield r else updated
+      yield fresh
     let newlyOnlineRemote = newlyOnlineRemoteKeys filteredOnline gossipResult.gm.appliedKeys
     fork (do
-      when (cappedHops > 1 && federationEnabled && count effectiveEvents > 0) (
-        sendBatchedGossip (gossipTargets gossipResult.gm.gossipPeerServers fromServer) effectiveEvents (cappedHops - 1))
+      when (cappedHops > 1 && federationEnabled && count freshEvents > 0) (
+        sendBatchedGossip (gossipTargets gossipResult.gm.gossipPeerServers fromServer) freshEvents (cappedHops - 1))
       broadcastOfflineGossip t gossipResult.pr.peerServers gossipResult.pr.expiredLocal
       when (federationEnabled && count newlyOnlineRemote > 0)
         (forwardQueuedMessages newlyOnlineRemote t))
@@ -1763,7 +1805,7 @@ handleRecvGossip = \events hopsRemaining fromServer authorization respond -> do
 
 -- POST /federation/forward: Receive a message forwarded from a peer server.
 -- Only accepts messages where fromServer == originServer (no cascade forwarding).
--- Deduplicates and stores; rejects if recipient mailbox is full.
+-- Deduplicates and stores; rejects if recipient mailbox is full or recv rate exceeded.
 handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer authorization respond -> do
   t <- now
   withFederationAuth authorization t respond fromServer (not (isLocalServer originServer) && fromServer == originServer) (do
@@ -1778,15 +1820,24 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
         else if countMessagesFor messages toKey t >= maxMessagesPerRecipient
           then yield {pr: pr, forward: ForwardRejected {}}
           else do
-            seqCounter <- *seqCounter
-            let seqTs = nextSeqTs t seqCounter
-            set *seqCounter = seqTs
-            let updatedMessages = union messages
-              [{messageId: messageId, toKey: toKey,
-                encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
-            set *messages = updatedMessages
-            signalMessageForKey toKey seqTs
-            yield {pr: pr, forward: ForwardStored {}}
+            recvRates <- *recvRates
+            let recvResult = checkRateWindow recvRates (\r -> r.pubkey == toKey)
+              (\ts -> {pubkey: toKey, windowStart: ts, count: 1})
+              (\r -> {pubkey: r.pubkey, windowStart: r.windowStart, count: r.count + 1})
+              maxRecvRatePerKey recvRateWindowMs maxRecvRateEntries t
+            if recvResult.limited
+              then yield {pr: pr, forward: ForwardRejected {}}
+              else do
+                set *recvRates = recvResult.entries
+                seqCounter <- *seqCounter
+                let seqTs = nextSeqTs t seqCounter
+                set *seqCounter = seqTs
+                let updatedMessages = union messages
+                  [{messageId: messageId, toKey: toKey,
+                    encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}]
+                set *messages = updatedMessages
+                signalMessageForKey toKey seqTs
+                yield {pr: pr, forward: ForwardStored {}}
     case result.forward of
       ForwardRejected {} -> println ("forward: rejected for " ++ toKey ++ " (mailbox full, max " ++ show maxMessagesPerRecipient ++ ")")
       _ -> yield {}
@@ -1864,12 +1915,23 @@ handleHealth = \respond -> do
     lastPrune <- *lastPrunedAt
     lastHb <- *lastHeartbeatAt
     sa <- *startedAt
+    presence <- *presence
+    forwards <- *forwards
+    sessions <- *sessions
+    activePolls <- *activePolls
     let warmup = t - sa < healthPruneMaxAge
+    -- Capacity pressure: flag when any capped collection exceeds 90% full
+    let capacityOk = count presence * 10 <= maxPresenceEntries * 9
+      && count forwards * 10 <= maxForwardsEntries * 9
+      && count sessions * 10 <= maxSessions * 9
+      && count activePolls * 10 <= maxActivePolls * 9
     yield {pruneOk: warmup || t - lastPrune < healthPruneMaxAge,
-           heartbeatOk: warmup || t - lastHb < healthHeartbeatMaxAge}
-  yield (respond {ok: result.pruneOk && result.heartbeatOk,
+           heartbeatOk: warmup || t - lastHb < healthHeartbeatMaxAge,
+           capacityOk: capacityOk}
+  yield (respond {ok: result.pruneOk && result.heartbeatOk && result.capacityOk,
                   pruneHealthy: result.pruneOk,
-                  heartbeatHealthy: result.heartbeatOk})
+                  heartbeatHealthy: result.heartbeatOk,
+                  capacityHealthy: result.capacityOk})
 
 handleStats = \authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
