@@ -702,10 +702,6 @@ dedupMessageIds = \messageIds ->
     else {n: acc.n + 1, items: union acc.items [mid]}) {n: 0, items: []} capped
   in result.items
 
--- Remove the N oldest acked entries (by ackedAt timestamp)
-evictOldestAckedIds = \items n ->
-  if n <= 0 then items
-  else diff items (takeRelation n (sortBy (\a -> a.ackedAt) items))
 
 -- Constant-time string comparison to prevent timing side-channels.
 -- Always iterates maxTokenLen characters regardless of input length;
@@ -742,9 +738,9 @@ checkRateWindow = \entries matchKey makeNew updateCount maxRate windowMs maxEntr
         else do r <- entries; yield (if matchKey r then updateCount r else r)
       in {limited: False {}, entries: if count newEntries > maxEntries then (do r <- newEntries; where t - r.windowStart < windowMs; yield r) else newEntries}
 
--- Remove the single item with the smallest key value (LRU-style eviction)
-evictOneOldest = \items getKey ->
-  let result = fold (\acc x ->
+-- Extract the item with the smallest key and return both the item and remaining list
+extractOldest = \items getKey ->
+  fold (\acc x ->
     case acc.candidate of
       Nothing {} -> {candidate: Just {value: x}, items: acc.items}
       Just {value: c} ->
@@ -752,9 +748,23 @@ evictOneOldest = \items getKey ->
           then {candidate: Just {value: x}, items: union acc.items [c]}
           else {candidate: acc.candidate, items: union acc.items [x]}
     ) {candidate: Nothing {}, items: []} items
-  in case result.candidate of
+
+-- Remove the single item with the smallest key value (LRU-style eviction)
+evictOneOldest = \items getKey ->
+  let r = extractOldest items getKey in
+  case r.candidate of
     Nothing {} -> items
-    Just {} -> result.items
+    Just {} -> r.items
+
+-- Remove the N items with the smallest key value. O(n*k) — efficient when k is small.
+evictSmallest = \items n getKey ->
+  if n <= 0 then {kept: items, evicted: []}
+  else let r = extractOldest items getKey in
+    case r.candidate of
+      Nothing {} -> {kept: items, evicted: []}
+      Just {value: c} ->
+        let rest = evictSmallest r.items (n - 1) getKey in
+        {kept: rest.kept, evicted: union [c] rest.evicted}
 
 -- Enforce per-key capacity: if a key has >= maxPerKey items, evict the oldest for that key.
 -- Also prunes expired items.
@@ -974,7 +984,10 @@ sendBatchedGossip = \peerServers allEvents hops ->
 
 broadcastOfflineGossip = \t peerServers expiredLocal ->
   when (federationEnabled && count peerServers > 0 && count expiredLocal > 0) (do
-    let gossipEvents = mergeByKey (\a b -> a.pubkey == b.pubkey) (\x -> x.timestamp) [] (offlineGossipEvents expiredLocal)
+    let cappedExpired = takeRelation maxPresenceEntries expiredLocal
+    when (count expiredLocal > maxPresenceEntries)
+      (println ("gossip: capped offline broadcast to " ++ show maxPresenceEntries ++ " entries (had " ++ show (count expiredLocal) ++ ")"))
+    let gossipEvents = mergeByKey (\a b -> a.pubkey == b.pubkey) (\x -> x.timestamp) [] (offlineGossipEvents cappedExpired)
     sendBatchedGossip peerServers gossipEvents gossipOriginHops)
 
 
@@ -1124,10 +1137,11 @@ retryForwardsForServer = \entries remaining ->
           Err e -> do
             println ("federation: forward to " ++ f.toServer ++ " failed for " ++ f.messageId ++ ": " ++ show e)
             recordFailure f.toServer
+            -- Stop retrying: server is unreachable, remaining forwards will fail too
           Ok _ -> do
             removeForward f.messageId f.toServer
             clearFailure f.toServer
-        retryForwardsForServer rest (remaining - 1)
+            retryForwardsForServer rest (remaining - 1)
 
 -- Retry all pending forwards, respecting per-server backoff. Skips servers that failed recently.
 retryPendingForwards : [ForwardEntry] -> IO {network} {}
@@ -1210,9 +1224,9 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
             if excess <= 0
               then do set *ackedIds = combined; yield []
               else do
-                let evicted = takeRelation excess (sortBy (\a -> a.ackedAt) combined)
-                set *ackedIds = diff combined evicted
-                yield evicted
+                let eviction = evictSmallest combined excess (\a -> a.ackedAt)
+                set *ackedIds = eviction.kept
+                yield eviction.evicted
           when (count overflow > 0) (do
             dropped <- atomic do
               ackOverflow <- *ackOverflow
@@ -1221,14 +1235,14 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
               if overflowExcess <= 0
                 then do set *ackOverflow = updated; yield 0
                 else do
-                  let oldest = takeRelation overflowExcess (sortBy (\a -> a.ackedAt) updated)
-                  set *ackOverflow = diff updated oldest
+                  let overflowEviction = evictSmallest updated overflowExcess (\a -> a.ackedAt)
+                  set *ackOverflow = overflowEviction.kept
                   deliveredIds <- *deliveredIds
-                  let newDelivered = do a <- oldest; yield {messageId: a.messageId, toKey: a.toKey, deliveredAt: a.ackedAt}
+                  let newDelivered = do a <- overflowEviction.evicted; yield {messageId: a.messageId, toKey: a.toKey, deliveredAt: a.ackedAt}
                   let combinedDelivered = union deliveredIds newDelivered
                   let deliveredExcess = count combinedDelivered - maxDeliveredIds
                   set *deliveredIds = if deliveredExcess <= 0 then combinedDelivered
-                    else diff combinedDelivered (takeRelation deliveredExcess (sortBy (\d -> d.deliveredAt) combinedDelivered))
+                    else (evictSmallest combinedDelivered deliveredExcess (\d -> d.deliveredAt)).kept
                   yield overflowExcess
             when (dropped > 0)
               (println ("ackMessages: overflow at capacity (" ++ show maxAckOverflow ++ "), " ++ show dropped ++ " ack entries moved to delivered set for " ++ server)))
@@ -1363,9 +1377,9 @@ ackPolledMessages = \pubkey cursor t -> do
       ackedIds <- *ackedIds
       let combinedAckedIds = union ackedIds ackedFederated
       let excessCount = count combinedAckedIds - maxAckedIds
-      let evictedEntries = if excessCount <= 0 then [] else takeRelation excessCount (sortBy (\a -> a.ackedAt) combinedAckedIds)
-      set *ackedIds = diff combinedAckedIds evictedEntries
-      yield {pendingAcks: ackedFederated, evictedEntries: evictedEntries}
+      let eviction = evictSmallest combinedAckedIds excessCount (\a -> a.ackedAt)
+      set *ackedIds = eviction.kept
+      yield {pendingAcks: ackedFederated, evictedEntries: eviction.evicted}
     else yield {pendingAcks: [], evictedEntries: []}
 
 pollNewEvents = \pubkey clampedCursor t -> do
@@ -1653,27 +1667,29 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
       else yield {valid: True {}}
   if validation.valid
     then do
-      -- Reject if server started draining after challenge was issued
-      isDraining <- *draining
-      if isDraining then yield (respond {token: "", expiresAt: 0})
-      else do
       token <- genToken
-      peerServers <- atomic do
-        sessions <- *sessions
-        presence <- *presence
-        let afterRevoke = if revokeOthers then do s <- sessions; where s.pubkey != pubkey; yield s else sessions
-        let capped = capPerKeyAndGlobal afterRevoke (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t maxSessions
-        set *sessions = union capped [{token: token, pubkey: pubkey, expiresAt: expiry}]
-        let presenceWithout = presenceWithoutLocalKey presence pubkey
-        let presenceEvicted = capGlobal presenceWithout maxPresenceEntries (\p -> p.expiresAt)
-        let updatedPresence = union presenceEvicted [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]
-        set *presence = updatedPresence
-        yield (if federationEnabled
-          then collectPeerServers updatedPresence (\p -> p.server)
-          else [])
-      fork (when federationEnabled
-        (sendBatchedGossip peerServers [{eventType: GossipOnline {}, pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}] gossipOriginHops))
-      yield (respond {token: token, expiresAt: expiry})
+      authResult <- atomic do
+        isDraining <- *draining
+        if isDraining then yield (Nothing {})
+        else do
+          sessions <- *sessions
+          presence <- *presence
+          let afterRevoke = if revokeOthers then do s <- sessions; where s.pubkey != pubkey; yield s else sessions
+          let capped = capPerKeyAndGlobal afterRevoke (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t maxSessions
+          set *sessions = union capped [{token: token, pubkey: pubkey, expiresAt: expiry}]
+          let presenceWithout = presenceWithoutLocalKey presence pubkey
+          let presenceEvicted = capGlobal presenceWithout maxPresenceEntries (\p -> p.expiresAt)
+          let updatedPresence = union presenceEvicted [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]
+          set *presence = updatedPresence
+          yield (Just {value: if federationEnabled
+            then collectPeerServers updatedPresence (\p -> p.server)
+            else []})
+      case authResult of
+        Nothing {} -> yield (respond {token: "", expiresAt: 0})
+        Just {value: peerServers} -> do
+          fork (when federationEnabled
+            (sendBatchedGossip peerServers [{eventType: GossipOnline {}, pubkey: pubkey, server: serverHostN, timestamp: t, ttl: onlineGossipTtl}] gossipOriginHops))
+          yield (respond {token: token, expiresAt: expiry})
     else yield (respond {token: "", expiresAt: 0})
 
 -- POST /poll: Long-poll for new messages. Cursor-based: messages at or before cursor
@@ -1700,16 +1716,15 @@ handlePoll = \cursor authorization respond -> do
 -- Rate-limited per sender key. If recipient is known on a remote server, forwards via federation.
 handleSendMessage = \to encryptedBlob timestamp messageId authorization respond -> do
   t <- now
-  draining <- *draining
-  if draining then yield (respond {status: MsDraining {}, messageId: ""})
-  else do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {status: MsRateLimited {}, messageId: ""})
   else do
     effectiveMsgId <- if messageId != "" then yield messageId else genToken
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
-      withSessionAuth authorization t
+      draining <- *draining
+      if draining then yield {send: SendFailed {status: MsDraining {}}, senderRateLimited: False {}, globalCapReached: False {}}
+      else withSessionAuth authorization t
         (yield {send: SendFailed {status: MsUnauthorized {}}, senderRateLimited: False {}, globalCapReached: False {}})
         (\senderKey -> do
           -- Reject self-sends (sender == recipient wastes a mailbox slot)
@@ -1801,14 +1816,13 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization respond 
 -- Returns local server if key is online locally, otherwise the remote with latest expiry.
 handleLookupPresence = \pubkey authorization respond -> do
   t <- now
-  draining <- *draining
-  if draining then yield (respond {server: "", authorized: False {}})
-  else do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {server: "", authorized: False {}})
   else do
     result <- atomic do
-      withSessionAuth authorization t
+      draining <- *draining
+      if draining then yield {server: "", authorized: False {}}
+      else withSessionAuth authorization t
         (yield {server: "", authorized: False {}})
         (\senderKey -> do
           lookupRates <- *lookupRates
@@ -1879,13 +1893,13 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
       ackedIds <- *ackedIds
       deliveredIds <- *deliveredIds
       if hasMessage messageId toKey messages || hasMessage messageId toKey ackedIds || hasMessage messageId toKey deliveredIds
-        then yield {forward: ForwardDuplicate {}, globalCapReached: False {}}
+        then yield {forward: ForwardDuplicate {}, globalCapReached: False {}, recvRateLimited: False {}}
         else do
           totalMsgCount <- *totalMessageCount
           if totalMsgCount >= maxMessages
-            then yield {forward: ForwardRejected {}, globalCapReached: True {}}
+            then yield {forward: ForwardRejected {}, globalCapReached: True {}, recvRateLimited: False {}}
           else if countMessagesFor messages toKey t >= maxMessagesPerRecipient
-            then yield {forward: ForwardRejected {}, globalCapReached: False {}}
+            then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}}
             else do
               recvRates <- *recvRates
               let recvResult = checkRateWindow recvRates (\r -> r.pubkey == toKey)
@@ -1893,7 +1907,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                 (\r -> {pubkey: r.pubkey, windowStart: r.windowStart, count: r.count + 1})
                 maxRecvRatePerKey recvRateWindowMs maxRecvRateEntries t
               if recvResult.limited
-                then yield {forward: ForwardRejected {}, globalCapReached: False {}}
+                then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: True {}}
                 else do
                   set *recvRates = recvResult.entries
                   seqCounter <- *seqCounter
@@ -1905,11 +1919,13 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                   set *messages = updatedMessages
                   set *totalMessageCount = totalMsgCount + 1
                   signalMessageForKey toKey seqTs
-                  yield {forward: ForwardStored {}, globalCapReached: False {}}
+                  yield {forward: ForwardStored {}, globalCapReached: False {}, recvRateLimited: False {}}
     case result.forward of
       ForwardRejected {} ->
         if result.globalCapReached
           then println ("forward: global message cap reached (" ++ show maxMessages ++ "), rejecting for " ++ toKey)
+          else if result.recvRateLimited
+          then println ("forward: recv rate limited (" ++ show maxRecvRatePerKey ++ "/s per key), rejecting for " ++ toKey)
           else println ("forward: rejected for " ++ toKey ++ " (mailbox full, max " ++ show maxMessagesPerRecipient ++ ")")
       _ -> yield {}
     yield (case result.forward of
@@ -1939,7 +1955,8 @@ handleFederationAck = \messageIds originServer fromServer authorization respond 
       let pastGrace = do f <- removable; where any messages (\m -> m.messageId == f.messageId && m.toKey == f.toKey && t - m.receivedAt >= ackGracePeriod); yield f
       let updatedMessages = do m <- messages; where none pastGrace (\f -> m.messageId == f.messageId && m.toKey == f.toKey); yield m
       set *messages = updatedMessages
-      set *totalMessageCount = count updatedMessages
+      totalMsgCount <- *totalMessageCount
+      set *totalMessageCount = totalMsgCount - count pastGrace
     yield (respond {ok: True {}, error: ""}))
 
 -- POST /maintenance/drain: Broadcast offline gossip for all local keys (graceful shutdown).
@@ -1962,7 +1979,9 @@ handleDrain = \authorization respond -> do
     ackedIds <- *ackedIds
     let pendingForwardCount = count forwards
     let pendingAckCount = count ackedIds
-    -- Block on gossip (don't fork) so drain completes before process exit
+    -- Block on gossip (don't fork) so drain completes before process exit.
+    -- NOTE: If peers are unreachable, this blocks until fetch returns (no timeout in runtime).
+    -- Consider killing the process with a deadline after calling /drain.
     when (federationEnabled && drainedCount > 0 && count drainResult.peerServers > 0) (do
       let gossipEvents = do p <- drainResult.localEntries; yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl}
       sendBatchedGossip drainResult.peerServers gossipEvents gossipOriginHops)
@@ -2167,8 +2186,11 @@ main = do
         && maxSessions > 0 && maxChallenges > 0 && backgroundPruneInterval > 0
         && pollTimeoutMs > 0 && challengeExpiry > 0 && sessionExpiry > 0
         && maxPresenceTtl > 0 && maxForwardsEntries > 0 && maxAckedIds > 0
+  let peerSecretsOk = none federationPeerSecrets (\p -> isBadServerName (normalizeServerName p.server) || p.secret == "")
   if not configOk
     then println "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
+    else if not peerSecretsOk
+    then println "FATAL: invalid federationPeerSecrets — server names must pass validation and secrets must be non-empty"
     else do
       t <- now
       atomic do set *startedAt = t
