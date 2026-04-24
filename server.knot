@@ -110,6 +110,10 @@ maxServerDowntime = 86400000 -- 24 hours; stop retrying a server after this dura
 federationFetchTimeoutMs : Int<Ms>
 federationFetchTimeoutMs = 30000 -- 30 seconds; consider server unresponsive if fetch hasn't returned
 maxFederationInFlight = 100
+-- Federation circuit breaker: pause all outbound federation when this many unique peer
+-- servers have active (non-expired) failure records. Prevents wasted retries and log spam
+-- when the local network is down. Set to 0 to disable.
+federationCircuitBreakerThreshold = 3
 
 -- Federation latency metric window
 federationLatencyWindowMs : Int<Ms>
@@ -416,6 +420,9 @@ type FederationInFlightEntry = {server: Text, count: Int, firstStartedAt: Timest
 -- Max concurrent background prune forks (prevents resource exhaustion from stuck recovery)
 *activePruneForks : Int
 
+-- Signal for drain timeout (set by forked timer, watched by STM retry in waitForInFlightDrain)
+*drainTimedOut : Bool
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -464,15 +471,15 @@ route ClientApi where
 route FederationApi where
   /federation
     -- Receive presence gossip events from a peer server
-    POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName} /gossip headers {authorization: Text}
+    POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName, requestTimestamp: Timestamp} /gossip headers {authorization: Text}
       -> {ok: Bool, error: Text}
       = RecvGossip
     -- Receive a forwarded message from a peer server on behalf of a sender
-    POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName} /forward headers {authorization: Text}
+    POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp} /forward headers {authorization: Text}
       -> {ok: Bool, error: Text}
       = ForwardMessage
     -- Acknowledge delivery of messages back to the origin server
-    POST {messageIds: [MessageIdHex], originServer: ServerName, fromServer: ServerName} /ack headers {authorization: Text}
+    POST {messageIds: [MessageIdHex], originServer: ServerName, fromServer: ServerName, requestTimestamp: Timestamp} /ack headers {authorization: Text}
       -> {ok: Bool, error: Text}
       = FederationAck
 
@@ -487,6 +494,17 @@ route MaintenanceApi where
   POST {} /maintenance/undrain headers {authorization: Text}
     -> {ok: Bool}
     = Undrain
+  -- Snapshot: export federation metadata for persistence across restarts.
+  -- Messages are excluded (ephemeral by design; clients handle re-delivery).
+  -- Includes presence, acked/delivered IDs (dedup state), and peer failure records.
+  GET /maintenance/snapshot headers {authorization: Text}
+    -> {ok: Bool, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure]}
+    = Snapshot
+  -- Restore: import a previously-exported snapshot. Server must be in drain mode
+  -- to prevent conflicts with live state. Run /maintenance/undrain after restore.
+  POST {presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure]} /maintenance/restore headers {authorization: Text}
+    -> {ok: Bool, error: Text, presenceCount: Int, ackedIdsCount: Int, deliveredIdsCount: Int}
+    = Restore
 
 route HealthApi where
   GET /health -> {ok: Bool, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, federationHealthy: Bool} = Health
@@ -874,6 +892,17 @@ countAllSessions = do
   s14 <- *sessionBucket14
   s15 <- *sessionBucket15
   yield (count s0 + count s1 + count s2 + count s3 + count s4 + count s5 + count s6 + count s7 + count s8 + count s9 + count s10 + count s11 + count s12 + count s13 + count s14 + count s15)
+
+-- Short-circuit scan: check if any session bucket contains a session for the given pubkey.
+-- Stops reading buckets as soon as one matching session is found (O(n/16) best case
+-- vs O(n) for readAllSessions when the user has sessions in early buckets).
+hasSessionForKey : PubkeyHex -> Int -> IO Bool
+hasSessionForKey = \pubkey b ->
+  if b > 15 then yield (False {})
+  else do
+    bucket <- readSessionBucket b
+    if any bucket (\s -> s.pubkey == pubkey) then yield (True {})
+    else hasSessionForKey pubkey (b + 1)
 
 -- Apply a filter/transform to every session bucket
 transformAllSessionBuckets : ([Session] -> [Session]) -> IO ()
@@ -1394,9 +1423,13 @@ pruneExpired = \t -> do
     set *recentGossip = do r <- recentGossip; where t - r.seenAt < gossipDedupWindow; yield r
     -- Clean up stale in-flight entries: remove zeroed entries and reset leaked slots
     -- where the forked task died without calling clearFederationInFlight.
-    -- Uses 3x timeout threshold to allow the skip-hung-server logic to take effect first.
+    -- Uses 2x timeout threshold (tighter than the skip-hung-server logic at 1x)
+    -- so leaked slots are reclaimed promptly after the skip logic has already taken effect.
     inFlight <- *federationInFlight
-    set *federationInFlight = do r <- inFlight; where r.count > 0 && (r.firstStartedAt == 0 || t - r.firstStartedAt < federationFetchTimeoutMs * 3); yield r
+    let staleInFlight = do r <- inFlight; where r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= federationFetchTimeoutMs * 2; yield r
+    when (count staleInFlight > 0)
+      (println ("pruneExpired: cleaning " ++ show (count staleInFlight) ++ " stale in-flight entries (leaked slots)"))
+    set *federationInFlight = do r <- inFlight; where r.count > 0 && (r.firstStartedAt == 0 || t - r.firstStartedAt < federationFetchTimeoutMs * 2); yield r
   yield presenceResult
 
 
@@ -1416,9 +1449,11 @@ forEachBatch = \items batchSize process ->
 sendBatchedGossipToServer : ServerName -> [GossipEvent] -> Int -> IO {network} {}
 sendBatchedGossipToServer = \server allEvents hops ->
   forEachBatch allEvents maxGossipEvents (\batch -> do
+    t <- now
     result <- fetchFederation server (RecvGossip {
       authorization: federationAuthForServer server,
-      events: batch, hopsRemaining: hops, fromServer: serverHostN})
+      events: batch, hopsRemaining: hops, fromServer: serverHostN,
+      requestTimestamp: t})
     case result of
       Err e -> println ("federation: gossip to " ++ server ++ " failed: " ++ show e)
       Ok _ -> yield {})
@@ -1429,6 +1464,10 @@ sendBatchedGossip = \peerServers allEvents hops ->
 
 broadcastOfflineGossip = \t peerServers expiredLocal ->
   when (federationEnabled && count peerServers > 0 && count expiredLocal > 0) (do
+    failures <- *forwardFailures
+    if isFederationCircuitOpen failures t
+      then println ("federation: circuit breaker open, skipping offline gossip broadcast")
+      else do
     let cappedExpired = takeRelation maxPresenceEntries expiredLocal
     when (count expiredLocal > maxPresenceEntries)
       (println ("gossip: capped offline broadcast to " ++ show maxPresenceEntries ++ " entries (had " ++ show (count expiredLocal) ++ ")"))
@@ -1516,9 +1555,15 @@ checkPreAuth = \clientIp t -> do
       if ipLimited then yield "ip_rate_limited"
       else yield ""
 
-withFederationAuth = \authorization t respond fromServer precondition action ->
+withFederationAuth = \authorization t respond fromServer requestTimestamp precondition action ->
   if not (verifyFederationAuthForServer fromServer authorization)
     then yield (respond {ok: False {}, error: "unauthorized"})
+    -- Replay protection: reject requests with timestamps too far from local clock.
+    -- requestTimestamp == 0 means the peer doesn't support this field yet (accept).
+    else if requestTimestamp > 0 && (requestTimestamp > t + clockSkewTolerance || requestTimestamp < t - clockSkewTolerance)
+    then do
+      println ("federation: clock skew " ++ show (t - requestTimestamp) ++ "ms from " ++ fromServer ++ ", rejecting (tolerance: " ++ show clockSkewTolerance ++ "ms)")
+      yield (respond {ok: False {}, error: "clock_skew"})
     else if not precondition
     then yield (respond {ok: False {}, error: "invalid_request"})
     else do
@@ -1558,6 +1603,31 @@ removeForward = \mid srv -> atomic do
   forwards <- *forwards
   set *forwards = forwardsExcluding forwards srv [mid]
 
+-- Reclaim origin messages after federation ack confirms delivery.
+-- Iterates removedForwards with one atomic block per message (short locks).
+ackCleanupForwards = \entries t -> case headOf entries of
+  Nothing {} -> yield {}
+  Just {value: rf} -> do
+    let rest = do x <- entries; where x.messageId != rf.messageId || x.toKey != rf.toKey; yield x
+    atomic do
+      presence <- *presence
+      forwards <- *forwards
+      let hasLocal = any presence (\p -> p.pubkey == rf.toKey && isLocalServer p.server && p.expiresAt > t)
+      let hasOtherForwards = any forwards (\f -> f.messageId == rf.messageId && f.toKey == rf.toKey)
+      when (not hasLocal && not hasOtherForwards) (do
+        let b = pubkeyBucket rf.toKey
+        bucket <- readMessageBucket b
+        let msg = headOf (do m <- bucket; where m.messageId == rf.messageId && m.toKey == rf.toKey && t - m.receivedAt >= ackGracePeriod; yield m)
+        case msg of
+          Nothing {} -> yield {}
+          Just {} -> do
+            writeMessageBucket b (do m <- bucket; where not (m.messageId == rf.messageId && m.toKey == rf.toKey); yield m)
+            tc <- *totalMessageCount
+            set *totalMessageCount = max 0 (tc - 1)
+            rc <- *recipientMsgCounts
+            set *recipientMsgCounts = adjustRecipientCount rc rf.toKey (0 - 1))
+    ackCleanupForwards rest t
+
 pow2 : Int -> Int
 pow2 = \n -> if n <= 0 then 1 else 2 * pow2 (n - 1)
 
@@ -1576,6 +1646,14 @@ shouldRetryServer = \server t failures ->
 shouldRetryServerEx : Text -> Timestamp -> [ForwardFailure] -> [FederationInFlightEntry] -> Bool
 shouldRetryServerEx = \server t failures inFlight ->
   shouldRetryServer server t failures && not (hasHungFederationRequest server t inFlight)
+
+-- Global circuit breaker: returns True when too many peers are failing simultaneously,
+-- indicating a likely local network issue rather than individual peer problems.
+-- When tripped, all outbound federation is paused until the next prune cycle.
+isFederationCircuitOpen : [ForwardFailure] -> Timestamp -> Bool
+isFederationCircuitOpen = \failures t ->
+  federationCircuitBreakerThreshold > 0
+  && count (do f <- failures; where t - f.firstFailedAt < maxServerDowntime; yield f) >= federationCircuitBreakerThreshold
 
 recordFailure = \server -> do
   t <- now
@@ -1602,10 +1680,12 @@ retryForwardsForServer = \entries remaining ->
       Nothing {} -> yield {}
       Just {value: f} -> do
         let rest = do x <- entries; where x.messageId != f.messageId; yield x
+        t <- now
         result <- fetchFederation f.toServer (ForwardMessage {
           toKey: f.toKey, encryptedBlob: f.encryptedBlob,
           timestamp: f.timestamp, originServer: f.originServer, messageId: f.messageId,
-          fromServer: serverHostN, authorization: federationAuthForServer f.toServer})
+          fromServer: serverHostN, requestTimestamp: t,
+          authorization: federationAuthForServer f.toServer})
         case result of
           Err e -> do
             println ("federation: forward to " ++ f.toServer ++ " failed for " ++ f.messageId ++ ": " ++ show e)
@@ -1620,11 +1700,15 @@ retryForwardsForServer = \entries remaining ->
             retryForwardsForServer rest (remaining - 1)
 
 -- Retry all pending forwards, respecting per-server backoff. Skips servers that failed recently.
+-- Circuit breaker: skips entirely when too many peers are failing (likely local network issue).
 retryPendingForwards : [ForwardEntry] -> IO {network} {}
 retryPendingForwards = \pending -> do
   let servers = collectPeerServers pending (\x -> x.toServer)
   t <- now
   failures <- *forwardFailures
+  if isFederationCircuitOpen failures t
+    then println ("federation: circuit breaker open (" ++ show (count failures) ++ " peers failing), skipping forward retries")
+    else do
   inFlight <- *federationInFlight
   let eligibleServers = do s <- servers; where shouldRetryServerEx s t failures inFlight; yield s
   sendToEach eligibleServers (\server ->
@@ -1648,16 +1732,21 @@ forwardQueuedMessages = \targets t -> do
     yield capped
   let servers = collectPeerServers newForwards (\x -> x.toServer)
   failures <- *forwardFailures
+  if isFederationCircuitOpen failures t
+    then println ("federation: circuit breaker open, skipping queued message forwarding")
+    else do
   inFlight <- *federationInFlight
   let eligibleServers = do s <- servers; where shouldRetryServerEx s t failures inFlight; yield s
   sendToEach eligibleServers (\server ->
     retryForwardsForServer (forwardsForServer newForwards server) maxForwardRetriesPerServer)
 
-fetchFederationAck = \origin messageIds ->
+fetchFederationAck = \origin messageIds -> do
+  t <- now
   fetchFederation origin (FederationAck {
     authorization: federationAuthForServer origin,
     messageIds: messageIds,
-    originServer: origin, fromServer: serverHostN})
+    originServer: origin, fromServer: serverHostN,
+    requestTimestamp: t})
 
 sendBatchedAcksToServer : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> ServerName -> IO {network} {}
 sendBatchedAcksToServer = \serverAcks server ->
@@ -1680,6 +1769,9 @@ sendAcksAndClean = \pendingAcks -> do
   let servers = collectPeerServers pendingAcks (\a -> a.originServer)
   t <- now
   failures <- *forwardFailures
+  if isFederationCircuitOpen failures t
+    then println ("federation: circuit breaker open, skipping ack retries")
+    else do
   inFlight <- *federationInFlight
   let eligibleServers = do s <- servers; where shouldRetryServerEx s t failures inFlight; yield s
   sendToEach eligibleServers (\server ->
@@ -1736,6 +1828,9 @@ retryOverflowAcks = \overflow -> do
   let servers = collectPeerServers overflow (\a -> a.originServer)
   t <- now
   failures <- *forwardFailures
+  if isFederationCircuitOpen failures t
+    then println ("federation: circuit breaker open, skipping overflow ack retries")
+    else do
   inFlight <- *federationInFlight
   let eligibleServers = do s <- servers; where shouldRetryServerEx s t failures inFlight; yield s
   sendToEach eligibleServers (\server ->
@@ -1751,18 +1846,29 @@ retryOverflowAcks = \overflow -> do
             ackOverflow <- *ackOverflow
             set *ackOverflow = do a <- ackOverflow; where not (a.originServer == server && hasMessage a.messageId a.toKey batch); yield a))
 
--- Poll federationInFlight until all in-flight requests complete or deadline passes.
--- Used during drain to wait for outstanding federation work before signaling completion.
+-- Wait for all in-flight federation requests to complete or timeout.
+-- Uses STM retry instead of busy-wait: blocks until *federationInFlight changes
+-- (when clearFederationInFlight writes) or *drainTimedOut is set by the timeout fork.
+-- This avoids the 1-second polling loop and wakes immediately when work completes.
 waitForInFlightDrain = \deadline -> do
   t <- now
-  if t >= deadline then println "drain: timed out waiting for in-flight federation tasks"
-  else do
-    inFlight <- *federationInFlight
-    let activeCount = fold (\acc r -> acc + r.count) 0 inFlight
-    if activeCount <= 0 then yield {}
+  let remaining = deadline - t
+  atomic do set *drainTimedOut = False {}
+  -- Fork a timer that sets the timeout signal after the deadline
+  fork (do
+    when (remaining > 0) (sleep remaining)
+    atomic do set *drainTimedOut = True {})
+  -- Block until either all in-flight complete or timeout fires
+  atomic do
+    timedOut <- *drainTimedOut
+    if timedOut then yield {}
     else do
-      sleep 1000
-      waitForInFlightDrain deadline
+      inFlight <- *federationInFlight
+      let activeCount = fold (\acc r -> acc + r.count) 0 inFlight
+      if activeCount <= 0 then yield {}
+      else retry
+  timedOut <- *drainTimedOut
+  when timedOut (println "drain: timed out waiting for in-flight federation tasks")
 
 -- Full maintenance cycle: prune expired state, retry pending forwards and acks,
 -- retry overflow acks, broadcast offline gossip, and refresh presence for local keys
@@ -2393,10 +2499,12 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp
               forwards <- *forwards
               yield (any forwards (\f -> f.messageId == effectiveMsgId && f.toServer == server))
             when stillPending (do
+              fwdT <- now
               fwdResult <- fetchFederation server (ForwardMessage {
                 toKey: to, encryptedBlob: encryptedBlob,
                 timestamp: clampedTs, originServer: serverHostN, messageId: effectiveMsgId,
-                fromServer: serverHostN, authorization: federationAuthForServer server})
+                fromServer: serverHostN, requestTimestamp: fwdT,
+                authorization: federationAuthForServer server})
               case fwdResult of
                 Err e -> do
                   println ("federation: send forward to " ++ server ++ " failed for " ++ effectiveMsgId ++ ": " ++ show e)
@@ -2535,10 +2643,12 @@ handleLogout = \authorization clientIp respond -> do
                   writeSessionBucket bucket (do s <- sessions; where not (safeCompare s.token token); yield s)
                   sc <- *totalSessionCount
                   set *totalSessionCount = max 0 (sc - 1)
-                  -- Check if this was the last session for this key
-                  allSessions <- readAllSessions
-                  let remaining = count (do s <- allSessions; where s.pubkey == pubkey; yield s)
-                  if remaining == 0
+                  -- Check if this was the last session for this key.
+                  -- Short-circuit scan: reads buckets one at a time, stopping as soon as
+                  -- a matching session is found. Avoids reading all 16 buckets when the
+                  -- user has sessions in other buckets (common case: multi-device).
+                  hasRemaining <- hasSessionForKey pubkey 0
+                  if not hasRemaining
                     then do
                       -- Remove local presence immediately
                       presence <- *presence
@@ -2561,10 +2671,10 @@ handleLogout = \authorization clientIp respond -> do
 -- Validates events, merges into presence table (last-write-wins), and re-gossips
 -- to other known peers with decremented hop count. Triggers message forwarding
 -- when a remote key comes online.
-handleRecvGossip = \events hopsRemaining fromServer authorization respond -> do
+handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorization respond -> do
   t <- now
   let cappedHops = clamp 0 maxGossipHops hopsRemaining
-  withFederationAuth authorization t respond fromServer (cappedHops >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (do
+  withFederationAuth authorization t respond fromServer requestTimestamp (cappedHops >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (do
     let validated = validGossipEvents events t
     let onlineEntries = validated.online
     let trustedOffline = trustedOfflineEvents validated.offline fromServer
@@ -2608,9 +2718,9 @@ handleRecvGossip = \events hopsRemaining fromServer authorization respond -> do
 -- (fromServer != originServer) where an intermediate server re-forwards because
 -- the recipient moved. Cascade is bounded by dedup (same messageId won't be stored
 -- twice) and forwardCandidates (won't re-forward to the same server).
-handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer authorization respond -> do
+handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp authorization respond -> do
   t <- now
-  withFederationAuth authorization t respond fromServer (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
+  withFederationAuth authorization t respond fromServer requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
     when (fromServer != originServer)
       (println ("forward: relay from " ++ fromServer ++ " (origin: " ++ originServer ++ ") for " ++ toKey))
     -- Replay protection: reject forwards with timestamps older than messageMaxAge.
@@ -2672,16 +2782,27 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
 -- POST /federation/ack: Peer server confirms delivery of messages we originated.
 -- Removes corresponding forward entries. Also cleans up the original message if the
 -- recipient has no local presence and no other pending forwards for that message.
-handleFederationAck = \messageIds originServer fromServer authorization respond -> do
+handleFederationAck = \messageIds originServer fromServer requestTimestamp authorization respond -> do
   t <- now
-  withFederationAuth authorization t respond fromServer (isLocalServer originServer && not (isLocalServer fromServer)) (do
+  withFederationAuth authorization t respond fromServer requestTimestamp (isLocalServer originServer && not (isLocalServer fromServer)) (do
     let dedupedIds = dedupMessageIds messageIds
-    -- Only clear forward entries; origin messages are retained until the recipient
-    -- polls from this server or they age out via unackedMessageMaxAge. This prevents
-    -- a compromised peer from deleting messages by sending unverified acks.
-    atomic do
+    -- Clear forward entries for the acking server. Extract removed forwards' toKey
+    -- so we can reclaim origin messages that are no longer needed.
+    removedForwards <- atomic do
       forwards <- *forwards
+      let removed = do f <- forwards; where f.toServer == fromServer && any dedupedIds (\mid -> f.messageId == mid); yield f
       set *forwards = forwardsExcluding forwards fromServer dedupedIds
+      yield removed
+    -- Best-effort origin message cleanup (forked to avoid slowing the ack response).
+    -- Reclaims messages past the ack grace period when the recipient has no local
+    -- presence and no other pending forwards remain. Without this, confirmed-delivered
+    -- messages sit for up to unackedMessageMaxAge (7 days).
+    when (count removedForwards > 0) (fork (do
+      sleep ackGracePeriod
+      t2 <- now
+      -- Each forward is cleaned up in its own atomic block (short locks, one per message).
+      -- Uses explicit recursion since fold is pure and can't sequence atomic IO.
+      ackCleanupForwards removedForwards t2))
     yield (respond {ok: True {}, error: ""}))
 
 -- POST /maintenance/drain: Broadcast offline gossip for all local keys (graceful shutdown).
@@ -2883,6 +3004,67 @@ handleStatsKey = \pubkey authorization respond -> do
       yield (respond {messages: result.messages, presence: result.presence, sessions: result.sessions, forwards: result.forwards, activePolls: result.activePolls, ok: True {}})
     else yield (respond {messages: 0, presence: [], sessions: 0, forwards: 0, activePolls: 0, ok: False {}})
 
+emptySnapshot = {ok: False {}, presence: [], ackedIds: [], ackOverflow: [], deliveredIds: [], forwardFailures: []}
+
+-- GET /maintenance/snapshot: Export federation metadata for persistence.
+-- Reads all dedup state (ackedIds, deliveredIds), presence, and peer failure records
+-- in a single atomic snapshot. Messages and forwards are excluded — messages are
+-- ephemeral (clients re-send unconfirmed), and forwards are re-created from
+-- messages + presence after restore by running a prune cycle.
+handleSnapshot = \authorization respond -> do
+  let authorized = verifyMaintenanceAuth authorization
+  if not authorized then yield (respond emptySnapshot)
+  else do
+    result <- atomic do
+      p <- *presence
+      a <- *ackedIds
+      ao <- *ackOverflow
+      d <- *deliveredIds
+      ff <- *forwardFailures
+      yield {presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff}
+    println ("snapshot: exported " ++ show (count result.presence) ++ " presence, " ++ show (count result.ackedIds) ++ " ackedIds, " ++ show (count result.deliveredIds) ++ " deliveredIds")
+    yield (respond {ok: True {}, presence: result.presence, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures})
+
+-- POST /maintenance/restore: Import a previously-exported snapshot.
+-- Requires drain mode to prevent conflicts with live state. Merges imported data
+-- with existing state (dedup entries are unioned, presence is merged by freshness).
+-- After restore, call /maintenance/undrain to resume, then /maintenance/prune to
+-- trigger federation forward creation from messages + restored presence.
+handleRestore = \presenceData ackedIdsData ackOverflowData deliveredIdsData forwardFailuresData authorization respond -> do
+  let authorized = verifyMaintenanceAuth authorization
+  if not authorized then yield (respond {ok: False {}, error: "unauthorized", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
+  else do
+    t <- now
+    isDraining <- *draining
+    if not isDraining then yield (respond {ok: False {}, error: "server_must_be_draining", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
+    else do
+      result <- atomic do
+        -- Merge presence (existing entries win on conflict via freshness)
+        presence <- *presence
+        let mergedPresence = mergeByPubkeyServer presence (do p <- presenceData; where p.expiresAt > t; yield p)
+        let cappedPresence = takeRelation maxPresenceEntries mergedPresence
+        set *presence = cappedPresence
+        -- Union dedup state, respecting capacity limits
+        ackedIds <- *ackedIds
+        let mergedAcked = union ackedIds ackedIdsData
+        let cappedAcked = takeRelation maxAckedIds mergedAcked
+        set *ackedIds = cappedAcked
+        ackOverflow <- *ackOverflow
+        let mergedOverflow = union ackOverflow ackOverflowData
+        set *ackOverflow = takeRelation maxAckOverflow mergedOverflow
+        deliveredIds <- *deliveredIds
+        let mergedDelivered = union deliveredIds deliveredIdsData
+        let cappedDelivered = takeRelation maxDeliveredIds mergedDelivered
+        set *deliveredIds = cappedDelivered
+        -- Restore peer failure records
+        forwardFailures <- *forwardFailures
+        let mergedFailures = mergeByKey (\a b -> a.server == b.server) (\x -> x.failedAt) forwardFailures forwardFailuresData
+        let cappedFailures = takeRelation maxForwardFailures mergedFailures
+        set *forwardFailures = cappedFailures
+        yield {presenceCount: count cappedPresence, ackedIdsCount: count cappedAcked, deliveredIdsCount: count cappedDelivered}
+      println ("restore: imported " ++ show result.presenceCount ++ " presence, " ++ show result.ackedIdsCount ++ " ackedIds, " ++ show result.deliveredIdsCount ++ " deliveredIds")
+      yield (respond {ok: True {}, error: "", presenceCount: result.presenceCount, ackedIdsCount: result.ackedIdsCount, deliveredIdsCount: result.deliveredIdsCount})
+
 serve = \req -> case req of
   ReqChallenge {pubkey, clientIp, respond} -> handleChallenge pubkey clientIp respond
   VerifyAuth {pubkey, challenge, signature, revokeOthers, clientIp, respond} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp respond
@@ -2892,12 +3074,14 @@ serve = \req -> case req of
   SendMessage {to, encryptedBlob, timestamp, messageId, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob timestamp messageId authorization clientIp respond
   MessageStatus {to, messageId, authorization, clientIp, respond} -> handleMessageStatus to messageId authorization clientIp respond
   LookupPresence {pubkey, authorization, clientIp, respond} -> handleLookupPresence pubkey authorization clientIp respond
-  RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer authorization respond
-  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer authorization respond
-  FederationAck {messageIds, originServer, fromServer, authorization, respond} -> handleFederationAck messageIds originServer fromServer authorization respond
+  RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp authorization respond
+  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp authorization respond
+  FederationAck {messageIds, originServer, fromServer, requestTimestamp, authorization, respond} -> handleFederationAck messageIds originServer fromServer requestTimestamp authorization respond
   Prune {authorization, respond} -> handlePrune authorization respond
   Drain {authorization, respond} -> handleDrain authorization respond
   Undrain {authorization, respond} -> handleUndrain authorization respond
+  Snapshot {authorization, respond} -> handleSnapshot authorization respond
+  Restore {presence, ackedIds, ackOverflow, deliveredIds, forwardFailures, authorization, respond} -> handleRestore presence ackedIds ackOverflow deliveredIds forwardFailures authorization respond
   Health {respond} -> handleHealth respond
   Stats {authorization, respond} -> handleStats authorization respond
   StatsPeers {authorization, respond} -> handleStatsPeers authorization respond
@@ -2988,9 +3172,23 @@ main = do
         && maxSessions > 0 && maxChallenges > 0 && backgroundPruneInterval > 0
         && pollTimeoutMs > 0 && challengeExpiry > 0 && sessionExpiry > 0
         && maxPresenceTtl > 0 && maxForwardsEntries > 0 && maxAckedIds > 0
+  -- Relationship invariants: these misconfigurations cause subtle bugs
+  -- (e.g., messages pruned before their stated max age, backoff that never increases)
+  let configRelationsOk = unackedMessageMaxAge <= messageMaxAge
+        && challengeExpiry < sessionExpiry
+        && retryBackoffBase <= retryBackoffMax
+        && backgroundPruneInterval < healthPruneMaxAge
+        && ackGracePeriod < unackedMessageMaxAge
+        && clockSkewTolerance < challengeExpiry
+        && maxMessagesPerRecipient <= maxMessages
+        && maxSessionsPerKey <= maxSessions
+        && maxChallengesPerKey <= maxChallenges
+        && maxPollsPerKey <= maxActivePolls
   let peerSecretsOk = none federationPeerSecrets (\p -> isBadServerName (normalizeServerName p.server) || p.secret == "")
   if not configOk
     then println "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
+    else if not configRelationsOk
+    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, per-key limits <= global limits), server not started"
     else if not peerSecretsOk
     then println "FATAL: invalid federationPeerSecrets — server names must pass validation and secrets must be non-empty"
     else do
@@ -3012,6 +3210,8 @@ main = do
       println ("  auth rate limit: " ++ show maxAuthGlobalRate ++ "/" ++ show authGlobalRateWindowMs ++ "ms")
       when (count federationPeerSecrets > 0)
         (println ("  per-peer secrets: " ++ show (count federationPeerSecrets) ++ " configured"))
+      when (federationCircuitBreakerThreshold > 0)
+        (println ("  circuit breaker: " ++ show federationCircuitBreakerThreshold ++ " failing peers"))
       fork backgroundPrune
       fork pollHeartbeat
       listen 8080 serve
