@@ -80,6 +80,10 @@ maxFederationRateEntries = 100
 maxGlobalRequestRate = 1000 -- max total requests per window
 globalRateWindowMs : Int<Ms>
 globalRateWindowMs = 1000
+-- Auth-tier global rate limiting (prevents auth flooding from starving client operations)
+maxAuthGlobalRate = 200 -- max auth requests (challenge + verify + revoke) per window
+authGlobalRateWindowMs : Int<Ms>
+authGlobalRateWindowMs = 1000
 -- Session and gossip timing
 sessionExpiry : Int<Ms>
 sessionExpiry = 3600000 -- 1 hour
@@ -402,6 +406,16 @@ type FederationInFlightEntry = {server: Text, count: Int, firstStartedAt: Timest
 -- Last time federation latency metrics were reset (for windowed averages)
 *federationLatencyResetAt : Timestamp
 
+-- Total session count across all buckets (avoids O(16) recount on monitoring paths)
+*totalSessionCount : Int
+
+-- Auth-tier global rate limiting state
+*authGlobalRateCount : Int
+*authGlobalRateWindowStart : Timestamp
+
+-- Max concurrent background prune forks (prevents resource exhaustion from stuck recovery)
+*activePruneForks : Int
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -421,6 +435,10 @@ route AuthApi where
     POST {targetToken: Text} /revoke headers {authorization: Text, clientIp: Text}
       -> {ok: Bool, authorized: Bool}
       = RevokeSession
+    -- Voluntary disconnect: removes session and gossips offline if last session for this key
+    POST {} /logout headers {authorization: Text, clientIp: Text}
+      -> {ok: Bool, authorized: Bool}
+      = Logout
 
 -- Client-facing API (requires session token in Authorization header)
 route ClientApi where
@@ -433,6 +451,10 @@ route ClientApi where
     POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId} / headers {authorization: Text, clientIp: Text}
       -> {status: MessageStatus, messageId: OptionalMessageId}
       = SendMessage
+    -- Check delivery status of a sent message (caller must know recipient to prove ownership)
+    POST {to: PubkeyHex, messageId: MessageIdHex} /status headers {authorization: Text, clientIp: Text}
+      -> {status: Text, authorized: Bool}
+      = MessageStatus
   -- Look up which server a pubkey is present on (for federation routing)
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text}
     -> {server: AnyServerName, authorized: Bool}
@@ -677,10 +699,12 @@ hasDotBeforePort = \s ->
 -- IPv6 shorthand, octal/hex IP tricks, bare IPs without dots, and .arpa domains.
 isBadServerName : Text -> Bool
 isBadServerName = \sn ->
-  sn == ""
-  || take 1 sn == "."
-  || take 1 sn == ":"
+  let fc = take 1 sn in
+  fc == ""
+  || fc == "."
+  || fc == ":"
   || containsBadUrlChar sn
+  || not (hasDotBeforePort sn)
   || matchesHostnameOrSubdomain sn "localhost"
   || matchesHostname sn "localhost.localdomain"
   || matchesHostnameOrSubdomain sn "local"
@@ -688,7 +712,7 @@ isBadServerName = \sn ->
   || matchesHostnameOrSubdomain sn "metadata"
   || take 4 sn == "127." || take 3 sn == "10."
   || take 8 sn == "192.168." || take 8 sn == "169.254."
-  || take 2 sn == "0." || take 1 sn == "["
+  || take 2 sn == "0." || fc == "["
   || is172Private sn
   || take 7 sn == "198.18." || take 7 sn == "198.19."
   || take 8 sn == "192.0.0."
@@ -701,9 +725,8 @@ isBadServerName = \sn ->
   || containsMultipleColons sn
   || hasOctalOctet sn
   || hasHexPrefix sn
-  || (isDigitChar (take 1 sn) && isAllDigitsOrDotsUntilColonOrEnd sn)
+  || (isDigitChar fc && isAllDigitsOrDotsUntilColonOrEnd sn)
   || isHighOctetPrefix sn
-  || not (hasDotBeforePort sn)
   || containsSuffix ".arpa" sn
   || containsSuffix ".onion" sn
   || containsSuffix ".i2p" sn
@@ -1302,6 +1325,8 @@ pruneExpired = \t -> do
     challenges <- *challenges
     set *challenges = do x <- challenges; where x.expiresAt > t; yield x
     transformAllSessionBuckets (\bucket -> do x <- bucket; where x.expiresAt > t; yield x)
+    sessionCount <- countAllSessions
+    set *totalSessionCount = sessionCount
   -- Prune messages across all 16 buckets. Each bucket prune is atomic (short lock).
   -- Recipient counts are rebuilt incrementally per-bucket — since messages are sharded
   -- by recipient pubkey, each bucket's counts are disjoint, so simple union merges them.
@@ -1342,22 +1367,29 @@ pruneExpired = \t -> do
     set *ackOverflow = do a <- ackOverflow; where a.ackedAt > retainCutoff; yield a
     deliveredIds <- *deliveredIds
     set *deliveredIds = do d <- deliveredIds; where d.deliveredAt > retainCutoff; yield d
-  -- Prune rate limiters and ephemeral state
+  -- Prune rate limiters (split into smaller atomic blocks to reduce lock contention)
   atomic do
     sendRates <- *sendRates
     set *sendRates = do r <- sendRates; where t - r.windowStart < sendRateWindowMs; yield r
     challengeRates <- *challengeRates
     set *challengeRates = do r <- challengeRates; where t - r.windowStart < challengeRateWindowMs; yield r
+    recvRates <- *recvRates
+    set *recvRates = do r <- recvRates; where t - r.windowStart < recvRateWindowMs; yield r
+    -- Reset auth-tier global rate window
+    authWS <- *authGlobalRateWindowStart
+    when (t - authWS >= authGlobalRateWindowMs) (do
+      set *authGlobalRateWindowStart = t
+      set *authGlobalRateCount = 0)
+  atomic do
     federationRates <- *federationRates
     set *federationRates = do r <- federationRates; where t - r.windowStart < federationRateWindowMs; yield r
-    activePolls <- *activePolls
-    set *activePolls = do p <- activePolls; where t - p.startedAt < pollTimeoutMs * 3; yield p
     ipRates <- *ipRates
     set *ipRates = do r <- ipRates; where t - r.windowStart < ipRateWindowMs; yield r
     lookupRates <- *lookupRates
     set *lookupRates = do r <- lookupRates; where t - r.windowStart < lookupRateWindowMs; yield r
-    recvRates <- *recvRates
-    set *recvRates = do r <- recvRates; where t - r.windowStart < recvRateWindowMs; yield r
+  atomic do
+    activePolls <- *activePolls
+    set *activePolls = do p <- activePolls; where t - p.startedAt < pollTimeoutMs * 3; yield p
     recentGossip <- *recentGossip
     set *recentGossip = do r <- recentGossip; where t - r.seenAt < gossipDedupWindow; yield r
     -- Clean up stale in-flight entries: remove zeroed entries and reset leaked slots
@@ -1443,6 +1475,21 @@ checkGlobalRate = \t -> atomic do
       then yield (True {})
       else do
         set *globalRateCount = rateCount + 1
+        yield (False {})
+
+-- Auth-tier global rate limiting (shared budget for challenge + verify + revoke)
+checkAuthGlobalRate = \t -> atomic do
+  windowStart <- *authGlobalRateWindowStart
+  rateCount <- *authGlobalRateCount
+  if t - windowStart >= authGlobalRateWindowMs
+    then do
+      set *authGlobalRateWindowStart = t
+      set *authGlobalRateCount = 1
+      yield (False {})
+    else if rateCount >= maxAuthGlobalRate
+      then yield (True {})
+      else do
+        set *authGlobalRateCount = rateCount + 1
         yield (False {})
 
 -- IP-based rate limiting; skips if clientIp header is empty (no reverse proxy)
@@ -1587,12 +1634,14 @@ retryPendingForwards = \pending -> do
 -- When a remote key comes online, create forward entries for queued messages and send them
 forwardQueuedMessages = \targets t -> do
   newForwards <- atomic do
-    allMessages <- readAllMessages
     forwards <- *forwards
     presence <- *presence
     let localOnline = localOnlineKeys presence t
     let remoteTargets = remoteOnlyTargets targets localOnline
-    let candidates = forwardCandidates remoteTargets allMessages forwards t
+    -- Read only the message buckets containing target pubkeys (not all 16)
+    let neededBuckets = uniqueBucketsFor remoteTargets (\target -> target.pubkey)
+    relevantMessages <- readSelectedBuckets neededBuckets
+    let candidates = forwardCandidates remoteTargets relevantMessages forwards t
     let capped = takeRelation (maxForwardsEntries - count forwards) candidates
     let updatedForwards = union forwards capped
     set *forwards = updatedForwards
@@ -2068,6 +2117,9 @@ handleChallenge = \pubkey clientIp respond -> do
       when (preAuth == "ip_rate_limited") (println ("challenge: IP rate limited for " ++ clientIp))
       yield (respond {challenge: "", ok: False {}, expiresAt: 0})
     else do
+      authLimited <- checkAuthGlobalRate t
+      if authLimited then yield (respond {challenge: "", ok: False {}, expiresAt: 0})
+      else do
       rawChallenge <- genToken
       let challenge = serverHostN ++ ":" ++ rawChallenge
       result <- atomic do
@@ -2121,11 +2173,13 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
       if authRateLimited then do
         println ("verify: rate limited (" ++ show maxChallengeRatePerKey ++ "/s per key), rejecting for " ++ pubkey)
         yield (respond {token: "", expiresAt: 0})
-      else verifyAuthInner pubkey challenge signature revokeOthers clientIp respond t
+      else do
+        authGlobalLimited <- checkAuthGlobalRate t
+        if authGlobalLimited then yield (respond {token: "", expiresAt: 0})
+        else verifyAuthInner pubkey challenge signature revokeOthers clientIp respond t
 
 verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t -> do
   let expiry = t + sessionExpiry
-  let sigValid = verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
   validation <- atomic do
     challenges <- *challenges
     let hasMatch = challengeMatch challenges pubkey challenge clientIp t
@@ -2134,11 +2188,17 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
     -- by submitting a bad signature from the same IP. Rate limiter still constrains
     -- brute-force attempts; not consuming on IP mismatch prevents remote attackers
     -- from burning challenges.
-    if not hasMatch || not sigValid
+    -- verify() is inside the atomic block to prevent a TOCTOU gap between challenge
+    -- validation and consumption. It's pure (no IO) so safe in STM.
+    if not hasMatch
       then yield {valid: False {}}
       else do
-        set *challenges = challengesExcluding challenges pubkey challenge
-        yield {valid: True {}}
+        let sigValid = verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
+        if not sigValid
+          then yield {valid: False {}}
+          else do
+            set *challenges = challengesExcluding challenges pubkey challenge
+            yield {valid: True {}}
   if validation.valid
     then do
       token <- genToken
@@ -2159,6 +2219,8 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
               let nb = tokenBucket token
               currentBucket <- readSessionBucket nb
               writeSessionBucket nb (union currentBucket [newSession])
+              sc <- *totalSessionCount
+              set *totalSessionCount = sc + 1
               let presenceWithout = presenceWithoutLocalKey presence pubkey
               let presenceEvicted = capGlobal presenceWithout maxPresenceEntries (\p -> p.expiresAt)
               let updatedPresence = union presenceEvicted [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]
@@ -2172,6 +2234,7 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
               let afterRevoke = if revokeOthers then do s <- allSessions; where s.pubkey != pubkey; yield s else allSessions
               let capped = capPerKeyAndGlobal afterRevoke (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt) t maxSessions
               let sessionsWithNew = union capped [newSession]
+              set *totalSessionCount = count sessionsWithNew
               let bFor = \b -> do s <- sessionsWithNew; where tokenBucket s.token == b; yield s
               writeSessionBucket 0 (bFor 0)
               writeSessionBucket 1 (bFor 1)
@@ -2380,6 +2443,39 @@ handleLookupPresence = \pubkey authorization clientIp respond -> do
               yield {server: maskedServer, authorized: True {}})
     yield (respond {server: result.server, authorized: result.authorized})
 
+-- POST /messages/status: Check delivery status of a previously sent message.
+-- Caller must provide both messageId and recipient pubkey (proves they know the recipient).
+-- Returns: "pending" (in mailbox), "forwarding" (federation in progress),
+-- "delivered" (acked by recipient), "unknown" (expired or never existed).
+handleMessageStatus = \to messageId authorization clientIp respond -> do
+  t <- now
+  globalRateLimited <- checkGlobalRate t
+  if globalRateLimited then yield (respond {status: "", authorized: False {}})
+  else
+    withSessionAuth authorization t clientIp
+      (yield (respond {status: "", authorized: False {}}))
+      (\senderKey -> do
+        result <- atomic do
+          let msgBucket = pubkeyBucket to
+          bucket <- readMessageBucket msgBucket
+          -- Check if message is still in mailbox (pending delivery)
+          let inMailbox = any bucket (\m -> m.messageId == messageId && m.toKey == to)
+          if inMailbox then yield "pending"
+          else do
+            -- Check if being forwarded to a remote server
+            forwards <- *forwards
+            let inForwards = any forwards (\f -> f.messageId == messageId && f.toKey == to)
+            if inForwards then yield "forwarding"
+            else do
+              -- Check if already delivered (acked or in terminal delivered set)
+              ackedIds <- *ackedIds
+              deliveredIds <- *deliveredIds
+              let inAcked = hasMessage messageId to ackedIds
+              let inDelivered = hasMessage messageId to deliveredIds
+              if inAcked || inDelivered then yield "delivered"
+              else yield "unknown"
+        yield (respond {status: result, authorized: True {}}))
+
 -- POST /auth/revoke: Revoke a specific session token.
 -- Caller authenticates via Authorization header, then specifies the target token to remove.
 -- Only removes the target if it belongs to the same pubkey as the caller (prevents cross-user revocation).
@@ -2408,10 +2504,58 @@ handleRevoke = \targetToken authorization clientIp respond -> do
           if hasTarget
             then do
               writeSessionBucket targetBucket (do s <- sessions; where not (safeCompare s.token targetToken && s.pubkey == callerPubkey); yield s)
+              sc <- *totalSessionCount
+              set *totalSessionCount = max 0 (sc - 1)
               yield (True {})
             else yield (False {})
         when removed (println ("revoke: session revoked for " ++ callerPubkey))
         yield (respond {ok: removed, authorized: True {}}))
+
+-- POST /auth/logout: Voluntary disconnect. Removes the caller's session and, if it was
+-- the last active session for this pubkey, clears local presence and gossips offline.
+-- This gives faster offline detection than waiting for session expiry (1 hour).
+handleLogout = \authorization clientIp respond -> do
+  t <- now
+  globalRateLimited <- checkGlobalRate t
+  if globalRateLimited then yield (respond {ok: False {}, authorized: False {}})
+  else
+    case extractToken authorization of
+      Nothing {} -> yield (respond {ok: False {}, authorized: False {}})
+      Just {value: token} -> do
+        let bucket = tokenBucket token
+        result <- atomic do
+          sessions <- readSessionBucket bucket
+          case authenticateSession sessions token t of
+            Unauthorized {} -> yield (Nothing {})
+            Authorized {pubkey, ip} ->
+              if clientIp != "" && ip != "" && clientIp != ip
+                then yield (Nothing {})
+                else do
+                  -- Remove the caller's session
+                  writeSessionBucket bucket (do s <- sessions; where not (safeCompare s.token token); yield s)
+                  sc <- *totalSessionCount
+                  set *totalSessionCount = max 0 (sc - 1)
+                  -- Check if this was the last session for this key
+                  allSessions <- readAllSessions
+                  let remaining = count (do s <- allSessions; where s.pubkey == pubkey; yield s)
+                  if remaining == 0
+                    then do
+                      -- Remove local presence immediately
+                      presence <- *presence
+                      set *presence = presenceWithoutLocalKey presence pubkey
+                      yield (Just {value: {pubkey: pubkey, gossipOffline: True {}}})
+                    else yield (Just {value: {pubkey: pubkey, gossipOffline: False {}}})
+        case result of
+          Nothing {} -> yield (respond {ok: False {}, authorized: False {}})
+          Just {value: r} -> do
+            when r.gossipOffline (do
+              println ("logout: last session for " ++ r.pubkey ++ ", gossiping offline")
+              when federationEnabled (do
+                presence <- *presence
+                let peerServers = collectPeerServers presence (\p -> p.server)
+                when (count peerServers > 0)
+                  (fork (sendBatchedGossip peerServers [{eventType: GossipOffline {}, pubkey: r.pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl}] gossipOriginHops))))
+            yield (respond {ok: True {}, authorized: True {}})
 
 -- POST /federation/gossip: Receive presence gossip from a peer server.
 -- Validates events, merges into presence table (last-write-wins), and re-gossips
@@ -2532,33 +2676,12 @@ handleFederationAck = \messageIds originServer fromServer authorization respond 
   t <- now
   withFederationAuth authorization t respond fromServer (isLocalServer originServer && not (isLocalServer fromServer)) (do
     let dedupedIds = dedupMessageIds messageIds
+    -- Only clear forward entries; origin messages are retained until the recipient
+    -- polls from this server or they age out via unackedMessageMaxAge. This prevents
+    -- a compromised peer from deleting messages by sending unverified acks.
     atomic do
       forwards <- *forwards
-      let ackedForwards = do f <- forwards; where f.toServer == fromServer && any dedupedIds (\mid -> f.messageId == mid); yield f
-      let updatedForwards = forwardsExcluding forwards fromServer dedupedIds
-      set *forwards = updatedForwards
-      -- Read only message buckets containing acked recipients (not all 16)
-      let neededBuckets = uniqueBucketsFor ackedForwards (\f -> f.toKey)
-      relevantMessages <- readSelectedBuckets neededBuckets
-      presence <- *presence
-      let removable = do
-        f <- ackedForwards
-        where none updatedForwards (\rf -> rf.messageId == f.messageId && rf.toKey == f.toKey)
-        where none presence (\p -> p.pubkey == f.toKey && isLocalServer p.server && p.expiresAt > t)
-        yield f
-      -- Only remove messages stored long enough for local clients to have polled them (grace period)
-      let pastGrace = do f <- removable; where any relevantMessages (\m -> m.messageId == f.messageId && m.toKey == f.toKey && t - m.receivedAt >= ackGracePeriod); yield f
-      let removed = count pastGrace
-      -- Remove matched messages from only the affected buckets
-      when (removed > 0) (do
-        transformSelectedBuckets neededBuckets (\bucket ->
-          do m <- bucket; where none pastGrace (\f -> m.messageId == f.messageId && m.toKey == f.toKey); yield m)
-        totalMsgCount <- *totalMessageCount
-        set *totalMessageCount = totalMsgCount - removed
-        -- Batch-adjust per-recipient counts (single pass instead of per-entry fold)
-        recipientCounts <- *recipientMsgCounts
-        let removedCounts = countByRecipient pastGrace
-        set *recipientMsgCounts = batchDecrementRecipientCounts recipientCounts removedCounts)
+      set *forwards = forwardsExcluding forwards fromServer dedupedIds
     yield (respond {ok: True {}, error: ""}))
 
 -- POST /maintenance/drain: Broadcast offline gossip for all local keys (graceful shutdown).
@@ -2579,14 +2702,20 @@ handleDrain = \authorization respond -> do
     let drainedCount = count drainResult.localEntries
     forwards <- *forwards
     ackedIds <- *ackedIds
+    let pendingAcks = do a <- ackedIds; where not (isLocalServer a.originServer); yield a
     let pendingForwardCount = count forwards
-    let pendingAckCount = count ackedIds
-    -- Fork gossip so drain responds immediately (hung peers can't block the response).
-    -- After gossip, wait for any in-flight federation requests (from prior forks) to
-    -- complete before signaling drainCompletedAt. Operator polls /stats for drainCompletedAt > 0
-    -- to know when it's truly safe to stop the process.
+    let pendingAckCount = count pendingAcks
+    -- Fork best-effort flush of pending federation ops, then gossip, then wait for in-flight.
+    -- Operator polls /stats for drainCompletedAt > 0 to know when safe to stop.
     atomic do set *drainCompletedAt = 0
     fork (do
+      -- Best-effort flush of pending forwards and acks before stopping
+      when (federationEnabled && pendingForwardCount > 0) (do
+        println ("drain: flushing " ++ show pendingForwardCount ++ " pending forwards")
+        retryPendingForwards forwards)
+      when (federationEnabled && pendingAckCount > 0) (do
+        println ("drain: flushing " ++ show pendingAckCount ++ " pending acks")
+        sendAcksAndClean pendingAcks)
       when (federationEnabled && drainedCount > 0 && count drainResult.peerServers > 0) (do
         let gossipEvents = do p <- drainResult.localEntries; yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl}
         sendBatchedGossip drainResult.peerServers gossipEvents gossipOriginHops)
@@ -2596,9 +2725,9 @@ handleDrain = \authorization respond -> do
       atomic do set *drainCompletedAt = t2)
     println ("drain: broadcast offline for " ++ show drainedCount ++ " local keys")
     when (pendingForwardCount > 0)
-      (println ("drain: warning: " ++ show pendingForwardCount ++ " pending forwards will not be retried"))
+      (println ("drain: flushing " ++ show pendingForwardCount ++ " pending forwards"))
     when (pendingAckCount > 0)
-      (println ("drain: warning: " ++ show pendingAckCount ++ " pending acks will not be sent"))
+      (println ("drain: flushing " ++ show pendingAckCount ++ " pending acks"))
     yield (respond {ok: True {}, drained: drainedCount})
 
 -- POST /maintenance/undrain: Resume accepting requests after a drain.
@@ -2634,7 +2763,7 @@ handleHealth = \respond -> do
     sa <- *startedAt
     presence <- *presence
     forwards <- *forwards
-    sessionCount <- countAllSessions
+    sessionCount <- *totalSessionCount
     activePolls <- *activePolls
     tmc <- *totalMessageCount
     lastFedSuccess <- *lastFederationSuccessAt
@@ -2665,14 +2794,17 @@ handleHealth = \respond -> do
 zeroStats = {sessions: 0, sessionsMax: 0, messages: 0, messagesMax: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, federationEnabled: False {}, recentGossip: 0, totalMessageCount: 0, recipientCounts: 0, federationInFlight: 0, messagesPct: 0, presencePct: 0, forwardsPct: 0, sessionsPct: 0, federationAvgLatencyMs: 0, federationMaxLatencyMs: 0, federationCallCount: 0, drainCompletedAt: 0, ok: False {}}
 
 handleStats = \authorization respond -> do
+  t <- now
+  globalRateLimited <- checkGlobalRate t
+  if globalRateLimited then yield (respond zeroStats)
+  else do
   let authorized = verifyMaintenanceAuth authorization
   if authorized
     then do
-      t <- now
       -- Split into two atomic reads: core capacity state (consistent) and counters/timing
       -- (slight inconsistency acceptable for monitoring). This narrows the lock window.
       core <- atomic do
-        sc <- countAllSessions
+        sc <- *totalSessionCount
         p <- *presence
         f <- *forwards
         c <- *challenges
@@ -2716,20 +2848,26 @@ handleStats = \authorization respond -> do
     else yield (respond zeroStats)
 
 handleStatsPeers = \authorization respond -> do
+  t <- now
+  globalRateLimited <- checkGlobalRate t
+  if globalRateLimited then yield (respond {peers: [], ok: False {}})
+  else do
   let authorized = verifyMaintenanceAuth authorization
   if authorized
     then do
-      t <- now
       failures <- *forwardFailures
       let peers = do f <- failures; yield {server: f.server, failures: f.failures, lastFailedAt: f.failedAt, firstFailedAt: f.firstFailedAt, backoffMs: retryBackoff f.failures, retriable: shouldRetryServer f.server t failures}
       yield (respond {peers: peers, ok: True {}})
     else yield (respond {peers: [], ok: False {}})
 
 handleStatsKey = \pubkey authorization respond -> do
+  t <- now
+  globalRateLimited <- checkGlobalRate t
+  if globalRateLimited then yield (respond {messages: 0, presence: [], sessions: 0, forwards: 0, activePolls: 0, ok: False {}})
+  else do
   let authorized = verifyMaintenanceAuth authorization
   if authorized
     then do
-      t <- now
       result <- atomic do
         keyBucket <- readMessageBucket (pubkeyBucket pubkey)
         presence <- *presence
@@ -2749,8 +2887,10 @@ serve = \req -> case req of
   ReqChallenge {pubkey, clientIp, respond} -> handleChallenge pubkey clientIp respond
   VerifyAuth {pubkey, challenge, signature, revokeOthers, clientIp, respond} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp respond
   RevokeSession {targetToken, authorization, clientIp, respond} -> handleRevoke targetToken authorization clientIp respond
+  Logout {authorization, clientIp, respond} -> handleLogout authorization clientIp respond
   Poll {cursor, generation, watchKeys, authorization, clientIp, respond} -> handlePoll cursor generation watchKeys authorization clientIp respond
   SendMessage {to, encryptedBlob, timestamp, messageId, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob timestamp messageId authorization clientIp respond
+  MessageStatus {to, messageId, authorization, clientIp, respond} -> handleMessageStatus to messageId authorization clientIp respond
   LookupPresence {pubkey, authorization, clientIp, respond} -> handleLookupPresence pubkey authorization clientIp respond
   RecvGossip {events, hopsRemaining, fromServer, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer authorization respond
   ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer authorization respond
@@ -2801,13 +2941,24 @@ backgroundPrune = do
   when status.recovered
     (println ("backgroundPrune: previous cycle stuck for " ++ show (t - status.stuckSince) ++ "ms, forcing recovery"))
   if status.canRun
-    then fork (do
-      pruneAndRetry t
-      -- Only clear running flag if this is still the latest generation
-      -- (prevents a stuck old fork from clearing the flag after a recovery cycle started)
-      atomic do
-        currentGen <- *pruneGeneration
-        when (currentGen == status.gen) (set *pruneRunning = 0))
+    then do
+      -- Guard against unbounded concurrent prune forks from repeated stuck recovery
+      forks <- *activePruneForks
+      if forks >= 2
+        then println "backgroundPrune: skipping (max concurrent prune forks reached)"
+        else do
+          atomic do
+            af <- *activePruneForks
+            set *activePruneForks = af + 1
+          fork (do
+            pruneAndRetry t
+            -- Only clear running flag if this is still the latest generation
+            -- (prevents a stuck old fork from clearing the flag after a recovery cycle started)
+            atomic do
+              currentGen <- *pruneGeneration
+              when (currentGen == status.gen) (set *pruneRunning = 0)
+              af <- *activePruneForks
+              set *activePruneForks = max 0 (af - 1))
     else println "backgroundPrune: skipping (previous cycle still running)"
   backgroundPrune
 
@@ -2851,6 +3002,16 @@ main = do
       println ("  federation: " ++ if federationEnabled then "enabled" else "disabled")
       println ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")
       println ("  poll timeout: " ++ show pollTimeoutMs ++ "ms")
+      println ("  max messages: " ++ show maxMessages ++ " (per recipient: " ++ show maxMessagesPerRecipient ++ ")")
+      println ("  max sessions: " ++ show maxSessions ++ " (per key: " ++ show maxSessionsPerKey ++ ")")
+      println ("  max presence: " ++ show maxPresenceEntries)
+      println ("  max forwards: " ++ show maxForwardsEntries)
+      println ("  session expiry: " ++ show sessionExpiry ++ "ms")
+      println ("  message max age: " ++ show messageMaxAge ++ "ms")
+      println ("  global rate limit: " ++ show maxGlobalRequestRate ++ "/" ++ show globalRateWindowMs ++ "ms")
+      println ("  auth rate limit: " ++ show maxAuthGlobalRate ++ "/" ++ show authGlobalRateWindowMs ++ "ms")
+      when (count federationPeerSecrets > 0)
+        (println ("  per-peer secrets: " ++ show (count federationPeerSecrets) ++ " configured"))
       fork backgroundPrune
       fork pollHeartbeat
       listen 8080 serve
