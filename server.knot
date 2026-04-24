@@ -15,18 +15,13 @@
 
 -- Server identity and federation credentials
 serverHost = "localhost:8080"
-federationSecret = "" -- must be set to enable federation
-maintenanceSecret = "" -- set to enable /maintenance/prune independently of federation
+maintenanceSecret = "" -- set to enable /maintenance/* and /stats endpoints
 federationScheme = "https://" -- scheme for federation HTTP calls
 -- NOTE: Outbound federation HTTP calls have no runtime-level timeout. The fetchFederation
 -- wrapper tracks in-flight requests per server and skips servers with outstanding requests
 -- older than federationFetchTimeoutMs (see shouldRetryServerEx). This prevents a single
 -- slow peer from consuming all concurrency slots, though truly hung connections still hold
 -- one slot until the forked task terminates.
--- Per-peer federation secrets (overrides global federationSecret for specific peers)
--- Format: [{server: "peer.example.com", secret: "peer-specific-secret"}]
-federationPeerSecrets : [{server: Text, secret: Text}]
-federationPeerSecrets = []
 -- Message and data size limits
 messageMaxAge : Int<Ms>
 messageMaxAge = 2592000000 -- 30 days
@@ -136,9 +131,13 @@ presenceRefreshInterval : Int<Ms>
 presenceRefreshInterval = 300000 -- 5 minutes
 presenceRefreshThreshold : Int<Ms>
 presenceRefreshThreshold = presenceRefreshInterval * 2 -- refresh entries expiring within this window
-federationEnabled = federationSecret != ""
-federationAuth = "Bearer " ++ federationSecret
+federationEnabled = True {}
 federationUrl = \server -> federationScheme ++ server
+-- Callback verification: outbound federation requests include a random single-use token;
+-- the receiver calls back to /federation/verify to confirm the sender actually issued it.
+maxPendingVerifications = 10000
+verificationTokenExpiry : Int<Ms>
+verificationTokenExpiry = 30000 -- 30 seconds
 -- IP-based rate limiting (reverse proxy sets ClientIp header)
 maxIpRatePerIp = 10 -- max auth requests per IP per window
 ipRateWindowMs : Int<Ms>
@@ -452,6 +451,9 @@ type RecentFederationRequest = {server: Text, timestamp: Timestamp, seenAt: Time
 -- Recent federation requests for replay detection (dedup by server+timestamp)
 *recentFederationRequests : [RecentFederationRequest]
 
+-- Pending verification tokens for federation callback auth (single-use, short-lived)
+*pendingVerifications : [{token: Text, createdAt: Timestamp}]
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -496,7 +498,7 @@ route ClientApi where
     -> {server: AnyServerName, authorized: Bool}
     = LookupPresence
 
--- Server-to-server federation API (requires federation secret)
+-- Server-to-server federation API (authenticated via domain callback verification)
 route FederationApi where
   /federation
     -- Receive presence gossip events from a peer server
@@ -511,6 +513,11 @@ route FederationApi where
     POST {messageIds: [MessageIdHex], originServer: ServerName, fromServer: ServerName, requestTimestamp: Timestamp} /ack headers {authorization: Text}
       -> {ok: Bool, error: Text}
       = FederationAck
+
+-- Federation callback verification: the receiving server calls back to the sender
+-- to confirm a request token is genuine. No shared secret needed.
+route FederationVerifyApi where
+  POST {token: Text} /federation/verify -> {ok: Bool} = VerifyToken
 
 -- Triggers pruning of expired state and retry of pending federation ops
 route MaintenanceApi where
@@ -538,7 +545,7 @@ route MaintenanceApi where
 route HealthApi where
   GET /health -> {ok: Bool, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, federationHealthy: Bool} = Health
 
--- Returns counts of in-memory collections (requires federation or maintenance secret)
+-- Returns counts of in-memory collections (requires maintenance secret)
 route StatsApi where
   GET /stats headers {authorization: Text}
     -> {sessions: Int, sessionsMax: Int, messages: Int, messagesMax: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, federationEnabled: Bool, recentGossip: Int, totalMessageCount: Int, recipientCounts: Int, federationInFlight: Int, messagesPct: Int, presencePct: Int, forwardsPct: Int, sessionsPct: Int, federationAvgLatencyMs: Int, federationMaxLatencyMs: Int, federationCallCount: Int, drainCompletedAt: Timestamp, ok: Bool}
@@ -550,7 +557,7 @@ route StatsApi where
     -> {messages: Int, presence: [KeyPresenceEntry], sessions: Int, forwards: Int, activePolls: Int, ok: Bool}
     = StatsKey
 
-route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi | HealthApi | StatsApi
+route Api = AuthApi | ClientApi | FederationApi | FederationVerifyApi | MaintenanceApi | HealthApi | StatsApi
 
 -- ============================================
 -- Helpers
@@ -800,7 +807,7 @@ extractToken = \authHeader ->
     then Just {value: token}
     else Nothing {}
 
--- Constant-time secret comparison (prevents timing attacks on federation/maintenance secrets)
+-- Constant-time secret comparison (prevents timing attacks on maintenance secret)
 verifySecret : Text -> Text -> Bool
 verifySecret = \token secret ->
   secret != "" && safeCompare token secret
@@ -811,27 +818,36 @@ verifyAuthWith = \check authorization ->
     Nothing {} -> False {}
     Just {value: token} -> check token
 
-verifyFederationAuth : Text -> Bool
-verifyFederationAuth = verifyAuthWith (\token -> verifySecret token federationSecret)
-
--- Per-peer federation auth: checks peer-specific secret first, falls back to global
-verifyFederationAuthForServer : Text -> Text -> Bool
-verifyFederationAuthForServer = \fromServer authorization ->
-  verifyAuthWith (\token ->
-    case headOf (do p <- federationPeerSecrets; where normalizeServerName p.server == fromServer; yield p) of
-      Just {value: p} -> verifySecret token p.secret
-      Nothing {} -> verifySecret token federationSecret
-  ) authorization
-
 verifyMaintenanceAuth : Text -> Bool
-verifyMaintenanceAuth = verifyAuthWith (\token -> verifySecret token federationSecret || verifySecret token maintenanceSecret)
+verifyMaintenanceAuth = verifyAuthWith (\token -> verifySecret token maintenanceSecret)
 
--- Outbound federation auth: use per-peer secret if configured, otherwise global
-federationAuthForServer : Text -> Text
-federationAuthForServer = \server ->
-  case headOf (do p <- federationPeerSecrets; where normalizeServerName p.server == server; yield p) of
-    Just {value: p} -> "Bearer " ++ p.secret
-    Nothing {} -> federationAuth
+-- Generate a single-use token for outbound federation auth.
+-- The receiving server calls back to /federation/verify to confirm we issued it.
+generateFederationAuth : IO {network} Text
+generateFederationAuth = do
+  token <- genToken
+  t <- now
+  atomic do
+    pending <- *pendingVerifications
+    let updated = union pending [{token: token, createdAt: t}]
+    set *pendingVerifications = if count updated > maxPendingVerifications
+      then evictOneOldest updated (\p -> p.createdAt)
+      else updated
+  yield ("Bearer " ++ token)
+
+-- Verify an inbound federation token by callback to the sender's /federation/verify endpoint.
+-- Single-use: the sender consumes the token on verification.
+verifyFederationCallback : Text -> Text -> IO {network} Bool
+verifyFederationCallback = \fromServer authorization ->
+  case extractToken authorization of
+    Nothing {} -> yield (False {})
+    Just {value: token} -> do
+      result <- fetch (federationUrl fromServer) (VerifyToken {token: token})
+      case result of
+        Err e -> do
+          println ("federation: verify callback to " ++ fromServer ++ " failed: " ++ show e)
+          yield (False {})
+        Ok r -> yield r.ok
 
 -- ============================================
 -- Session Bucket Helpers
@@ -1591,6 +1607,9 @@ pruneExpired = \t -> do
     -- Prune stale federation replay dedup entries
     recentFedReqs <- *recentFederationRequests
     set *recentFederationRequests = do r <- recentFedReqs; where t - r.seenAt < clockSkewTolerance * 2; yield r
+    -- Prune expired federation verification tokens
+    pending <- *pendingVerifications
+    set *pendingVerifications = do p <- pending; where t - p.createdAt < verificationTokenExpiry; yield p
   yield presenceResult
 
 
@@ -1611,8 +1630,9 @@ sendBatchedGossipToServer : ServerName -> [GossipEvent] -> Int -> IO {network} {
 sendBatchedGossipToServer = \server allEvents hops ->
   forEachBatch allEvents maxGossipEvents (\batch -> do
     t <- now
+    auth <- generateFederationAuth
     result <- fetchFederation server (RecvGossip {
-      authorization: federationAuthForServer server,
+      authorization: auth,
       events: batch, hopsRemaining: hops, fromServer: serverHostN,
       requestTimestamp: t})
     case result of
@@ -1716,8 +1736,9 @@ checkPreAuth = \clientIp t -> do
       if ipLimited then yield "ip_rate_limited"
       else yield ""
 
-withFederationAuth = \authorization t respond fromServer requestTimestamp precondition action ->
-  if not (verifyFederationAuthForServer fromServer authorization)
+withFederationAuth = \authorization t respond fromServer requestTimestamp precondition action -> do
+  verified <- verifyFederationCallback fromServer authorization
+  if not verified
     then yield (respond {ok: False {}, error: "unauthorized"})
     -- Replay protection: reject requests with timestamps too far from local clock.
     -- requestTimestamp == 0 means the peer doesn't support this field yet (accept).
@@ -1757,10 +1778,6 @@ withFederationAuth = \authorization t respond fromServer requestTimestamp precon
               println ("federation: rate limited (" ++ show maxFederationRatePerServer ++ "/s per server), rejecting for " ++ fromServer)
               yield (respond {ok: False {}, error: "rate_limited"})
             else do
-              let hasPeerSecrets = count federationPeerSecrets > 0
-              let hasSpecificSecret = any federationPeerSecrets (\p -> normalizeServerName p.server == fromServer)
-              when (hasPeerSecrets && not hasSpecificSecret)
-                (println ("federation: warning: " ++ fromServer ++ " using global secret (no per-peer secret configured)"))
               clearFailure fromServer
               action
 
@@ -1875,11 +1892,12 @@ retryForwardsForServer = \entries remaining ->
       Just {value: f} -> do
         let rest = do x <- entries; where x.messageId != f.messageId; yield x
         t <- now
+        auth <- generateFederationAuth
         result <- fetchFederation f.toServer (ForwardMessage {
           toKey: f.toKey, encryptedBlob: f.encryptedBlob,
           timestamp: f.timestamp, originServer: f.originServer, messageId: f.messageId,
           fromServer: serverHostN, requestTimestamp: t,
-          authorization: federationAuthForServer f.toServer})
+          authorization: auth})
         case result of
           Err e -> do
             println ("federation: forward to " ++ f.toServer ++ " failed for " ++ f.messageId ++ ": " ++ show e)
@@ -1938,8 +1956,9 @@ forwardQueuedMessages = \targets t -> do
 
 fetchFederationAck = \origin messageIds -> do
   t <- now
+  auth <- generateFederationAuth
   fetchFederation origin (FederationAck {
-    authorization: federationAuthForServer origin,
+    authorization: auth,
     messageIds: messageIds,
     originServer: origin, fromServer: serverHostN,
     requestTimestamp: t})
@@ -2698,11 +2717,12 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp
               yield (any forwards (\f -> f.messageId == effectiveMsgId && f.toServer == server))
             when stillPending (do
               fwdT <- now
+              fwdAuth <- generateFederationAuth
               fwdResult <- fetchFederation server (ForwardMessage {
                 toKey: to, encryptedBlob: encryptedBlob,
                 timestamp: clampedTs, originServer: serverHostN, messageId: effectiveMsgId,
                 fromServer: serverHostN, requestTimestamp: fwdT,
-                authorization: federationAuthForServer server})
+                authorization: fwdAuth})
               case fwdResult of
                 Err e -> do
                   println ("federation: send forward to " ++ server ++ " failed for " ++ effectiveMsgId ++ ": " ++ show e)
@@ -2884,6 +2904,18 @@ handleLogout = \authorization clientIp respond -> do
                 (fork (sendBatchedGossip r.peerServers [{eventType: GossipOffline {}, pubkey: r.pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl}] gossipOriginHops)))
             yield (respond {ok: True {}, authorized: True {}})
 
+-- POST /federation/verify: Confirm a token was issued by this server.
+-- Called by the receiving server during federation callback verification.
+-- Tokens are single-use and expire after verificationTokenExpiry.
+handleVerifyToken = \token respond -> do
+  t <- now
+  found <- atomic do
+    pending <- *pendingVerifications
+    let match = any pending (\p -> safeCompare p.token token && t - p.createdAt < verificationTokenExpiry)
+    when match (set *pendingVerifications = do p <- pending; where not (safeCompare p.token token); yield p)
+    yield match
+  yield (respond {ok: found})
+
 -- POST /federation/gossip: Receive presence gossip from a peer server.
 -- Validates events, merges into presence table (last-write-wins), and re-gossips
 -- to other known peers with decremented hop count. Triggers message forwarding
@@ -2941,13 +2973,6 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
   withFederationAuth authorization t respond fromServer requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
     when (fromServer != originServer)
       (println ("forward: relay from " ++ fromServer ++ " (origin: " ++ originServer ++ ") for " ++ toKey))
-    -- Relay origin validation: when per-peer secrets are configured, only accept
-    -- relays claiming an origin that is also a configured peer
-    if fromServer != originServer && count federationPeerSecrets > 0 && none federationPeerSecrets (\p -> normalizeServerName p.server == originServer)
-      then do
-        println ("forward: rejecting relay with unknown origin " ++ originServer ++ " from " ++ fromServer)
-        yield (respond {ok: False {}, error: "unknown_origin"})
-      else do
     -- Replay protection: reject forwards with timestamps older than messageMaxAge.
     -- Legitimate queued messages have timestamps within this window. Replayed captures
     -- become stale once dedup state (messages + ackedIds + deliveredIds) is pruned (~30 days).
@@ -3308,6 +3333,7 @@ serve = \req -> case req of
   RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp authorization respond
   ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp authorization respond
   FederationAck {messageIds, originServer, fromServer, requestTimestamp, authorization, respond} -> handleFederationAck messageIds originServer fromServer requestTimestamp authorization respond
+  VerifyToken {token, respond} -> handleVerifyToken token respond
   Prune {authorization, respond} -> handlePrune authorization respond
   Drain {authorization, respond} -> handleDrain authorization respond
   Undrain {authorization, respond} -> handleUndrain authorization respond
@@ -3425,6 +3451,7 @@ main = do
         && maxPresenceTtl > 0 && maxForwardsEntries > 0 && maxAckedIds > 0
         && maxForwardRetries > 0 && maxGossipHops > 0 && maxPollsPerKey > 0
         && gossipOriginHops > 0
+        && verificationTokenExpiry > 0
   -- Relationship invariants: these misconfigurations cause subtle bugs
   -- (e.g., messages pruned before their stated max age, backoff that never increases)
   let configRelationsOk = unackedMessageMaxAge <= messageMaxAge
@@ -3442,13 +3469,11 @@ main = do
         && federationFetchTimeoutMs <= backgroundPruneInterval
         && maxAckOverflow <= maxAckedIds
         && gossipOriginHops <= maxGossipHops
-  let peerSecretsOk = none federationPeerSecrets (\p -> isBadServerName (normalizeServerName p.server) || p.secret == "")
+        && verificationTokenExpiry <= federationFetchTimeoutMs
   if not configOk
     then println "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
     else if not configRelationsOk
-    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, per-key limits <= global limits), server not started"
-    else if not peerSecretsOk
-    then println "FATAL: invalid federationPeerSecrets — server names must pass validation and secrets must be non-empty"
+    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, per-key limits <= global limits), server not started"
     else do
       t <- now
       atomic do
@@ -3466,8 +3491,6 @@ main = do
       println ("  message max age: " ++ show messageMaxAge ++ "ms")
       println ("  global rate limit: " ++ show maxGlobalRequestRate ++ "/" ++ show globalRateWindowMs ++ "ms")
       println ("  auth rate limit: " ++ show maxAuthGlobalRate ++ "/" ++ show authGlobalRateWindowMs ++ "ms")
-      when (count federationPeerSecrets > 0)
-        (println ("  per-peer secrets: " ++ show (count federationPeerSecrets) ++ " configured"))
       when (federationCircuitBreakerThreshold > 0)
         (println ("  circuit breaker: " ++ show federationCircuitBreakerThreshold ++ " failing peers"))
       when (autoSnapshotInterval > 0)
