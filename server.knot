@@ -18,6 +18,10 @@ serverHost = "localhost:8080"
 federationSecret = "" -- must be set to enable federation
 maintenanceSecret = "" -- set to enable /maintenance/prune independently of federation
 federationScheme = "https://" -- scheme for federation HTTP calls
+-- Per-peer federation secrets (overrides global federationSecret for specific peers)
+-- Format: [{server: "peer.example.com", secret: "peer-specific-secret"}]
+federationPeerSecrets : [{server: Text, secret: Text}]
+federationPeerSecrets = []
 -- Message and data size limits
 messageMaxAge : Int<Ms>
 messageMaxAge = 2592000000 -- 30 days
@@ -31,6 +35,7 @@ maxGossipEvents = 100
 maxPollEvents = 50
 maxPresenceEntries = 10000
 maxMessagesPerRecipient = 500
+maxMessages = 100000 -- global cap on total stored messages across all recipients
 -- Global capacity limits for in-memory collections
 clockSkewTolerance : Int<Ms>
 clockSkewTolerance = 5000 -- 5 seconds tolerance for clock skew between federated servers
@@ -225,6 +230,7 @@ type LookupRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
 -- Tracks recently re-broadcast gossip events to suppress amplification from duplicate cycles
 type RecentGossipEntry = {pubkey: PubkeyHex, server: Text, timestamp: Timestamp, seenAt: Timestamp}
 type PeerStatus = {server: Text, failures: Int, lastFailedAt: Timestamp, firstFailedAt: Timestamp, backoffMs: Int, retriable: Bool}
+type KeyPresenceEntry = {server: Text, expiresAt: Timestamp}
 
 -- ============================================
 -- Persisted State
@@ -380,11 +386,14 @@ route HealthApi where
 -- Returns counts of in-memory collections (requires federation or maintenance secret)
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {sessions: Int, sessionsMax: Int, messages: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pruneCount: Int, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, ok: Bool}
+    -> {sessions: Int, sessionsMax: Int, messages: Int, messagesMax: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pruneCount: Int, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, ok: Bool}
     = Stats
   GET /stats/peers headers {authorization: Text}
     -> {peers: [PeerStatus], ok: Bool}
     = StatsPeers
+  GET /stats/key/{pubkey: PubkeyHex} headers {authorization: Text}
+    -> {messages: Int, presence: [KeyPresenceEntry], sessions: Int, forwards: Int, activePolls: Int, ok: Bool}
+    = StatsKey
 
 route Api = AuthApi | ClientApi | FederationApi | MaintenanceApi | HealthApi | StatsApi
 
@@ -639,6 +648,15 @@ verifyAuthWith = \check authorization ->
 verifyFederationAuth : Text -> Bool
 verifyFederationAuth = verifyAuthWith (\token -> verifySecret token federationSecret)
 
+-- Per-peer federation auth: checks peer-specific secret first, falls back to global
+verifyFederationAuthForServer : Text -> Text -> Bool
+verifyFederationAuthForServer = \fromServer authorization ->
+  verifyAuthWith (\token ->
+    case headOf (do p <- federationPeerSecrets; where normalizeServerName p.server == fromServer; yield p) of
+      Just {value: p} -> verifySecret token p.secret
+      Nothing {} -> verifySecret token federationSecret
+  ) authorization
+
 verifyMaintenanceAuth : Text -> Bool
 verifyMaintenanceAuth = verifyAuthWith (\token -> verifySecret token federationSecret || verifySecret token maintenanceSecret)
 
@@ -664,10 +682,11 @@ nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
 -- Deduplicate message IDs, preserving order, capped at maxMessageIds
 dedupMessageIds : [MessageIdHex] -> [MessageIdHex]
 dedupMessageIds = \messageIds ->
-  fold (\acc mid ->
-    if count acc >= maxMessageIds then acc
-    else if any acc (\a -> a == mid) then acc
-    else union acc [mid]) [] messageIds
+  let result = fold (\acc mid ->
+    if acc.n >= maxMessageIds then acc
+    else if any acc.items (\a -> a == mid) then acc
+    else {n: acc.n + 1, items: union acc.items [mid]}) {n: 0, items: []} messageIds
+  in result.items
 
 -- Remove the N oldest acked entries (by ackedAt timestamp)
 evictOldestAckedIds = \items n ->
@@ -1001,7 +1020,7 @@ checkPreAuth = \clientIp t -> do
       else yield ""
 
 withFederationAuth = \authorization t respond fromServer precondition action ->
-  if not (verifyFederationAuth authorization)
+  if not (verifyFederationAuthForServer fromServer authorization)
     then do
       maybePruneAndBroadcast t
       yield (respond {ok: False {}, error: "unauthorized"})
@@ -1249,8 +1268,9 @@ hexCharIndex = \c ->
 -- Map pubkey to one of 16 signal buckets based on first hex digit.
 -- This partitions the signal space so storing a message for one pubkey
 -- only wakes polls in the same bucket, not all active polls.
+-- Defensive clamp ensures an invalid first char never indexes out of bounds
 pubkeyBucket : PubkeyHex -> Int
-pubkeyBucket = \pubkey -> hexCharIndex (take 1 pubkey)
+pubkeyBucket = \pubkey -> clamp 0 15 (hexCharIndex (take 1 pubkey))
 
 -- Update the signal timestamp for a pubkey's bucket, waking any blocked polls in that bucket
 signalMessageForKey = \pubkey ts ->
@@ -1452,7 +1472,7 @@ forwardCandidates = \targets messages forwards t ->
 
 
 challengeMatch = \challenges pubkey challenge ip t ->
-  any challenges (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t && (ip == "" || c.ip == "" || c.ip == ip))
+  any challenges (\c -> c.pubkey == pubkey && safeCompare c.challenge challenge && c.expiresAt > t && (ip == "" || c.ip == "" || c.ip == ip))
 
 challengesExcluding = \challenges pubkey challenge ->
   do c <- challenges; where c.pubkey != pubkey || c.challenge != challenge; yield c
@@ -1680,7 +1700,9 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization respond 
                     then yield {pr: pr, send: SendFailed {status: MsRateLimited {}}, senderRateLimited: False {}}
                     else do
                       set *recvRates = recvResult.entries
-                      if countMessagesFor messages to t >= maxMessagesPerRecipient
+                      if count messages >= maxMessages
+                        then yield {pr: pr, send: SendFailed {status: MsRejected {}}, senderRateLimited: False {}}
+                      else if countMessagesFor messages to t >= maxMessagesPerRecipient
                         then yield {pr: pr, send: SendFailed {status: MsRejected {}}, senderRateLimited: False {}}
                         else do
                           presence <- *presence
@@ -1817,6 +1839,8 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
       deliveredIds <- *deliveredIds
       if hasMessage messageId toKey messages || hasMessage messageId toKey ackedIds || hasMessage messageId toKey deliveredIds
         then yield {pr: pr, forward: ForwardDuplicate {}}
+        else if count messages >= maxMessages
+          then yield {pr: pr, forward: ForwardRejected {}}
         else if countMessagesFor messages toKey t >= maxMessagesPerRecipient
           then yield {pr: pr, forward: ForwardRejected {}}
           else do
@@ -1919,9 +1943,11 @@ handleHealth = \respond -> do
     forwards <- *forwards
     sessions <- *sessions
     activePolls <- *activePolls
+    messages <- *messages
     let warmup = t - sa < healthPruneMaxAge
     -- Capacity pressure: flag when any capped collection exceeds 90% full
-    let capacityOk = count presence * 10 <= maxPresenceEntries * 9
+    let capacityOk = count messages * 10 <= maxMessages * 9
+      && count presence * 10 <= maxPresenceEntries * 9
       && count forwards * 10 <= maxForwardsEntries * 9
       && count sessions * 10 <= maxSessions * 9
       && count activePolls * 10 <= maxActivePolls * 9
@@ -1962,8 +1988,8 @@ handleStats = \authorization respond -> do
         lp <- *lastPrunedAt
         lh <- *lastHeartbeatAt
         yield {sessions: count s, messages: count m, presence: count p, forwards: count f, challenges: count c, ackedIds: count a, ackOverflow: count ao, deliveredIds: count d, forwardFailures: count ff, activePolls: count ap, sendRates: count sr, challengeRates: count cr, federationRates: count fr, globalRateCount: grc, ipRates: count ir, lookupRates: count lr, recvRates: count rr, pruneCount: pc, heartbeatCount: hc, uptime: t - sa, lastPruneAt: lp, lastHeartbeatAt: lh}
-      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pruneCount: result.pruneCount, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, ok: True {}})
-    else yield (respond {sessions: 0, sessionsMax: 0, messages: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pruneCount: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, ok: False {}})
+      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pruneCount: result.pruneCount, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, ok: True {}})
+    else yield (respond {sessions: 0, sessionsMax: 0, messages: 0, messagesMax: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pruneCount: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, ok: False {}})
 
 handleStatsPeers = \authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
@@ -1974,6 +2000,26 @@ handleStatsPeers = \authorization respond -> do
       let peers = do f <- failures; yield {server: f.server, failures: f.failures, lastFailedAt: f.failedAt, firstFailedAt: f.firstFailedAt, backoffMs: retryBackoff f.failures, retriable: shouldRetryServer f.server t failures}
       yield (respond {peers: peers, ok: True {}})
     else yield (respond {peers: [], ok: False {}})
+
+handleStatsKey = \pubkey authorization respond -> do
+  let authorized = verifyMaintenanceAuth authorization
+  if authorized
+    then do
+      t <- now
+      result <- atomic do
+        messages <- *messages
+        presence <- *presence
+        sessions <- *sessions
+        forwards <- *forwards
+        activePolls <- *activePolls
+        let keyMessages = count (do m <- messages; where m.toKey == pubkey; yield m)
+        let keyPresence = do p <- presence; where p.pubkey == pubkey && p.expiresAt > t; yield {server: p.server, expiresAt: p.expiresAt}
+        let keySessions = count (do s <- sessions; where s.pubkey == pubkey; yield s)
+        let keyForwards = count (do f <- forwards; where f.toKey == pubkey; yield f)
+        let keyPolls = count (do p <- activePolls; where p.pubkey == pubkey; yield p)
+        yield {messages: keyMessages, presence: keyPresence, sessions: keySessions, forwards: keyForwards, activePolls: keyPolls}
+      yield (respond {messages: result.messages, presence: result.presence, sessions: result.sessions, forwards: result.forwards, activePolls: result.activePolls, ok: True {}})
+    else yield (respond {messages: 0, presence: [], sessions: 0, forwards: 0, activePolls: 0, ok: False {}})
 
 serve = \req -> case req of
   ReqChallenge {pubkey, clientIp, respond} -> handleChallenge pubkey clientIp respond
@@ -1989,6 +2035,7 @@ serve = \req -> case req of
   Health {respond} -> handleHealth respond
   Stats {authorization, respond} -> handleStats authorization respond
   StatsPeers {authorization, respond} -> handleStatsPeers authorization respond
+  StatsKey {pubkey, authorization, respond} -> handleStatsKey pubkey authorization respond
 
 -- ============================================
 -- Entry Point
@@ -2003,16 +2050,18 @@ backgroundPrune = do
   if draining then println "backgroundPrune: stopping (server draining)"
   else do
   t <- now
-  canRun <- atomic do
+  status <- atomic do
     running <- *pruneRunning
-    if running > 0 && t - running < backgroundPruneInterval * 5
-      then yield (False {})
+    if running > 0 && t - running < backgroundPruneInterval * 3
+      then yield {canRun: False {}, recovered: False {}}
       else do
         set *pruneRunning = t
         pc <- *pruneCount
         set *pruneCount = pc + 1
-        yield (True {})
-  if canRun
+        yield {canRun: True {}, recovered: running > 0}
+  when status.recovered
+    (println "backgroundPrune: previous cycle appears stuck, forcing new cycle")
+  if status.canRun
     then fork (do
       pruneAndRetry t
       atomic do set *pruneRunning = 0)
@@ -2039,12 +2088,19 @@ pollHeartbeat = do
     pollHeartbeat
 
 main = do
-  t <- now
-  atomic do set *startedAt = t
-  println "Skrepka relay server starting on port 8080..."
-  println ("  federation: " ++ if federationEnabled then "enabled" else "disabled")
-  println ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")
-  println ("  poll timeout: " ++ show pollTimeoutMs ++ "ms")
-  fork backgroundPrune
-  fork pollHeartbeat
-  listen 8080 serve
+  let configOk = maxMessages > 0 && maxMessagesPerRecipient > 0 && maxPresenceEntries > 0
+        && maxSessions > 0 && maxChallenges > 0 && backgroundPruneInterval > 0
+        && pollTimeoutMs > 0 && challengeExpiry > 0 && sessionExpiry > 0
+        && maxPresenceTtl > 0 && maxForwardsEntries > 0 && maxAckedIds > 0
+  if not configOk
+    then println "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
+    else do
+      t <- now
+      atomic do set *startedAt = t
+      println "Skrepka relay server starting on port 8080..."
+      println ("  federation: " ++ if federationEnabled then "enabled" else "disabled")
+      println ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")
+      println ("  poll timeout: " ++ show pollTimeoutMs ++ "ms")
+      fork backgroundPrune
+      fork pollHeartbeat
+      listen 8080 serve
