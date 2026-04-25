@@ -16,22 +16,8 @@
 -- Server identity and federation credentials
 serverHost = "localhost:8080"
 listenPort = 8080
--- TODO: Support runtime secret rotation: accept both old and new secrets during a
--- transition window, so operators can rotate without restarting. E.g., add a
--- maintenanceSecretPrevious field that's accepted for a configurable overlap period.
 maintenanceSecret = "" -- set to enable /maintenance/* and /stats endpoints
--- Secret rotation: when non-empty, both maintenanceSecret and maintenanceSecretPrevious
--- are accepted. To rotate: (1) set maintenanceSecretPrevious = current secret,
--- (2) set maintenanceSecret = new secret, (3) redeploy, (4) after all clients update,
--- clear maintenanceSecretPrevious and redeploy.
-maintenanceSecretPrevious = ""
 federationScheme = "https://" -- scheme for federation HTTP calls
--- Optional pre-shared key for federation auth. When non-empty and a peer's server name
--- matches, the key is used instead of callback verification — eliminates the verify
--- round-trip for trusted peers. Format: "server1:key1,server2:key2".
--- Keys must be at least 16 hex characters. Peers with pre-shared keys skip the
--- /federation/verify callback entirely, halving federation latency.
-federationPresharedKeys = ""
 -- NOTE: listenHost is not configurable — Knot's listen primitive only accepts a port.
 -- To restrict the bind address (e.g., 127.0.0.1 behind a reverse proxy), use
 -- firewall rules (e.g., iptables -A INPUT -p tcp --dport 8080 -s 127.0.0.1 -j ACCEPT)
@@ -1319,7 +1305,7 @@ verifyAuthWith = \check authorization ->
     Just {value: token} -> check token
 
 verifyMaintenanceAuth : Text -> Bool
-verifyMaintenanceAuth = verifyAuthWith (\token -> verifySecret token maintenanceSecret || (maintenanceSecretPrevious != "" && verifySecret token maintenanceSecretPrevious))
+verifyMaintenanceAuth = verifyAuthWith (\token -> verifySecret token maintenanceSecret)
 
 -- Check if a server is on the blocklist
 isBlockedPeer : Text -> [Text] -> Bool
@@ -1329,75 +1315,11 @@ isBlockedPeer = \server blocked -> any blocked (\b -> b == server)
 isAllowedByAllowlist : Text -> [Text] -> Bool
 isAllowedByAllowlist = \server allowed -> count allowed == 0 || any allowed (\a -> a == server)
 
--- ============================================
--- Pre-shared Federation Key Helpers
--- ============================================
--- Parse "server1:key1,server2:key2" into a lookup-ready list.
--- Keys provide HMAC-style auth: the outbound side sends "PresharedKey <key>" in the
--- Authorization header; the inbound side checks safeCompare against the stored key.
--- No callback round-trip needed for configured peers.
-
--- Parse one "server:key" entry from the head of a comma-separated string.
--- Returns {server, key, rest} where rest is everything after the comma (or "").
-parsePskEntry : Text -> {server: Text, key: Text, rest: Text}
-parsePskEntry = \s -> parsePskServer s ""
-
-parsePskServer : Text -> Text -> {server: Text, key: Text, rest: Text}
-parsePskServer = \s acc ->
-  if s == "" then {server: acc, key: "", rest: ""}
-  else if take 1 s == ":" then parsePskKey (drop 1 s) acc ""
-  else if take 1 s == "," then {server: acc, key: "", rest: drop 1 s}
-  else parsePskServer (drop 1 s) (acc ++ take 1 s)
-
-parsePskKey : Text -> Text -> Text -> {server: Text, key: Text, rest: Text}
-parsePskKey = \s server acc ->
-  if s == "" then {server: server, key: acc, rest: ""}
-  else if take 1 s == "," then {server: server, key: acc, rest: drop 1 s}
-  else parsePskKey (drop 1 s) server (acc ++ take 1 s)
-
--- Parse the full config string into a list of {server, key} pairs.
--- Filters out entries with empty server/key or keys shorter than 16 chars.
-parsePresharedKeys : Text -> [{server: Text, key: Text}]
-parsePresharedKeys = \s ->
-  if s == "" then []
-  else
-    let entry = parsePskEntry s in
-    let rest = parsePresharedKeys entry.rest in
-    if entry.server == "" || entry.key == "" || not (tooLong entry.key 15)
-      then rest
-      else union [{server: normalizeServerName entry.server, key: entry.key}] rest
-
--- Pre-parsed at startup (evaluated once since federationPresharedKeys is a constant)
-presharedKeyList = parsePresharedKeys federationPresharedKeys
-
--- Look up a pre-shared key for a server. Returns "" if no key configured.
-lookupPresharedKey : Text -> Text
-lookupPresharedKey = \server ->
-  fold (\acc entry -> if acc != "" then acc else if entry.server == server then entry.key else "") "" presharedKeyList
-
--- Check if an authorization header contains a valid pre-shared key for the given server.
--- Uses constant-time comparison to prevent timing side-channels.
-verifyPresharedKey : Text -> Text -> Bool
-verifyPresharedKey = \server authorization ->
-  case extractToken authorization of
-    Nothing {} -> False {}
-    Just {value: token} ->
-      let psk = lookupPresharedKey server in
-      psk != "" && safeCompare token psk
-
 -- Generate a single-use token for outbound federation auth.
--- If a pre-shared key is configured for the target server, uses it directly
--- (no token generation, no pending verification entry, no callback needed).
--- Otherwise falls back to the callback verification flow.
 -- scope binds the token to a request type ("gossip", "forward", "ack") so a token
 -- issued for one operation cannot authorize a different one.
 generateFederationAuth : Text -> Text -> IO {network} Text
-generateFederationAuth = \scope server ->
-  -- Fast path: use pre-shared key if configured for this peer (no token generation,
-  -- no pending verification entry, no callback round-trip on the receiving side)
-  let psk = lookupPresharedKey server in
-  if psk != "" then yield ("Bearer " ++ psk)
-  else do
+generateFederationAuth = \scope server -> do
     token <- genToken
     t <- now
     atomic do
@@ -1411,16 +1333,11 @@ generateFederationAuth = \scope server ->
 -- Verify an inbound federation token. First checks if a pre-shared key is configured
 -- for the sender — if so, verifies via constant-time comparison (no network round-trip).
 -- Otherwise falls back to callback verification via the sender's /federation/verify endpoint.
--- Pre-shared key auth halves federation latency and removes the verify endpoint as an
--- attack surface for configured peers.
 -- No retry: a failed verify rejects the request. The peer's federation rate limit + circuit breaker
 -- handle unreliable peers; retrying here doubles verify traffic and blocks with a 1s sleep per op,
 -- which a malicious peer can exploit for amplification.
 verifyFederationCallback : Text -> Text -> Text -> IO {network} Bool
 verifyFederationCallback = \fromServer authorization scope ->
-  -- Fast path: pre-shared key verification (no network round-trip)
-  if verifyPresharedKey fromServer authorization then yield (True {})
-  else
     case extractToken authorization of
       Nothing {} -> yield (False {})
       Just {value: token} -> do
@@ -6584,8 +6501,6 @@ main = do
         (logWarn "maintenanceSecret is empty — /maintenance/* and /stats endpoints are disabled")
       when (maintenanceSecret != "" && not (tooLong maintenanceSecret 15))
         (logWarn "maintenanceSecret is shorter than 16 characters — use a longer secret for production deployments")
-      when (maintenanceSecretPrevious != "")
-        (logInfo "maintenanceSecretPrevious is set — both current and previous secrets are accepted (rotation mode)")
       when (matchesHostnameOrSubdomain serverHostN "localhost")
         (logWarn ("serverHost is " ++ serverHost ++ " — peers cannot reach this server for federation"))
       when (federationEnabled && isBadServerName serverHostN)
@@ -6593,8 +6508,6 @@ main = do
       logInfo "IP binding is active — sessions created with a ClientIp header will reject requests without one"
       when federationEnabled
         (logWarn "SECURITY: DNS rebinding risk — federation URLs resolve DNS at fetch time, not at validation time. A peer hostname passing isBadServerName could rebind to a private IP between validation and fetch. Mitigate by blocking outbound connections to RFC1918/link-local/CGNAT ranges at the firewall level.")
-      when (count presharedKeyList > 0)
-        (logInfo ("pre-shared federation keys configured for " ++ show (count presharedKeyList) ++ " peer(s) — callback verification bypassed for those peers"))
       logInfo ("Skrepka relay server starting on port " ++ show listenPort ++ "...")
       logInfo ("  federation: " ++ if federationEnabled then "enabled" else "disabled")
       logInfo ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")
