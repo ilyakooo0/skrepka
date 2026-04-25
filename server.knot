@@ -136,6 +136,14 @@ reconciliationFrequency = 10
 federationLatencyWindowMs : Int<Ms>
 federationLatencyWindowMs = 300000 -- 5 minutes; reset latency metrics after this interval
 
+-- Per-peer gossip event volume limiting (prevents flooding via large batches of unique pubkeys)
+maxGossipEventsPerServer = 500 -- max total gossip events per server per window
+gossipEventRateWindowMs : Int<Ms>
+gossipEventRateWindowMs = 60000 -- 1 minute
+maxGossipEventRateEntries = 100
+-- Global federation connection cap (bounds total concurrent outbound connections across all paths)
+maxGlobalFederationConcurrency = 30
+
 -- Background task intervals
 backgroundPruneInterval : Int<Ms>
 backgroundPruneInterval = 30000 -- 30 seconds; also retries failed forwards/acks
@@ -293,6 +301,7 @@ type RecipientCount = {pubkey: PubkeyHex, count: Int}
 type FederationInFlightEntry = {server: Text, count: Int, firstStartedAt: Timestamp}
 -- Tracks recent federation request (server, timestamp) pairs for replay detection
 type RecentFederationRequest = {server: Text, timestamp: Timestamp, seenAt: Timestamp}
+type GossipEventRateEntry = {server: Text, windowStart: Timestamp, count: Int}
 
 -- ============================================
 -- Persisted State
@@ -499,6 +508,12 @@ type RecentFederationRequest = {server: Text, timestamp: Timestamp, seenAt: Time
 -- Tracks when /maintenance/snapshot was last exported (for staleness warnings)
 *lastSnapshotExportAt : Timestamp
 
+-- Per-peer gossip event volume rate limiting
+*gossipEventRates : [GossipEventRateEntry]
+
+-- Global federation connection counter (tracks total concurrent outbound connections)
+*federationActiveConnections : Int
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -527,7 +542,7 @@ route AuthApi where
 route ClientApi where
   -- Long-poll for new messages; cursor tracks last-seen receivedAt timestamp
   POST {cursor: Timestamp, generation: Int, watchKeys: [PubkeyHex]} /poll headers {authorization: Text, clientIp: Text}
-    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, presenceUpdates: [{pubkey: PubkeyHex, online: Bool}]}
+    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, presenceUpdates: [{pubkey: PubkeyHex, online: Bool}], heartbeat: Bool}
     = Poll
   /messages
     -- Send an E2E encrypted message to a recipient pubkey
@@ -538,6 +553,10 @@ route ClientApi where
     POST {to: PubkeyHex, messageId: MessageIdHex} /status headers {authorization: Text, clientIp: Text}
       -> {status: Text, authorized: Bool}
       = MessageStatus
+    -- Explicitly acknowledge received messages by ID (alternative to cursor-based ack in poll)
+    POST {messageIds: [MessageIdHex]} /ack headers {authorization: Text, clientIp: Text}
+      -> {ok: Bool, authorized: Bool, ackedCount: Int}
+      = AckMessages
   -- Look up which server a pubkey is present on (for federation routing)
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text}
     -> {server: AnyServerName, authorized: Bool}
@@ -886,7 +905,9 @@ generateFederationAuth = \scope -> do
 -- Verify an inbound federation token by callback to the sender's /federation/verify endpoint.
 -- Single-use: the sender consumes the token on verification.
 -- scope must match the scope the token was generated with; empty scope accepts any (backward compat).
--- Retries once on network error to handle transient failures (e.g., peer restarting).
+-- No retry: a failed verify rejects the request. The peer's federation rate limit + circuit breaker
+-- handle unreliable peers; retrying here doubles verify traffic and blocks with a 1s sleep per op,
+-- which a malicious peer can exploit for amplification.
 verifyFederationCallback : Text -> Text -> Text -> IO {network} Bool
 verifyFederationCallback = \fromServer authorization scope ->
   case extractToken authorization of
@@ -895,14 +916,8 @@ verifyFederationCallback = \fromServer authorization scope ->
       result <- fetch (federationUrl fromServer) (VerifyToken {token: token, scope: scope})
       case result of
         Err e -> do
-          println ("federation: verify callback to " ++ fromServer ++ " failed (attempt 1): " ++ show e)
-          sleep 1000
-          result2 <- fetch (federationUrl fromServer) (VerifyToken {token: token, scope: scope})
-          case result2 of
-            Err e2 -> do
-              println ("federation: verify callback to " ++ fromServer ++ " failed (attempt 2): " ++ show e2)
-              yield (False {})
-            Ok r -> yield r.ok
+          println ("federation: verify callback to " ++ fromServer ++ " failed: " ++ show e)
+          yield (False {})
         Ok r -> yield r.ok
 
 -- ============================================
@@ -1357,12 +1372,21 @@ hasHungFederationRequest : Text -> Timestamp -> [FederationInFlightEntry] -> Boo
 hasHungFederationRequest = \server t inFlight ->
   any inFlight (\r -> r.server == server && r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= federationFetchTimeoutMs)
 
--- Wrapper around fetch for federation calls: tracks in-flight state, logs slow responses, records failures
+-- Wrapper around fetch for federation calls: tracks in-flight state, global connection count,
+-- logs slow responses, and records latency metrics.
 fetchFederation = \server request -> do
+  -- Acquire global federation connection slot
+  atomic do
+    ac <- *federationActiveConnections
+    set *federationActiveConnections = ac + 1
   markFederationInFlight server
   startTime <- now
   result <- fetch (federationUrl server) request
   clearFederationInFlight server
+  -- Release global federation connection slot
+  atomic do
+    ac <- *federationActiveConnections
+    set *federationActiveConnections = max 0 (ac - 1)
   endTime <- now
   let latency = endTime - startTime
   when (latency > federationFetchTimeoutMs)
@@ -1588,26 +1612,54 @@ sendToEachN = \servers action remaining ->
     Nothing {} -> yield {}
     Just {value: server} -> do
       let rest = do s <- servers; where s != server; yield s
-      if remaining > 0
+      -- Check global federation connection cap: fall back to sequential when at limit
+      globalActive <- *federationActiveConnections
+      let effectiveRemaining = if globalActive >= maxGlobalFederationConcurrency then 0 else remaining
+      if effectiveRemaining > 0
         then do
           fork (action server)
-          sendToEachN rest action (remaining - 1)
+          sendToEachN rest action (effectiveRemaining - 1)
         else do
           action server
           sendToEachN rest action 0
 
+-- Per-bucket presence pruning: prune a single presence bucket atomically.
+-- Returns expired local entries (for offline gossip), peer servers in kept entries,
+-- all peer servers (before pruning), and count of removed entries.
+prunePresenceBucketN = \b t -> atomic do
+  bucket <- readPresenceBucket b
+  let kept = do x <- bucket; where x.expiresAt > t; yield x
+  let expired = do x <- bucket; where x.expiresAt <= t; yield x
+  -- Expired local entries: only those without a surviving local presence entry for the same key
+  -- (all entries for a pubkey live in the same bucket, so this per-bucket check is complete)
+  let expiredLocal = do x <- expired; where isLocalServer x.server && none kept (\k -> k.pubkey == x.pubkey && isLocalServer k.server); yield x
+  writePresenceBucket b kept
+  yield {expiredLocal: expiredLocal, keptPeerServers: collectPeerServers kept (\p -> p.server), allPeerServers: collectPeerServers bucket (\p -> p.server), removedCount: count expired}
+
+-- Recursively prune all 16 presence buckets and aggregate results.
+prunePresenceBuckets = \b t ->
+  if b > 15 then yield {expiredLocal: [], keptPeerServers: [], allPeerServers: [], totalRemoved: 0}
+  else do
+    r <- prunePresenceBucketN b t
+    rest <- prunePresenceBuckets (b + 1) t
+    let mergePeers = \a ps -> fold (\acc s -> if any acc (\x -> x == s) then acc else union acc [s]) a ps
+    yield {expiredLocal: union r.expiredLocal rest.expiredLocal,
+           keptPeerServers: mergePeers r.keptPeerServers rest.keptPeerServers,
+           allPeerServers: mergePeers r.allPeerServers rest.allPeerServers,
+           totalRemoved: r.removedCount + rest.totalRemoved}
+
 -- Remove all expired entries from every collection. Returns expired local presence
 -- entries (for broadcasting offline gossip) and the set of peer servers known before pruning.
 pruneExpired = \t -> do
-  -- Prune presence (must be atomic for before/after comparison)
-  presenceResult <- atomic do
-    presenceBefore <- readAllPresence
-    let peerServersBefore = collectPeerServers presenceBefore (\p -> p.server)
-    let presenceAfter = do x <- presenceBefore; where x.expiresAt > t; yield x
-    writeAllPresence presenceAfter
-    set *totalPresenceCount = count presenceAfter
-    set *knownPeerServers = collectPeerServers presenceAfter (\p -> p.server)
-    yield {expiredLocal: expiredLocalPresence presenceBefore presenceAfter t, peerServers: peerServersBefore}
+  -- Prune presence per-bucket (16 smaller atomic blocks instead of one large one).
+  -- Each bucket is independent: all entries for a pubkey hash to the same bucket,
+  -- so per-bucket before/after comparison is equivalent to the global check.
+  presenceResults <- prunePresenceBuckets 0 t
+  atomic do
+    tpc <- *totalPresenceCount
+    set *totalPresenceCount = max 0 (tpc - presenceResults.totalRemoved)
+    set *knownPeerServers = presenceResults.keptPeerServers
+  let presenceResult = {expiredLocal: presenceResults.expiredLocal, peerServers: presenceResults.allPeerServers}
   -- Prune auth state
   atomic do
     challenges <- *challenges
@@ -1700,6 +1752,13 @@ pruneExpired = \t -> do
     -- Prune expired forward nonces (extended replay protection)
     forwardNonces <- *forwardNonces
     set *forwardNonces = do n <- forwardNonces; where t - n.seenAt < forwardNonceRetention; yield n
+    -- Prune gossip event rate entries
+    gossipEventRates <- *gossipEventRates
+    set *gossipEventRates = do r <- gossipEventRates; where t - r.windowStart < gossipEventRateWindowMs; yield r
+    -- Reconcile global federation connection counter with actual in-flight state
+    -- (self-heals drift from leaked slots where a forked task died without decrementing)
+    inFlightRec <- *federationInFlight
+    set *federationActiveConnections = fold (\acc r -> acc + r.count) 0 inFlightRec
   yield presenceResult
 
 
@@ -2215,7 +2274,22 @@ waitForInFlightDrain = \deadline -> do
 pruneAndRetry = \t -> do
   atomic do set *lastPrunedAt = t
   pr <- pruneExpired t
-  -- Periodic counter reconciliation: recount from actual data every N prune cycles to self-heal drift
+  -- Counter reconciliation: always reconcile presence and session counters (cheap: just
+  -- counting list lengths across buckets). Message reconciliation stays periodic because
+  -- it requires reading all messages and rebuilding per-recipient counts.
+  presDrift <- atomic do
+    actual <- countAllPresence
+    stored <- *totalPresenceCount
+    set *totalPresenceCount = actual
+    yield (actual - stored)
+  sessDrift <- atomic do
+    actual <- countAllSessions
+    stored <- *totalSessionCount
+    set *totalSessionCount = actual
+    yield (actual - stored)
+  when (presDrift != 0 || sessDrift != 0)
+    (println ("reconciliation: corrected drift — presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift))
+  -- Message reconciliation is expensive (reads all 16 buckets + rebuilds recipient counts), keep periodic
   pc <- *pruneCount
   when (pc > 0 && pc - (pc / reconciliationFrequency) * reconciliationFrequency == 0) (do
     msgDrift <- atomic do
@@ -2225,18 +2299,8 @@ pruneAndRetry = \t -> do
       set *totalMessageCount = actual
       set *recipientMsgCounts = countByRecipient allMsgs
       yield (actual - stored)
-    presDrift <- atomic do
-      actual <- countAllPresence
-      stored <- *totalPresenceCount
-      set *totalPresenceCount = actual
-      yield (actual - stored)
-    sessDrift <- atomic do
-      actual <- countAllSessions
-      stored <- *totalSessionCount
-      set *totalSessionCount = actual
-      yield (actual - stored)
-    when (msgDrift != 0 || presDrift != 0 || sessDrift != 0)
-      (println ("reconciliation: corrected drift — messages: " ++ show msgDrift ++ ", presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift)))
+    when (msgDrift != 0)
+      (println ("reconciliation: corrected message drift: " ++ show msgDrift)))
   pendingForwards <- atomic do f <- *forwards; yield f
   ackState <- atomic do
     ackedIds2 <- *ackedIds
@@ -3111,6 +3175,27 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorizati
   t <- now
   let cappedHops = clamp 0 maxGossipHops hopsRemaining
   withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (cappedHops >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (do
+    -- Per-peer gossip event volume limiting: counts total events (not just requests) per server.
+    -- A single gossip request carries up to maxGossipEvents entries; without this, a peer
+    -- sending 50 req/s * 100 events = 5000 presence mutations/second.
+    eventRateLimited <- atomic do
+      ger <- *gossipEventRates
+      let eventCount = count events
+      let entry = headOf (do r <- ger; where r.server == fromServer; yield r)
+      let isNewWindow = case entry of Nothing {} -> True {}; Just {value: r} -> t - r.windowStart >= gossipEventRateWindowMs
+      let currentCount = case entry of Nothing {} -> 0; Just {value: r} -> if isNewWindow then 0 else r.count
+      if currentCount + eventCount > maxGossipEventsPerServer
+        then yield (True {})
+        else do
+          let newEntries = if isNewWindow
+            then union (do r <- ger; where r.server != fromServer; yield r) [{server: fromServer, windowStart: t, count: eventCount}]
+            else do r <- ger; yield (if r.server == fromServer then {server: r.server, windowStart: r.windowStart, count: r.count + eventCount} else r)
+          set *gossipEventRates = if count newEntries > maxGossipEventRateEntries then (do r <- newEntries; where t - r.windowStart < gossipEventRateWindowMs; yield r) else newEntries
+          yield (False {})
+    if eventRateLimited then do
+      println ("gossip: event volume rate limited for " ++ fromServer ++ " (" ++ show maxGossipEventsPerServer ++ " events/" ++ show gossipEventRateWindowMs ++ "ms)")
+      yield (respond {ok: False {}, error: "event_rate_limited"})
+    else do
     let validated = validGossipEvents events t
     let onlineEntries = validated.online
     let trustedOffline = trustedOfflineEvents validated.offline fromServer
@@ -3191,6 +3276,16 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
     if t - timestamp > messageMaxAge
       then yield (respond {ok: False {}, error: "stale_timestamp"})
       else do
+    -- Verify recipient has active presence on this server. Peers should only forward
+    -- to us if gossip indicated the key is here. Accepting messages for completely
+    -- unknown keys wastes mailbox slots that will never be drained by polling.
+    hasPresence <- atomic do
+      bkt <- readPresenceBucket (pubkeyBucket toKey)
+      yield (any bkt (\p -> p.pubkey == toKey && p.expiresAt > t))
+    if not hasPresence then do
+      println ("forward: rejected for " ++ toKey ++ " — no active presence on this server (from " ++ fromServer ++ ")")
+      yield (respond {ok: False {}, error: "no_presence"})
+    else do
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       let msgBucket = pubkeyBucket toKey
@@ -3526,6 +3621,15 @@ handleRestore = \presenceData ackedIdsData ackOverflowData deliveredIdsData forw
     isDraining <- *draining
     if not isDraining then yield (respond {ok: False {}, error: "server_must_be_draining", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
     else do
+      -- Validate imported data: reject entries with invalid or self-referencing server names.
+      -- originServer in ForwardEntry is untyped Text (not ServerName), so not validated by the type system.
+      -- Also reject entries pointing to the local server (nonsensical: we don't forward to ourselves
+      -- or ack to ourselves).
+      let validForwards = do f <- forwardsData; where not (isLocalServer f.toServer) && (f.originServer == "" || not (isBadServerName f.originServer)) && not (isLocalServer f.originServer); yield f
+      let validAcked = do a <- ackedIdsData; where not (isLocalServer a.originServer); yield a
+      let validOverflow = do a <- ackOverflowData; where not (isLocalServer a.originServer); yield a
+      let rejectedCount = (count forwardsData - count validForwards) + (count ackedIdsData - count validAcked) + (count ackOverflowData - count validOverflow)
+      when (rejectedCount > 0) (println ("restore: rejected " ++ show rejectedCount ++ " imported entries with invalid or local server references"))
       result <- atomic do
         -- Merge presence (existing entries win on conflict via freshness)
         allPresence <- readAllPresence
@@ -3534,13 +3638,13 @@ handleRestore = \presenceData ackedIdsData ackOverflowData deliveredIdsData forw
         writeAllPresence cappedPresence
         set *totalPresenceCount = count cappedPresence
         set *knownPeerServers = collectPeerServers cappedPresence (\p -> p.server)
-        -- Union dedup state, respecting capacity limits
+        -- Union dedup state, respecting capacity limits (using validated data)
         ackedIds <- *ackedIds
-        let mergedAcked = union ackedIds ackedIdsData
+        let mergedAcked = union ackedIds validAcked
         let cappedAcked = takeRelation maxAckedIds mergedAcked
         set *ackedIds = cappedAcked
         ackOverflow <- *ackOverflow
-        let mergedOverflow = union ackOverflow ackOverflowData
+        let mergedOverflow = union ackOverflow validOverflow
         set *ackOverflow = takeRelation maxAckOverflow mergedOverflow
         deliveredIds <- *deliveredIds
         let mergedDelivered = union deliveredIds deliveredIdsData
@@ -3551,14 +3655,55 @@ handleRestore = \presenceData ackedIdsData ackOverflowData deliveredIdsData forw
         let mergedFailures = mergeByKey (\a b -> a.server == b.server) (\x -> x.failedAt) forwardFailures forwardFailuresData
         let cappedFailures = takeRelation maxForwardFailures mergedFailures
         set *forwardFailures = cappedFailures
-        -- Restore forward entries (dedup by messageId + toServer, keep fresher on conflict)
+        -- Restore forward entries (dedup by messageId + toServer, keep fresher on conflict; using validated data)
         forwards <- *forwards
-        let mergedForwards = mergeByKey (\a b -> a.messageId == b.messageId && a.toServer == b.toServer) (\x -> x.createdAt) forwards forwardsData
+        let mergedForwards = mergeByKey (\a b -> a.messageId == b.messageId && a.toServer == b.toServer) (\x -> x.createdAt) forwards validForwards
         let cappedForwards = takeRelation maxForwardsEntries mergedForwards
         set *forwards = cappedForwards
         yield {presenceCount: count cappedPresence, ackedIdsCount: count cappedAcked, deliveredIdsCount: count cappedDelivered}
       println ("restore: imported " ++ show result.presenceCount ++ " presence, " ++ show result.ackedIdsCount ++ " ackedIds, " ++ show result.deliveredIdsCount ++ " deliveredIds")
       yield (respond {ok: True {}, error: "", presenceCount: result.presenceCount, ackedIdsCount: result.ackedIdsCount, deliveredIdsCount: result.deliveredIdsCount})
+
+-- POST /messages/ack: Explicitly acknowledge received messages by ID.
+-- Alternative to the implicit cursor-based ack in poll. Benefits:
+-- 1. Reduces the window for duplicate delivery (ack immediately without waiting for next poll)
+-- 2. Selective ack: acknowledge specific messages without acking all messages up to a cursor
+-- Rate-limited via global rate limiter; requires session auth.
+handleAckMessages = \messageIds authorization clientIp respond -> do
+  t <- now
+  globalRateLimited <- checkGlobalRate t
+  if globalRateLimited then yield (respond {ok: False {}, authorized: False {}, ackedCount: 0})
+  else
+    withSessionAuth authorization t clientIp
+      (yield (respond {ok: False {}, authorized: False {}, ackedCount: 0}))
+      (\pubkey -> do
+        let dedupedIds = dedupMessageIds messageIds
+        result <- atomic do
+          let b = pubkeyBucket pubkey
+          bucket <- readMessageBucket b
+          let toAck = do m <- bucket; where m.toKey == pubkey && any dedupedIds (\mid -> m.messageId == mid); yield m
+          let ackCount = count toAck
+          if ackCount > 0 then do
+            writeMessageBucket b (diff bucket toAck)
+            totalCount <- *totalMessageCount
+            set *totalMessageCount = max 0 (totalCount - ackCount)
+            recipientCounts <- *recipientMsgCounts
+            set *recipientMsgCounts = adjustRecipientCount recipientCounts pubkey (0 - ackCount)
+            let ackedMsgIds = do m <- toAck; yield m.messageId
+            forwards <- *forwards
+            set *forwards = do f <- forwards; where none ackedMsgIds (\mid -> f.messageId == mid && f.toKey == pubkey); yield f
+            let ackedFederated = federatedAckEntries toAck t
+            ackedIds <- *ackedIds
+            let combinedAckedIds = union ackedIds ackedFederated
+            let excessCount = max 0 (count combinedAckedIds - maxAckedIds)
+            let eviction = evictSmallest combinedAckedIds excessCount (\a -> a.ackedAt)
+            set *ackedIds = eviction.kept
+            yield {ackedCount: ackCount, pendingAcks: ackedFederated, evictedEntries: eviction.evicted}
+          else yield {ackedCount: 0, pendingAcks: [], evictedEntries: []}
+        fork (when federationEnabled (do
+          sendAcksAndClean result.pendingAcks
+          retryEvictedAcks result.evictedEntries result.pendingAcks))
+        yield (respond {ok: True {}, authorized: True {}, ackedCount: result.ackedCount}))
 
 serve = \req -> case req of
   ReqChallenge {pubkey, clientIp, respond} -> handleChallenge pubkey clientIp respond
@@ -3568,6 +3713,7 @@ serve = \req -> case req of
   Poll {cursor, generation, watchKeys, authorization, clientIp, respond} -> handlePoll cursor generation watchKeys authorization clientIp respond
   SendMessage {to, encryptedBlob, timestamp, messageId, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob timestamp messageId authorization clientIp respond
   MessageStatus {to, messageId, authorization, clientIp, respond} -> handleMessageStatus to messageId authorization clientIp respond
+  AckMessages {messageIds, authorization, clientIp, respond} -> handleAckMessages messageIds authorization clientIp respond
   LookupPresence {pubkey, authorization, clientIp, respond} -> handleLookupPresence pubkey authorization clientIp respond
   RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp authorization respond
   ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp authorization respond
@@ -3703,6 +3849,8 @@ main = do
         && maxAckRetries > 0 && maxPairRatePerPair > 0 && pairRateWindowMs > 0
         && maxFederationPairRatePerPair > 0 && federationPairRateWindowMs > 0
         && reconciliationFrequency > 0 && maxForwardNonces > 0
+        && maxGossipEventsPerServer > 0 && gossipEventRateWindowMs > 0
+        && maxGlobalFederationConcurrency > 0
   -- Relationship invariants: these misconfigurations cause subtle bugs
   -- (e.g., messages pruned before their stated max age, backoff that never increases)
   let configRelationsOk = unackedMessageMaxAge <= messageMaxAge
@@ -3723,10 +3871,12 @@ main = do
         && maxThirdPartyGossipHops <= maxGossipHops
         && verificationTokenExpiry <= federationFetchTimeoutMs
         && forwardNonceRetention >= messageMaxAge
+        && maxGlobalFederationConcurrency >= maxFederationConcurrency
+        && maxGossipEventsPerServer > maxGossipEvents
   if not configOk
     then println "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
     else if not configRelationsOk
-    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, maxThirdPartyGossipHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, forwardNonceRetention >= messageMaxAge, per-key limits <= global limits), server not started"
+    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, maxThirdPartyGossipHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, forwardNonceRetention >= messageMaxAge, maxGlobalFederationConcurrency >= maxFederationConcurrency, maxGossipEventsPerServer > maxGossipEvents, per-key limits <= global limits), server not started"
     else do
       t <- now
       atomic do
@@ -3751,6 +3901,8 @@ main = do
       println ("  auth rate limit: " ++ show maxAuthGlobalRate ++ "/" ++ show authGlobalRateWindowMs ++ "ms")
       println ("  pair rate limit: " ++ show maxPairRatePerPair ++ "/" ++ show pairRateWindowMs ++ "ms per sender-recipient")
       println ("  federation pair rate limit: " ++ show maxFederationPairRatePerPair ++ "/" ++ show federationPairRateWindowMs ++ "ms per server-recipient")
+      println ("  gossip event rate limit: " ++ show maxGossipEventsPerServer ++ " events/" ++ show gossipEventRateWindowMs ++ "ms per server")
+      println ("  global federation concurrency: " ++ show maxGlobalFederationConcurrency)
       println ("  ack retry limit: " ++ show maxAckRetries ++ " per entry")
       when (federationCircuitBreakerThreshold > 0)
         (println ("  circuit breaker: " ++ show federationCircuitBreakerThreshold ++ " failing peers"))
