@@ -165,7 +165,7 @@ federationLatencyWindowMs : Int<Ms>
 federationLatencyWindowMs = 300000 -- 5 minutes; reset latency metrics after this interval
 
 -- Snapshot format version (increment on schema changes to prevent corrupt restores)
-snapshotVersion = 7 -- bumped for pendingAckCleanups field in snapshot
+snapshotVersion = 8 -- bumped for senderExpirations field in snapshot
 
 -- Server build version: included in /health and /stats responses for deployment verification.
 -- Update this string when deploying a new build so operators can confirm which version is running.
@@ -543,6 +543,8 @@ type SenderExpiration = {senderKey: Text, messageId: MessageIdHex, toKey: Pubkey
 -- Round-robin presence refresh: tracks which bucket group (0-3) to scan next.
 -- Each refresh cycle scans 4 buckets (0-3, 4-7, 8-11, 12-15), cycling through
 -- all 16 over 4 refresh intervals. Spreads gossip traffic across prune cycles.
+-- NOTE: group only advances when shouldRefresh is true (enough time passed since
+-- lastPresenceRefresh), so skipped/delayed prune cycles don't cause bucket gaps.
 *presenceRefreshGroup : Int
 
 *challengeRates : [ChallengeRateEntry]
@@ -766,6 +768,11 @@ type SenderExpiration = {senderKey: Text, messageId: MessageIdHex, toKey: Pubkey
 -- Populated during prune for locally-originated messages (senderKey != "").
 *senderExpirations : [SenderExpiration]
 
+-- Runtime maintenance secret: when non-empty, used instead of compile-time maintenanceSecret.
+-- Set via /maintenance/rotate-secret to enable zero-downtime secret rotation.
+-- Empty = use compile-time maintenanceSecret (default).
+*runtimeMaintenanceSecret : Text
+
 -- Runtime-configurable rate limit overrides (0 = use compile-time default).
 -- Adjusted via /maintenance/rate-limits POST endpoint without recompile+restart.
 *rateOverrideGlobalRequest : Int
@@ -941,12 +948,12 @@ route MaintenanceApi where
   -- Messages are excluded (ephemeral by design; clients handle re-delivery).
   -- Includes presence, acked/delivered IDs (dedup state), and peer failure records.
   GET /maintenance/snapshot headers {authorization: Text}
-    -> {ok: Bool, version: Int, checksum: Int, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry], forwardNonces: [ForwardNonce], blockedPeers: [Text], allowedPeers: [Text], pendingAckCleanups: [{messageId: MessageIdHex, toKey: PubkeyHex, cleanupAfter: Timestamp}]}
+    -> {ok: Bool, version: Int, checksum: Int, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry], forwardNonces: [ForwardNonce], blockedPeers: [Text], allowedPeers: [Text], pendingAckCleanups: [{messageId: MessageIdHex, toKey: PubkeyHex, cleanupAfter: Timestamp}], senderExpirations: [SenderExpiration]}
     = Snapshot
   -- Restore: import a previously-exported snapshot. Server must be in drain mode
   -- to prevent conflicts with live state. Run /maintenance/undrain after restore.
   -- checksum: integrity check (0 = skip verification, for pre-v6 snapshots)
-  POST {version: Int, checksum: Int, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry], forwardNonces: [ForwardNonce], blockedPeers: [Text], allowedPeers: [Text], pendingAckCleanups: [{messageId: MessageIdHex, toKey: PubkeyHex, cleanupAfter: Timestamp}]} /maintenance/restore headers {authorization: Text}
+  POST {version: Int, checksum: Int, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry], forwardNonces: [ForwardNonce], blockedPeers: [Text], allowedPeers: [Text], pendingAckCleanups: [{messageId: MessageIdHex, toKey: PubkeyHex, cleanupAfter: Timestamp}], senderExpirations: [SenderExpiration]} /maintenance/restore headers {authorization: Text}
     -> {ok: Bool, error: Text, presenceCount: Int, ackedIdsCount: Int, deliveredIdsCount: Int}
     = Restore
   -- Block a federation peer (rejects all inbound/outbound federation with this server)
@@ -1016,6 +1023,12 @@ route MaintenanceApi where
   POST {} /maintenance/reconcile headers {authorization: Text}
     -> {ok: Bool, messageDrift: Int, presenceDrift: Int, sessionDrift: Int}
     = Reconcile
+  -- Rotate maintenance secret at runtime (zero-downtime rotation).
+  -- Authenticated with the current secret; sets a new runtime secret that overrides
+  -- the compile-time default. Pass empty newSecret to revert to compile-time secret.
+  POST {newSecret: Text} /maintenance/rotate-secret headers {authorization: Text}
+    -> {ok: Bool, error: Text}
+    = RotateSecret
 
 route HealthApi where
   GET /health headers {authorization: Text} -> {ok: Bool, version: Text, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, federationHealthy: Bool, snapshotHealthy: Bool, watchdogHealthy: Bool, draining: Bool} = Health
@@ -1028,7 +1041,7 @@ route HealthApi where
 -- BREAKING CHANGE from flat format — existing scrapers must update field paths.
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, messagesMax: Int, messagesPct: Int, totalMessageCount: Int, presence: Int, presenceMax: Int, presencePct: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int}}
+    -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, messagesMax: Int, messagesPct: Int, totalMessageCount: Int, presence: Int, presenceMax: Int, presencePct: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int, prunesSinceSnapshot: Int, totalEntries: Int}}
     = Stats
   GET /stats/peers headers {authorization: Text}
     -> {peers: [PeerStatus], ok: Bool}
@@ -1059,6 +1072,13 @@ route Api = AuthApi | ClientApi | FederationApi | FederationVerifyApi | Maintena
 logInfo = \msg -> println ("[INFO] " ++ msg)
 logWarn = \msg -> println ("[WARN] " ++ msg)
 logError = \msg -> println ("[ERROR] " ++ msg)
+
+-- JSON structured log helper for machine-parseable events.
+-- Outputs: {"level":"<level>","event":"<event>","msg":"<message>"}
+-- Use for key operational events that monitoring pipelines need to parse
+-- (rate limit rejections, federation failures, capacity warnings).
+-- Plain-text logInfo/logWarn/logError remain for human-readable context.
+logEvent = \level event msg -> println ("{\"level\":\"" ++ level ++ "\",\"event\":\"" ++ event ++ "\",\"msg\":\"" ++ msg ++ "\"}")
 
 any : [a] -> (a -> Bool) -> Bool
 any = \xs pred -> fold (\acc x -> if acc then acc else pred x) (False {}) xs
@@ -1381,8 +1401,14 @@ verifyAuthWith = \check authorization ->
     Nothing {} -> False {}
     Just {value: token} -> check token
 
-verifyMaintenanceAuth : Text -> Bool
-verifyMaintenanceAuth = verifyAuthWith (\token -> verifySecret token maintenanceSecret)
+-- Check maintenance auth: tries runtime secret first (if set), then compile-time secret.
+-- This allows zero-downtime rotation: set the new secret via /maintenance/rotate-secret,
+-- then update the compile-time config and restart at convenience.
+verifyMaintenanceAuth : Text -> IO Bool
+verifyMaintenanceAuth = \authorization -> do
+  runtimeSecret <- *runtimeMaintenanceSecret
+  let checkSecret = if runtimeSecret != "" then runtimeSecret else maintenanceSecret
+  yield (verifyAuthWith (\token -> verifySecret token checkSecret) authorization)
 
 -- Check if a server is on the blocklist
 isBlockedPeer : Text -> [Text] -> Bool
@@ -2394,16 +2420,21 @@ computeForwardStatsInner = \b t acc ->
 -- Remove forward entries matching a server and message IDs, scanning per-bucket.
 -- Only rewrites buckets that actually changed (avoids writeAllForwards repartitioning).
 -- Returns all removed forward entries across all buckets.
+-- Batches the totalForwardCount decrement into a single atomic write at the end
+-- to reduce STM contention (vs per-bucket decrements contending on the shared counter).
 removeForwardsByServer = \server messageIds b acc ->
-  if b > 15 then yield acc
+  if b > 15 then do
+    let totalRemoved = count acc
+    when (totalRemoved > 0) (atomic do
+      tfc <- *totalForwardCount
+      set *totalForwardCount = max 0 (tfc - totalRemoved))
+    yield acc
   else do
     removed <- atomic do
       bucket <- readFwdBucket b
       let matched = do f <- bucket; where f.toServer == server && any messageIds (\mid -> f.messageId == mid); yield f
-      when (count matched > 0) (do
-        writeFwdBucket b (do f <- bucket; where not (f.toServer == server && any messageIds (\mid -> f.messageId == mid)); yield f)
-        tfc <- *totalForwardCount
-        set *totalForwardCount = max 0 (tfc - count matched))
+      when (count matched > 0) (
+        writeFwdBucket b (do f <- bucket; where not (f.toServer == server && any messageIds (\mid -> f.messageId == mid)); yield f))
       yield matched
     removeForwardsByServer server messageIds (b + 1) (if count removed > 0 then union acc removed else acc)
 
@@ -3611,7 +3642,9 @@ retryPendingForwards = \pending -> do
   t <- now
   failures <- *forwardFailures
   if isFederationCircuitOpen failures t
-    then logWarn ("federation: circuit breaker open (" ++ show (count failures) ++ " peers failing), skipping forward retries")
+    then do
+      logWarn ("federation: circuit breaker open (" ++ show (count failures) ++ " peers failing), skipping forward retries")
+      logEvent "warn" "circuit_breaker_open" (show (count failures) ++ " peers failing")
     else do
   inFlight <- *federationInFlight
   blocked <- *blockedPeers
@@ -4088,6 +4121,10 @@ ackPolledMessages = \pubkey cursor t -> do
 
 pollNewEvents = \pubkey clampedCursor t -> do
   bucket <- readMessageBucket (pubkeyBucket pubkey)
+  -- NOTE: sortBy is technically redundant since receivedAt is monotonically increasing
+  -- (via nextSeqTs) and union appends new messages at the end. Kept as a defensive
+  -- measure in case bucket ordering assumptions are ever violated (e.g., by a future
+  -- bulk-import feature or runtime changes to list representation).
   let limitedMsgs = takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (pollableMessages bucket pubkey clampedCursor t))
   let evts = do
     m <- limitedMsgs
@@ -4245,8 +4282,15 @@ forwardCandidates = \targets messages forwards t ->
              originServer: origin, retries: 0})) [] targets
 
 
+-- Challenge-IP binding rules:
+-- 1. Both sides have IPs: must match (standard proxy case)
+-- 2. Challenge created without IP, verify without IP: accept (no-proxy case)
+-- 3. Challenge created without IP, verify with IP: accept (proxy added mid-flow)
+-- 4. Challenge created with IP, verify without IP: REJECT (proxy removed or bypassed)
+-- Case 4 prevents an attacker who intercepts the challenge string from verifying
+-- without going through the same reverse proxy that issued the challenge.
 challengeMatch = \challenges pubkey challenge ip t ->
-  any challenges (\c -> c.pubkey == pubkey && safeCompare c.challenge challenge && c.expiresAt > t && (ip == "" || c.ip == "" || c.ip == ip))
+  any challenges (\c -> c.pubkey == pubkey && safeCompare c.challenge challenge && c.expiresAt > t && (if c.ip == "" then True {} else if ip == "" then False {} else c.ip == ip))
 
 challengesExcluding = \challenges pubkey challenge ->
   do c <- challenges; where c.pubkey != pubkey || c.challenge != challenge; yield c
@@ -4966,7 +5010,9 @@ handleVerifyToken = \token scope clientIp respond -> do
     when match (set *pendingVerifications = do p <- pending; where not (safeCompare p.token token); yield p)
     yield match
   -- Omit scope from log to prevent scope enumeration by attackers probing the endpoint
-  when (not found) (logWarn ("federation/verify: failed attempt from " ++ clientIp))
+  when (not found) (do
+    logWarn ("federation/verify: failed attempt from " ++ clientIp)
+    logEvent "warn" "verify_failed" clientIp)
   yield (respond {ok: found})
 
 -- POST /federation/gossip: Receive presence gossip from a peer server.
@@ -5286,7 +5332,12 @@ handleFederationCancel = \messageId toKey fromServer requestTimestamp correlatio
           writeRcBucket b (adjustRecipientCount rc toKey (0 - 1))
           -- Also cancel pending forwards for this message
           fwdBkt <- readFwdBucket b
-          writeFwdBucket b (do f <- fwdBkt; where not (f.messageId == messageId && f.toKey == toKey); yield f)
+          let keptFwds = do f <- fwdBkt; where not (f.messageId == messageId && f.toKey == toKey); yield f
+          writeFwdBucket b keptFwds
+          let fwdRemoved = count fwdBkt - count keptFwds
+          when (fwdRemoved > 0) (do
+            tfc <- *totalForwardCount
+            set *totalForwardCount = max 0 (tfc - fwdRemoved))
           yield {cancelled: True {}}
     when result.cancelled
       (logInfo ("federation/cancel: cancelled " ++ messageId ++ " for " ++ toKey ++ " (from " ++ fromServer ++ ")"))
@@ -5298,7 +5349,7 @@ handleFederationCancel = \messageId toKey fromServer requestTimestamp correlatio
 -- phase: 0 or 2 = full drain (backward compat default), 1 = soft drain (block new auth only)
 handleDrain = \phase authorization respond -> do
   t <- now
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, drained: 0, phase: 0})
   else do
     -- Effective phase: 0 or >=2 means full drain (backward compat for clients sending empty body)
@@ -5349,8 +5400,9 @@ handleDrain = \phase authorization respond -> do
       bp <- *blockedPeers
       ap <- *allowedPeers
       pac <- *pendingAckCleanups
+      se <- *senderExpirations
       let drainCs = snapshotChecksum (count drainResult.localEntries) (count a) (count d) (count flushState.forwards) (count fn)
-      yield {version: snapshotVersion, checksum: drainCs, presence: drainResult.localEntries, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: flushState.forwards, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap, pendingAckCleanups: pac}
+      yield {version: snapshotVersion, checksum: drainCs, presence: drainResult.localEntries, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: flushState.forwards, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap, pendingAckCleanups: pac, senderExpirations: se}
     -- Sentinel-wrapped: sidecar processes should verify [SNAPSHOT_END] follows to detect truncation
     println ("[SNAPSHOT_DATA] " ++ toJson drainSnapshot)
     println "[SNAPSHOT_END]"
@@ -5396,7 +5448,7 @@ handleDrain = \phase authorization respond -> do
 -- POST /maintenance/undrain: Resume accepting requests after a drain.
 -- Background loops (prune, heartbeat) automatically resume on next iteration.
 handleUndrain = \authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}})
   else do
     wasDraining <- atomic do
@@ -5404,6 +5456,9 @@ handleUndrain = \authorization respond -> do
       set *drainPhase = 0
       set *drainCompletedAt = 0
       set *shutdownRequested = False {}
+      -- Clear stale verification cache: entries cached during drain may reference
+      -- peers whose trust state changed during the drain/undrain cycle.
+      set *verificationCache = []
       yield (d > 0)
     when wasDraining (logInfo "undrain: server resumed, accepting new requests")
     when (not wasDraining) (logInfo "undrain: server was not draining")
@@ -5414,7 +5469,7 @@ handleUndrain = \authorization respond -> do
 -- Unlike drain, shutdown is not undoable (requires process restart).
 handleShutdown = \authorization respond -> do
   t <- now
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, drained: 0})
   else do
     dp <- *drainPhase
@@ -5433,7 +5488,8 @@ handleShutdown = \authorization respond -> do
 handlePrune = \authorization respond -> do
   t <- now
   dp <- *drainPhase
-  let authorized = verifyMaintenanceAuth authorization && dp < 2
+  authOk <- verifyMaintenanceAuth authorization
+  let authorized = authOk && dp < 2
   when authorized (fork (pruneAndRetry t))
   yield (respond {ok: authorized})
 
@@ -5441,7 +5497,7 @@ handlePrune = \authorization respond -> do
 -- Returns drift values for messages, presence, and sessions. Non-zero drift means
 -- counters were corrected. Use when /stats shows suspicious counter values.
 handleReconcile = \authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, messageDrift: 0, presenceDrift: 0, sessionDrift: 0})
   else do
     presDrift <- atomic do
@@ -5536,8 +5592,9 @@ handleHealth = \authorization respond -> do
       yield {ok: cOk && dp == 0, version: serverBuildVersion, pruneHealthy: cP, heartbeatHealthy: cH, capacityHealthy: cC, federationHealthy: cF, snapshotHealthy: cS, watchdogHealthy: cW, draining: dp > 0}
     yield (respond cached)
   else do
-  let isAuthed = verifyMaintenanceAuth authorization
+  isAuthed <- verifyMaintenanceAuth authorization
   result <- computeAndCacheHealth t
+  let allOk = not result.isDraining && result.pruneOk && result.heartbeatOk && result.capacityOk && result.federationOk && result.snapshotOk && result.watchdogOk
   -- Unauthenticated: return real ok boolean so load balancers can route around unhealthy nodes,
   -- but hide subsystem breakdown to prevent targeted load-correlation attacks.
   -- Draining status is always visible (load balancers need it for routing decisions).
@@ -5557,14 +5614,14 @@ handleHealth = \authorization respond -> do
                   watchdogHealthy: True {},
                   draining: result.isDraining})
 
-zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0}}
+zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, prunesSinceSnapshot: 0, totalEntries: 0}}
 
 handleStats = \authorization respond -> do
   t <- now
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond zeroStats)
   else do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if authorized
     then do
       -- Split into two atomic reads: core capacity state (consistent) and counters/timing
@@ -5612,6 +5669,7 @@ handleStats = \authorization respond -> do
         lp <- *lastPrunedAt
         lh <- *lastHeartbeatAt
         dr <- *drainPhase
+        pss <- *prunesSinceSnapshot
         flt <- *federationLatencyTotal
         flc <- *federationLatencyCount
         flm <- *federationLatencyMax
@@ -5623,7 +5681,7 @@ handleStats = \authorization respond -> do
         rla <- *rateLimitedAuth
         rlk <- *rateLimitedPerKey
         rlf <- *rateLimitedFederation
-        yield {sr: sr, cr: cr, fr: fr, fpr: fpr, grc: grc, ir: ir, lr: lr, rr: rr, prr: prr, pc: pc, pr: pr, hc: hc, sa: sa, lp: lp, lh: lh, dr: dr, flt: flt, flc: flc, flm: flm, svc: svc, vfc: vfc, dca: dca, rlg: rlg, rli: rli, rla: rla, rlk: rlk, rlf: rlf}
+        yield {sr: sr, cr: cr, fr: fr, fpr: fpr, grc: grc, ir: ir, lr: lr, rr: rr, prr: prr, pc: pc, pr: pr, hc: hc, sa: sa, lp: lp, lh: lh, dr: dr, pss: pss, flt: flt, flc: flc, flm: flm, svc: svc, vfc: vfc, dca: dca, rlg: rlg, rli: rli, rla: rla, rlk: rlk, rlf: rlf}
       -- Compute derived metrics
       let sessions = core.sc
       let messages = core.tmc
@@ -5646,7 +5704,7 @@ handleStats = \authorization respond -> do
         capacity: {sessions: sessions, sessionsMax: maxSessions, sessionsPct: sessPct, messages: messages, messagesMax: maxMessages, messagesPct: msgPct, totalMessageCount: messages, presence: presence, presenceMax: maxPresenceEntries, presencePct: presPct, forwards: fwds, forwardsMax: maxForwardsEntries, forwardsPct: fwdPct, challenges: count core.c, challengesMax: maxChallenges, ackedIds: core.aCount, ackedIdsMax: maxAckedIds, ackOverflow: count core.ao, ackOverflowMax: maxAckOverflow, deliveredIds: core.dCount, deliveredIdsMax: maxDeliveredIds, forwardNonces: core.fnCount, forwardNoncesMax: maxForwardNonces, activePolls: count core.ap, activePollsMax: maxActivePolls, recipientCounts: count core.rc},
         federation: {enabled: federationEnabled, inFlight: count core.fi, hungSlots: hungFedSlots, avgLatencyMs: fedAvg, maxLatencyMs: counters.flm, callCount: counters.flc, slowVerifies: counters.svc, verifyFailures: counters.vfc, forwardFailures: count core.ff, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, recentGossip: count core.rg, blockedPeers: count core.bp, drainCompletedAt: counters.dca, forwardServers: fwdServerCount, maxForwardQueueDepth: maxFwdDepth},
         rates: {send: count counters.sr, challenge: count counters.cr, federation: count counters.fr, federationPair: count counters.fpr, global: counters.grc, ip: count counters.ir, lookup: count counters.lr, recv: count counters.rr, pair: count counters.prr, gossipEvent: count core.ger, verifyIp: count core.vir, uniqueKeyIp: count core.ukir, pendingAckCleanups: count core.pac, senderExpirations: count core.se, rejectedGlobal: counters.rlg, rejectedIp: counters.rli, rejectedAuth: counters.rla, rejectedPerKey: counters.rlk, rejectedFederation: counters.rlf},
-        timing: {pruneCount: counters.pc, pruneRunning: counters.pr, heartbeatCount: counters.hc, uptime: t - counters.sa, lastPruneAt: counters.lp, lastHeartbeatAt: counters.lh, draining: counters.dr > 0, drainPhase: counters.dr}})
+        timing: {pruneCount: counters.pc, pruneRunning: counters.pr, heartbeatCount: counters.hc, uptime: t - counters.sa, lastPruneAt: counters.lp, lastHeartbeatAt: counters.lh, draining: counters.dr > 0, drainPhase: counters.dr, prunesSinceSnapshot: counters.pss, totalEntries: sessions + messages + presence + fwds + count core.c + core.aCount + count core.ao + core.dCount + core.fnCount + count core.ap + count core.fi}})
     else yield (respond zeroStats)
 
 handleStatsPeers = \authorization respond -> do
@@ -5654,7 +5712,7 @@ handleStatsPeers = \authorization respond -> do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {peers: [], ok: False {}})
   else do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if authorized
     then do
       failures <- *forwardFailures
@@ -5674,7 +5732,7 @@ handleStatsKey = \pubkey authorization respond -> do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {messages: 0, presence: [], sessions: 0, forwards: 0, activePolls: 0, ok: False {}})
   else do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if authorized
     then do
       result <- atomic do
@@ -5703,7 +5761,7 @@ handleTopRecipients = \limit authorization respond -> do
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {recipients: [], ok: False {}, total: 0})
   else do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if authorized
     then do
       let effectiveLimit = if limit <= 0 then 20 else clamp 1 100 limit
@@ -5719,20 +5777,26 @@ handleTopRecipients = \limit authorization respond -> do
 -- Returns false until the first prune cycle completes (server fully initialized).
 handleReady = \respond -> do
   t <- now
-  sa <- *startedAt
-  lastPrune <- *lastPrunedAt
-  -- Ready once the first prune cycle has run (indicates all background loops are alive)
-  let isReady = lastPrune > 0 && lastPrune >= sa
-  yield (respond {ready: isReady})
+  -- Rate-limit /ready to prevent DoS (shares health rate limiter since both are
+  -- unauthenticated probes). Without this, /ready can be hit unlimited times
+  -- for cheap reconnaissance (detecting restarts) or resource exhaustion.
+  healthLimited <- checkHealthRate t
+  if healthLimited then yield (respond {ready: True {}})
+  else do
+    sa <- *startedAt
+    lastPrune <- *lastPrunedAt
+    -- Ready once the first prune cycle has run (indicates all background loops are alive)
+    let isReady = lastPrune > 0 && lastPrune >= sa
+    yield (respond {ready: isReady})
 
-emptySnapshot = {ok: False {}, version: 0, checksum: 0, presence: [], ackedIds: [], ackOverflow: [], deliveredIds: [], forwardFailures: [], forwards: [], forwardNonces: [], blockedPeers: [], allowedPeers: [], pendingAckCleanups: []}
+emptySnapshot = {ok: False {}, version: 0, checksum: 0, presence: [], ackedIds: [], ackOverflow: [], deliveredIds: [], forwardFailures: [], forwards: [], forwardNonces: [], blockedPeers: [], allowedPeers: [], pendingAckCleanups: [], senderExpirations: []}
 
 -- GET /maintenance/snapshot: Export federation metadata for persistence.
 -- Reads all dedup state (ackedIds, deliveredIds), presence, peer failure records,
 -- and pending forwards in a single atomic snapshot. Forward retry counters are
 -- preserved so they survive restarts (prevents re-trying permanently-failing forwards).
 handleSnapshot = \authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond emptySnapshot)
   else do
     t <- now
@@ -5747,27 +5811,28 @@ handleSnapshot = \authorization respond -> do
       bp <- *blockedPeers
       ap <- *allowedPeers
       pac <- *pendingAckCleanups
-      yield {presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap, pendingAckCleanups: pac}
+      se <- *senderExpirations
+      yield {presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap, pendingAckCleanups: pac, senderExpirations: se}
     atomic do
       set *lastSnapshotExportAt = t
       set *prunesSinceSnapshot = 0
     let cs = snapshotChecksum (count result.presence) (count result.ackedIds) (count result.deliveredIds) (count result.forwards) (count result.forwardNonces)
-    logInfo ("snapshot: exported " ++ show (count result.presence) ++ " presence, " ++ show (count result.ackedIds) ++ " ackedIds, " ++ show (count result.deliveredIds) ++ " deliveredIds, " ++ show (count result.forwards) ++ " forwards, " ++ show (count result.forwardNonces) ++ " forwardNonces, " ++ show (count result.blockedPeers) ++ " blockedPeers, " ++ show (count result.allowedPeers) ++ " allowedPeers, " ++ show (count result.pendingAckCleanups) ++ " pendingAckCleanups, checksum=" ++ show cs)
-    yield (respond {ok: True {}, version: snapshotVersion, checksum: cs, presence: result.presence, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, forwards: result.forwards, forwardNonces: result.forwardNonces, blockedPeers: result.blockedPeers, allowedPeers: result.allowedPeers, pendingAckCleanups: result.pendingAckCleanups})
+    logInfo ("snapshot: exported " ++ show (count result.presence) ++ " presence, " ++ show (count result.ackedIds) ++ " ackedIds, " ++ show (count result.deliveredIds) ++ " deliveredIds, " ++ show (count result.forwards) ++ " forwards, " ++ show (count result.forwardNonces) ++ " forwardNonces, " ++ show (count result.blockedPeers) ++ " blockedPeers, " ++ show (count result.allowedPeers) ++ " allowedPeers, " ++ show (count result.pendingAckCleanups) ++ " pendingAckCleanups, " ++ show (count result.senderExpirations) ++ " senderExpirations, checksum=" ++ show cs)
+    yield (respond {ok: True {}, version: snapshotVersion, checksum: cs, presence: result.presence, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, forwards: result.forwards, forwardNonces: result.forwardNonces, blockedPeers: result.blockedPeers, allowedPeers: result.allowedPeers, pendingAckCleanups: result.pendingAckCleanups, senderExpirations: result.senderExpirations})
 
 -- POST /maintenance/restore: Import a previously-exported snapshot.
 -- Requires drain mode to prevent conflicts with live state. Merges imported data
 -- with existing state (dedup entries are unioned, presence is merged by freshness).
 -- After restore, call /maintenance/undrain to resume, then /maintenance/prune to
 -- trigger federation forward creation from messages + restored presence.
-handleRestore = \version checksumIn presenceData ackedIdsData ackOverflowData deliveredIdsData forwardFailuresData forwardsData forwardNoncesData blockedPeersData allowedPeersData pendingAckCleanupsData authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+handleRestore = \version checksumIn presenceData ackedIdsData ackOverflowData deliveredIdsData forwardFailuresData forwardsData forwardNoncesData blockedPeersData allowedPeersData pendingAckCleanupsData senderExpirationsData authorization respond -> do
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, error: "unauthorized", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
   else do
     -- Version 0 = pre-versioning snapshot, version 1 = pre-forwardNonces, version 2 = pre-blockedPeers,
     -- version 3 = pre-ForwardEntry changes, version 4 = pre-allowedPeers, version 5 = pre-checksum
     -- (accept all for backwards compatibility; missing fields default to empty list or 0)
-    if version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != snapshotVersion then do
+    if version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != snapshotVersion then do
       logError ("restore: incompatible snapshot version " ++ show version ++ " (expected " ++ show snapshotVersion ++ ")")
       yield (respond {ok: False {}, error: "incompatible_version", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
     else do
@@ -5853,6 +5918,11 @@ handleRestore = \version checksumIn presenceData ackedIdsData ackOverflowData de
         existingCleanups <- *pendingAckCleanups
         let mergedCleanups = union existingCleanups pendingAckCleanupsData
         set *pendingAckCleanups = takeRelation maxPendingAckCleanups mergedCleanups
+        -- Restore sender expiration notifications (union with existing, cap at maxSenderExpirations)
+        -- pre-v8 snapshots have empty senderExpirations (field defaults to [])
+        existingSenderExp <- *senderExpirations
+        let mergedSenderExp = union existingSenderExp senderExpirationsData
+        set *senderExpirations = takeRelation maxSenderExpirations mergedSenderExp
         yield {presenceCount: count cappedPresence, ackedIdsCount: count cappedAcked, deliveredIdsCount: count cappedDelivered}
       logInfo ("restore: imported " ++ show result.presenceCount ++ " presence, " ++ show result.ackedIdsCount ++ " ackedIds, " ++ show result.deliveredIdsCount ++ " deliveredIds")
       yield (respond {ok: True {}, error: "", presenceCount: result.presenceCount, ackedIdsCount: result.ackedIdsCount, deliveredIdsCount: result.deliveredIdsCount})
@@ -6149,7 +6219,7 @@ sendBatchInner = \senderKey messages t acc ->
 -- POST /maintenance/block: Add a server to the federation blocklist.
 -- Blocked peers are rejected from all inbound and outbound federation operations.
 handleBlockPeer = \server authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, blocked: 0})
   else do
     result <- atomic do
@@ -6169,7 +6239,7 @@ handleBlockPeer = \server authorization respond -> do
 
 -- POST /maintenance/unblock: Remove a server from the federation blocklist.
 handleUnblockPeer = \server authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, unblocked: False {}})
   else do
     removed <- atomic do
@@ -6182,7 +6252,7 @@ handleUnblockPeer = \server authorization respond -> do
 
 -- GET /maintenance/blocked: List currently blocked federation peers.
 handleListBlocked = \authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {peers: [], ok: False {}})
   else do
     blocked <- *blockedPeers
@@ -6192,7 +6262,7 @@ handleListBlocked = \authorization respond -> do
 -- When the allowlist is non-empty, only servers on the list can federate with us.
 -- Adding the first server transitions from open federation to allowlist-only mode.
 handleAllowPeer = \server authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, allowed: 0})
   else do
     result <- atomic do
@@ -6212,7 +6282,7 @@ handleAllowPeer = \server authorization respond -> do
 -- POST /maintenance/unallow: Remove a server from the federation allowlist.
 -- Removing the last server transitions back to open federation mode.
 handleUnallowPeer = \server authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, removed: False {}})
   else do
     removed <- atomic do
@@ -6226,7 +6296,7 @@ handleUnallowPeer = \server authorization respond -> do
 -- GET /maintenance/allowed: List currently allowed federation peers.
 -- Empty list = open federation (all peers allowed).
 handleListAllowed = \authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {peers: [], ok: False {}})
   else do
     allowed <- *allowedPeers
@@ -6238,7 +6308,7 @@ handleListAllowed = \authorization respond -> do
 -- then processes the empty gossip (no mutations, no re-broadcast since hops=1).
 -- This exercises the real bidirectional connectivity and auth flow.
 handlePingPeer = \server authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, latencyMs: 0, error: "unauthorized"})
   else do
     startTime <- now
@@ -6260,7 +6330,7 @@ handlePingPeer = \server authorization respond -> do
 -- Uses per-bucket scan (collectSessionsForKey) instead of readAllSessions to avoid
 -- materializing all 16 session buckets into one list just to filter by pubkey.
 handleAdminListSessions = \pubkey authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {sessions: [], count: 0, ok: False {}})
   else do
     keySessions <- collectSessionsForKey pubkey 0
@@ -6273,7 +6343,7 @@ handleAdminListSessions = \pubkey authorization respond -> do
 -- POST /maintenance/sessions/revoke-all: Revoke all sessions for a pubkey (abuse response).
 -- Also clears local presence and gossips offline if federation is enabled.
 handleAdminRevokeSessions = \pubkey authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, revokedCount: 0})
   else do
     t <- now
@@ -6304,7 +6374,7 @@ handleAdminRevokeSessions = \pubkey authorization respond -> do
 -- Federated messages (originServer != "") generate ack entries so origin servers
 -- can reclaim their forward entries instead of retrying until prune.
 handleAdminPurgeMessages = \pubkey authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, purgedCount: 0})
   else do
     t <- now
@@ -6352,7 +6422,7 @@ handleAdminPurgeMessages = \pubkey authorization respond -> do
 -- Scans all 16 session buckets, removes matching sessions, and gossips offline
 -- for any pubkey that lost its last session.
 handleAdminRevokeIp = \ip authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0})
   else if ip == "" then yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0})
   else do
@@ -6408,31 +6478,39 @@ checkCleanupForKeys = \keys t acc ->
 -- Useful for detecting suspicious multi-key activity (e.g., one IP authenticating many keys)
 -- without needing to know the pubkey in advance. Groups sessions by pubkey.
 handleAdminListAllSessions = \limit authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {sessions: [], ok: False {}, total: 0})
   else do
     let effectiveLimit = if limit <= 0 then 100 else clamp 1 500 limit
-    allSessions <- readAllSessions
     t <- now
-    let active = do s <- allSessions; where s.expiresAt > t && t - s.createdAt < maxSessionLifetime; yield s
-    -- Group by pubkey: accumulate count, unique IPs, and latest expiry per pubkey.
-    -- O(n*k) where k = unique pubkeys; acceptable since readAllSessions already materialized all.
-    let grouped = fold (\acc s ->
-      if any acc (\a -> a.pubkey == s.pubkey)
-        then do a <- acc; yield (if a.pubkey == s.pubkey then {pubkey: a.pubkey, count: a.count + 1, ips: if any a.ips (\i -> i == s.ip) || s.ip == "" then a.ips else union a.ips [s.ip], latestExpiry: max a.latestExpiry s.expiresAt} else a)
-        else union acc [{pubkey: s.pubkey, count: 1, ips: if s.ip == "" then [] else [s.ip], latestExpiry: s.expiresAt}])
-      [] active
+    -- Per-bucket scan: reads one session bucket at a time instead of materializing
+    -- all 16 into one list (avoids O(n) union across all sessions).
+    grouped <- groupSessionsByBucket 0 t []
     -- Sort by count descending (most sessions first) for abuse investigation
     let sorted = sortBy (\g -> 0 - g.count) grouped
     let capped = takeRelation effectiveLimit sorted
     yield (respond {sessions: capped, ok: True {}, total: count grouped})
+
+-- Per-bucket session grouping: reads one bucket at a time, merging active sessions
+-- into the running grouped accumulator. Avoids readAllSessions O(n) materialization.
+groupSessionsByBucket = \b t acc ->
+  if b > 15 then yield acc
+  else do
+    bucket <- readSessionBucket b
+    let active = do s <- bucket; where s.expiresAt > t && t - s.createdAt < maxSessionLifetime; yield s
+    let merged = fold (\grouped s ->
+      if any grouped (\a -> a.pubkey == s.pubkey)
+        then do a <- grouped; yield (if a.pubkey == s.pubkey then {pubkey: a.pubkey, count: a.count + 1, ips: if any a.ips (\i -> i == s.ip) || s.ip == "" then a.ips else union a.ips [s.ip], latestExpiry: max a.latestExpiry s.expiresAt} else a)
+        else union grouped [{pubkey: s.pubkey, count: 1, ips: if s.ip == "" then [] else [s.ip], latestExpiry: s.expiresAt}])
+      acc active
+    groupSessionsByBucket (b + 1) t merged
 
 -- POST /maintenance/nonces/flush: Clear all forward nonces (recovery from corruption).
 -- Nonces provide extended replay protection beyond message/ack dedup lifetime.
 -- Flushing temporarily reopens a replay window for messages older than 30 days but
 -- younger than 60 days. Use only for recovery, not routine maintenance.
 handleFlushNonces = \authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, flushedCount: 0})
   else do
     flushedCount <- atomic do
@@ -6442,9 +6520,27 @@ handleFlushNonces = \authorization respond -> do
     logInfo ("nonces/flush: flushed " ++ show flushedCount ++ " forward nonces")
     yield (respond {ok: True {}, flushedCount: flushedCount})
 
+-- POST /maintenance/rotate-secret: Rotate the maintenance secret at runtime.
+-- Authenticated with the current secret. The new secret takes effect immediately
+-- for all subsequent requests. Pass empty newSecret to revert to the compile-time default.
+handleRotateSecret = \newSecret authorization respond -> do
+  authorized <- verifyMaintenanceAuth authorization
+  if not authorized then yield (respond {ok: False {}, error: "unauthorized"})
+  else if newSecret != "" && not (tooLong newSecret 31) then do
+    logWarn "rotate-secret: new secret is shorter than 32 characters — 32+ recommended for production"
+    atomic do set *runtimeMaintenanceSecret = newSecret
+    logInfo "rotate-secret: maintenance secret rotated (warning: short secret)"
+    yield (respond {ok: True {}, error: ""})
+  else do
+    atomic do set *runtimeMaintenanceSecret = newSecret
+    if newSecret == ""
+      then logInfo "rotate-secret: reverted to compile-time maintenance secret"
+      else logInfo "rotate-secret: maintenance secret rotated"
+    yield (respond {ok: True {}, error: ""})
+
 -- GET /maintenance/rate-limits: Return current effective rate limits.
 handleGetRateLimits = \authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, globalRequest: 0, ipRate: 0, sendRate: 0, federationRate: 0, authGlobal: 0, recvRate: 0, challengeRate: 0, pairRate: 0, lookupRate: 0, clientWriteRate: 0})
   else do
     result <- atomic do
@@ -6464,7 +6560,7 @@ handleGetRateLimits = \authorization respond -> do
 -- POST /maintenance/rate-limits: Update rate limits at runtime. 0 = reset to compile-time default.
 -- Negative values are clamped to 0. Changes take effect on the next rate check cycle.
 handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization respond -> do
-  let authorized = verifyMaintenanceAuth authorization
+  authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}})
   else do
     atomic do
@@ -6524,6 +6620,7 @@ requestPath = \req -> case req of
   UnallowPeer {} -> "POST /maintenance/unallow"
   ListAllowed {} -> "GET /maintenance/allowed"
   Reconcile {} -> "POST /maintenance/reconcile"
+  RotateSecret {} -> "POST /maintenance/rotate-secret"
   Health {} -> "GET /health"
   Stats {} -> "GET /stats"
   StatsPeers {} -> "GET /stats/peers"
@@ -6574,6 +6671,7 @@ requestClientIp = \req -> case req of
   UnallowPeer {} -> ""
   ListAllowed {} -> ""
   Reconcile {} -> ""
+  RotateSecret {} -> ""
   Health {} -> ""
   Stats {} -> ""
   StatsPeers {} -> ""
@@ -6610,7 +6708,7 @@ serveInner = \req -> case req of
   Shutdown {authorization, respond} -> handleShutdown authorization respond
   Undrain {authorization, respond} -> handleUndrain authorization respond
   Snapshot {authorization, respond} -> handleSnapshot authorization respond
-  Restore {version, checksum, presence, ackedIds, ackOverflow, deliveredIds, forwardFailures, forwards, forwardNonces, blockedPeers, allowedPeers, pendingAckCleanups, authorization, respond} -> handleRestore version checksum presence ackedIds ackOverflow deliveredIds forwardFailures forwards forwardNonces blockedPeers allowedPeers pendingAckCleanups authorization respond
+  Restore {version, checksum, presence, ackedIds, ackOverflow, deliveredIds, forwardFailures, forwards, forwardNonces, blockedPeers, allowedPeers, pendingAckCleanups, senderExpirations, authorization, respond} -> handleRestore version checksum presence ackedIds ackOverflow deliveredIds forwardFailures forwards forwardNonces blockedPeers allowedPeers pendingAckCleanups senderExpirations authorization respond
   BlockPeer {server, authorization, respond} -> handleBlockPeer server authorization respond
   UnblockPeer {server, authorization, respond} -> handleUnblockPeer server authorization respond
   ListBlocked {authorization, respond} -> handleListBlocked authorization respond
@@ -6627,6 +6725,7 @@ serveInner = \req -> case req of
   UnallowPeer {server, authorization, respond} -> handleUnallowPeer server authorization respond
   ListAllowed {authorization, respond} -> handleListAllowed authorization respond
   Reconcile {authorization, respond} -> handleReconcile authorization respond
+  RotateSecret {newSecret, authorization, respond} -> handleRotateSecret newSecret authorization respond
   Health {authorization, respond} -> handleHealth authorization respond
   Stats {authorization, respond} -> handleStats authorization respond
   StatsPeers {authorization, respond} -> handleStatsPeers authorization respond
@@ -6649,7 +6748,9 @@ serve = \req -> do
   let ipSuffix = if ip != "" then " " ++ ip else ""
   if path != ""
     then logInfo ("[ACCESS] " ++ reqId ++ " " ++ path ++ " " ++ show latency ++ "ms" ++ ipSuffix)
-    else when (latency > slowRequestThreshold) (logInfo ("[SLOW] " ++ reqId ++ " poll " ++ show latency ++ "ms" ++ ipSuffix))
+    else when (latency > slowRequestThreshold) (do
+      logInfo ("[SLOW] " ++ reqId ++ " poll " ++ show latency ++ "ms" ++ ipSuffix)
+      logEvent "warn" "slow_request" ("poll " ++ show latency ++ "ms"))
 
 -- ============================================
 -- Entry Point
@@ -6822,8 +6923,9 @@ backgroundSnapshot = do
           bp <- *blockedPeers
           ap <- *allowedPeers
           pac <- *pendingAckCleanups
+          se <- *senderExpirations
           let exportCs = snapshotChecksum (count p) (count a) (count d) (count f) (count fn)
-          yield {version: snapshotVersion, checksum: exportCs, presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap, pendingAckCleanups: pac}
+          yield {version: snapshotVersion, checksum: exportCs, presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap, pendingAckCleanups: pac, senderExpirations: se}
         println ("[SNAPSHOT_DATA] " ++ toJson exportData)
         println "[SNAPSHOT_END]"
         atomic do
@@ -6958,6 +7060,10 @@ main = do
         (logWarn "maintenanceSecret is empty — /maintenance/* and /stats endpoints are disabled")
       when (maintenanceSecret != "" && not (tooLong maintenanceSecret 15))
         (logWarn "maintenanceSecret is shorter than 16 characters — use a longer secret for production deployments")
+      when (maintenanceSecret != "" && not (tooLong maintenanceSecret 31))
+        (logWarn "maintenanceSecret is shorter than 32 characters — 32+ character secrets recommended for production (128+ bits of entropy)")
+      when (maintenanceSecret != "" && federationEnabled && not (tooLong maintenanceSecret 15))
+        (logError "SECURITY: maintenanceSecret is weak and federation is enabled — maintenance endpoints control drain, snapshot, and peer blocking. Use a secret of at least 32 characters.")
       when (matchesHostnameOrSubdomain serverHostN "localhost")
         (logWarn ("serverHost is " ++ serverHost ++ " — peers cannot reach this server for federation"))
       when (federationEnabled && isBadServerName serverHostN)
