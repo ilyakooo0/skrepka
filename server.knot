@@ -101,6 +101,7 @@ maxForwardRetriesPerServer = 100
 maxForwardRetries = 10 -- max retries per individual forward entry before dropping
 maxAckRetries = 10 -- max retries per ack entry before dropping to deliveredIds
 maxGossipHops = 5 -- max hops a gossip event can propagate across servers
+maxThirdPartyGossipHops = 2 -- max re-broadcast hops for relayed (third-party) gossip events
 gossipOriginHops = 2 -- hops set when this server originates a gossip event
 gossipDedupWindow : Int<Ms>
 gossipDedupWindow = 60000 -- suppress re-broadcast of identical gossip events within this window
@@ -140,6 +141,8 @@ backgroundPruneInterval : Int<Ms>
 backgroundPruneInterval = 30000 -- 30 seconds; also retries failed forwards/acks
 autoSnapshotInterval : Int<Ms>
 autoSnapshotInterval = 300000 -- 5 minutes; periodic state summary to stdout (0 to disable)
+snapshotStalenessWarning : Int<Ms>
+snapshotStalenessWarning = 3600000 -- 1 hour; warn if no snapshot exported via /maintenance/snapshot
 pollTimeoutMs : Int<Ms>
 pollTimeoutMs = 25000 -- long-poll heartbeat interval (how long a poll blocks before returning empty)
 maxPollsPerKey = 3 -- max concurrent long-poll connections per pubkey
@@ -166,6 +169,11 @@ maxLookupRatePerKey = 5 -- max lookups per key per window
 lookupRateWindowMs : Int<Ms>
 lookupRateWindowMs = 1000
 maxLookupRateEntries = 1000
+-- Federation verify rate limiting (per-IP, tighter than general IP rate)
+maxVerifyRatePerIp = 5 -- max verify requests per IP per window
+verifyRateWindowMs : Int<Ms>
+verifyRateWindowMs = 1000
+maxVerifyRateEntries = 1000
 -- Unacked message aging (messages pruned after this regardless of ack status)
 unackedMessageMaxAge : Int<Ms>
 unackedMessageMaxAge = 604800000 -- 7 days
@@ -485,6 +493,12 @@ type RecentFederationRequest = {server: Text, timestamp: Timestamp, seenAt: Time
 -- Forward nonce dedup: (messageId, toKey, seenAt) for replay protection beyond message lifetime
 *forwardNonces : [{messageId: MessageIdHex, toKey: PubkeyHex, seenAt: Timestamp}]
 
+-- Federation verify per-IP rate limiting (tighter than general IP rate)
+*verifyIpRates : [IpRateEntry]
+
+-- Tracks when /maintenance/snapshot was last exported (for staleness warnings)
+*lastSnapshotExportAt : Timestamp
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -565,11 +579,11 @@ route MaintenanceApi where
   -- Messages are excluded (ephemeral by design; clients handle re-delivery).
   -- Includes presence, acked/delivered IDs (dedup state), and peer failure records.
   GET /maintenance/snapshot headers {authorization: Text}
-    -> {ok: Bool, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure]}
+    -> {ok: Bool, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry]}
     = Snapshot
   -- Restore: import a previously-exported snapshot. Server must be in drain mode
   -- to prevent conflicts with live state. Run /maintenance/undrain after restore.
-  POST {presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure]} /maintenance/restore headers {authorization: Text}
+  POST {presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry]} /maintenance/restore headers {authorization: Text}
     -> {ok: Bool, error: Text, presenceCount: Int, ackedIdsCount: Int, deliveredIdsCount: Int}
     = Restore
 
@@ -579,7 +593,7 @@ route HealthApi where
 -- Returns counts of in-memory collections (requires maintenance secret)
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {sessions: Int, sessionsMax: Int, messages: Int, messagesMax: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pairRates: Int, federationPairRates: Int, pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, federationEnabled: Bool, recentGossip: Int, totalMessageCount: Int, recipientCounts: Int, federationInFlight: Int, messagesPct: Int, presencePct: Int, forwardsPct: Int, sessionsPct: Int, federationAvgLatencyMs: Int, federationMaxLatencyMs: Int, federationCallCount: Int, drainCompletedAt: Timestamp, ok: Bool}
+    -> {sessions: Int, sessionsMax: Int, messages: Int, messagesMax: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pairRates: Int, federationPairRates: Int, pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, federationEnabled: Bool, recentGossip: Int, totalMessageCount: Int, recipientCounts: Int, federationInFlight: Int, messagesPct: Int, presencePct: Int, forwardsPct: Int, sessionsPct: Int, federationAvgLatencyMs: Int, federationMaxLatencyMs: Int, federationCallCount: Int, drainCompletedAt: Timestamp, oldestForwardAge: Int, oldestAckAge: Int, ok: Bool}
     = Stats
   GET /stats/peers headers {authorization: Text}
     -> {peers: [PeerStatus], ok: Bool}
@@ -1648,6 +1662,8 @@ pruneExpired = \t -> do
     set *ipRates = do r <- ipRates; where t - r.windowStart < ipRateWindowMs; yield r
     lookupRates <- *lookupRates
     set *lookupRates = do r <- lookupRates; where t - r.windowStart < lookupRateWindowMs; yield r
+    verifyIpRates <- *verifyIpRates
+    set *verifyIpRates = do r <- verifyIpRates; where t - r.windowStart < verifyRateWindowMs; yield r
   atomic do
     activePolls <- *activePolls
     set *activePolls = do p <- activePolls; where t - p.startedAt < pollTimeoutMs * 3; yield p
@@ -3040,12 +3056,27 @@ handleVerifyToken = \token scope clientIp respond -> do
   ipLimited <- checkIpRate clientIp t
   if ipLimited then yield (respond {ok: False {}})
   else do
+  -- Dedicated verify rate limit (tighter than general IP rate to limit token probing)
+  verifyLimited <- if clientIp == "" then yield (False {})
+    else atomic do
+      verifyIpRates <- *verifyIpRates
+      let result = checkRateWindow verifyIpRates (\r -> r.ip == clientIp)
+        (\ts -> {ip: clientIp, windowStart: ts, count: 1})
+        (\r -> {ip: r.ip, windowStart: r.windowStart, count: r.count + 1})
+        maxVerifyRatePerIp verifyRateWindowMs maxVerifyRateEntries t
+      set *verifyIpRates = result.entries
+      yield result.limited
+  if verifyLimited then do
+    println ("federation/verify: rate limited for IP " ++ clientIp)
+    yield (respond {ok: False {}})
+  else do
   found <- atomic do
     pending <- *pendingVerifications
     -- Scope is required: callers must specify the operation type (gossip/forward/ack)
     let match = any pending (\p -> safeCompare p.token token && p.scope == scope && t - p.createdAt < verificationTokenExpiry)
     when match (set *pendingVerifications = do p <- pending; where not (safeCompare p.token token); yield p)
     yield match
+  when (not found) (println ("federation/verify: failed attempt from " ++ clientIp ++ " (scope: " ++ scope ++ ")"))
   yield (respond {ok: found})
 
 -- POST /federation/gossip: Receive presence gossip from a peer server.
@@ -3090,8 +3121,15 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorizati
       yield fresh
     let newlyOnlineRemote = newlyOnlineRemoteKeys filteredOnline gossipResult.gm.appliedKeys
     fork (do
-      when (cappedHops > 1 && federationEnabled && count freshEvents > 0) (
-        sendBatchedGossip (gossipTargets gossipResult.gm.gossipPeerServers fromServer) freshEvents (cappedHops - 1))
+      when (cappedHops > 1 && federationEnabled && count freshEvents > 0) (do
+        let targets = gossipTargets gossipResult.gm.gossipPeerServers fromServer
+        -- Split first-party (from the sender) vs third-party (relayed) events.
+        -- Third-party events get fewer hops to limit amplification from inflated hopsRemaining.
+        let firstPartyEvents = do e <- freshEvents; where e.server == fromServer; yield e
+        let thirdPartyEvents = do e <- freshEvents; where e.server != fromServer; yield e
+        when (count firstPartyEvents > 0) (sendBatchedGossip targets firstPartyEvents (cappedHops - 1))
+        let thirdPartyHops = min (cappedHops - 1) maxThirdPartyGossipHops
+        when (thirdPartyHops > 1 && count thirdPartyEvents > 0) (sendBatchedGossip targets thirdPartyEvents thirdPartyHops))
       when (federationEnabled && count newlyOnlineRemote > 0)
         (forwardQueuedMessages newlyOnlineRemote t))
     yield (respond {ok: True {}, error: ""}))
@@ -3106,6 +3144,17 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
   withFederationAuth authorization t respond fromServer "forward" requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
     when (fromServer != originServer)
       (println ("forward: relay from " ++ fromServer ++ " (origin: " ++ originServer ++ ") for " ++ toKey))
+    -- Relay origin verification: for relay forwards, verify originServer is a known peer
+    -- to prevent ack routing (and metadata leakage) to arbitrary servers.
+    originOk <- if fromServer == originServer then yield (True {})
+      else do
+        knownPeers <- *knownPeerServers
+        yield (any knownPeers (\p -> p == originServer))
+    if not originOk
+      then do
+        println ("forward: rejected relay with unknown origin " ++ originServer ++ " from " ++ fromServer)
+        yield (respond {ok: False {}, error: "unknown_origin"})
+      else do
     -- Replay protection: reject forwards with timestamps older than messageMaxAge.
     -- Legitimate queued messages have timestamps within this window. Replayed captures
     -- become stale once dedup state (messages + ackedIds + deliveredIds) is pruned (~30 days).
@@ -3313,7 +3362,7 @@ handleHealth = \respond -> do
                   capacityHealthy: result.capacityOk,
                   federationHealthy: result.federationOk})
 
-zeroStats = {sessions: 0, sessionsMax: 0, messages: 0, messagesMax: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pairRates: 0, federationPairRates: 0, pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, federationEnabled: False {}, recentGossip: 0, totalMessageCount: 0, recipientCounts: 0, federationInFlight: 0, messagesPct: 0, presencePct: 0, forwardsPct: 0, sessionsPct: 0, federationAvgLatencyMs: 0, federationMaxLatencyMs: 0, federationCallCount: 0, drainCompletedAt: 0, ok: False {}}
+zeroStats = {sessions: 0, sessionsMax: 0, messages: 0, messagesMax: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pairRates: 0, federationPairRates: 0, pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, federationEnabled: False {}, recentGossip: 0, totalMessageCount: 0, recipientCounts: 0, federationInFlight: 0, messagesPct: 0, presencePct: 0, forwardsPct: 0, sessionsPct: 0, federationAvgLatencyMs: 0, federationMaxLatencyMs: 0, federationCallCount: 0, drainCompletedAt: 0, oldestForwardAge: 0, oldestAckAge: 0, ok: False {}}
 
 handleStats = \authorization respond -> do
   t <- now
@@ -3368,7 +3417,9 @@ handleStats = \authorization respond -> do
       let fwdPct = if maxForwardsEntries > 0 then result.forwards * 100 / maxForwardsEntries else 0
       let sessPct = if maxSessions > 0 then result.sessions * 100 / maxSessions else 0
       let fedAvg = if result.federationLatencyCount > 0 then result.federationLatencyTotal / result.federationLatencyCount else 0
-      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pairRates: result.pairRates, federationPairRates: result.federationPairRates, pruneCount: result.pruneCount, pruneRunning: result.pruneRunning, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, draining: result.draining, federationEnabled: federationEnabled, recentGossip: result.recentGossip, totalMessageCount: result.totalMessageCount, recipientCounts: result.recipientCounts, federationInFlight: result.federationInFlight, messagesPct: msgPct, presencePct: presPct, forwardsPct: fwdPct, sessionsPct: sessPct, federationAvgLatencyMs: fedAvg, federationMaxLatencyMs: result.federationLatencyMax, federationCallCount: result.federationLatencyCount, drainCompletedAt: result.drainCompletedAt, ok: True {}})
+      let oldestFwdAge = case minBy core.f (\x -> x.createdAt) of Nothing {} -> 0; Just {value: x} -> t - x.createdAt
+      let oldestAckAge = case minBy core.a (\x -> x.ackedAt) of Nothing {} -> 0; Just {value: x} -> t - x.ackedAt
+      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pairRates: result.pairRates, federationPairRates: result.federationPairRates, pruneCount: result.pruneCount, pruneRunning: result.pruneRunning, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, draining: result.draining, federationEnabled: federationEnabled, recentGossip: result.recentGossip, totalMessageCount: result.totalMessageCount, recipientCounts: result.recipientCounts, federationInFlight: result.federationInFlight, messagesPct: msgPct, presencePct: presPct, forwardsPct: fwdPct, sessionsPct: sessPct, federationAvgLatencyMs: fedAvg, federationMaxLatencyMs: result.federationLatencyMax, federationCallCount: result.federationLatencyCount, drainCompletedAt: result.drainCompletedAt, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, ok: True {}})
     else yield (respond zeroStats)
 
 handleStatsPeers = \authorization respond -> do
@@ -3408,33 +3459,35 @@ handleStatsKey = \pubkey authorization respond -> do
       yield (respond {messages: result.messages, presence: result.presence, sessions: result.sessions, forwards: result.forwards, activePolls: result.activePolls, ok: True {}})
     else yield (respond {messages: 0, presence: [], sessions: 0, forwards: 0, activePolls: 0, ok: False {}})
 
-emptySnapshot = {ok: False {}, presence: [], ackedIds: [], ackOverflow: [], deliveredIds: [], forwardFailures: []}
+emptySnapshot = {ok: False {}, presence: [], ackedIds: [], ackOverflow: [], deliveredIds: [], forwardFailures: [], forwards: []}
 
 -- GET /maintenance/snapshot: Export federation metadata for persistence.
--- Reads all dedup state (ackedIds, deliveredIds), presence, and peer failure records
--- in a single atomic snapshot. Messages and forwards are excluded — messages are
--- ephemeral (clients re-send unconfirmed), and forwards are re-created from
--- messages + presence after restore by running a prune cycle.
+-- Reads all dedup state (ackedIds, deliveredIds), presence, peer failure records,
+-- and pending forwards in a single atomic snapshot. Forward retry counters are
+-- preserved so they survive restarts (prevents re-trying permanently-failing forwards).
 handleSnapshot = \authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
   if not authorized then yield (respond emptySnapshot)
   else do
+    t <- now
     result <- atomic do
       p <- readAllPresence
       a <- *ackedIds
       ao <- *ackOverflow
       d <- *deliveredIds
       ff <- *forwardFailures
-      yield {presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff}
-    println ("snapshot: exported " ++ show (count result.presence) ++ " presence, " ++ show (count result.ackedIds) ++ " ackedIds, " ++ show (count result.deliveredIds) ++ " deliveredIds")
-    yield (respond {ok: True {}, presence: result.presence, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures})
+      f <- *forwards
+      yield {presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f}
+    atomic do set *lastSnapshotExportAt = t
+    println ("snapshot: exported " ++ show (count result.presence) ++ " presence, " ++ show (count result.ackedIds) ++ " ackedIds, " ++ show (count result.deliveredIds) ++ " deliveredIds, " ++ show (count result.forwards) ++ " forwards")
+    yield (respond {ok: True {}, presence: result.presence, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, forwards: result.forwards})
 
 -- POST /maintenance/restore: Import a previously-exported snapshot.
 -- Requires drain mode to prevent conflicts with live state. Merges imported data
 -- with existing state (dedup entries are unioned, presence is merged by freshness).
 -- After restore, call /maintenance/undrain to resume, then /maintenance/prune to
 -- trigger federation forward creation from messages + restored presence.
-handleRestore = \presenceData ackedIdsData ackOverflowData deliveredIdsData forwardFailuresData authorization respond -> do
+handleRestore = \presenceData ackedIdsData ackOverflowData deliveredIdsData forwardFailuresData forwardsData authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, error: "unauthorized", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
   else do
@@ -3467,6 +3520,11 @@ handleRestore = \presenceData ackedIdsData ackOverflowData deliveredIdsData forw
         let mergedFailures = mergeByKey (\a b -> a.server == b.server) (\x -> x.failedAt) forwardFailures forwardFailuresData
         let cappedFailures = takeRelation maxForwardFailures mergedFailures
         set *forwardFailures = cappedFailures
+        -- Restore forward entries (dedup by messageId + toServer, keep fresher on conflict)
+        forwards <- *forwards
+        let mergedForwards = mergeByKey (\a b -> a.messageId == b.messageId && a.toServer == b.toServer) (\x -> x.createdAt) forwards forwardsData
+        let cappedForwards = takeRelation maxForwardsEntries mergedForwards
+        set *forwards = cappedForwards
         yield {presenceCount: count cappedPresence, ackedIdsCount: count cappedAcked, deliveredIdsCount: count cappedDelivered}
       println ("restore: imported " ++ show result.presenceCount ++ " presence, " ++ show result.ackedIdsCount ++ " ackedIds, " ++ show result.deliveredIdsCount ++ " deliveredIds")
       yield (respond {ok: True {}, error: "", presenceCount: result.presenceCount, ackedIdsCount: result.ackedIdsCount, deliveredIdsCount: result.deliveredIdsCount})
@@ -3488,7 +3546,7 @@ serve = \req -> case req of
   Drain {authorization, respond} -> handleDrain authorization respond
   Undrain {authorization, respond} -> handleUndrain authorization respond
   Snapshot {authorization, respond} -> handleSnapshot authorization respond
-  Restore {presence, ackedIds, ackOverflow, deliveredIds, forwardFailures, authorization, respond} -> handleRestore presence ackedIds ackOverflow deliveredIds forwardFailures authorization respond
+  Restore {presence, ackedIds, ackOverflow, deliveredIds, forwardFailures, forwards, authorization, respond} -> handleRestore presence ackedIds ackOverflow deliveredIds forwardFailures forwards authorization respond
   Health {respond} -> handleHealth respond
   Stats {authorization, respond} -> handleStats authorization respond
   StatsPeers {authorization, respond} -> handleStatsPeers authorization respond
@@ -3529,8 +3587,10 @@ backgroundPrune = do
         pc <- *pruneCount
         set *pruneCount = pc + 1
         yield {canRun: True {}, recovered: running > 0, gen: newGen, stuckSince: running}
-  when status.recovered
-    (println ("backgroundPrune: previous cycle stuck for " ++ show (t - status.stuckSince) ++ "ms, forcing recovery"))
+  when status.recovered (do
+    println ("backgroundPrune: previous cycle stuck for " ++ show (t - status.stuckSince) ++ "ms, forcing recovery")
+    -- Reset fork counter: the stuck fork leaked its slot, so reclaim it to prevent permanent lockout
+    atomic do set *activePruneForks = 0)
   if status.canRun
     then do
       -- Guard against unbounded concurrent prune forks from repeated stuck recovery
@@ -3591,6 +3651,13 @@ backgroundSnapshot = do
       ff <- *forwardFailures
       yield {messages: tmc, sessions: sc, presence: pc, forwards: count f, ackedIds: count a, ackOverflow: count ao, deliveredIds: count d, forwardFailures: count ff}
     println ("snapshot: messages=" ++ show result.messages ++ " sessions=" ++ show result.sessions ++ " presence=" ++ show result.presence ++ " forwards=" ++ show result.forwards ++ " ackedIds=" ++ show result.ackedIds ++ " ackOverflow=" ++ show result.ackOverflow ++ " deliveredIds=" ++ show result.deliveredIds ++ " forwardFailures=" ++ show result.forwardFailures)
+    -- Warn if federation state hasn't been exported recently (will be lost on restart)
+    t <- now
+    lastExport <- *lastSnapshotExportAt
+    when (maintenanceSecret != "" && snapshotStalenessWarning > 0
+      && (lastExport == 0 || t - lastExport > snapshotStalenessWarning)
+      && (result.ackedIds > 0 || result.deliveredIds > 0 || result.forwards > 0 || result.presence > 0))
+      (println ("WARNING: no snapshot exported in " ++ show (if lastExport == 0 then 0 else (t - lastExport) / 1000) ++ "s — federation state will be lost on restart (presence=" ++ show result.presence ++ " forwards=" ++ show result.forwards ++ " ackedIds=" ++ show result.ackedIds ++ " deliveredIds=" ++ show result.deliveredIds ++ ")"))
   else yield {}
   backgroundSnapshot
 
@@ -3600,7 +3667,7 @@ main = do
         && pollTimeoutMs > 0 && challengeExpiry > 0 && sessionExpiry > 0
         && maxPresenceTtl > 0 && maxForwardsEntries > 0 && maxAckedIds > 0
         && maxForwardRetries > 0 && maxGossipHops > 0 && maxPollsPerKey > 0
-        && gossipOriginHops > 0
+        && gossipOriginHops > 0 && maxThirdPartyGossipHops > 0
         && verificationTokenExpiry > 0
         && maxAckRetries > 0 && maxPairRatePerPair > 0 && pairRateWindowMs > 0
         && maxFederationPairRatePerPair > 0 && federationPairRateWindowMs > 0
@@ -3622,12 +3689,13 @@ main = do
         && federationFetchTimeoutMs <= backgroundPruneInterval
         && maxAckOverflow <= maxAckedIds
         && gossipOriginHops <= maxGossipHops
+        && maxThirdPartyGossipHops <= maxGossipHops
         && verificationTokenExpiry <= federationFetchTimeoutMs
         && forwardNonceRetention >= messageMaxAge
   if not configOk
     then println "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
     else if not configRelationsOk
-    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, forwardNonceRetention >= messageMaxAge, per-key limits <= global limits), server not started"
+    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, maxThirdPartyGossipHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, forwardNonceRetention >= messageMaxAge, per-key limits <= global limits), server not started"
     else do
       t <- now
       atomic do
