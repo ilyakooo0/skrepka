@@ -505,6 +505,8 @@ type SenderExpiration = {senderKey: Text, messageId: MessageIdHex, toKey: Pubkey
 *fwdBucket14 : [ForwardEntry]
 *fwdBucket15 : [ForwardEntry]
 
+*totalForwardCount : Int
+
 -- Messages acked by local recipients, pending federation ack to origin server.
 -- Sharded into 16 buckets by pubkeyBucket(toKey) for O(n/16) dedup in sendMessageCore.
 *ackedBucket0 : [AckedEntry]
@@ -2339,8 +2341,10 @@ removeForwardsByServer = \server messageIds b acc ->
     removed <- atomic do
       bucket <- readFwdBucket b
       let matched = do f <- bucket; where f.toServer == server && any messageIds (\mid -> f.messageId == mid); yield f
-      when (count matched > 0)
-        (writeFwdBucket b (do f <- bucket; where not (f.toServer == server && any messageIds (\mid -> f.messageId == mid)); yield f))
+      when (count matched > 0) (do
+        writeFwdBucket b (do f <- bucket; where not (f.toServer == server && any messageIds (\mid -> f.messageId == mid)); yield f)
+        tfc <- *totalForwardCount
+        set *totalForwardCount = max 0 (tfc - count matched))
       yield matched
     removeForwardsByServer server messageIds (b + 1) (if count removed > 0 then union acc removed else acc)
 
@@ -2622,11 +2626,11 @@ dedupMessageIds = \messageIds ->
     else union [mid] acc) [] capped
 
 
--- Constant-time comparison iteration count. Derived from tokenHexLen (48) + 16
--- headroom. Must be >= the longest secret compared (tokens = tokenHexLen hex
--- chars, maintenance secret = variable). If tokenChunks changes, this adjusts
--- automatically.
-safeCompareLen = tokenHexLen + 16
+-- Constant-time comparison iteration count. Must be >= the longest secret
+-- compared: session tokens are tokenHexLen (48) hex chars, but maintenance
+-- secrets can be up to maxTokenLen (256) chars (validated by extractToken).
+-- Using maxTokenLen + 16 ensures full comparison for all accepted inputs.
+safeCompareLen = maxTokenLen + 16
 
 -- Constant-time string comparison to prevent timing side-channels.
 -- Always iterates safeCompareLen characters regardless of input length;
@@ -2985,8 +2989,10 @@ pruneExpired = \t -> do
   atomic do
     forwards <- readAllForwards
     -- Clear all forwards when federation is disabled (they can never be retried)
-    writeAllForwards (if not federationEnabled then []
-      else do f <- forwards; where f.createdAt > retainCutoff; yield f)
+    let prunedForwards = if not federationEnabled then []
+      else do f <- forwards; where f.createdAt > retainCutoff; yield f
+    writeAllForwards prunedForwards
+    set *totalForwardCount = count prunedForwards
   -- AckedIds: per-bucket pruning (each bucket in its own atomic block to reduce lock
   -- contention with poll-ack paths that write to ackedIds concurrently).
   pruneAllAckedBuckets 0 retainCutoff
@@ -3342,7 +3348,14 @@ withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
         Authorized {pubkey, ip} ->
           if not (matchIp clientIp ip)
             then onUnauth
-            else onAuth pubkey
+            else do
+              -- Sliding window: refresh session expiry on every authenticated operation.
+              -- Without this, users who send/lookup/ack but don't poll would have their
+              -- session expire after sessionExpiry even though they're actively using it.
+              -- Pre-filter by pubkey before safeCompare to avoid O(bucket_size) constant-time
+              -- comparisons (same optimization as reauthenticateSession).
+              writeSessionBucket bucket (do s <- sessions; yield (if s.pubkey == pubkey && safeCompare s.token token then {token: s.token, pubkey: s.pubkey, expiresAt: t + sessionExpiry, ip: s.ip, createdAt: s.createdAt} else s))
+              onAuth pubkey
 
 -- Check if a pubkey has no remaining sessions and, if so, clean up local presence.
 -- Must be called inside an atomic block after the session has already been removed.
@@ -3381,7 +3394,12 @@ gossipOfflineIfLastSession = \r label -> do
 removeForward = \mid srv toKey -> atomic do
   let b = pubkeyBucket toKey
   fwdBkt <- readFwdBucket b
-  writeFwdBucket b (forwardsExcluding fwdBkt srv [mid])
+  let kept = forwardsExcluding fwdBkt srv [mid]
+  writeFwdBucket b kept
+  let removed = count fwdBkt - count kept
+  when (removed > 0) (do
+    tfc <- *totalForwardCount
+    set *totalForwardCount = max 0 (tfc - removed))
 
 -- Reclaim origin messages after federation ack confirms delivery.
 -- Batched by message bucket: all entries for the same bucket are processed in one
@@ -3476,6 +3494,8 @@ incrementForwardRetries = \messageId toServer toKey -> atomic do
   if shouldDrop
     then do
       writeFwdBucket b (do f <- fwdBkt; where not (f.messageId == messageId && f.toServer == toServer); yield f)
+      tfc <- *totalForwardCount
+      set *totalForwardCount = max 0 (tfc - 1)
       logWarn ("federation: dropping forward " ++ messageId ++ " to " ++ toServer ++ " after " ++ show maxForwardRetries ++ " retries")
     else writeFwdBucket b (do f <- fwdBkt; yield (if f.messageId == messageId && f.toServer == toServer then {messageId: f.messageId, toServer: f.toServer, createdAt: f.createdAt, toKey: f.toKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, originServer: f.originServer, retries: f.retries + 1} else f))
 
@@ -3553,7 +3573,7 @@ forwardQueuedMessages = \targets t -> do
     let neededBuckets = uniqueBucketsFor remoteTargets (\target -> target.pubkey)
     relevantMessages <- readSelectedBuckets neededBuckets
     let candidates = forwardCandidates remoteTargets relevantMessages forwards t
-    let totalFwdCount <- countAllForwards 0
+    totalFwdCount <- *totalForwardCount
     -- Per-key cap: filter candidates to respect maxForwardsPerKey per recipient
     let perKeyCapped = fold (\acc c ->
       let existingForKey = count (do f <- forwards; where f.toKey == c.toKey; yield f)
@@ -3563,6 +3583,7 @@ forwardQueuedMessages = \targets t -> do
     -- Write back only the affected forward buckets (not all 16)
     let combined = union forwards capped
     writeSelectedFwdBuckets neededFwdBuckets combined
+    set *totalForwardCount = totalFwdCount + count capped
     yield capped
   let servers = collectPeerServers newForwards (\x -> x.toServer)
   failures <- *forwardFailures
@@ -3585,6 +3606,41 @@ fetchFederationAck = \origin messageIds -> do
     originServer: origin, fromServer: serverHostN,
     requestTimestamp: t, correlationId: corrId})
 
+-- Per-bucket ack retry increment: scans only the buckets containing entries from the batch.
+-- Each bucket is processed in its own atomic block to reduce lock contention.
+-- Drops entries exceeding maxAckRetries to deliveredIds. Returns total dropped count.
+incrementAckRetriesPerBucket = \bucketIds server batch droppedAcc ->
+  case headOf bucketIds of
+    Nothing {} -> yield droppedAcc
+    Just {value: b} -> do
+      let remainingBuckets = do x <- bucketIds; where x != b; yield x
+      bucketDropped <- atomic do
+        bucket <- readAckedBucket b
+        let isTarget = \a -> a.originServer == server && hasMessage a.messageId a.toKey batch
+        let toDrop = do a <- bucket; where isTarget a && a.retries + 1 >= maxAckRetries; yield a
+        let dropCount = count toDrop
+        writeAckedBucket b (do a <- bucket
+          where not (isTarget a && a.retries + 1 >= maxAckRetries)
+          yield (if isTarget a then {messageId: a.messageId, toKey: a.toKey, ackedAt: a.ackedAt, originServer: a.originServer, retries: a.retries + 1} else a))
+        when (dropCount > 0) (do
+          delivBkt <- readDelivBucket b
+          let newDelivered = do d <- toDrop; yield {messageId: d.messageId, toKey: d.toKey, deliveredAt: d.ackedAt}
+          let combined = union delivBkt newDelivered
+          writeDelivBucket b (if count combined > maxDeliveredIds then (evictSmallest combined (count combined - maxDeliveredIds) (\d -> d.deliveredAt)).kept else combined))
+        yield dropCount
+      incrementAckRetriesPerBucket remainingBuckets server batch (droppedAcc + bucketDropped)
+
+-- Per-bucket ack removal on success: only rewrites buckets containing matched entries.
+removeAckedPerBucket = \bucketIds server batch ->
+  case headOf bucketIds of
+    Nothing {} -> yield {}
+    Just {value: b} -> do
+      let remainingBuckets = do x <- bucketIds; where x != b; yield x
+      atomic do
+        bucket <- readAckedBucket b
+        writeAckedBucket b (do a <- bucket; where not (a.originServer == server && hasMessage a.messageId a.toKey batch); yield a)
+      removeAckedPerBucket remainingBuckets server batch
+
 sendBatchedAcksToServer : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> ServerName -> IO {network} {}
 sendBatchedAcksToServer = \serverAcks server ->
   forEachBatch serverAcks maxMessageIds (\batch -> do
@@ -3593,29 +3649,17 @@ sendBatchedAcksToServer = \serverAcks server ->
       Err e -> do
         logWarn ("federation: ack to " ++ server ++ " failed: " ++ show e)
         recordFailure server
-        -- Increment retry counters; drop entries exceeding maxAckRetries to deliveredIds
-        dropped <- atomic do
-          ackedIds <- readAllAcked
-          let isTarget = \a -> a.originServer == server && hasMessage a.messageId a.toKey batch
-          let toDrop = do a <- ackedIds; where isTarget a && a.retries + 1 >= maxAckRetries; yield a
-          let dropCount = count toDrop
-          writeAllAcked (do a <- ackedIds
-            where not (isTarget a && a.retries + 1 >= maxAckRetries)
-            yield (if isTarget a then {messageId: a.messageId, toKey: a.toKey, ackedAt: a.ackedAt, originServer: a.originServer, retries: a.retries + 1} else a))
-          when (dropCount > 0) (do
-            deliveredIds <- readAllDelivered
-            let newDelivered = do d <- toDrop; yield {messageId: d.messageId, toKey: d.toKey, deliveredAt: d.ackedAt}
-            let combined = union deliveredIds newDelivered
-            writeAllDelivered (if count combined > maxDeliveredIds then (evictSmallest combined (count combined - maxDeliveredIds) (\d -> d.deliveredAt)).kept else combined))
-          yield dropCount
+        -- Increment retry counters per-bucket; drop entries exceeding maxAckRetries to deliveredIds.
+        -- Only touches buckets containing entries from this batch (vs readAllAcked scanning all 16).
+        let affectedBuckets = uniqueBucketsFor batch (\a -> a.toKey)
+        dropped <- incrementAckRetriesPerBucket affectedBuckets server batch 0
         when (dropped > 0)
           (logWarn ("federation: dropped " ++ show dropped ++ " ack entries to " ++ server ++ " after " ++ show maxAckRetries ++ " retries"))
       Ok _ -> do
         clearFailure server
-        atomic do
-          ackedIds <- readAllAcked
-          let updatedAckedIds = ackedIdsExcludingBatch ackedIds server batch
-          writeAllAcked updatedAckedIds)
+        -- Remove acked entries per-bucket (vs readAllAcked/writeAllAcked repartitioning all 16)
+        let affectedBuckets = uniqueBucketsFor batch (\a -> a.toKey)
+        removeAckedPerBucket affectedBuckets server batch)
 
 -- Send delivery acknowledgments back to origin servers and remove acked entries on success
 sendAcksAndClean : [{messageId: MessageIdHex, toKey: PubkeyHex, originServer: ServerName, | a}] -> IO {network} {}
@@ -3771,8 +3815,13 @@ pruneAndRetry = \t -> do
     stored <- *totalSessionCount
     set *totalSessionCount = actual
     yield (actual - stored)
-  when (presDrift != 0 || sessDrift != 0)
-    (logInfo ("reconciliation: corrected drift — presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift))
+  fwdDrift <- atomic do
+    actual <- countAllForwards 0
+    stored <- *totalForwardCount
+    set *totalForwardCount = actual
+    yield (actual - stored)
+  when (presDrift != 0 || sessDrift != 0 || fwdDrift != 0)
+    (logInfo ("reconciliation: corrected drift — presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift ++ ", forwards: " ++ show fwdDrift))
   -- Message reconciliation: cheap check first (sum rcBucket .count fields vs totalMessageCount).
   -- Full scan only when drift detected or every Nth cycle (reconciliationFullCycleInterval).
   pc <- *pruneCount
@@ -4489,13 +4538,14 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId t ->
                   let fbi = pubkeyBucket to
                   fwdBkt <- readFwdBucket fbi
                   let newFwds = do s <- remoteServers; where none fwdBkt (\f -> f.messageId == effectiveMsgId && f.toServer == s); yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: serverHostN, retries: 0}
-                  totalFwdCount <- countAllForwards 0
+                  totalFwdCount <- *totalForwardCount
                   let globalCap = maxForwardsEntries - totalFwdCount
                   -- Per-key cap: prevents one key from consuming disproportionate forward slots
                   let keyFwdCount = count (do f <- fwdBkt; where f.toKey == to; yield f)
                   let keyCap = maxForwardsPerKey - keyFwdCount
                   let cappedFwds = takeRelation (min globalCap keyCap) newFwds
                   writeFwdBucket fbi (union fwdBkt cappedFwds)
+                  set *totalForwardCount = totalFwdCount + count cappedFwds
                   -- Return whether any forwards were actually enqueued (vs dropped by capacity cap)
                   yield (count cappedFwds > 0)
                 else yield (False {})
@@ -5300,9 +5350,14 @@ handleReconcile = \authorization respond -> do
       stored <- *totalSessionCount
       set *totalSessionCount = actual
       yield (actual - stored)
+    fwdDrift <- atomic do
+      actual <- countAllForwards 0
+      stored <- *totalForwardCount
+      set *totalForwardCount = actual
+      yield (actual - stored)
     msgDrift <- reconcileMessageCounts 0 0
-    when (presDrift != 0 || sessDrift != 0 || msgDrift != 0)
-      (logInfo ("reconcile: corrected drift — messages: " ++ show msgDrift ++ ", presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift))
+    when (presDrift != 0 || sessDrift != 0 || fwdDrift != 0 || msgDrift != 0)
+      (logInfo ("reconcile: corrected drift — messages: " ++ show msgDrift ++ ", presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift ++ ", forwards: " ++ show fwdDrift))
     yield (respond {ok: True {}, messageDrift: msgDrift, presenceDrift: presDrift, sessionDrift: sessDrift})
 
 -- Compute health state and update the cached health values.
@@ -5667,6 +5722,7 @@ handleRestore = \version checksumIn presenceData ackedIdsData ackOverflowData de
         let mergedForwards = mergeByKey (\a b -> a.messageId == b.messageId && a.toServer == b.toServer) (\x -> x.createdAt) existingForwards validForwards
         let cappedForwards = takeRelation maxForwardsEntries mergedForwards
         writeAllForwards cappedForwards
+        set *totalForwardCount = count cappedForwards
         -- Restore forward nonces (dedup by messageId + toKey + originServer, keep fresher on conflict)
         existingNonces <- readAllNonces
         let validNonces = do n <- forwardNoncesData; where n.seenAt <= t && t - n.seenAt < forwardNonceRetention; yield n
