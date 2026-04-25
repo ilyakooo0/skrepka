@@ -123,6 +123,13 @@ maxFederationInFlight = 100
 federationCircuitBreakerThreshold = 3
 -- Federation replay dedup: track recent (server, timestamp) pairs to reject exact replays
 maxRecentFederationRequests = 1000
+-- Forward nonce dedup: tracks (messageId, toKey) pairs to catch replays
+-- beyond the lifetime of messages/ackedIds/deliveredIds
+maxForwardNonces = 100000
+forwardNonceRetention : Int<Ms>
+forwardNonceRetention = messageMaxAge * 2 -- 60 days; extends 30 days beyond message dedup
+-- Counter reconciliation: every N prune cycles, recount from truth to self-heal drift
+reconciliationFrequency = 10
 
 -- Federation latency metric window
 federationLatencyWindowMs : Int<Ms>
@@ -475,6 +482,9 @@ type RecentFederationRequest = {server: Text, timestamp: Timestamp, seenAt: Time
 -- scope binds the token to a specific request type (gossip/forward/ack) to prevent cross-use
 *pendingVerifications : [{token: Text, createdAt: Timestamp, scope: Text}]
 
+-- Forward nonce dedup: (messageId, toKey, seenAt) for replay protection beyond message lifetime
+*forwardNonces : [{messageId: MessageIdHex, toKey: PubkeyHex, seenAt: Timestamp}]
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -538,7 +548,7 @@ route FederationApi where
 -- Federation callback verification: the receiving server calls back to the sender
 -- to confirm a request token is genuine. No shared secret needed.
 route FederationVerifyApi where
-  POST {token: Text, scope: Text} /federation/verify -> {ok: Bool} = VerifyToken
+  POST {token: Text, scope: Text} /federation/verify headers {clientIp: Text} -> {ok: Bool} = VerifyToken
 
 -- Triggers pruning of expired state and retry of pending federation ops
 route MaintenanceApi where
@@ -1658,6 +1668,9 @@ pruneExpired = \t -> do
     -- Prune expired federation verification tokens
     pending <- *pendingVerifications
     set *pendingVerifications = do p <- pending; where t - p.createdAt < verificationTokenExpiry; yield p
+    -- Prune expired forward nonces (extended replay protection)
+    forwardNonces <- *forwardNonces
+    set *forwardNonces = do n <- forwardNonces; where t - n.seenAt < forwardNonceRetention; yield n
   yield presenceResult
 
 
@@ -2173,6 +2186,28 @@ waitForInFlightDrain = \deadline -> do
 pruneAndRetry = \t -> do
   atomic do set *lastPrunedAt = t
   pr <- pruneExpired t
+  -- Periodic counter reconciliation: recount from actual data every N prune cycles to self-heal drift
+  pc <- *pruneCount
+  when (pc > 0 && pc - (pc / reconciliationFrequency) * reconciliationFrequency == 0) (do
+    msgDrift <- atomic do
+      allMsgs <- readAllMessages
+      let actual = count allMsgs
+      stored <- *totalMessageCount
+      set *totalMessageCount = actual
+      set *recipientMsgCounts = countByRecipient allMsgs
+      yield (actual - stored)
+    presDrift <- atomic do
+      actual <- countAllPresence
+      stored <- *totalPresenceCount
+      set *totalPresenceCount = actual
+      yield (actual - stored)
+    sessDrift <- atomic do
+      actual <- countAllSessions
+      stored <- *totalSessionCount
+      set *totalSessionCount = actual
+      yield (actual - stored)
+    when (msgDrift != 0 || presDrift != 0 || sessDrift != 0)
+      (println ("reconciliation: corrected drift — messages: " ++ show msgDrift ++ ", presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift)))
   pendingForwards <- atomic do f <- *forwards; yield f
   ackState <- atomic do
     ackedIds2 <- *ackedIds
@@ -2997,15 +3032,18 @@ handleLogout = \authorization clientIp respond -> do
 -- POST /federation/verify: Confirm a token was issued by this server.
 -- Called by the receiving server during federation callback verification.
 -- Tokens are single-use and expire after verificationTokenExpiry.
-handleVerifyToken = \token scope respond -> do
+handleVerifyToken = \token scope clientIp respond -> do
   t <- now
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {ok: False {}})
   else do
+  ipLimited <- checkIpRate clientIp t
+  if ipLimited then yield (respond {ok: False {}})
+  else do
   found <- atomic do
     pending <- *pendingVerifications
-    -- Empty scope accepts any (backward compat with peers that don't send scope yet)
-    let match = any pending (\p -> safeCompare p.token token && (scope == "" || p.scope == scope) && t - p.createdAt < verificationTokenExpiry)
+    -- Scope is required: callers must specify the operation type (gossip/forward/ack)
+    let match = any pending (\p -> safeCompare p.token token && p.scope == scope && t - p.createdAt < verificationTokenExpiry)
     when match (set *pendingVerifications = do p <- pending; where not (safeCompare p.token token); yield p)
     yield match
   yield (respond {ok: found})
@@ -3080,7 +3118,8 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
       bucket <- readMessageBucket msgBucket
       ackedIds <- *ackedIds
       deliveredIds <- *deliveredIds
-      let isDup = checkMessageDup bucket messageId toKey || hasMessage messageId toKey ackedIds || hasMessage messageId toKey deliveredIds
+      forwardNonces <- *forwardNonces
+      let isDup = checkMessageDup bucket messageId toKey || hasMessage messageId toKey ackedIds || hasMessage messageId toKey deliveredIds || any forwardNonces (\n -> n.messageId == messageId && n.toKey == toKey)
       if isDup
         then yield {forward: ForwardDuplicate {}, globalCapReached: False {}, recvRateLimited: False {}}
         else do
@@ -3120,6 +3159,10 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                       set *totalMessageCount = totalMsgCount + 1
                       set *recipientMsgCounts = adjustRecipientCount recipientCounts toKey 1
                       signalMessageForKey toKey seqTs
+                      -- Record forward nonce for replay protection beyond message/ack dedup lifetime
+                      fwdNonces <- *forwardNonces
+                      let updatedNonces = union fwdNonces [{messageId: messageId, toKey: toKey, seenAt: t}]
+                      set *forwardNonces = if count updatedNonces > maxForwardNonces then evictOneOldest updatedNonces (\n -> n.seenAt) else updatedNonces
                       yield {forward: ForwardStored {}, globalCapReached: False {}, recvRateLimited: False {}}
     case result.forward of
       ForwardRejected {} ->
@@ -3440,7 +3483,7 @@ serve = \req -> case req of
   RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp authorization respond
   ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp authorization respond
   FederationAck {messageIds, originServer, fromServer, requestTimestamp, authorization, respond} -> handleFederationAck messageIds originServer fromServer requestTimestamp authorization respond
-  VerifyToken {token, scope, respond} -> handleVerifyToken token scope respond
+  VerifyToken {token, scope, clientIp, respond} -> handleVerifyToken token scope clientIp respond
   Prune {authorization, respond} -> handlePrune authorization respond
   Drain {authorization, respond} -> handleDrain authorization respond
   Undrain {authorization, respond} -> handleUndrain authorization respond
@@ -3561,6 +3604,7 @@ main = do
         && verificationTokenExpiry > 0
         && maxAckRetries > 0 && maxPairRatePerPair > 0 && pairRateWindowMs > 0
         && maxFederationPairRatePerPair > 0 && federationPairRateWindowMs > 0
+        && reconciliationFrequency > 0 && maxForwardNonces > 0
   -- Relationship invariants: these misconfigurations cause subtle bugs
   -- (e.g., messages pruned before their stated max age, backoff that never increases)
   let configRelationsOk = unackedMessageMaxAge <= messageMaxAge
@@ -3579,15 +3623,20 @@ main = do
         && maxAckOverflow <= maxAckedIds
         && gossipOriginHops <= maxGossipHops
         && verificationTokenExpiry <= federationFetchTimeoutMs
+        && forwardNonceRetention >= messageMaxAge
   if not configOk
     then println "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
     else if not configRelationsOk
-    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, per-key limits <= global limits), server not started"
+    then println "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, forwardNonceRetention >= messageMaxAge, per-key limits <= global limits), server not started"
     else do
       t <- now
       atomic do
         set *startedAt = t
         set *serverGeneration = t
+      when (maintenanceSecret == "")
+        (println "WARNING: maintenanceSecret is empty — /maintenance/* and /stats endpoints are disabled")
+      when (matchesHostnameOrSubdomain serverHostN "localhost")
+        (println ("WARNING: serverHost is " ++ serverHost ++ " — peers cannot reach this server for federation"))
       println "Skrepka relay server starting on port 8080..."
       println ("  federation: " ++ if federationEnabled then "enabled" else "disabled")
       println ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")
