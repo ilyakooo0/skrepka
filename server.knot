@@ -845,10 +845,11 @@ authenticateSession = \sessions token t ->
     Nothing {} -> Unauthorized {}
     Just {value: s} -> Authorized {pubkey: s.pubkey, ip: s.ip}
 
--- Extract bearer token from "Authorization: Bearer <token>" header
+-- Extract bearer token from "Authorization: Bearer <token>" header.
+-- Rejects empty tokens early to avoid unnecessary session bucket scans.
 extractToken = \authHeader ->
   let token = drop 7 authHeader in
-  if toLower (take 7 authHeader) == "bearer " && not (tooLong token maxTokenLen)
+  if toLower (take 7 authHeader) == "bearer " && token != "" && not (tooLong token maxTokenLen)
     then Just {value: token}
     else Nothing {}
 
@@ -885,6 +886,7 @@ generateFederationAuth = \scope -> do
 -- Verify an inbound federation token by callback to the sender's /federation/verify endpoint.
 -- Single-use: the sender consumes the token on verification.
 -- scope must match the scope the token was generated with; empty scope accepts any (backward compat).
+-- Retries once on network error to handle transient failures (e.g., peer restarting).
 verifyFederationCallback : Text -> Text -> Text -> IO {network} Bool
 verifyFederationCallback = \fromServer authorization scope ->
   case extractToken authorization of
@@ -893,8 +895,14 @@ verifyFederationCallback = \fromServer authorization scope ->
       result <- fetch (federationUrl fromServer) (VerifyToken {token: token, scope: scope})
       case result of
         Err e -> do
-          println ("federation: verify callback to " ++ fromServer ++ " failed: " ++ show e)
-          yield (False {})
+          println ("federation: verify callback to " ++ fromServer ++ " failed (attempt 1): " ++ show e)
+          sleep 1000
+          result2 <- fetch (federationUrl fromServer) (VerifyToken {token: token, scope: scope})
+          case result2 of
+            Err e2 -> do
+              println ("federation: verify callback to " ++ fromServer ++ " failed (attempt 2): " ++ show e2)
+              yield (False {})
+            Ok r -> yield r.ok
         Ok r -> yield r.ok
 
 -- ============================================
@@ -1417,11 +1425,15 @@ safeCompare = \a b ->
   if take 1 a == "" || take 1 b == "" then False {}
   else safeCompareLoop a b maxTokenLen 0 0 == 0
 
--- Constant-time IP binding check: returns True if IPs match or either is empty (no binding).
+-- Constant-time IP binding check: returns True if IPs match or no binding is configured.
+-- When a session was created with an IP (behind a proxy), requests without an IP header
+-- are rejected — prevents bypass if the proxy is removed mid-session.
 -- Uses safeCompareLoop to prevent timing side-channels on IP comparison.
 matchIp : Text -> Text -> Bool
 matchIp = \clientIp sessionIp ->
-  clientIp == "" || sessionIp == "" || safeCompareLoop clientIp sessionIp maxServerNameLen 0 0 == 0
+  if sessionIp == "" then True {} -- no binding configured for this session
+  else if clientIp == "" then False {} -- session has IP but request doesn't — proxy disappeared
+  else safeCompareLoop clientIp sessionIp maxServerNameLen 0 0 == 0
 
 -- Generic sliding-window rate limiter. Returns whether the request is rate-limited
 -- and the updated entries list. Callers provide match/create/update functions for their entry type.
@@ -1671,13 +1683,14 @@ pruneExpired = \t -> do
     set *recentGossip = do r <- recentGossip; where t - r.seenAt < gossipDedupWindow; yield r
     -- Clean up stale in-flight entries: remove zeroed entries and reset leaked slots
     -- where the forked task died without calling clearFederationInFlight.
-    -- Uses 2x timeout threshold (tighter than the skip-hung-server logic at 1x)
-    -- so leaked slots are reclaimed promptly after the skip logic has already taken effect.
+    -- Uses 1.5x timeout threshold so leaked slots are reclaimed promptly
+    -- after the skip-hung-server logic (at 1x) has already taken effect.
     inFlight <- *federationInFlight
-    let staleInFlight = do r <- inFlight; where r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= federationFetchTimeoutMs * 2; yield r
+    let staleThreshold = federationFetchTimeoutMs * 3 / 2
+    let staleInFlight = do r <- inFlight; where r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= staleThreshold; yield r
     when (count staleInFlight > 0)
       (println ("pruneExpired: cleaning " ++ show (count staleInFlight) ++ " stale in-flight entries (leaked slots)"))
-    set *federationInFlight = do r <- inFlight; where r.count > 0 && (r.firstStartedAt == 0 || t - r.firstStartedAt < federationFetchTimeoutMs * 2); yield r
+    set *federationInFlight = do r <- inFlight; where r.count > 0 && (r.firstStartedAt == 0 || t - r.firstStartedAt < staleThreshold); yield r
     -- Prune stale federation replay dedup entries
     recentFedReqs <- *recentFederationRequests
     set *recentFederationRequests = do r <- recentFedReqs; where t - r.seenAt < clockSkewTolerance * 2; yield r
@@ -2437,8 +2450,10 @@ pollOnce = \token cursor clientIp -> do
                       r <- pollNewEvents s.pubkey s.clampedCursor t2
                       yield {authorized: True {}, events: r.events, cursor: r.cursor}
                 yield {authorized: result.authorized, events: result.events, cursor: result.cursor}
-          -- Release poll slot. Safety net: if this is never reached (e.g., panic between
-          -- acquire and release), pruneExpired cleans stale entries after pollTimeoutMs * 3.
+          -- Release poll slot. Safety: the code between acquire and release only contains
+          -- atomic reads and STM retry (no IO that can throw), so this path is always reached.
+          -- If it ever isn't (e.g., runtime panic), pruneExpired cleans stale entries
+          -- after pollTimeoutMs * 3 as a safety net.
           atomic do
             activePolls <- *activePolls
             set *activePolls = removeOneForKey activePolls s.pubkey
@@ -2734,10 +2749,10 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
   let effectiveCursor = if generation == serverGen then cursor else 0
   let cappedWatchKeys = takeRelation maxWatchKeys watchKeys
   draining <- *draining
-  if draining then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: []})
+  if draining then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}})
   else do
   globalRateLimited <- checkGlobalRate t
-  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: []})
+  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}})
   else do
     result <- case extractToken authorization of
       Nothing {} -> yield {authorized: False {}, events: [], cursor: 0, pendingAcks: [], evictedEntries: []}
@@ -2752,7 +2767,8 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
     fork (when federationEnabled (do
       sendAcksAndClean result.pendingAcks
       retryEvictedAcks result.evictedEntries result.pendingAcks))
-    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates})
+    let isHeartbeat = result.authorized && count result.events == 0
+    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat})
 
 -- POST /messages: Send an encrypted message to a recipient.
 -- Deduplicates by messageId across messages, ackedIds, and deliveredIds.
@@ -2766,6 +2782,10 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp
     if t - timestamp > messageMaxAge
       then yield (respond {status: MsRejected {}, messageId: ""})
       else do
+    when (timestamp > t + clockSkewTolerance)
+      (println ("sendMessage: future timestamp detected (+" ++ show (timestamp - t) ++ "ms ahead), clamping to now"))
+    when (timestamp < t - messageMaxAge / 2)
+      (println ("sendMessage: stale timestamp (" ++ show ((t - timestamp) / 86400000) ++ " days old) for " ++ effectiveMsgId))
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       draining <- *draining
@@ -2836,6 +2856,10 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp
                           let toPresence = presenceForKey recipientPresence to t
                           let localOnline = hasLocalPresence toPresence
                           let remoteServers = collectPeerServers toPresence (\p -> p.server)
+                          -- Note: DsFederated means "queued for federation forwarding", not
+                          -- "confirmed delivered to remote server". The actual HTTP forward
+                          -- happens asynchronously in a fork below; retries are handled by
+                          -- the background prune cycle if the initial attempt fails.
                           let delivery = if localOnline then DsDelivered {}
                             else if federationEnabled && count remoteServers > 0 then DsFederated {}
                             else DsQueued {}
@@ -3099,14 +3123,20 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorizati
     let deduped = mergeByPubkeyServer [] filteredOnline
     gossipResult <- atomic do
       allPresence <- readAllPresence
-      let gm = mergeGossipPresence allPresence deduped trustedOffline fromServer t
+      tpc <- *totalPresenceCount
+      -- Pre-filter: when near capacity, reject gossip entries for pubkeys not already in presence.
+      -- This prevents a malicious peer from spiking presence above maxPresenceEntries via large batches.
+      let capacityDeduped = if tpc >= maxPresenceEntries
+        then do d <- deduped; where any allPresence (\p -> p.pubkey == d.pubkey); yield d
+        else deduped
+      let gm = mergeGossipPresence allPresence capacityDeduped trustedOffline fromServer t
       writeAllPresence gm.finalPresence
       set *totalPresenceCount = count gm.finalPresence
       set *knownPeerServers = gm.gossipPeerServers
-      yield {gm: gm}
+      yield {gm: gm, preFiltered: count deduped - count capacityDeduped}
     let effectiveEvents = union (effectiveGossipEvents filteredOnline gossipResult.gm.appliedKeys (GossipOnline {})) (effectiveGossipEvents filteredOffline gossipResult.gm.appliedKeys (GossipOffline {}))
-    when (not gossipResult.gm.withinCapacity)
-      (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer))
+    when (not gossipResult.gm.withinCapacity || gossipResult.preFiltered > 0)
+      (println ("gossip: presence at capacity (" ++ show maxPresenceEntries ++ "), limiting new entries from " ++ fromServer ++ " (pre-filtered: " ++ show gossipResult.preFiltered ++ ")"))
     -- Suppress re-broadcast of events we've already gossiped recently (prevents amplification)
     freshEvents <- atomic do
       recentGossip <- *recentGossip
@@ -3417,9 +3447,10 @@ handleStats = \authorization respond -> do
       let fwdPct = if maxForwardsEntries > 0 then result.forwards * 100 / maxForwardsEntries else 0
       let sessPct = if maxSessions > 0 then result.sessions * 100 / maxSessions else 0
       let fedAvg = if result.federationLatencyCount > 0 then result.federationLatencyTotal / result.federationLatencyCount else 0
+      let hungFedSlots = count (do r <- core.fi; where r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= federationFetchTimeoutMs; yield r)
       let oldestFwdAge = case minBy core.f (\x -> x.createdAt) of Nothing {} -> 0; Just {value: x} -> t - x.createdAt
       let oldestAckAge = case minBy core.a (\x -> x.ackedAt) of Nothing {} -> 0; Just {value: x} -> t - x.ackedAt
-      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pairRates: result.pairRates, federationPairRates: result.federationPairRates, pruneCount: result.pruneCount, pruneRunning: result.pruneRunning, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, draining: result.draining, federationEnabled: federationEnabled, recentGossip: result.recentGossip, totalMessageCount: result.totalMessageCount, recipientCounts: result.recipientCounts, federationInFlight: result.federationInFlight, messagesPct: msgPct, presencePct: presPct, forwardsPct: fwdPct, sessionsPct: sessPct, federationAvgLatencyMs: fedAvg, federationMaxLatencyMs: result.federationLatencyMax, federationCallCount: result.federationLatencyCount, drainCompletedAt: result.drainCompletedAt, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, ok: True {}})
+      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pairRates: result.pairRates, federationPairRates: result.federationPairRates, pruneCount: result.pruneCount, pruneRunning: result.pruneRunning, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, draining: result.draining, federationEnabled: federationEnabled, recentGossip: result.recentGossip, totalMessageCount: result.totalMessageCount, recipientCounts: result.recipientCounts, federationInFlight: result.federationInFlight, hungFederationSlots: hungFedSlots, messagesPct: msgPct, presencePct: presPct, forwardsPct: fwdPct, sessionsPct: sessPct, federationAvgLatencyMs: fedAvg, federationMaxLatencyMs: result.federationLatencyMax, federationCallCount: result.federationLatencyCount, drainCompletedAt: result.drainCompletedAt, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, ok: True {}})
     else yield (respond zeroStats)
 
 handleStatsPeers = \authorization respond -> do
@@ -3705,6 +3736,7 @@ main = do
         (println "WARNING: maintenanceSecret is empty — /maintenance/* and /stats endpoints are disabled")
       when (matchesHostnameOrSubdomain serverHostN "localhost")
         (println ("WARNING: serverHost is " ++ serverHost ++ " — peers cannot reach this server for federation"))
+      println "NOTE: IP binding is active — sessions created with a ClientIp header will reject requests without one"
       println "Skrepka relay server starting on port 8080..."
       println ("  federation: " ++ if federationEnabled then "enabled" else "disabled")
       println ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")

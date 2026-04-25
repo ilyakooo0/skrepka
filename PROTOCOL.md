@@ -409,13 +409,16 @@ The server fills in `from` from the authenticated session.
 **Response:**
 ```json
 {
-  "status": "delivered" | "queued",
+  "status": "delivered" | "federated" | "queued",
   "message_id": "<server_assigned_id>"
 }
 ```
 
-- `delivered` — recipient is online, message was forwarded.
-- `queued` — recipient is offline, message is queued for later delivery.
+- `delivered` — recipient is online locally, message is available for polling.
+- `federated` — recipient is known to be online on a remote server; message has been accepted for federation forwarding. This does **not** guarantee delivery to the remote server — the forward is attempted asynchronously and retried on failure.
+- `queued` — recipient is offline or unknown, message is queued for later delivery.
+
+**`message_id` field:** If the client sends a non-empty `messageId` in the request, the server uses it for deduplication (idempotent sends). If omitted or empty, the server generates a unique ID and returns it. Clients that do not need idempotency may omit it.
 
 #### `POST /messages/ack` — Acknowledge receipt
 
@@ -636,6 +639,12 @@ Alice does not need to stay online. Her server handles delivery independently.
 - If the sender's server goes down before delivering, queued messages are **lost**. This is an accepted tradeoff — servers are disposable.
 - If the recipient never comes back online within 30 days, the message is deleted.
 - The sender sees `queued` status until ACK is received, at which point it becomes `delivered`.
+
+### Message Ordering
+
+Message ordering is **best-effort** and guaranteed only within a single server. Each server maintains a monotonic sequence counter (`receivedAt`) that provides strict ordering for locally stored messages. The `cursor` returned by `/poll` reflects this sequence.
+
+Across federated servers, messages may arrive out of order due to network latency, retry delays, or differing reception times. Clients SHOULD use the sender-provided `timestamp` field for display ordering and treat `cursor` as a polling checkpoint only, not a global ordering guarantee.
 
 ---
 
