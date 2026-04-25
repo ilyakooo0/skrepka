@@ -335,7 +335,7 @@ type IpRateEntry = {ip: Text, windowStart: Timestamp, count: Int}
 type LookupRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
 -- Tracks recently re-broadcast gossip events to suppress amplification from duplicate cycles
 type RecentGossipEntry = {pubkey: PubkeyHex, server: Text, timestamp: Timestamp, seenAt: Timestamp}
-type PeerStatus = {server: Text, failures: Int, lastFailedAt: Timestamp, firstFailedAt: Timestamp, backoffMs: Int, retriable: Bool}
+type PeerStatus = {server: Text, failures: Int, lastFailedAt: Timestamp, firstFailedAt: Timestamp, backoffMs: Int, retriable: Bool, pendingForwards: Int}
 type KeyPresenceEntry = {server: Text, expiresAt: Timestamp}
 type RecipientCount = {pubkey: PubkeyHex, count: Int}
 type FederationInFlightEntry = {server: Text, count: Int, firstStartedAt: Timestamp}
@@ -723,7 +723,7 @@ route AuthApi where
 route ClientApi where
   -- Long-poll for new messages; cursor tracks last-seen receivedAt timestamp
   POST {cursor: Timestamp, generation: Int, watchKeys: [PubkeyHex]} /poll headers {authorization: Text, clientIp: Text}
-    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, presenceUpdates: [{pubkey: PubkeyHex, online: Bool}], heartbeat: Bool, retryAfterMs: Int}
+    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, presenceUpdates: [{pubkey: PubkeyHex, online: Bool}], heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool}
     = Poll
   /messages
     -- Send an E2E encrypted message to a recipient pubkey
@@ -838,7 +838,7 @@ route MaintenanceApi where
     = SetRateLimits
 
 route HealthApi where
-  GET /health headers {authorization: Text} -> {ok: Bool, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, federationHealthy: Bool, snapshotHealthy: Bool, watchdogHealthy: Bool} = Health
+  GET /health headers {authorization: Text} -> {ok: Bool, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, federationHealthy: Bool, snapshotHealthy: Bool, watchdogHealthy: Bool, draining: Bool} = Health
 
 -- Returns counts of in-memory collections (requires maintenance secret)
 -- TODO: If Knot adds raw text response support, add a /metrics endpoint
@@ -1670,10 +1670,13 @@ pruneMessageBucket = \b messageCutoff -> atomic do
 -- deltas and apply them in a single final atomic block.
 pruneMessageBucketsConcurrent = \b messageCutoff ->
   if b > 15 then yield {}
-  else if b < 15 then do
-    fork (pruneMessageBucket b messageCutoff)
-    pruneMessageBucketsConcurrent (b + 1) messageCutoff
-  else pruneMessageBucket b messageCutoff
+  else do
+    bucket <- readMessageBucket b
+    if count bucket == 0 then pruneMessageBucketsConcurrent (b + 1) messageCutoff
+    else if b < 15 then do
+      fork (pruneMessageBucket b messageCutoff)
+      pruneMessageBucketsConcurrent (b + 1) messageCutoff
+    else pruneMessageBucket b messageCutoff
 
 -- Per-bucket message reconciliation: reads one bucket per atomic block instead of all 16
 -- at once, reducing lock contention during reconciliation. Each pubkey maps to exactly one
@@ -3783,13 +3786,17 @@ verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t ->
 handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
   t <- now
   serverGen <- *serverGeneration
-  let effectiveCursor = if generation == serverGen then cursor else 0
+  let generationMismatch = generation != serverGen
+  let effectiveCursor = if generationMismatch then 0 else cursor
+  -- Cursor reset: generation changed (server restarted) and client had a non-zero cursor.
+  -- Tells the client their cursor was invalidated so they can handle re-delivery.
+  let cursorWasReset = generationMismatch && cursor > 0
   let cappedWatchKeys = takeRelation maxWatchKeys watchKeys
   draining <- *draining
-  if draining then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0})
+  if draining then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0, cursorReset: cursorWasReset})
   else do
   globalRateLimited <- checkGlobalRate t
-  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: globalRateWindowMs})
+  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: globalRateWindowMs, cursorReset: cursorWasReset})
   else do
     -- Snapshot presenceVersion before long-poll wait to skip unchanged lookups
     startPresenceVersion <- *presenceVersion
@@ -3812,7 +3819,7 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
       sendAcksAndClean result.pendingAcks
       retryEvictedAcks result.evictedEntries result.pendingAcks))
     let isHeartbeat = result.authorized && count result.events == 0
-    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat, retryAfterMs: 0})
+    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat, retryAfterMs: 0, cursorReset: cursorWasReset})
 
 -- Core send logic: dedup, rate limiting, store message, create forwards.
 -- Called inside an atomic block by both handleSendMessage and sendBatchInner.
@@ -4589,7 +4596,8 @@ handleHealth = \authorization respond -> do
       cF <- *cachedHealthFederation
       cS <- *cachedHealthSnapshot
       cW <- *cachedHealthWatchdog
-      yield {ok: cOk, pruneHealthy: cP, heartbeatHealthy: cH, capacityHealthy: cC, federationHealthy: cF, snapshotHealthy: cS, watchdogHealthy: cW}
+      isDraining <- *draining
+      yield {ok: cOk && not isDraining, pruneHealthy: cP, heartbeatHealthy: cH, capacityHealthy: cC, federationHealthy: cF, snapshotHealthy: cS, watchdogHealthy: cW, draining: isDraining}
     yield (respond cached)
   else do
   let isAuthed = verifyMaintenanceAuth authorization
@@ -4607,6 +4615,7 @@ handleHealth = \authorization respond -> do
     forwardFailures <- *forwardFailures
     pruneRun <- *pruneRunning
     lastSnap <- *lastSnapshotExportAt
+    isDraining <- *draining
     let warmup = t - sa < healthPruneMaxAge
     let pruneStuck = pruneRun > 0 && t - pruneRun > backgroundPruneInterval * 2
     -- Capacity pressure: flag when any capped collection exceeds 90% full
@@ -4631,8 +4640,10 @@ handleHealth = \authorization respond -> do
            capacityOk: capacityOk,
            federationOk: fedOk,
            snapshotOk: snapOk,
-           watchdogOk: wdOk}
-  let allOk = result.pruneOk && result.heartbeatOk && result.capacityOk && result.federationOk && result.snapshotOk && result.watchdogOk
+           watchdogOk: wdOk,
+           isDraining: isDraining}
+  -- Draining servers report ok=False so load balancers stop routing traffic to them
+  let allOk = not result.isDraining && result.pruneOk && result.heartbeatOk && result.capacityOk && result.federationOk && result.snapshotOk && result.watchdogOk
   -- Cache health result for rate-limited responses
   atomic do
     set *cachedHealthOk = allOk
@@ -4644,19 +4655,22 @@ handleHealth = \authorization respond -> do
     set *cachedHealthWatchdog = result.watchdogOk
   -- Unauthenticated: return real ok boolean so load balancers can route around unhealthy nodes,
   -- but hide subsystem breakdown to prevent targeted load-correlation attacks.
+  -- Draining status is always visible (load balancers need it for routing decisions).
   if isAuthed
     then yield (respond {ok: allOk, pruneHealthy: result.pruneOk,
                   heartbeatHealthy: result.heartbeatOk,
                   capacityHealthy: result.capacityOk,
                   federationHealthy: result.federationOk,
                   snapshotHealthy: result.snapshotOk,
-                  watchdogHealthy: result.watchdogOk})
+                  watchdogHealthy: result.watchdogOk,
+                  draining: result.isDraining})
     else yield (respond {ok: allOk, pruneHealthy: True {},
                   heartbeatHealthy: True {},
                   capacityHealthy: True {},
                   federationHealthy: True {},
                   snapshotHealthy: True {},
-                  watchdogHealthy: True {}})
+                  watchdogHealthy: True {},
+                  draining: result.isDraining})
 
 zeroStats = {ok: False {}, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}}}
 
@@ -4742,8 +4756,16 @@ handleStatsPeers = \authorization respond -> do
   if authorized
     then do
       failures <- *forwardFailures
-      let peers = do f <- failures; yield {server: f.server, failures: f.failures, lastFailedAt: f.failedAt, firstFailedAt: f.firstFailedAt, backoffMs: retryBackoffFor f.failures f.server, retriable: shouldRetryServer f.server t failures}
-      yield (respond {peers: peers, ok: True {}})
+      forwards <- readAllForwards
+      -- Count pending forwards per server in a single pass
+      let fwdCounts = fold (\acc f ->
+        if any acc (\a -> a.server == f.toServer) then do a <- acc; yield (if a.server == f.toServer then {server: a.server, count: a.count + 1} else a)
+        else union acc [{server: f.toServer, count: 1}]) [] forwards
+      let fwdCountFor = \server -> fold (\acc c -> if c.server == server then c.count else acc) 0 fwdCounts
+      let peers = do f <- failures; yield {server: f.server, failures: f.failures, lastFailedAt: f.failedAt, firstFailedAt: f.firstFailedAt, backoffMs: retryBackoffFor f.failures f.server, retriable: shouldRetryServer f.server t failures, pendingForwards: fwdCountFor f.server}
+      -- Include servers with pending forwards but no failure records
+      let fwdOnlyPeers = do c <- fwdCounts; where none failures (\f -> f.server == c.server); yield {server: c.server, failures: 0, lastFailedAt: 0, firstFailedAt: 0, backoffMs: 0, retriable: True {}, pendingForwards: c.count}
+      yield (respond {peers: union peers fwdOnlyPeers, ok: True {}})
     else yield (respond {peers: [], ok: False {}})
 
 handleStatsKey = \pubkey authorization respond -> do
@@ -5155,12 +5177,14 @@ handleAdminRevokeSessions = \pubkey authorization respond -> do
 -- POST /maintenance/messages/purge: Purge all pending messages for a specific pubkey.
 -- Use for inbox-bombing abuse response: clears the recipient's mailbox without
 -- requiring their session token. Also cancels pending forwards for purged messages.
+-- Federated messages (originServer != "") generate ack entries so origin servers
+-- can reclaim their forward entries instead of retrying until prune.
 handleAdminPurgeMessages = \pubkey authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, purgedCount: 0})
   else do
     t <- now
-    purgedCount <- atomic do
+    purgeResult <- atomic do
       let b = pubkeyBucket pubkey
       bucket <- readMessageBucket b
       let toDelete = do m <- bucket; where m.toKey == pubkey; yield m
@@ -5176,11 +5200,27 @@ handleAdminPurgeMessages = \pubkey authorization respond -> do
         let pfb = pubkeyBucket pubkey
         fwdBkt <- readFwdBucket pfb
         writeFwdBucket pfb (do f <- fwdBkt; where none deletedMsgIds (\mid -> f.messageId == mid && f.toKey == pubkey); yield f)
-        yield removed
-      else yield 0
-    when (purgedCount > 0)
-      (logInfo ("admin: purged " ++ show purgedCount ++ " messages for " ++ pubkey))
-    yield (respond {ok: True {}, purgedCount: purgedCount})
+        -- Create ack entries for federated messages so origin servers learn about the purge
+        let federatedPurged = do m <- toDelete; where m.originServer != ""; yield m
+        let ackedFederated = federatedAckEntries federatedPurged t
+        if count ackedFederated > 0 then do
+          ackedBkt <- readAckedBucket b
+          let combinedAcked = union ackedBkt ackedFederated
+          let excessCount = max 0 (count combinedAcked - maxAckedIds)
+          let eviction = evictSmallest combinedAcked excessCount (\a -> a.ackedAt)
+          writeAckedBucket b eviction.kept
+          yield {purgedCount: removed, pendingAcks: ackedFederated, evictedEntries: eviction.evicted}
+        else yield {purgedCount: removed, pendingAcks: [], evictedEntries: []}
+      else yield {purgedCount: 0, pendingAcks: [], evictedEntries: []}
+    when (purgeResult.purgedCount > 0)
+      (logInfo ("admin: purged " ++ show purgeResult.purgedCount ++ " messages for " ++ pubkey))
+    when (count purgeResult.pendingAcks > 0)
+      (logInfo ("admin: sending federation acks for " ++ show (count purgeResult.pendingAcks) ++ " purged federated messages"))
+    -- Send federation acks in the background (same pattern as handleAckMessages)
+    fork (when federationEnabled (do
+      sendAcksAndClean purgeResult.pendingAcks
+      retryEvictedAcks purgeResult.evictedEntries purgeResult.pendingAcks))
+    yield (respond {ok: True {}, purgedCount: purgeResult.purgedCount})
 
 -- GET /maintenance/rate-limits: Return current effective rate limits.
 handleGetRateLimits = \authorization respond -> do
