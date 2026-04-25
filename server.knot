@@ -185,6 +185,11 @@ maxIpRatePerIp = 10 -- max auth requests per IP per window
 ipRateWindowMs : Int<Ms>
 ipRateWindowMs = 1000
 maxIpRateEntries = 5000
+-- Per-IP unique key tracking (detects key-rotation abuse: single IP authenticating many distinct pubkeys)
+maxUniqueKeysPerIp = 20 -- max distinct pubkeys per IP per window before throttling
+uniqueKeyIpWindowMs : Int<Ms>
+uniqueKeyIpWindowMs = 60000 -- 1 minute
+maxUniqueKeyIpEntries = 5000
 -- Lookup rate limiting (per-key, on presence lookups)
 maxLookupRatePerKey = 5 -- max lookups per key per window
 lookupRateWindowMs : Int<Ms>
@@ -318,6 +323,8 @@ type FederationInFlightEntry = {server: Text, count: Int, firstStartedAt: Timest
 -- Tracks recent federation request (server, timestamp) pairs for replay detection
 type RecentFederationRequest = {server: Text, timestamp: Timestamp, seenAt: Timestamp}
 type GossipEventRateEntry = {server: Text, windowStart: Timestamp, count: Int}
+-- Tracks unique pubkeys authenticated per IP (key-rotation abuse detection)
+type UniqueKeyIpEntry = {ip: Text, keys: [PubkeyHex], windowStart: Timestamp}
 
 -- Forward nonce for extended replay protection (persisted in snapshots)
 type ForwardNonce = {messageId: MessageIdHex, toKey: PubkeyHex, originServer: Text, seenAt: Timestamp}
@@ -338,8 +345,8 @@ type BatchResult = {messageId: OptionalMessageId, status: MessageStatus}
 -- Hot-path auth scans only one bucket (~1/16 of sessions).
 -- TODO: If Knot adds indexed arrays or maps, replace the 16 manual bucket
 -- refs and their if-else dispatch chains with a single indexed collection.
--- This would eliminate ~800 lines of mechanical boilerplate across sessions,
--- messages, presence, and signal buckets.
+-- This would eliminate ~1000 lines of mechanical boilerplate across sessions,
+-- messages, presence, signal, and recipientCount buckets.
 *sessionBucket0 : [Session]
 *sessionBucket1 : [Session]
 *sessionBucket2 : [Session]
@@ -486,8 +493,24 @@ type BatchResult = {messageId: OptionalMessageId, status: MessageStatus}
 
 *lastFederationSuccessAt : Timestamp
 
--- Per-recipient message counts (avoids O(n) scan of all messages on send/forward)
-*recipientMsgCounts : [RecipientCount]
+-- Per-recipient message counts sharded into 16 buckets by pubkeyBucket.
+-- Each pubkey maps to exactly one bucket, so lookups scan ~1/16 of entries.
+*rcBucket0 : [RecipientCount]
+*rcBucket1 : [RecipientCount]
+*rcBucket2 : [RecipientCount]
+*rcBucket3 : [RecipientCount]
+*rcBucket4 : [RecipientCount]
+*rcBucket5 : [RecipientCount]
+*rcBucket6 : [RecipientCount]
+*rcBucket7 : [RecipientCount]
+*rcBucket8 : [RecipientCount]
+*rcBucket9 : [RecipientCount]
+*rcBucket10 : [RecipientCount]
+*rcBucket11 : [RecipientCount]
+*rcBucket12 : [RecipientCount]
+*rcBucket13 : [RecipientCount]
+*rcBucket14 : [RecipientCount]
+*rcBucket15 : [RecipientCount]
 
 -- Tracks outstanding federation fetches per server (detects hung connections)
 *federationInFlight : [FederationInFlightEntry]
@@ -547,6 +570,10 @@ type BatchResult = {messageId: OptionalMessageId, status: MessageStatus}
 -- Deferred ack cleanups: origin message reclamation queued by federation ack handlers,
 -- processed by the prune cycle after ackGracePeriod elapses (replaces fork+sleep pattern).
 *pendingAckCleanups : [{messageId: MessageIdHex, toKey: PubkeyHex, cleanupAfter: Timestamp}]
+
+-- Per-IP unique key tracking: detects when a single IP authenticates many distinct pubkeys
+-- (key-rotation abuse bypassing per-key rate limits). Pruned with other rate limiters.
+*uniqueKeyIpRates : [UniqueKeyIpEntry]
 
 -- Monotonic counter bumped on any presence change (gossip, auth, logout, prune, restore, drain)
 -- Polls compare against this to skip expensive presence lookups when nothing changed.
@@ -686,9 +713,13 @@ route HealthApi where
 -- TODO: If Knot adds raw text response support, add a /metrics endpoint
 -- returning Prometheus exposition format for direct integration with standard
 -- monitoring stacks. Currently /stats returns JSON which requires a custom scraper.
+-- TODO: Consider grouping the flat 60+ field response into nested objects
+-- (e.g., {capacity: {messages, sessions, ...}, federation: {avgLatency, ...}})
+-- for better monitoring dashboard ergonomics. This is a wire format change
+-- that would require coordinating with any existing scrapers.
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {sessions: Int, sessionsMax: Int, messages: Int, messagesMax: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pairRates: Int, federationPairRates: Int, pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, federationEnabled: Bool, recentGossip: Int, totalMessageCount: Int, recipientCounts: Int, federationInFlight: Int, hungFederationSlots: Int, messagesPct: Int, presencePct: Int, forwardsPct: Int, sessionsPct: Int, federationAvgLatencyMs: Int, federationMaxLatencyMs: Int, federationCallCount: Int, drainCompletedAt: Timestamp, oldestForwardAge: Int, oldestAckAge: Int, forwardNonces: Int, forwardNoncesMax: Int, pendingAckCleanups: Int, blockedPeers: Int, gossipEventRates: Int, verifyIpRates: Int, ok: Bool}
+    -> {sessions: Int, sessionsMax: Int, messages: Int, messagesMax: Int, presence: Int, presenceMax: Int, forwards: Int, forwardsMax: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardFailures: Int, activePolls: Int, activePollsMax: Int, sendRates: Int, challengeRates: Int, federationRates: Int, globalRateCount: Int, ipRates: Int, lookupRates: Int, recvRates: Int, pairRates: Int, federationPairRates: Int, pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, federationEnabled: Bool, recentGossip: Int, totalMessageCount: Int, recipientCounts: Int, federationInFlight: Int, hungFederationSlots: Int, messagesPct: Int, presencePct: Int, forwardsPct: Int, sessionsPct: Int, federationAvgLatencyMs: Int, federationMaxLatencyMs: Int, federationCallCount: Int, drainCompletedAt: Timestamp, oldestForwardAge: Int, oldestAckAge: Int, forwardNonces: Int, forwardNoncesMax: Int, pendingAckCleanups: Int, blockedPeers: Int, gossipEventRates: Int, verifyIpRates: Int, uniqueKeyIpRates: Int, ok: Bool}
     = Stats
   GET /stats/peers headers {authorization: Text}
     -> {peers: [PeerStatus], ok: Bool}
@@ -1060,7 +1091,10 @@ writeSessionBucket = \b sessions ->
   else if b == 14 then set *sessionBucket14 = sessions
   else set *sessionBucket15 = sessions
 
--- Read all 16 session buckets (for per-key operations, prune, stats)
+-- Read all 16 session buckets (for per-key operations, prune, stats).
+-- Right-nested union is intentional: union copies the left operand, so right-nesting
+-- copies small buckets onto the growing accumulator (O(n) total), while left-nesting
+-- would copy the growing accumulator repeatedly (O(n * 16)).
 readAllSessions : IO [Session]
 readAllSessions = do
   s0 <- *sessionBucket0
@@ -1454,7 +1488,7 @@ uniqueBucketsFor = \items getKey ->
     if any acc (\i -> i == b) then acc else union acc [b]) [] items
 
 -- Prune a single message bucket and atomically adjust shared counters.
--- Each bucket prune decrements totalMessageCount and recipientMsgCounts by exactly
+-- Each bucket prune decrements totalMessageCount and its rcBucket by exactly
 -- what was removed, preserving concurrent modifications from poll-ack or send.
 pruneMessageBucket = \b messageCutoff -> atomic do
   bucket <- readMessageBucket b
@@ -1464,35 +1498,48 @@ pruneMessageBucket = \b messageCutoff -> atomic do
   if removedCount > 0 then do
     tc <- *totalMessageCount
     set *totalMessageCount = max 0 (tc - removedCount)
-    rc <- *recipientMsgCounts
+    rc <- readRcBucket b
     let removed = do m <- bucket; where m.receivedAt <= messageCutoff; yield m
-    set *recipientMsgCounts = batchDecrementRecipientCounts rc (countByRecipient removed)
+    writeRcBucket b (batchDecrementRecipientCounts rc (countByRecipient removed))
   else yield {}
+
+-- Prune all 16 message buckets with concurrency: fork first 15, run last in foreground.
+-- Each bucket's atomic block only contends on *totalMessageCount (a single Int);
+-- rcBuckets and message buckets are per-bucket and independent.
+pruneMessageBucketsConcurrent = \b messageCutoff ->
+  if b > 15 then yield {}
+  else if b < 15 then do
+    fork (pruneMessageBucket b messageCutoff)
+    pruneMessageBucketsConcurrent (b + 1) messageCutoff
+  else pruneMessageBucket b messageCutoff
 
 -- Per-bucket message reconciliation: reads one bucket per atomic block instead of all 16
 -- at once, reducing lock contention during reconciliation. Each pubkey maps to exactly one
--- bucket, so per-bucket recipient counts are disjoint and can be merged without overlap.
-reconcileMessageCounts = \b acc ->
+-- bucket, so per-bucket recipient counts are disjoint — each bucket's counts are written
+-- to the corresponding rcBucket without overlap.
+reconcileMessageCounts = \b totalAcc ->
   if b > 15 then do
     atomic do
-      let total = fold (\a c -> a + c.count) 0 acc
       stored <- *totalMessageCount
-      set *totalMessageCount = total
-      set *recipientMsgCounts = acc
-      yield (total - stored)
+      set *totalMessageCount = totalAcc
+      yield (totalAcc - stored)
   else do
-    bucketCounts <- atomic do
+    bucketTotal <- atomic do
       bucket <- readMessageBucket b
-      yield (countByRecipient bucket)
-    reconcileMessageCounts (b + 1) (union acc bucketCounts)
+      let counts = countByRecipient bucket
+      writeRcBucket b counts
+      yield (fold (\a c -> a + c.count) 0 counts)
+    reconcileMessageCounts (b + 1) (totalAcc + bucketTotal)
 
 -- ============================================
 -- Recipient Count Helpers
 -- ============================================
 -- Per-recipient message counts avoid O(n) scan of all messages on send/forward.
+-- Sharded into 16 buckets (rcBucket0-15) by pubkeyBucket, reducing scan from
+-- O(unique_recipients) to O(unique_recipients/16). Each pubkey maps to exactly
+-- one bucket, so lookups never cross shards.
 -- TODO: If Knot adds a map/dictionary type, replace [RecipientCount] with a
--- Map<PubkeyHex, Int> for O(1) lookups. Currently getRecipientCount and
--- adjustRecipientCount are O(unique_recipients) per call.
+-- Map<PubkeyHex, Int> for O(1) lookups.
 
 getRecipientCount : PubkeyHex -> [RecipientCount] -> Int
 getRecipientCount = \pubkey counts ->
@@ -1529,7 +1576,55 @@ batchDecrementRecipientCounts : [RecipientCount] -> [RecipientCount] -> [Recipie
 batchDecrementRecipientCounts = \counts removedCounts ->
   do c <- counts; let adj = c.count - getRecipientCount c.pubkey removedCounts; where adj > 0; yield {pubkey: c.pubkey, count: adj}
 
--- Check message dedup only (without counting — count comes from recipientMsgCounts)
+-- Recipient count bucket helpers (sharded by pubkeyBucket, same as messages)
+readRcBucket : Int -> IO [RecipientCount]
+readRcBucket = \b ->
+  if b == 0 then do s <- *rcBucket0; yield s
+  else if b == 1 then do s <- *rcBucket1; yield s
+  else if b == 2 then do s <- *rcBucket2; yield s
+  else if b == 3 then do s <- *rcBucket3; yield s
+  else if b == 4 then do s <- *rcBucket4; yield s
+  else if b == 5 then do s <- *rcBucket5; yield s
+  else if b == 6 then do s <- *rcBucket6; yield s
+  else if b == 7 then do s <- *rcBucket7; yield s
+  else if b == 8 then do s <- *rcBucket8; yield s
+  else if b == 9 then do s <- *rcBucket9; yield s
+  else if b == 10 then do s <- *rcBucket10; yield s
+  else if b == 11 then do s <- *rcBucket11; yield s
+  else if b == 12 then do s <- *rcBucket12; yield s
+  else if b == 13 then do s <- *rcBucket13; yield s
+  else if b == 14 then do s <- *rcBucket14; yield s
+  else do s <- *rcBucket15; yield s
+
+writeRcBucket : Int -> [RecipientCount] -> IO ()
+writeRcBucket = \b counts ->
+  if b == 0 then set *rcBucket0 = counts
+  else if b == 1 then set *rcBucket1 = counts
+  else if b == 2 then set *rcBucket2 = counts
+  else if b == 3 then set *rcBucket3 = counts
+  else if b == 4 then set *rcBucket4 = counts
+  else if b == 5 then set *rcBucket5 = counts
+  else if b == 6 then set *rcBucket6 = counts
+  else if b == 7 then set *rcBucket7 = counts
+  else if b == 8 then set *rcBucket8 = counts
+  else if b == 9 then set *rcBucket9 = counts
+  else if b == 10 then set *rcBucket10 = counts
+  else if b == 11 then set *rcBucket11 = counts
+  else if b == 12 then set *rcBucket12 = counts
+  else if b == 13 then set *rcBucket13 = counts
+  else if b == 14 then set *rcBucket14 = counts
+  else set *rcBucket15 = counts
+
+-- Count total recipients across all 16 rc buckets (for stats)
+countAllRcEntries : Int -> IO Int
+countAllRcEntries = \b ->
+  if b > 15 then yield 0
+  else do
+    bucket <- readRcBucket b
+    rest <- countAllRcEntries (b + 1)
+    yield (count bucket + rest)
+
+-- Check message dedup only (without counting — count comes from rcBuckets)
 checkMessageDup : [Message] -> Text -> PubkeyHex -> Bool
 checkMessageDup = \messages messageId toKey ->
   messageId != "" && any messages (\m -> m.messageId == messageId && m.toKey == toKey)
@@ -1609,8 +1704,13 @@ dedupMessageIds = \messageIds ->
     else union acc [mid]) [] capped
 
 
+-- Constant-time comparison iteration count. Must be >= the longest secret
+-- compared (tokens = 48 hex chars, maintenance secret = variable). Using 64
+-- provides headroom without the waste of maxTokenLen (256 = 5x actual length).
+safeCompareLen = 64
+
 -- Constant-time string comparison to prevent timing side-channels.
--- Always iterates maxTokenLen characters regardless of input length;
+-- Always iterates safeCompareLen characters regardless of input length;
 -- rejects empty strings. Tracks both character mismatches and length
 -- mismatch (one string ended before the other) within the loop itself,
 -- avoiding variable-time count(chars) calls that would leak string length.
@@ -1628,7 +1728,7 @@ safeCompareLoop = \s1 s2 n diff lenDiff ->
 safeCompare : Text -> Text -> Bool
 safeCompare = \a b ->
   if take 1 a == "" || take 1 b == "" then False {}
-  else safeCompareLoop a b maxTokenLen 0 0 == 0
+  else safeCompareLoop a b safeCompareLen 0 0 == 0
 
 -- Constant-time IP binding check: returns True if IPs match or no binding is configured.
 -- When a session was created with an IP (behind a proxy), requests without an IP header
@@ -1681,6 +1781,25 @@ checkPairRate = \rates sender recipient maxRate windowMs maxEntries t ->
     (\ts -> {sender: sender, recipient: recipient, windowStart: ts, count: 1})
     (\r -> {sender: r.sender, recipient: r.recipient, windowStart: r.windowStart, count: r.count + 1})
     maxRate windowMs maxEntries t
+
+-- Per-IP unique key rate check: tracks distinct pubkeys per IP per window.
+-- Returns True if the IP has authenticated too many unique keys (key-rotation abuse).
+checkUniqueKeyIpRate : [UniqueKeyIpEntry] -> Text -> PubkeyHex -> Timestamp -> {limited: Bool, entries: [UniqueKeyIpEntry]}
+checkUniqueKeyIpRate = \entries ip pubkey t ->
+  if ip == "" then {limited: False {}, entries: entries}
+  else
+    let entry = headOf (do r <- entries; where r.ip == ip; yield r) in
+    let isNewWindow = case entry of Nothing {} -> True {}; Just {value: r} -> t - r.windowStart >= uniqueKeyIpWindowMs in
+    if isNewWindow
+      then {limited: False {}, entries: union (do r <- entries; where r.ip != ip; yield r) [{ip: ip, keys: [pubkey], windowStart: t}]}
+      else case entry of
+        Nothing {} -> {limited: False {}, entries: entries}
+        Just {value: r} ->
+          let alreadyTracked = any r.keys (\k -> k == pubkey) in
+          if alreadyTracked then {limited: False {}, entries: entries}
+          else if count r.keys >= maxUniqueKeysPerIp
+            then {limited: True {}, entries: entries}
+            else {limited: False {}, entries: do e <- entries; yield (if e.ip == ip then {ip: e.ip, keys: union e.keys [pubkey], windowStart: e.windowStart} else e)}
 
 checkServerRecipientRate = \rates server recipient maxRate windowMs maxEntries t ->
   checkRateWindow rates (\r -> r.server == server && r.recipient == recipient)
@@ -1883,26 +2002,12 @@ pruneExpired = \t -> do
     transformAllSessionBuckets (\bucket -> do x <- bucket; where x.expiresAt > t && t - x.createdAt < maxSessionLifetime; yield x)
     sessionCount <- countAllSessions
     set *totalSessionCount = sessionCount
-  -- Prune messages across all 16 buckets. Each bucket prune is atomic and adjusts
-  -- shared counters (totalMessageCount, recipientMsgCounts) by delta, preserving
-  -- concurrent modifications from poll-ack or send-message operations.
+  -- Prune messages across all 16 buckets concurrently. Each bucket prune is atomic
+  -- and touches only its own message bucket + rcBucket. The only shared write is
+  -- *totalMessageCount (a single Int), so STM contention is minimal.
+  -- Fork first 15 buckets; run the last one in the foreground to bound concurrency.
   let messageCutoff = t - unackedMessageMaxAge
-  pruneMessageBucket 0 messageCutoff
-  pruneMessageBucket 1 messageCutoff
-  pruneMessageBucket 2 messageCutoff
-  pruneMessageBucket 3 messageCutoff
-  pruneMessageBucket 4 messageCutoff
-  pruneMessageBucket 5 messageCutoff
-  pruneMessageBucket 6 messageCutoff
-  pruneMessageBucket 7 messageCutoff
-  pruneMessageBucket 8 messageCutoff
-  pruneMessageBucket 9 messageCutoff
-  pruneMessageBucket 10 messageCutoff
-  pruneMessageBucket 11 messageCutoff
-  pruneMessageBucket 12 messageCutoff
-  pruneMessageBucket 13 messageCutoff
-  pruneMessageBucket 14 messageCutoff
-  pruneMessageBucket 15 messageCutoff
+  pruneMessageBucketsConcurrent 0 messageCutoff
   -- Prune federation state
   atomic do
     let retainCutoff = t - messageMaxAge
@@ -1944,6 +2049,8 @@ pruneExpired = \t -> do
     set *lookupRates = do r <- lookupRates; where t - r.windowStart < lookupRateWindowMs; yield r
     verifyIpRates <- *verifyIpRates
     set *verifyIpRates = do r <- verifyIpRates; where t - r.windowStart < verifyRateWindowMs; yield r
+    uniqueKeyIpRates <- *uniqueKeyIpRates
+    set *uniqueKeyIpRates = do r <- uniqueKeyIpRates; where t - r.windowStart < uniqueKeyIpWindowMs; yield r
   atomic do
     activePolls <- *activePolls
     set *activePolls = do p <- activePolls; where t - p.startedAt < pollTimeoutMs * 3; yield p
@@ -2187,7 +2294,7 @@ ackCleanupByBucket = \bucketIds entries t -> case headOf bucketIds of
       forwards <- *forwards
       msgs <- readMessageBucket b
       tc <- *totalMessageCount
-      rc <- *recipientMsgCounts
+      rc <- readRcBucket b
       let cleanup = fold (\acc rf ->
         let hasLocal = any bucketPresence (\p -> p.pubkey == rf.toKey && isLocalServer p.server && p.expiresAt > t) in
         let hasOtherFwds = any forwards (\f -> f.messageId == rf.messageId && f.toKey == rf.toKey) in
@@ -2198,7 +2305,7 @@ ackCleanupByBucket = \bucketIds entries t -> case headOf bucketIds of
         ) {msgs: msgs, removed: 0, rc: rc} bucketEntries
       writeMessageBucket b cleanup.msgs
       set *totalMessageCount = max 0 (tc - cleanup.removed)
-      set *recipientMsgCounts = cleanup.rc
+      writeRcBucket b cleanup.rc
     ackCleanupByBucket remainingBuckets entries t
 
 pow2 : Int -> Int
@@ -2583,6 +2690,9 @@ pruneAndRetry = \t -> do
     when (count result.refreshPeers > 0 && count refreshEvents > 0)
       (fork (sendBatchedGossip result.refreshPeers refreshEvents gossipOriginHops)))
 
+-- Map a single hex character to its integer value (0-15).
+-- 16-way if-else chain is mechanical but fine: Knot lacks char-to-int or lookup-table
+-- primitives. Clamped to 0-15 by callers (pubkeyBucket, tokenBucket) as a safety net.
 hexCharIndex : Text -> Int
 hexCharIndex = \c ->
   if c == "0" then 0 else if c == "1" then 1 else if c == "2" then 2 else if c == "3" then 3
@@ -2649,8 +2759,8 @@ ackPolledMessages = \pubkey cursor t -> do
       writeMessageBucket b (diff bucket toAck)
       totalCount <- *totalMessageCount
       set *totalMessageCount = max 0 (totalCount - ackCount)
-      recipientCounts <- *recipientMsgCounts
-      set *recipientMsgCounts = adjustRecipientCount recipientCounts pubkey (0 - ackCount)
+      recipientCounts <- readRcBucket b
+      writeRcBucket b (adjustRecipientCount recipientCounts pubkey (0 - ackCount))
       let ackedMsgIds = do m <- toAck; yield m.messageId
       forwards <- *forwards
       set *forwards = do f <- forwards; where none ackedMsgIds (\mid -> f.messageId == mid && f.toKey == pubkey); yield f
@@ -2952,6 +3062,18 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
       else do
         authGlobalLimited <- checkAuthGlobalRate t
         if authGlobalLimited then yield (respond {token: "", expiresAt: 0})
+        else do
+        -- Per-IP unique key abuse detection: reject IPs authenticating too many distinct pubkeys
+        uniqueKeyLimited <- atomic do
+          ukr <- *uniqueKeyIpRates
+          let result = checkUniqueKeyIpRate ukr clientIp pubkey t
+          set *uniqueKeyIpRates = if count result.entries > maxUniqueKeyIpEntries
+            then do r <- result.entries; where t - r.windowStart < uniqueKeyIpWindowMs; yield r
+            else result.entries
+          yield result.limited
+        if uniqueKeyLimited then do
+          logWarn ("verify: unique key per IP rate limited (" ++ show maxUniqueKeysPerIp ++ " keys/" ++ show uniqueKeyIpWindowMs ++ "ms) for IP " ++ clientIp)
+          yield (respond {token: "", expiresAt: 0})
         else verifyAuthInner pubkey challenge signature revokeOthers clientIp respond t
 
 verifyAuthInner = \pubkey challenge signature revokeOthers clientIp respond t -> do
@@ -3097,7 +3219,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId t ->
             totalMsgCount <- *totalMessageCount
             if totalMsgCount >= maxMessages then yield {status: MsRejected {}, remoteServers: [], retryAfterMs: 0}
             else do
-              recipientCounts <- *recipientMsgCounts
+              recipientCounts <- readRcBucket msgBucket
               let recipientCount = getRecipientCount to recipientCounts
               if recipientCount >= maxMessagesPerRecipient then yield {status: MsRejected {}, remoteServers: [], retryAfterMs: 0}
               else do
@@ -3109,7 +3231,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId t ->
                   [{messageId: effectiveMsgId, toKey: to,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs}])
                 set *totalMessageCount = totalMsgCount + 1
-                set *recipientMsgCounts = adjustRecipientCount recipientCounts to 1
+                writeRcBucket msgBucket (adjustRecipientCount recipientCounts to 1)
                 signalMessageForKey to seqTs
                 let toPresence = presenceForKey recipientPresence to t
                 let localOnline = hasLocalPresence toPresence
@@ -3449,9 +3571,10 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorizati
     freshEvents <- atomic do
       recentGossip <- *recentGossip
       let active = do r <- recentGossip; where t - r.seenAt < gossipDedupWindow; yield r
-      -- Pre-filter active entries to only those matching pubkeys in this batch (reduces O(n*m) inner scan)
-      let batchPubkeys = fold (\acc e -> if any acc (\a -> a == e.pubkey) then acc else union acc [e.pubkey]) [] effectiveEvents
-      let relevantActive = do r <- active; where any batchPubkeys (\pk -> pk == r.pubkey); yield r
+      -- Pre-filter active entries to only those matching (pubkey, server) pairs in this batch.
+      -- Reduces the inner dedup scan from O(n*m) to O(n*k) where k << m (k = matching pairs).
+      let batchPairs = fold (\acc e -> if any acc (\a -> a.pubkey == e.pubkey && a.server == e.server) then acc else union acc [{pubkey: e.pubkey, server: e.server}]) [] effectiveEvents
+      let relevantActive = do r <- active; where any batchPairs (\p -> p.pubkey == r.pubkey && p.server == r.server); yield r
       let fresh = do e <- effectiveEvents; where none relevantActive (\r -> r.pubkey == e.pubkey && r.server == e.server && r.timestamp == e.timestamp); yield e
       let newRecent = do e <- fresh; yield {pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, seenAt: t}
       let updated = union active newRecent
@@ -3524,7 +3647,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
           if totalMsgCount >= maxMessages
             then yield {forward: ForwardRejected {}, globalCapReached: True {}, recvRateLimited: False {}}
             else do
-              recipientCounts <- *recipientMsgCounts
+              recipientCounts <- readRcBucket msgBucket
               let recipientCount = getRecipientCount toKey recipientCounts
               if recipientCount >= maxMessagesPerRecipient
                 then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}}
@@ -3548,7 +3671,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                         [{messageId: messageId, toKey: toKey,
                           encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs}])
                       set *totalMessageCount = totalMsgCount + 1
-                      set *recipientMsgCounts = adjustRecipientCount recipientCounts toKey 1
+                      writeRcBucket msgBucket (adjustRecipientCount recipientCounts toKey 1)
                       signalMessageForKey toKey seqTs
                       -- Record forward nonce for replay protection beyond message/ack dedup lifetime
                       fwdNonces <- *forwardNonces
@@ -3632,6 +3755,19 @@ handleDrain = \authorization respond -> do
       yield {forwards: f, pendingAcks: pa}
     let pendingForwardCount = count flushState.forwards
     let pendingAckCount = count flushState.pendingAcks
+    -- Auto-snapshot on drain: export federation state so a crash during drain doesn't lose it.
+    -- Output as structured JSON with [SNAPSHOT_DATA] prefix for log-shipping pipelines.
+    -- This is the last chance to persist state before the server stops.
+    drainSnapshot <- atomic do
+      a <- *ackedIds
+      ao <- *ackOverflow
+      d <- *deliveredIds
+      ff <- *forwardFailures
+      fn <- *forwardNonces
+      bp <- *blockedPeers
+      yield {version: snapshotVersion, presence: drainResult.localEntries, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: flushState.forwards, forwardNonces: fn, blockedPeers: bp}
+    println ("[SNAPSHOT_DATA] " ++ toJson drainSnapshot)
+    logInfo ("drain: auto-snapshot exported (" ++ show (count drainResult.localEntries) ++ " presence, " ++ show (count flushState.forwards) ++ " forwards)")
     -- Fork best-effort flush of pending federation ops, then gossip, then wait for in-flight.
     -- Operator polls /stats for drainCompletedAt > 0 to know when safe to stop.
     atomic do set *drainCompletedAt = 0
@@ -3725,8 +3861,8 @@ handleHealth = \authorization respond -> do
            snapshotOk: snapOk,
            watchdogOk: wdOk}
   let allOk = result.pruneOk && result.heartbeatOk && result.capacityOk && result.federationOk && result.snapshotOk && result.watchdogOk
-  -- Unauthenticated: always return ok:true to prevent information leakage.
-  -- Attackers could correlate ok:false transitions with targeted load to infer subsystem pressure.
+  -- Unauthenticated: return real ok boolean so load balancers can route around unhealthy nodes,
+  -- but hide subsystem breakdown to prevent targeted load-correlation attacks.
   if isAuthed
     then yield (respond {ok: allOk, pruneHealthy: result.pruneOk,
                   heartbeatHealthy: result.heartbeatOk,
@@ -3734,14 +3870,14 @@ handleHealth = \authorization respond -> do
                   federationHealthy: result.federationOk,
                   snapshotHealthy: result.snapshotOk,
                   watchdogHealthy: result.watchdogOk})
-    else yield (respond {ok: True {}, pruneHealthy: True {},
+    else yield (respond {ok: allOk, pruneHealthy: True {},
                   heartbeatHealthy: True {},
                   capacityHealthy: True {},
                   federationHealthy: True {},
                   snapshotHealthy: True {},
                   watchdogHealthy: True {}})
 
-zeroStats = {sessions: 0, sessionsMax: 0, messages: 0, messagesMax: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pairRates: 0, federationPairRates: 0, pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, federationEnabled: False {}, recentGossip: 0, totalMessageCount: 0, recipientCounts: 0, federationInFlight: 0, hungFederationSlots: 0, messagesPct: 0, presencePct: 0, forwardsPct: 0, sessionsPct: 0, federationAvgLatencyMs: 0, federationMaxLatencyMs: 0, federationCallCount: 0, drainCompletedAt: 0, oldestForwardAge: 0, oldestAckAge: 0, forwardNonces: 0, forwardNoncesMax: 0, pendingAckCleanups: 0, blockedPeers: 0, gossipEventRates: 0, verifyIpRates: 0, ok: False {}}
+zeroStats = {sessions: 0, sessionsMax: 0, messages: 0, messagesMax: 0, presence: 0, presenceMax: 0, forwards: 0, forwardsMax: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardFailures: 0, activePolls: 0, activePollsMax: 0, sendRates: 0, challengeRates: 0, federationRates: 0, globalRateCount: 0, ipRates: 0, lookupRates: 0, recvRates: 0, pairRates: 0, federationPairRates: 0, pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, federationEnabled: False {}, recentGossip: 0, totalMessageCount: 0, recipientCounts: 0, federationInFlight: 0, hungFederationSlots: 0, messagesPct: 0, presencePct: 0, forwardsPct: 0, sessionsPct: 0, federationAvgLatencyMs: 0, federationMaxLatencyMs: 0, federationCallCount: 0, drainCompletedAt: 0, oldestForwardAge: 0, oldestAckAge: 0, forwardNonces: 0, forwardNoncesMax: 0, pendingAckCleanups: 0, blockedPeers: 0, gossipEventRates: 0, verifyIpRates: 0, uniqueKeyIpRates: 0, ok: False {}}
 
 handleStats = \authorization respond -> do
   t <- now
@@ -3764,7 +3900,7 @@ handleStats = \authorization respond -> do
         ff <- *forwardFailures
         ap <- *activePolls
         tmc <- *totalMessageCount
-        rc <- *recipientMsgCounts
+        rc <- countAllRcEntries 0
         fi <- *federationInFlight
         rg <- *recentGossip
         fn <- *forwardNonces
@@ -3772,7 +3908,8 @@ handleStats = \authorization respond -> do
         bp <- *blockedPeers
         ger <- *gossipEventRates
         vir <- *verifyIpRates
-        yield {sc: sc, pc: pc, f: f, c: c, a: a, ao: ao, d: d, ff: ff, ap: ap, tmc: tmc, rc: rc, fi: fi, rg: rg, fn: fn, pac: pac, bp: bp, ger: ger, vir: vir}
+        ukir <- *uniqueKeyIpRates
+        yield {sc: sc, pc: pc, f: f, c: c, a: a, ao: ao, d: d, ff: ff, ap: ap, tmc: tmc, rc: rc, fi: fi, rg: rg, fn: fn, pac: pac, bp: bp, ger: ger, vir: vir, ukir: ukir}
       counters <- atomic do
         sr <- *sendRates
         cr <- *challengeRates
@@ -3804,7 +3941,7 @@ handleStats = \authorization respond -> do
       let hungFedSlots = count (do r <- core.fi; where r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= federationFetchTimeoutMs; yield r)
       let oldestFwdAge = case minBy core.f (\x -> x.createdAt) of Nothing {} -> 0; Just {value: x} -> t - x.createdAt
       let oldestAckAge = case minBy core.a (\x -> x.ackedAt) of Nothing {} -> 0; Just {value: x} -> t - x.ackedAt
-      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pairRates: result.pairRates, federationPairRates: result.federationPairRates, pruneCount: result.pruneCount, pruneRunning: result.pruneRunning, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, draining: result.draining, federationEnabled: federationEnabled, recentGossip: result.recentGossip, totalMessageCount: result.totalMessageCount, recipientCounts: result.recipientCounts, federationInFlight: result.federationInFlight, hungFederationSlots: hungFedSlots, messagesPct: msgPct, presencePct: presPct, forwardsPct: fwdPct, sessionsPct: sessPct, federationAvgLatencyMs: fedAvg, federationMaxLatencyMs: result.federationLatencyMax, federationCallCount: result.federationLatencyCount, drainCompletedAt: result.drainCompletedAt, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, forwardNonces: count core.fn, forwardNoncesMax: maxForwardNonces, pendingAckCleanups: count core.pac, blockedPeers: count core.bp, gossipEventRates: count core.ger, verifyIpRates: count core.vir, ok: True {}})
+      yield (respond {sessions: result.sessions, sessionsMax: maxSessions, messages: result.messages, messagesMax: maxMessages, presence: result.presence, presenceMax: maxPresenceEntries, forwards: result.forwards, forwardsMax: maxForwardsEntries, challenges: result.challenges, challengesMax: maxChallenges, ackedIds: result.ackedIds, ackedIdsMax: maxAckedIds, ackOverflow: result.ackOverflow, ackOverflowMax: maxAckOverflow, deliveredIds: result.deliveredIds, deliveredIdsMax: maxDeliveredIds, forwardFailures: result.forwardFailures, activePolls: result.activePolls, activePollsMax: maxActivePolls, sendRates: result.sendRates, challengeRates: result.challengeRates, federationRates: result.federationRates, globalRateCount: result.globalRateCount, ipRates: result.ipRates, lookupRates: result.lookupRates, recvRates: result.recvRates, pairRates: result.pairRates, federationPairRates: result.federationPairRates, pruneCount: result.pruneCount, pruneRunning: result.pruneRunning, heartbeatCount: result.heartbeatCount, uptime: result.uptime, lastPruneAt: result.lastPruneAt, lastHeartbeatAt: result.lastHeartbeatAt, draining: result.draining, federationEnabled: federationEnabled, recentGossip: result.recentGossip, totalMessageCount: result.totalMessageCount, recipientCounts: result.recipientCounts, federationInFlight: result.federationInFlight, hungFederationSlots: hungFedSlots, messagesPct: msgPct, presencePct: presPct, forwardsPct: fwdPct, sessionsPct: sessPct, federationAvgLatencyMs: fedAvg, federationMaxLatencyMs: result.federationLatencyMax, federationCallCount: result.federationLatencyCount, drainCompletedAt: result.drainCompletedAt, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, forwardNonces: count core.fn, forwardNoncesMax: maxForwardNonces, pendingAckCleanups: count core.pac, blockedPeers: count core.bp, gossipEventRates: count core.ger, verifyIpRates: count core.vir, uniqueKeyIpRates: count core.ukir, ok: True {}})
     else yield (respond zeroStats)
 
 handleStatsPeers = \authorization respond -> do
@@ -3973,8 +4110,8 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
             writeMessageBucket b (diff bucket toAck)
             totalCount <- *totalMessageCount
             set *totalMessageCount = max 0 (totalCount - ackCount)
-            recipientCounts <- *recipientMsgCounts
-            set *recipientMsgCounts = adjustRecipientCount recipientCounts pubkey (0 - ackCount)
+            recipientCounts <- readRcBucket b
+            writeRcBucket b (adjustRecipientCount recipientCounts pubkey (0 - ackCount))
             let ackedMsgIds = do m <- toAck; yield m.messageId
             forwards <- *forwards
             set *forwards = do f <- forwards; where none ackedMsgIds (\mid -> f.messageId == mid && f.toKey == pubkey); yield f
@@ -4138,7 +4275,9 @@ handleAdminListSessions = \pubkey authorization respond -> do
   else do
     result <- atomic do
       allSessions <- readAllSessions
-      let keySessions = do s <- allSessions; where s.pubkey == pubkey; yield {token: take 8 s.token ++ "...", expiresAt: s.expiresAt, ip: s.ip, createdAt: s.createdAt}
+      -- Show only shard prefix (4 hex chars = 16 bits) for identification without aiding brute-force.
+      -- Previous 8-char prefix exposed 32 bits, narrowing brute-force from 192 to 160 bits.
+      let keySessions = do s <- allSessions; where s.pubkey == pubkey; yield {token: take 4 s.token ++ "...", expiresAt: s.expiresAt, ip: s.ip, createdAt: s.createdAt}
       yield {sessions: keySessions, total: count keySessions}
     yield (respond {sessions: result.sessions, count: result.total, ok: True {}})
 
@@ -4171,7 +4310,44 @@ handleAdminRevokeSessions = \pubkey authorization respond -> do
       (fork (sendBatchedGossip result.peerServers [{eventType: GossipOffline {}, pubkey: pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl}] gossipOriginHops))
     yield (respond {ok: True {}, revokedCount: result.revokedCount})
 
-serve = \req -> case req of
+-- Extract request path for access logging (excludes poll to reduce log volume)
+requestPath = \req -> case req of
+  ReqChallenge {} -> "POST /auth/challenge"
+  VerifyAuth {} -> "POST /auth/verify"
+  RevokeSession {} -> "POST /auth/revoke"
+  Logout {} -> "POST /auth/logout"
+  Poll {} -> ""  -- suppress: high volume, logged on slow path only
+  SendMessage {} -> "POST /messages"
+  MessageStatus {} -> "POST /messages/status"
+  AckMessages {} -> "POST /messages/ack"
+  SendBatch {} -> "POST /messages/batch"
+  ListMessages {} -> "GET /messages/list"
+  LookupPresence {} -> "GET /lookup"
+  RecvGossip {} -> "POST /federation/gossip"
+  ForwardMessage {} -> "POST /federation/forward"
+  FederationAck {} -> "POST /federation/ack"
+  VerifyToken {} -> "POST /federation/verify"
+  Prune {} -> "POST /maintenance/prune"
+  Drain {} -> "POST /maintenance/drain"
+  Undrain {} -> "POST /maintenance/undrain"
+  Snapshot {} -> "GET /maintenance/snapshot"
+  Restore {} -> "POST /maintenance/restore"
+  BlockPeer {} -> "POST /maintenance/block"
+  UnblockPeer {} -> "POST /maintenance/unblock"
+  ListBlocked {} -> "GET /maintenance/blocked"
+  PingPeer {} -> "POST /maintenance/ping"
+  AdminListSessions {} -> "GET /maintenance/sessions"
+  AdminRevokeSessions {} -> "POST /maintenance/sessions/revoke-all"
+  Health {} -> "GET /health"
+  Stats {} -> "GET /stats"
+  StatsPeers {} -> "GET /stats/peers"
+  StatsKey {} -> "GET /stats/key"
+
+-- Slow request threshold for access logging (ms)
+slowRequestThreshold : Int<Ms>
+slowRequestThreshold = 1000
+
+serveInner = \req -> case req of
   ReqChallenge {pubkey, clientIp, respond} -> handleChallenge pubkey clientIp respond
   VerifyAuth {pubkey, challenge, signature, revokeOthers, clientIp, respond} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp respond
   RevokeSession {targetToken, authorization, clientIp, respond} -> handleRevoke targetToken authorization clientIp respond
@@ -4203,6 +4379,19 @@ serve = \req -> case req of
   StatsPeers {authorization, respond} -> handleStatsPeers authorization respond
   StatsKey {pubkey, authorization, respond} -> handleStatsKey pubkey authorization respond
 
+-- Access-logged request handler: wraps serveInner with timing.
+-- Logs all non-poll requests. Polls are only logged when slow (> slowRequestThreshold)
+-- to avoid overwhelming logs with high-frequency long-poll traffic.
+serve = \req -> do
+  startTime <- now
+  serveInner req
+  endTime <- now
+  let latency = endTime - startTime
+  let path = requestPath req
+  if path != ""
+    then logInfo ("[ACCESS] " ++ path ++ " " ++ show latency ++ "ms")
+    else when (latency > slowRequestThreshold) (logInfo ("[SLOW] poll " ++ show latency ++ "ms"))
+
 -- ============================================
 -- Entry Point
 -- ============================================
@@ -4212,6 +4401,11 @@ serve = \req -> case req of
 -- NOTE: This function (and all background loops below) recurse via tail calls.
 -- Knot compiles tail calls to loops, so stack growth is bounded. If Knot's tail-call
 -- optimization is ever disabled, these loops will overflow the stack over time.
+-- The backgroundWatchdog can restart backgroundPrune and pollHeartbeat if they die,
+-- but cannot restart itself or backgroundSnapshot. A TCO failure in any loop would
+-- eventually surface as a health check failure (pruneHealthy/heartbeatHealthy/watchdogHealthy).
+-- TODO: If Knot adds an iterative construct (e.g., loop/while), migrate background loops
+-- to avoid the TCO dependency entirely.
 backgroundPrune = do
   jitter <- randomInt 5000
   sleep (backgroundPruneInterval + jitter)
@@ -4297,9 +4491,11 @@ pollHeartbeat = do
 
 -- Background loop: periodically logs a state summary to stdout.
 -- Operators can capture stdout to detect state drift; use /maintenance/snapshot for full export.
+-- The drain handler now auto-exports a [SNAPSHOT_DATA] JSON line for log-shipping pipelines,
+-- but a crash outside drain still loses state. Mitigate with frequent /maintenance/snapshot calls
+-- or a sidecar that watches for [SNAPSHOT_DATA] lines and writes them to disk.
 -- TODO: If Knot adds file I/O primitives, auto-export snapshots to a file
--- (e.g., /var/lib/skrepka/snapshot.json) in addition to logging. Currently
--- a crash between manual snapshot exports loses all federation state.
+-- (e.g., /var/lib/skrepka/snapshot.json) in addition to logging.
 backgroundSnapshot = do
   sleep autoSnapshotInterval
   draining <- *draining
@@ -4361,6 +4557,35 @@ backgroundWatchdog = do
         set *federationActiveConnections = fold (\acc r -> acc + r.count) 0 inFlight)
     backgroundWatchdog
 
+-- Startup connectivity probe: send an empty gossip to each known peer and log results.
+-- Surfaces DNS, firewall, and TLS issues before the first real gossip cycle.
+-- Probes up to 10 peers sequentially (not forked) to avoid overwhelming the network.
+startupProbePeers = \probed -> do
+  knownPeers <- *knownPeerServers
+  let remaining = do p <- knownPeers; yield p
+  startupProbeNext remaining 0
+
+startupProbeNext = \peers probed ->
+  if probed >= 10 then logInfo ("startup: probed " ++ show probed ++ " peers")
+  else case headOf peers of
+    Nothing {} -> logInfo ("startup: probed " ++ show probed ++ " peers")
+    Just {value: server} -> do
+      let rest = do p <- peers; where p != server; yield p
+      startTime <- now
+      auth <- generateFederationAuth "gossip"
+      result <- fetchFederation server (RecvGossip {
+        authorization: auth,
+        events: [], hopsRemaining: 1, fromServer: serverHostN,
+        requestTimestamp: startTime})
+      endTime <- now
+      let latency = endTime - startTime
+      case result of
+        Err e -> logWarn ("startup: peer " ++ server ++ " unreachable (" ++ show e ++ ") — check DNS/firewall/TLS")
+        Ok r -> if r.ok
+          then logInfo ("startup: peer " ++ server ++ " ok (" ++ show latency ++ "ms)")
+          else logWarn ("startup: peer " ++ server ++ " rejected (" ++ r.error ++ ", " ++ show latency ++ "ms)")
+      startupProbeNext rest (probed + 1)
+
 main = do
   let configOk = maxMessages > 0 && maxMessagesPerRecipient > 0 && maxPresenceEntries > 0
         && maxSessions > 0 && maxChallenges > 0 && backgroundPruneInterval > 0
@@ -4412,6 +4637,8 @@ main = do
       when (matchesHostnameOrSubdomain serverHostN "localhost")
         (logWarn ("serverHost is " ++ serverHost ++ " — peers cannot reach this server for federation"))
       logInfo "IP binding is active — sessions created with a ClientIp header will reject requests without one"
+      when federationEnabled
+        (logWarn "SECURITY: DNS rebinding risk — federation URLs resolve DNS at fetch time, not at validation time. A peer hostname passing isBadServerName could rebind to a private IP between validation and fetch. Mitigate by blocking outbound connections to RFC1918/link-local/CGNAT ranges at the firewall level.")
       logInfo "Skrepka relay server starting on port 8080..."
       logInfo ("  federation: " ++ if federationEnabled then "enabled" else "disabled")
       logInfo ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")
@@ -4437,4 +4664,11 @@ main = do
       fork pollHeartbeat
       fork backgroundWatchdog
       when (autoSnapshotInterval > 0) (fork backgroundSnapshot)
+      -- Startup peer connectivity check: probe known peers after a short delay
+      -- to surface federation misconfigurations immediately (DNS, firewall, TLS).
+      -- Runs as a forked task so it doesn't delay server startup.
+      when federationEnabled (fork (do
+        sleep 5000  -- wait for listener to be ready
+        logInfo "startup: probing federation peers..."
+        startupProbePeers 0))
       listen 8080 serve
