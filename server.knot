@@ -39,10 +39,6 @@ maxPresenceTtl : Int<S>
 maxPresenceTtl = 3600 -- max presence TTL from gossip
 maxPubkeyLen = 256
 maxBlobLen = 65536
--- Minimum message TTL (sender-specified). Prevents very short TTLs that would expire
--- before the recipient polls, wasting mailbox slots and federation bandwidth.
-minMessageTtl : Int<Ms>
-minMessageTtl = 60000 -- 1 minute
 maxSignatureLen = 256
 maxIpLen = 45 -- max length of an IP address string (IPv6 = 45 chars); used in matchIp instead of maxServerNameLen
 maxMessageIds = 100
@@ -339,7 +335,6 @@ type Challenge = {pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp, ip: 
 -- Authenticated session; token is a random hex string
 type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp, ip: Text, createdAt: Timestamp}
 -- Stored message; originServer is "" for locally-originated messages, set to sender server for federated forwards.
--- expiresAt: computed from sender-specified TTL or default unackedMessageMaxAge.
 -- Messages with expiresAt <= now are pruned and excluded from polls.
 -- senderKey: pubkey of the authenticated sender (locally-originated only; "" for federation forwards).
 -- Used by /messages/cancel to verify the caller is the actual sender.
@@ -347,9 +342,7 @@ type Message = {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHe
 -- Presence: tracks that a pubkey is online at a given server, with expiry
 type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Timestamp, timestamp: Timestamp}
 -- Queued federation forward: message waiting to be delivered to a remote server.
--- messageTtl: remaining TTL in ms at time of enqueue (0 = default). Passed to the
--- receiving server so it can compute its own expiresAt.
-type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, retries: Int, messageTtl: Int}
+type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, retries: Int}
 -- Tracks message IDs that were acked by a polling client, pending federation ack back to origin
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName, retries: Int}
 -- Terminal state: message delivered and ack confirmed (used for dedup after ack overflow)
@@ -387,7 +380,7 @@ type UniqueKeyIpEntry = {ip: Text, keys: [PubkeyHex], windowStart: Timestamp}
 type ForwardNonce = {messageId: MessageIdHex, toKey: PubkeyHex, originServer: Text, seenAt: Timestamp}
 
 -- Batch send types
-type BatchMessage = {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId, messageTtl: Int}
+type BatchMessage = {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId}
 type BatchResult = {messageId: OptionalMessageId, status: MessageStatus}
 
 -- Sender expiration notification: tracks when a locally-originated message expired unread.
@@ -800,10 +793,7 @@ route ClientApi where
     = Poll
   /messages
     -- Send an E2E encrypted message to a recipient pubkey.
-    -- messageTtl: optional TTL in milliseconds (0 = default unackedMessageMaxAge).
-    -- Clamped to [minMessageTtl, unackedMessageMaxAge]. Short TTLs for ephemeral data
-    -- (typing indicators, read receipts) free mailbox slots faster than the default 7 days.
-    POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId, messageTtl: Int} / headers {authorization: Text, clientIp: Text}
+    POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId} / headers {authorization: Text, clientIp: Text}
       -> {status: MessageStatus, messageId: OptionalMessageId, retryAfterMs: Int, error: Text}
       = SendMessage
     -- Check delivery status of a sent message (caller must know recipient to prove ownership)
@@ -853,14 +843,12 @@ route FederationApi where
       -> {ok: Bool, error: Text}
       = RecvGossip
     -- Receive a forwarded message from a peer server on behalf of a sender.
-    -- messageTtl: remaining TTL in ms (0 = default). Allows short-lived messages to
-    -- expire on the destination server without waiting for the full unackedMessageMaxAge.
     -- NOTE: senderKey is intentionally NOT included in the forward protocol. The sender's
     -- identity is inside the E2E encrypted blob — exposing it in plaintext would break the
     -- privacy model (the server never learns who sent a message). /messages/cancel for
     -- federated messages requires the client to include sender identity in the encrypted
     -- payload; the server cannot verify sender identity for federation-forwarded messages.
-    POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, messageTtl: Int} /forward headers {authorization: Text}
+    POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /forward headers {authorization: Text}
       -> {ok: Bool, error: Text}
       = ForwardMessage
     -- Acknowledge delivery of messages back to the origin server
@@ -2499,13 +2487,6 @@ fetchFederation = \server request -> do
 clampTtl : Int<S> -> Int<S>
 clampTtl = clamp 1 maxPresenceTtl
 
--- Compute message expiresAt from a sender-specified TTL (in ms).
--- 0 = default (unackedMessageMaxAge). Non-zero values are clamped to [minMessageTtl, unackedMessageMaxAge].
-computeMessageExpiresAt : Timestamp -> Int -> Timestamp
-computeMessageExpiresAt = \receivedAt messageTtl ->
-  if messageTtl <= 0 then receivedAt + unackedMessageMaxAge
-  else receivedAt + clamp minMessageTtl unackedMessageMaxAge messageTtl
-
 clampTimestamp : Timestamp -> Timestamp -> Timestamp
 clampTimestamp = \timestamp t -> clamp (t - messageMaxAge) t timestamp
 
@@ -3370,7 +3351,7 @@ retryForwardsForServer = \entries remaining ->
           toKey: f.toKey, encryptedBlob: f.encryptedBlob,
           timestamp: f.timestamp, originServer: f.originServer, messageId: f.messageId,
           fromServer: serverHostN, requestTimestamp: t,
-          authorization: auth, correlationId: corrId, messageTtl: f.messageTtl})
+          authorization: auth, correlationId: corrId})
         case result of
           Err e -> do
             logWarn ("federation: forward to " ++ f.toServer ++ " failed for " ++ f.messageId ++ ": " ++ show e)
@@ -3961,10 +3942,9 @@ forwardCandidates = \targets messages forwards t ->
       where m.toKey == target.pubkey
       where none serverFwdIds (\fid -> fid == m.messageId)
       let origin = if m.originServer == "" then serverHostN else m.originServer
-      let remainingTtl = if m.expiresAt > 0 && m.expiresAt > t then max 0 (m.expiresAt - t) else 0
       yield {messageId: m.messageId, toServer: target.server, createdAt: t,
              toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp,
-             originServer: origin, retries: 0, messageTtl: remainingTtl})) [] targets
+             originServer: origin, retries: 0})) [] targets
 
 
 challengeMatch = \challenges pubkey challenge ip t ->
@@ -4278,9 +4258,8 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
 -- Core send logic: dedup, rate limiting, store message, create forwards.
 -- Called inside an atomic block by both handleSendMessage and sendBatchInner.
 -- Caller handles auth, drain checks, and messageId generation.
--- messageTtl: sender-specified TTL in ms (0 = default unackedMessageMaxAge).
-sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId messageTtl t ->
-  if senderKey == to then yield {status: MsRejected {}, remoteServers: [], retryAfterMs: 0, msgExpiresAt: 0}
+sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId t ->
+  if senderKey == to then yield {status: MsRejected {}, remoteServers: [], retryAfterMs: 0}
   else do
     let msgBucket = pubkeyBucket to
     bucket <- readMessageBucket msgBucket
@@ -4291,37 +4270,37 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId messageTt
     -- expire but before the nonce expires.
     nonceBkt <- readNonceBucket msgBucket
     let isDup = checkMessageDup bucket effectiveMsgId to || hasMessage effectiveMsgId to ackedBkt || hasMessage effectiveMsgId to delivBkt || any nonceBkt (\n -> n.messageId == effectiveMsgId && n.toKey == to)
-    if isDup then yield {status: MsDuplicate {}, remoteServers: [], retryAfterMs: 0, msgExpiresAt: 0}
+    if isDup then yield {status: MsDuplicate {}, remoteServers: [], retryAfterMs: 0}
     else do
       sendRates <- *sendRates
       sendRate <- effectiveSendRate
       let rateResult = checkPubkeyRate sendRates senderKey sendRate sendRateWindowMs maxSendRateEntries t
-      if rateResult.limited then yield {status: MsRateLimited {}, remoteServers: [], retryAfterMs: rateResult.retryAfterMs, msgExpiresAt: 0}
+      if rateResult.limited then yield {status: MsRateLimited {}, remoteServers: [], retryAfterMs: rateResult.retryAfterMs}
       else do
         set *sendRates = rateResult.entries
         pairRates <- *pairRates
         let pairResult = checkPairRate pairRates senderKey to maxPairRatePerPair pairRateWindowMs maxPairRateEntries t
         set *pairRates = pairResult.entries
-        if pairResult.limited then yield {status: MsRateLimited {}, remoteServers: [], retryAfterMs: pairResult.retryAfterMs, msgExpiresAt: 0}
+        if pairResult.limited then yield {status: MsRateLimited {}, remoteServers: [], retryAfterMs: pairResult.retryAfterMs}
         else do
           recvRates <- *recvRates
           recvRate <- effectiveRecvRate
           let recvResult = checkPubkeyRate recvRates to recvRate recvRateWindowMs maxRecvRateEntries t
-          if recvResult.limited then yield {status: MsRateLimited {}, remoteServers: [], retryAfterMs: recvResult.retryAfterMs, msgExpiresAt: 0}
+          if recvResult.limited then yield {status: MsRateLimited {}, remoteServers: [], retryAfterMs: recvResult.retryAfterMs}
           else do
             set *recvRates = recvResult.entries
             totalMsgCount <- *totalMessageCount
-            if totalMsgCount >= maxMessages then yield {status: MsRejected {}, remoteServers: [], retryAfterMs: 0, msgExpiresAt: 0}
+            if totalMsgCount >= maxMessages then yield {status: MsRejected {}, remoteServers: [], retryAfterMs: 0}
             else do
               recipientCounts <- readRcBucket msgBucket
               let recipientCount = getRecipientCount to recipientCounts
-              if recipientCount >= maxMessagesPerRecipient then yield {status: MsRejected {}, remoteServers: [], retryAfterMs: 0, msgExpiresAt: 0}
+              if recipientCount >= maxMessagesPerRecipient then yield {status: MsRejected {}, remoteServers: [], retryAfterMs: 0}
               else do
                 recipientPresence <- readPresenceBucket (pubkeyBucket to)
                 seqCounter <- *seqCounter
                 let seqTs = nextSeqTs t seqCounter
                 set *seqCounter = seqTs
-                let msgExpiresAt = computeMessageExpiresAt seqTs messageTtl
+                let msgExpiresAt = seqTs + unackedMessageMaxAge
                 writeMessageBucket msgBucket (union bucket
                   [{messageId: effectiveMsgId, toKey: to,
                     encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: "", receivedAt: seqTs, expiresAt: msgExpiresAt, senderKey: senderKey}])
@@ -4345,8 +4324,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId messageTt
                 let forwardsEnqueued = if federationEnabled && count remoteServers > 0 then do
                   let fbi = pubkeyBucket to
                   fwdBkt <- readFwdBucket fbi
-                  let remainingTtl = if messageTtl > 0 then max 0 (msgExpiresAt - t) else 0
-                  let newFwds = do s <- remoteServers; where none fwdBkt (\f -> f.messageId == effectiveMsgId && f.toServer == s); yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: serverHostN, retries: 0, messageTtl: remainingTtl}
+                  let newFwds = do s <- remoteServers; where none fwdBkt (\f -> f.messageId == effectiveMsgId && f.toServer == s); yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: serverHostN, retries: 0}
                   totalFwdCount <- countAllForwards 0
                   let globalCap = maxForwardsEntries - totalFwdCount
                   -- Per-key cap: prevents one key from consuming disproportionate forward slots
@@ -4360,12 +4338,10 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId messageTt
                 let status = if localOnline then MsDelivered {}
                   else if federationEnabled && forwardsEnqueued then MsFederated {}
                   else MsQueued {}
-                yield {status: status, remoteServers: remoteServers, retryAfterMs: 0, msgExpiresAt: msgExpiresAt}
+                yield {status: status, remoteServers: remoteServers, retryAfterMs: 0}
 
 -- Fork federation forwards for messages that need to be delivered to remote servers.
--- msgExpiresAt: the stored message's expiration timestamp (used to compute remaining TTL
--- at forward time, ensuring the remote server gets the correct remaining lifetime).
-forkSendForwards = \effectiveMsgId to encryptedBlob clampedTs msgExpiresAt remoteServers ->
+forkSendForwards = \effectiveMsgId to encryptedBlob clampedTs remoteServers ->
   when (count remoteServers > 0 && federationEnabled) (
     fork (sendToEach remoteServers (\server -> do
       stillPending <- atomic do
@@ -4375,15 +4351,11 @@ forkSendForwards = \effectiveMsgId to encryptedBlob clampedTs msgExpiresAt remot
         fwdT <- now
         fwdAuth <- generateFederationAuth "forward" server
         fwdCorrId <- genTokenN 1
-        -- Compute remaining TTL from the stored message's expiration (not the original TTL).
-        -- This ensures the remote server gets the correct remaining lifetime, even if
-        -- the fork is delayed by network issues or server load.
-        let fwdTtl = if msgExpiresAt > 0 then max 0 (msgExpiresAt - fwdT) else 0
         fwdResult <- fetchFederation server (ForwardMessage {
           toKey: to, encryptedBlob: encryptedBlob,
           timestamp: clampedTs, originServer: serverHostN, messageId: effectiveMsgId,
           fromServer: serverHostN, requestTimestamp: fwdT,
-          authorization: fwdAuth, correlationId: fwdCorrId, messageTtl: fwdTtl})
+          authorization: fwdAuth, correlationId: fwdCorrId})
         case fwdResult of
           Err e -> do
             logWarn ("federation: forward to " ++ server ++ " failed for " ++ effectiveMsgId ++ ": " ++ show e)
@@ -4409,13 +4381,11 @@ sendBatchForwardsSequential = \msgs server ->
         fwdT <- now
         fwdAuth <- generateFederationAuth "forward" server
         fwdCorrId <- genTokenN 1
-        -- Use stored msgExpiresAt to compute remaining TTL (not original messageTtl)
-        let fwdTtl = if r.msgExpiresAt > 0 then max 0 (r.msgExpiresAt - fwdT) else 0
         fwdResult <- fetchFederation server (ForwardMessage {
           toKey: r.toKey, encryptedBlob: r.blob,
           timestamp: r.ts, originServer: serverHostN, messageId: r.messageId,
           fromServer: serverHostN, requestTimestamp: fwdT,
-          authorization: fwdAuth, correlationId: fwdCorrId, messageTtl: fwdTtl})
+          authorization: fwdAuth, correlationId: fwdCorrId})
         case fwdResult of
           Err e -> do
             logWarn ("federation: forward to " ++ server ++ " failed for " ++ r.messageId ++ ": " ++ show e)
@@ -4431,7 +4401,7 @@ sendBatchForwardsSequential = \msgs server ->
 -- POST /messages: Send an encrypted message to a recipient.
 -- Deduplicates by messageId across messages, ackedIds, and deliveredIds.
 -- Rate-limited per sender key. If recipient is known on a remote server, forwards via federation.
-handleSendMessage = \to encryptedBlob timestamp messageId messageTtl authorization clientIp respond -> do
+handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp respond -> do
   t <- now
   globalRateLimited <- checkGlobalRate t
   if globalRateLimited then yield (respond {status: MsRateLimited {}, messageId: "", retryAfterMs: 0, error: "rate_limited"})
@@ -4447,15 +4417,15 @@ handleSendMessage = \to encryptedBlob timestamp messageId messageTtl authorizati
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
       dp <- *drainPhase
-      if dp >= 2 then yield {status: MsDraining {}, remoteServers: [], retryAfterMs: 0, msgExpiresAt: 0}
+      if dp >= 2 then yield {status: MsDraining {}, remoteServers: [], retryAfterMs: 0}
       else withSessionAuth authorization t clientIp
-        (yield {status: MsUnauthorized {}, remoteServers: [], retryAfterMs: 0, msgExpiresAt: 0})
-        (\senderKey -> sendMessageCore senderKey to encryptedBlob clampedTs effectiveMsgId messageTtl t)
+        (yield {status: MsUnauthorized {}, remoteServers: [], retryAfterMs: 0})
+        (\senderKey -> sendMessageCore senderKey to encryptedBlob clampedTs effectiveMsgId t)
     case result.status of
       MsRateLimited {} -> logWarn ("sendMessage: rate limited for " ++ effectiveMsgId)
       MsRejected {} -> when (result.retryAfterMs == 0) (logWarn ("sendMessage: rejected for " ++ effectiveMsgId ++ " (capacity or mailbox full)"))
       _ -> yield {}
-    forkSendForwards effectiveMsgId to encryptedBlob clampedTs result.msgExpiresAt result.remoteServers
+    forkSendForwards effectiveMsgId to encryptedBlob clampedTs result.remoteServers
     yield (case result.status of
       MsDuplicate {} -> respond {status: MsDuplicate {}, messageId: effectiveMsgId, retryAfterMs: 0, error: ""}
       MsDelivered {} -> respond {status: MsDelivered {}, messageId: effectiveMsgId, retryAfterMs: 0, error: ""}
@@ -4806,7 +4776,7 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
 -- (fromServer != originServer) where an intermediate server re-forwards because
 -- the recipient moved. Cascade is bounded by dedup (same messageId won't be stored
 -- twice) and forwardCandidates (won't re-forward to the same server).
-handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId messageTtl authorization respond -> do
+handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId authorization respond -> do
   t <- now
   let corrId = sanitizeCorrelationId correlationId
   when (corrId != "") (logInfo ("[CORR] " ++ corrId ++ " forward " ++ messageId ++ " from " ++ fromServer))
@@ -4890,12 +4860,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                       seqCounter <- *seqCounter
                       let seqTs = nextSeqTs t seqCounter
                       set *seqCounter = seqTs
-                      -- Federation forwards: use raw TTL without minMessageTtl clamp.
-                      -- The TTL represents remaining lifetime from the origin server, which
-                      -- may legitimately be less than minMessageTtl near expiry. Clamping
-                      -- to minMessageTtl would extend the message's life on each hop.
-                      let fwdExpiresAt = if messageTtl <= 0 then seqTs + unackedMessageMaxAge
-                        else seqTs + clamp 1 unackedMessageMaxAge messageTtl
+                      let fwdExpiresAt = seqTs + unackedMessageMaxAge
                       writeMessageBucket bkt (union bucket
                         [{messageId: messageId, toKey: toKey,
                           encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: ""}])
@@ -5443,7 +5408,7 @@ handleRestore = \version presenceData ackedIdsData ackOverflowData deliveredIdsD
   if not authorized then yield (respond {ok: False {}, error: "unauthorized", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
   else do
     -- Version 0 = pre-versioning snapshot, version 1 = pre-forwardNonces, version 2 = pre-blockedPeers,
-    -- version 3 = pre-messageTtl in ForwardEntry, version 4 = pre-allowedPeers
+    -- version 3 = pre-ForwardEntry changes, version 4 = pre-allowedPeers
     -- (accept all for backwards compatibility; missing fields default to empty list or 0)
     if version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != snapshotVersion then do
       logError ("restore: incompatible snapshot version " ++ show version ++ " (expected " ++ show snapshotVersion ++ ")")
@@ -5781,18 +5746,18 @@ sendBatchInner = \senderKey messages t acc ->
       when (msg.timestamp < t - messageMaxAge / 2 && t - msg.timestamp <= messageMaxAge)
         (logWarn ("sendBatch: stale timestamp (" ++ show ((t - msg.timestamp) / 86400000) ++ " days old) for " ++ effectiveMsgId))
       result <- if t - msg.timestamp > messageMaxAge
-        then yield {messageId: effectiveMsgId, status: MsRejected {}, remoteServers: [], toKey: "", blob: "", ts: 0, msgExpiresAt: 0, retryAfterMs: 0}
+        then yield {messageId: effectiveMsgId, status: MsRejected {}, remoteServers: [], toKey: "", blob: "", ts: 0, retryAfterMs: 0}
         else do
           let clampedTs = clampTimestamp msg.timestamp t
           sendResult <- atomic do
             dp <- *drainPhase
-            if dp >= 2 then yield {status: MsDraining {}, remoteServers: [], retryAfterMs: 0, msgExpiresAt: 0}
-            else sendMessageCore senderKey msg.to msg.encryptedBlob clampedTs effectiveMsgId msg.messageTtl t
+            if dp >= 2 then yield {status: MsDraining {}, remoteServers: [], retryAfterMs: 0}
+            else sendMessageCore senderKey msg.to msg.encryptedBlob clampedTs effectiveMsgId t
           case sendResult.status of
             MsRateLimited {} -> logWarn ("sendBatch: rate limited for " ++ effectiveMsgId)
             MsRejected {} -> logWarn ("sendBatch: rejected for " ++ effectiveMsgId ++ " (capacity or mailbox full)")
             _ -> yield {}
-          yield {messageId: effectiveMsgId, status: sendResult.status, remoteServers: sendResult.remoteServers, toKey: msg.to, blob: msg.encryptedBlob, ts: clampedTs, msgExpiresAt: sendResult.msgExpiresAt, retryAfterMs: sendResult.retryAfterMs}
+          yield {messageId: effectiveMsgId, status: sendResult.status, remoteServers: sendResult.remoteServers, toKey: msg.to, blob: msg.encryptedBlob, ts: clampedTs, retryAfterMs: sendResult.retryAfterMs}
       sendBatchInner senderKey split.rest t (union acc [result])
 
 -- POST /maintenance/block: Add a server to the federation blocklist.
@@ -6146,7 +6111,7 @@ serveInner = \req -> case req of
   RevokeSession {targetToken, authorization, clientIp, respond} -> handleRevoke targetToken authorization clientIp respond
   Logout {authorization, clientIp, respond} -> handleLogout authorization clientIp respond
   Poll {cursor, generation, watchKeys, authorization, clientIp, respond} -> handlePoll cursor generation watchKeys authorization clientIp respond
-  SendMessage {to, encryptedBlob, timestamp, messageId, messageTtl, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob timestamp messageId messageTtl authorization clientIp respond
+  SendMessage {to, encryptedBlob, timestamp, messageId, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob timestamp messageId authorization clientIp respond
   MessageStatus {to, messageId, authorization, clientIp, respond} -> handleMessageStatus to messageId authorization clientIp respond
   AckMessages {messageIds, authorization, clientIp, respond} -> handleAckMessages messageIds authorization clientIp respond
   SendBatch {messages, authorization, clientIp, respond} -> handleSendBatch messages authorization clientIp respond
@@ -6156,7 +6121,7 @@ serveInner = \req -> case req of
   LookupPresence {pubkey, authorization, clientIp, respond} -> handleLookupPresence pubkey authorization clientIp respond
   BatchLookupPresence {pubkeys, authorization, clientIp, respond} -> handleBatchLookupPresence pubkeys authorization clientIp respond
   RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, correlationId, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp correlationId authorization respond
-  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, correlationId, messageTtl, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId messageTtl authorization respond
+  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, correlationId, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId authorization respond
   FederationAck {messageIds, originServer, fromServer, requestTimestamp, correlationId, authorization, respond} -> handleFederationAck messageIds originServer fromServer requestTimestamp correlationId authorization respond
   FederationCancel {messageId, toKey, fromServer, requestTimestamp, correlationId, authorization, respond} -> handleFederationCancel messageId toKey fromServer requestTimestamp correlationId authorization respond
   VerifyToken {token, scope, clientIp, respond} -> handleVerifyToken token scope clientIp respond
