@@ -66,6 +66,11 @@ maxRecvRatePerKey = 10 -- max messages received by a key per window (across all 
 recvRateWindowMs : Int<Ms>
 recvRateWindowMs = 1000
 maxRecvRateEntries = 1000
+-- Per-sender-per-recipient rate limiting (prevents one sender from filling a recipient's mailbox)
+maxPairRatePerPair = 30 -- max messages per sender-recipient pair per window
+pairRateWindowMs : Int<Ms>
+pairRateWindowMs = 60000 -- 1 minute
+maxPairRateEntries = 5000
 -- Federation rate limiting (per-server)
 maxFederationRatePerServer = 50 -- max federation requests per server per window
 federationRateWindowMs : Int<Ms>
@@ -89,6 +94,7 @@ offlineGossipMinTtl = 60 -- minimum TTL for offline gossip events
 maxFederationConcurrency = 10 -- max concurrent outbound federation requests per cycle
 maxForwardRetriesPerServer = 100
 maxForwardRetries = 10 -- max retries per individual forward entry before dropping
+maxAckRetries = 10 -- max retries per ack entry before dropping to deliveredIds
 maxGossipHops = 5 -- max hops a gossip event can propagate across servers
 gossipOriginHops = 2 -- hops set when this server originates a gossip event
 gossipDedupWindow : Int<Ms>
@@ -238,7 +244,7 @@ type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Times
 -- Queued federation forward: message waiting to be delivered to a remote server
 type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, retries: Int}
 -- Tracks message IDs that were acked by a polling client, pending federation ack back to origin
-type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName}
+type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName, retries: Int}
 -- Terminal state: message delivered and ack confirmed (used for dedup after ack overflow)
 type DeliveredEntry = {messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}
 -- Tracks consecutive failures per federation peer for exponential backoff
@@ -246,6 +252,7 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFa
 -- Sliding-window rate limit state per pubkey
 type SendRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
 type RecvRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
+type PairRateEntry = {sender: PubkeyHex, recipient: PubkeyHex, windowStart: Timestamp, count: Int}
 type ChallengeRateEntry = {pubkey: PubkeyHex, windowStart: Timestamp, count: Int}
 -- Sliding-window rate limit state per federation peer server
 type FederationRateEntry = {server: Text, windowStart: Timestamp, count: Int}
@@ -411,6 +418,8 @@ type RecentFederationRequest = {server: Text, timestamp: Timestamp, seenAt: Time
 
 *recvRates : [RecvRateEntry]
 
+*pairRates : [PairRateEntry]
+
 *recentGossip : [RecentGossipEntry]
 
 *lastFederationSuccessAt : Timestamp
@@ -452,7 +461,8 @@ type RecentFederationRequest = {server: Text, timestamp: Timestamp, seenAt: Time
 *recentFederationRequests : [RecentFederationRequest]
 
 -- Pending verification tokens for federation callback auth (single-use, short-lived)
-*pendingVerifications : [{token: Text, createdAt: Timestamp}]
+-- scope binds the token to a specific request type (gossip/forward/ack) to prevent cross-use
+*pendingVerifications : [{token: Text, createdAt: Timestamp, scope: Text}]
 
 -- ============================================
 -- Routes
@@ -517,7 +527,7 @@ route FederationApi where
 -- Federation callback verification: the receiving server calls back to the sender
 -- to confirm a request token is genuine. No shared secret needed.
 route FederationVerifyApi where
-  POST {token: Text} /federation/verify -> {ok: Bool} = VerifyToken
+  POST {token: Text, scope: Text} /federation/verify -> {ok: Bool} = VerifyToken
 
 -- Triggers pruning of expired state and retry of pending federation ops
 route MaintenanceApi where
@@ -823,13 +833,15 @@ verifyMaintenanceAuth = verifyAuthWith (\token -> verifySecret token maintenance
 
 -- Generate a single-use token for outbound federation auth.
 -- The receiving server calls back to /federation/verify to confirm we issued it.
-generateFederationAuth : IO {network} Text
-generateFederationAuth = do
+-- scope binds the token to a request type ("gossip", "forward", "ack") so a token
+-- issued for one operation cannot authorize a different one.
+generateFederationAuth : Text -> IO {network} Text
+generateFederationAuth = \scope -> do
   token <- genToken
   t <- now
   atomic do
     pending <- *pendingVerifications
-    let updated = union pending [{token: token, createdAt: t}]
+    let updated = union pending [{token: token, createdAt: t, scope: scope}]
     set *pendingVerifications = if count updated > maxPendingVerifications
       then evictOneOldest updated (\p -> p.createdAt)
       else updated
@@ -837,12 +849,13 @@ generateFederationAuth = do
 
 -- Verify an inbound federation token by callback to the sender's /federation/verify endpoint.
 -- Single-use: the sender consumes the token on verification.
-verifyFederationCallback : Text -> Text -> IO {network} Bool
-verifyFederationCallback = \fromServer authorization ->
+-- scope must match the scope the token was generated with; empty scope accepts any (backward compat).
+verifyFederationCallback : Text -> Text -> Text -> IO {network} Bool
+verifyFederationCallback = \fromServer authorization scope ->
   case extractToken authorization of
     Nothing {} -> yield (False {})
     Just {value: token} -> do
-      result <- fetch (federationUrl fromServer) (VerifyToken {token: token})
+      result <- fetch (federationUrl fromServer) (VerifyToken {token: token, scope: scope})
       case result of
         Err e -> do
           println ("federation: verify callback to " ++ fromServer ++ " failed: " ++ show e)
@@ -1578,6 +1591,8 @@ pruneExpired = \t -> do
     set *challengeRates = do r <- challengeRates; where t - r.windowStart < challengeRateWindowMs; yield r
     recvRates <- *recvRates
     set *recvRates = do r <- recvRates; where t - r.windowStart < recvRateWindowMs; yield r
+    pairRates <- *pairRates
+    set *pairRates = do r <- pairRates; where t - r.windowStart < pairRateWindowMs; yield r
     -- Reset auth-tier global rate window
     authWS <- *authGlobalRateWindowStart
     when (t - authWS >= authGlobalRateWindowMs) (do
@@ -1630,7 +1645,7 @@ sendBatchedGossipToServer : ServerName -> [GossipEvent] -> Int -> IO {network} {
 sendBatchedGossipToServer = \server allEvents hops ->
   forEachBatch allEvents maxGossipEvents (\batch -> do
     t <- now
-    auth <- generateFederationAuth
+    auth <- generateFederationAuth "gossip"
     result <- fetchFederation server (RecvGossip {
       authorization: auth,
       events: batch, hopsRemaining: hops, fromServer: serverHostN,
@@ -1736,8 +1751,8 @@ checkPreAuth = \clientIp t -> do
       if ipLimited then yield "ip_rate_limited"
       else yield ""
 
-withFederationAuth = \authorization t respond fromServer requestTimestamp precondition action -> do
-  verified <- verifyFederationCallback fromServer authorization
+withFederationAuth = \authorization t respond fromServer scope requestTimestamp precondition action -> do
+  verified <- verifyFederationCallback fromServer authorization scope
   if not verified
     then yield (respond {ok: False {}, error: "unauthorized"})
     -- Replay protection: reject requests with timestamps too far from local clock.
@@ -1892,7 +1907,7 @@ retryForwardsForServer = \entries remaining ->
       Just {value: f} -> do
         let rest = do x <- entries; where x.messageId != f.messageId; yield x
         t <- now
-        auth <- generateFederationAuth
+        auth <- generateFederationAuth "forward"
         result <- fetchFederation f.toServer (ForwardMessage {
           toKey: f.toKey, encryptedBlob: f.encryptedBlob,
           timestamp: f.timestamp, originServer: f.originServer, messageId: f.messageId,
@@ -1956,7 +1971,7 @@ forwardQueuedMessages = \targets t -> do
 
 fetchFederationAck = \origin messageIds -> do
   t <- now
-  auth <- generateFederationAuth
+  auth <- generateFederationAuth "ack"
   fetchFederation origin (FederationAck {
     authorization: auth,
     messageIds: messageIds,
@@ -1971,6 +1986,23 @@ sendBatchedAcksToServer = \serverAcks server ->
       Err e -> do
         println ("federation: ack to " ++ server ++ " failed: " ++ show e)
         recordFailure server
+        -- Increment retry counters; drop entries exceeding maxAckRetries to deliveredIds
+        dropped <- atomic do
+          ackedIds <- *ackedIds
+          let isTarget = \a -> a.originServer == server && hasMessage a.messageId a.toKey batch
+          let toDrop = do a <- ackedIds; where isTarget a && a.retries + 1 >= maxAckRetries; yield a
+          let dropCount = count toDrop
+          set *ackedIds = do a <- ackedIds
+            where not (isTarget a && a.retries + 1 >= maxAckRetries)
+            yield (if isTarget a then {messageId: a.messageId, toKey: a.toKey, ackedAt: a.ackedAt, originServer: a.originServer, retries: a.retries + 1} else a)
+          when (dropCount > 0) (do
+            deliveredIds <- *deliveredIds
+            let newDelivered = do d <- toDrop; yield {messageId: d.messageId, toKey: d.toKey, deliveredAt: d.ackedAt}
+            let combined = union deliveredIds newDelivered
+            set *deliveredIds = if count combined > maxDeliveredIds then (evictSmallest combined (count combined - maxDeliveredIds) (\d -> d.deliveredAt)).kept else combined)
+          yield dropCount
+        when (dropped > 0)
+          (println ("federation: dropped " ++ show dropped ++ " ack entries to " ++ server ++ " after " ++ show maxAckRetries ++ " retries"))
       Ok _ -> do
         clearFailure server
         atomic do
@@ -2006,7 +2038,7 @@ retryEvictedAcks = \evictedEntries pendingAcks ->
           println ("federation: evicted ack to " ++ server ++ " failed: " ++ show e)
           overflow <- atomic do
             ackedIds <- *ackedIds
-            let reinsert = acksForServer evictedToRetry server
+            let reinsert = do a <- acksForServer evictedToRetry server; yield {messageId: a.messageId, toKey: a.toKey, ackedAt: a.ackedAt, originServer: a.originServer, retries: a.retries + 1}
             let combined = union ackedIds reinsert
             let excess = count combined - maxAckedIds
             if excess <= 0
@@ -2055,6 +2087,23 @@ retryOverflowAcks = \overflow -> do
         Err e -> do
           println ("federation: overflow ack to " ++ server ++ " failed: " ++ show e)
           recordFailure server
+          -- Increment retry counters in overflow; drop entries exceeding maxAckRetries to deliveredIds
+          dropped <- atomic do
+            ackOverflow <- *ackOverflow
+            let isTarget = \a -> a.originServer == server && hasMessage a.messageId a.toKey batch
+            let toDrop = do a <- ackOverflow; where isTarget a && a.retries + 1 >= maxAckRetries; yield a
+            let dropCount = count toDrop
+            set *ackOverflow = do a <- ackOverflow
+              where not (isTarget a && a.retries + 1 >= maxAckRetries)
+              yield (if isTarget a then {messageId: a.messageId, toKey: a.toKey, ackedAt: a.ackedAt, originServer: a.originServer, retries: a.retries + 1} else a)
+            when (dropCount > 0) (do
+              deliveredIds <- *deliveredIds
+              let newDelivered = do d <- toDrop; yield {messageId: d.messageId, toKey: d.toKey, deliveredAt: d.ackedAt}
+              let combined = union deliveredIds newDelivered
+              set *deliveredIds = if count combined > maxDeliveredIds then (evictSmallest combined (count combined - maxDeliveredIds) (\d -> d.deliveredAt)).kept else combined)
+            yield dropCount
+          when (dropped > 0)
+            (println ("federation: dropped " ++ show dropped ++ " overflow ack entries to " ++ server ++ " after " ++ show maxAckRetries ++ " retries"))
         Ok _ -> do
           clearFailure server
           atomic do
@@ -2344,7 +2393,7 @@ pollableMessages = \messages pubkey cursor t ->
 
 -- Build ack entries for messages that came from a remote origin server (need federation ack)
 federatedAckEntries = \ackedMessages t ->
-  do m <- ackedMessages; where m.originServer != ""; yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer}
+  do m <- ackedMessages; where m.originServer != ""; yield {messageId: m.messageId, toKey: m.toKey, ackedAt: t, originServer: m.originServer, retries: 0}
 
 -- Remove forwards for specific message IDs destined to a given server
 forwardsExcluding = \forwards server messageIds ->
@@ -2660,6 +2709,15 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp
                 then yield {send: SendFailed {status: MsRateLimited {}}, senderRateLimited: True {}, globalCapReached: False {}}
                 else do
                   set *sendRates = rateResult.entries
+                  pairRates <- *pairRates
+                  let pairResult = checkRateWindow pairRates (\r -> r.sender == senderKey && r.recipient == to)
+                    (\ts -> {sender: senderKey, recipient: to, windowStart: ts, count: 1})
+                    (\r -> {sender: r.sender, recipient: r.recipient, windowStart: r.windowStart, count: r.count + 1})
+                    maxPairRatePerPair pairRateWindowMs maxPairRateEntries t
+                  set *pairRates = pairResult.entries
+                  if pairResult.limited
+                    then yield {send: SendFailed {status: MsRateLimited {}}, senderRateLimited: False {}, globalCapReached: False {}}
+                    else do
                   recvRates <- *recvRates
                   let recvResult = checkRateWindow recvRates (\r -> r.pubkey == to)
                     (\ts -> {pubkey: to, windowStart: ts, count: 1})
@@ -2717,7 +2775,7 @@ handleSendMessage = \to encryptedBlob timestamp messageId authorization clientIp
               yield (any forwards (\f -> f.messageId == effectiveMsgId && f.toServer == server))
             when stillPending (do
               fwdT <- now
-              fwdAuth <- generateFederationAuth
+              fwdAuth <- generateFederationAuth "forward"
               fwdResult <- fetchFederation server (ForwardMessage {
                 toKey: to, encryptedBlob: encryptedBlob,
                 timestamp: clampedTs, originServer: serverHostN, messageId: effectiveMsgId,
@@ -2907,11 +2965,12 @@ handleLogout = \authorization clientIp respond -> do
 -- POST /federation/verify: Confirm a token was issued by this server.
 -- Called by the receiving server during federation callback verification.
 -- Tokens are single-use and expire after verificationTokenExpiry.
-handleVerifyToken = \token respond -> do
+handleVerifyToken = \token scope respond -> do
   t <- now
   found <- atomic do
     pending <- *pendingVerifications
-    let match = any pending (\p -> safeCompare p.token token && t - p.createdAt < verificationTokenExpiry)
+    -- Empty scope accepts any (backward compat with peers that don't send scope yet)
+    let match = any pending (\p -> safeCompare p.token token && (scope == "" || p.scope == scope) && t - p.createdAt < verificationTokenExpiry)
     when match (set *pendingVerifications = do p <- pending; where not (safeCompare p.token token); yield p)
     yield match
   yield (respond {ok: found})
@@ -2923,7 +2982,7 @@ handleVerifyToken = \token respond -> do
 handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorization respond -> do
   t <- now
   let cappedHops = clamp 0 maxGossipHops hopsRemaining
-  withFederationAuth authorization t respond fromServer requestTimestamp (cappedHops >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (do
+  withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (cappedHops >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (do
     let validated = validGossipEvents events t
     let onlineEntries = validated.online
     let trustedOffline = trustedOfflineEvents validated.offline fromServer
@@ -2970,7 +3029,7 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorizati
 -- twice) and forwardCandidates (won't re-forward to the same server).
 handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp authorization respond -> do
   t <- now
-  withFederationAuth authorization t respond fromServer requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
+  withFederationAuth authorization t respond fromServer "forward" requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
     when (fromServer != originServer)
       (println ("forward: relay from " ++ fromServer ++ " (origin: " ++ originServer ++ ") for " ++ toKey))
     -- Replay protection: reject forwards with timestamps older than messageMaxAge.
@@ -3034,7 +3093,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
 -- recipient has no local presence and no other pending forwards for that message.
 handleFederationAck = \messageIds originServer fromServer requestTimestamp authorization respond -> do
   t <- now
-  withFederationAuth authorization t respond fromServer requestTimestamp (isLocalServer originServer && not (isLocalServer fromServer)) (do
+  withFederationAuth authorization t respond fromServer "ack" requestTimestamp (isLocalServer originServer && not (isLocalServer fromServer)) (do
     let dedupedIds = dedupMessageIds messageIds
     -- Clear forward entries for the acking server. Extract removed forwards' toKey
     -- so we can reclaim origin messages that are no longer needed.
@@ -3333,7 +3392,7 @@ serve = \req -> case req of
   RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp authorization respond
   ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp authorization respond
   FederationAck {messageIds, originServer, fromServer, requestTimestamp, authorization, respond} -> handleFederationAck messageIds originServer fromServer requestTimestamp authorization respond
-  VerifyToken {token, respond} -> handleVerifyToken token respond
+  VerifyToken {token, scope, respond} -> handleVerifyToken token scope respond
   Prune {authorization, respond} -> handlePrune authorization respond
   Drain {authorization, respond} -> handleDrain authorization respond
   Undrain {authorization, respond} -> handleUndrain authorization respond
@@ -3452,6 +3511,7 @@ main = do
         && maxForwardRetries > 0 && maxGossipHops > 0 && maxPollsPerKey > 0
         && gossipOriginHops > 0
         && verificationTokenExpiry > 0
+        && maxAckRetries > 0 && maxPairRatePerPair > 0 && pairRateWindowMs > 0
   -- Relationship invariants: these misconfigurations cause subtle bugs
   -- (e.g., messages pruned before their stated max age, backoff that never increases)
   let configRelationsOk = unackedMessageMaxAge <= messageMaxAge
@@ -3491,6 +3551,8 @@ main = do
       println ("  message max age: " ++ show messageMaxAge ++ "ms")
       println ("  global rate limit: " ++ show maxGlobalRequestRate ++ "/" ++ show globalRateWindowMs ++ "ms")
       println ("  auth rate limit: " ++ show maxAuthGlobalRate ++ "/" ++ show authGlobalRateWindowMs ++ "ms")
+      println ("  pair rate limit: " ++ show maxPairRatePerPair ++ "/" ++ show pairRateWindowMs ++ "ms per sender-recipient")
+      println ("  ack retry limit: " ++ show maxAckRetries ++ " per entry")
       when (federationCircuitBreakerThreshold > 0)
         (println ("  circuit breaker: " ++ show federationCircuitBreakerThreshold ++ " failing peers"))
       when (autoSnapshotInterval > 0)
