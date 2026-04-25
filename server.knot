@@ -31,6 +31,7 @@ maxPubkeyLen = 256
 maxBlobLen = 65536
 maxSignatureLen = 256
 maxMessageIds = 100
+maxBatchSize = 100 -- max messages per batch request (bounds recursion depth in sendBatchInner)
 maxGossipEvents = 100
 maxPollEvents = 50
 maxPresenceEntries = 10000
@@ -2339,15 +2340,32 @@ evictOneOldest = \items getKey ->
     Nothing {} -> items
     Just {} -> r.items
 
--- Remove the N items with the smallest key value. O(n*k) — efficient when k is small.
+-- Remove the first item matching a predicate. O(n) single pass.
+removeFirstMatch = \items pred ->
+  let r = fold (\acc x ->
+    if not acc.done && pred x then {items: acc.items, done: True {}}
+    else {items: union acc.items [x], done: acc.done}
+  ) {items: [], done: False {}} items
+  in r.items
+
+-- Remove the N items with the smallest key value.
+-- Single-pass fold maintaining N candidates with smallest keys, then diff.
+-- O(n*k) time — avoids the O(k*n²) cost of recursive extractOldest + list rebuilding.
 evictSmallest = \items n getKey ->
   if n <= 0 then {kept: items, evicted: []}
-  else let r = extractOldest items getKey in
-    case r.candidate of
-      Nothing {} -> {kept: items, evicted: []}
-      Just {value: c} ->
-        let rest = evictSmallest r.items (n - 1) getKey in
-        {kept: rest.kept, evicted: union [c] rest.evicted}
+  else if count items <= n then {kept: [], evicted: items}
+  else
+    let result = fold (\acc x ->
+      if count acc.evict < n
+        then {evict: union acc.evict [x], maxKey: if getKey x > acc.maxKey then getKey x else acc.maxKey}
+        else if getKey x >= acc.maxKey then acc
+        else
+          let without = removeFirstMatch acc.evict (\e -> getKey e == acc.maxKey) in
+          let newEvict = union without [x] in
+          let newMax = fold (\m e -> if getKey e > m then getKey e else m) (getKey x) newEvict in
+          {evict: newEvict, maxKey: newMax}
+    ) {evict: [], maxKey: 0} items
+    in {kept: diff items result.evict, evicted: result.evict}
 
 -- Single-pass eviction by timestamp cutoff: keeps items where getKey >= cutoff.
 -- O(n) vs O(n*k) for evictSmallest. Used for forward nonce eviction on the hot path.
@@ -3866,7 +3884,11 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId t ->
     bucket <- readMessageBucket msgBucket
     ackedBkt <- readAckedBucket msgBucket
     delivBkt <- readDelivBucket msgBucket
-    let isDup = checkMessageDup bucket effectiveMsgId to || hasMessage effectiveMsgId to ackedBkt || hasMessage effectiveMsgId to delivBkt
+    -- Nonce check closes the dedup gap between message expiry (30 days) and nonce retention
+    -- (60 days): without this, a client could replay a messageId after messages/ackedIds/deliveredIds
+    -- expire but before the nonce expires.
+    nonceBkt <- readNonceBucket msgBucket
+    let isDup = checkMessageDup bucket effectiveMsgId to || hasMessage effectiveMsgId to ackedBkt || hasMessage effectiveMsgId to delivBkt || any nonceBkt (\n -> n.messageId == effectiveMsgId && n.toKey == to)
     if isDup then yield {status: MsDuplicate {}, remoteServers: [], retryAfterMs: 0}
     else do
       sendRates <- *sendRates
@@ -4256,26 +4278,28 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
     let filteredOnline = resolveByTimestamp onlineEntries trustedOffline
     let filteredOffline = resolveByTimestamp trustedOffline onlineEntries
     let deduped = mergeByPubkeyServer [] filteredOnline
-    -- Reject first-party gossip entries that claim keys locally authenticated on this server.
+    -- Reject gossip entries that claim keys locally authenticated on this server.
     -- A peer announcing presence for a key we have a live session for could be a presence
     -- hijack attempt: the attacker's server would receive forwarded message copies.
-    -- Filter these out before the merge to prevent duplicate routing.
+    -- Covers both first-party (e.server == fromServer) and third-party relay (e.server != fromServer)
+    -- to prevent attackers from using relay gossip to reroute locally-authenticated keys.
     localClashes <- atomic do
-      let firstParty = do e <- deduped; where e.server == fromServer; yield e
-      let targetBuckets = uniqueBucketsFor firstParty (\e -> e.pubkey)
+      let targetBuckets = uniqueBucketsFor deduped (\e -> e.pubkey)
       localPresence <- readSelectedPresenceBuckets targetBuckets
-      yield (do e <- firstParty; where any localPresence (\p -> p.pubkey == e.pubkey && isLocalServer p.server && p.expiresAt > t); yield e.pubkey)
+      yield (do e <- deduped; where any localPresence (\p -> p.pubkey == e.pubkey && isLocalServer p.server && p.expiresAt > t); yield e.pubkey)
     when (count localClashes > 0)
       (logWarn ("gossip: " ++ fromServer ++ " claims " ++ show (count localClashes) ++ " locally-authenticated key(s) — filtering from merge"))
-    -- Remove clashing entries from deduped before merge (only first-party claims for
-    -- locally-authenticated keys; third-party relays are handled by trustedGossipEntries)
+    -- Remove clashing entries from both deduped and trustedOffline before merge
     let safeDeduped = if count localClashes > 0
-      then do d <- deduped; where not (d.server == fromServer && any localClashes (\pk -> pk == d.pubkey)); yield d
+      then do d <- deduped; where not (any localClashes (\pk -> pk == d.pubkey)); yield d
       else deduped
     -- Per-bucket gossip merge: read only presence buckets affected by this gossip batch
     -- instead of all 16. All entries for a pubkey hash to the same bucket, so per-bucket
     -- merge is equivalent to global merge. Reduces lock scope for small gossip batches.
-    let allGossipEntries = union safeDeduped trustedOffline
+    let safeTrustedOffline = if count localClashes > 0
+      then do d <- trustedOffline; where not (any localClashes (\pk -> pk == d.pubkey)); yield d
+      else trustedOffline
+    let allGossipEntries = union safeDeduped safeTrustedOffline
     let affectedBuckets = uniqueBucketsFor allGossipEntries (\e -> e.pubkey)
     gossipResult <- atomic do
       selectedPresence <- readSelectedPresenceBuckets affectedBuckets
@@ -4285,7 +4309,7 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
       let capacityDeduped = if tpc >= maxPresenceEntries
         then do d <- safeDeduped; where any selectedPresence (\p -> p.pubkey == d.pubkey); yield d
         else safeDeduped
-      let gm = mergeGossipPresence selectedPresence capacityDeduped trustedOffline fromServer t
+      let gm = mergeGossipPresence selectedPresence capacityDeduped safeTrustedOffline fromServer t
       -- Write back only affected buckets (not writeAllPresence, which would zero unaffected buckets)
       writeSelectedPresenceBuckets affectedBuckets gm.finalPresence
       let delta = count gm.finalPresence - count selectedPresence
@@ -4747,9 +4771,10 @@ handleStats = \authorization respond -> do
       let oldestFwdAge = case minBy core.f (\x -> x.createdAt) of Nothing {} -> 0; Just {value: x} -> t - x.createdAt
       let oldestAckAge = case minBy core.a (\x -> x.ackedAt) of Nothing {} -> 0; Just {value: x} -> t - x.ackedAt
       -- Per-server forward queue summary: count unique servers and max queue depth
-      let fwdCounts = fold (\acc f ->
-        if any acc (\a -> a.server == f.toServer) then do a <- acc; yield (if a.server == f.toServer then {server: a.server, count: a.count + 1} else a)
-        else union acc [{server: f.toServer, count: 1}]) [] core.f
+      -- Two-pass aggregation: collect unique servers, then count per server.
+      -- Avoids O(n*k) accumulator rebuilding in the fold (no list comprehension per step).
+      let fwdServers = fold (\acc f -> if any acc (\s -> s == f.toServer) then acc else union acc [f.toServer]) [] core.f
+      let fwdCounts = do s <- fwdServers; yield {server: s, count: count (do f <- core.f; where f.toServer == s; yield f)}
       let fwdServerCount = count fwdCounts
       let maxFwdDepth = fold (\acc c -> max acc c.count) 0 fwdCounts
       yield (respond {ok: True {},
@@ -4770,9 +4795,9 @@ handleStatsPeers = \authorization respond -> do
       failures <- *forwardFailures
       forwards <- readAllForwards
       -- Count pending forwards per server in a single pass
-      let fwdCounts = fold (\acc f ->
-        if any acc (\a -> a.server == f.toServer) then do a <- acc; yield (if a.server == f.toServer then {server: a.server, count: a.count + 1} else a)
-        else union acc [{server: f.toServer, count: 1}]) [] forwards
+      -- Two-pass aggregation: collect unique servers, then count per server.
+      let fwdServers = fold (\acc f -> if any acc (\s -> s == f.toServer) then acc else union acc [f.toServer]) [] forwards
+      let fwdCounts = do s <- fwdServers; yield {server: s, count: count (do f <- forwards; where f.toServer == s; yield f)}
       let fwdCountFor = \server -> fold (\acc c -> if c.server == server then c.count else acc) 0 fwdCounts
       let peers = do f <- failures; yield {server: f.server, failures: f.failures, lastFailedAt: f.failedAt, firstFailedAt: f.firstFailedAt, backoffMs: retryBackoffFor f.failures f.server, retriable: shouldRetryServer f.server t failures, pendingForwards: fwdCountFor f.server}
       -- Include servers with pending forwards but no failure records
@@ -4863,7 +4888,9 @@ handleRestore = \version presenceData ackedIdsData ackOverflowData deliveredIdsD
       -- snapshot could inject presence pointing to private IPs, causing forward attempts
       -- to those addresses.
       let validPresence = do p <- presenceData; where not (isLocalServer p.server) && not (isBadServerName p.server); yield p
-      let rejectedCount = (count forwardsData - count validForwards) + (count ackedIdsData - count validAcked) + (count ackOverflowData - count validOverflow) + (count presenceData - count validPresence)
+      let validDeliveredIds = do d <- deliveredIdsData; where not (isLocalServer d.originServer); yield d
+      let validFailures = do f <- forwardFailuresData; where not (isBadServerName f.server) && not (isLocalServer f.server); yield f
+      let rejectedCount = (count forwardsData - count validForwards) + (count ackedIdsData - count validAcked) + (count ackOverflowData - count validOverflow) + (count presenceData - count validPresence) + (count deliveredIdsData - count validDeliveredIds) + (count forwardFailuresData - count validFailures)
       when (rejectedCount > 0) (logWarn ("restore: rejected " ++ show rejectedCount ++ " imported entries with invalid or local server references"))
       result <- atomic do
         -- Merge presence (existing entries win on conflict via freshness)
@@ -4883,12 +4910,12 @@ handleRestore = \version presenceData ackedIdsData ackOverflowData deliveredIdsD
         let mergedOverflow = union ackOverflow validOverflow
         set *ackOverflow = takeRelation maxAckOverflow mergedOverflow
         deliveredIds <- readAllDelivered
-        let mergedDelivered = union deliveredIds deliveredIdsData
+        let mergedDelivered = union deliveredIds validDeliveredIds
         let cappedDelivered = takeRelation maxDeliveredIds mergedDelivered
         writeAllDelivered cappedDelivered
         -- Restore peer failure records
         forwardFailures <- *forwardFailures
-        let mergedFailures = mergeByKey (\a b -> a.server == b.server) (\x -> x.failedAt) forwardFailures forwardFailuresData
+        let mergedFailures = mergeByKey (\a b -> a.server == b.server) (\x -> x.failedAt) forwardFailures validFailures
         let cappedFailures = takeRelation maxForwardFailures mergedFailures
         set *forwardFailures = cappedFailures
         -- Restore forward entries (dedup by messageId + toServer, keep fresher on conflict; using validated data)
@@ -5056,7 +5083,12 @@ handleSendBatch = \messages authorization clientIp respond -> do
     withSessionAuth authorization t clientIp
       (yield (respond {results: [], authorized: False {}, retryAfterMs: 0}))
       (\senderKey -> do
-        let capped = takeRelation maxMessageIds messages
+        let sized = takeRelation maxBatchSize messages
+        -- Pre-deduplicate by explicit messageId to prevent within-batch duplicates.
+        -- Each message in a batch gets its own atomic block via sendMessageCore, so
+        -- dedup between messages in the same batch is not caught by STM.
+        -- Messages with empty messageId (auto-generated) are always kept.
+        let capped = fold (\acc m -> if m.messageId != "" && any acc (\a -> a.messageId == m.messageId) then acc else union acc [m]) [] sized
         results <- sendBatchInner senderKey capped t []
         -- Fork federation forwarding: one forked task per target server (not per message).
         -- Within each task, forwards are sent sequentially to avoid per-message fork overhead.
