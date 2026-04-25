@@ -71,8 +71,10 @@ maxMessages = 100000 -- global cap on total stored messages across all recipient
 clockSkewTolerance : Int<Ms>
 clockSkewTolerance = 5000 -- 5 seconds tolerance for clock skew between federated servers
 maxForwardsEntries = 10000
+maxForwardsPerKey = 50 -- max pending forwards per recipient pubkey (prevents one key from starving others)
 maxServerNameLen = 128
 maxMessageIdLen = 128
+maxCorrelationIdLen = 128
 maxTokenLen = 256
 maxChallenges = 10000
 maxSessions = 10000
@@ -177,7 +179,7 @@ federationLatencyWindowMs : Int<Ms>
 federationLatencyWindowMs = 300000 -- 5 minutes; reset latency metrics after this interval
 
 -- Snapshot format version (increment on schema changes to prevent corrupt restores)
-snapshotVersion = 4 -- bumped for messageTtl field in ForwardEntry
+snapshotVersion = 5 -- bumped for allowedPeers field in snapshot
 
 -- Per-peer gossip event volume limiting (prevents flooding via large batches of unique pubkeys)
 maxGossipEventsPerServer = 500 -- max total gossip events per server per window
@@ -669,6 +671,10 @@ type SenderExpiration = {senderKey: Text, messageId: MessageIdHex, toKey: Pubkey
 -- Last time federation latency metrics were reset (for windowed averages)
 *federationLatencyResetAt : Timestamp
 
+-- Suppresses latency metric recording during startup probe phase (prevents
+-- unauthenticated probe results from skewing initial /stats readings)
+*startupProbeActive : Bool
+
 -- Total session count across all buckets (avoids O(16) recount on monitoring paths)
 *totalSessionCount : Int
 
@@ -903,11 +909,11 @@ route MaintenanceApi where
   -- Messages are excluded (ephemeral by design; clients handle re-delivery).
   -- Includes presence, acked/delivered IDs (dedup state), and peer failure records.
   GET /maintenance/snapshot headers {authorization: Text}
-    -> {ok: Bool, version: Int, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry], forwardNonces: [ForwardNonce], blockedPeers: [Text]}
+    -> {ok: Bool, version: Int, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry], forwardNonces: [ForwardNonce], blockedPeers: [Text], allowedPeers: [Text]}
     = Snapshot
   -- Restore: import a previously-exported snapshot. Server must be in drain mode
   -- to prevent conflicts with live state. Run /maintenance/undrain after restore.
-  POST {version: Int, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry], forwardNonces: [ForwardNonce], blockedPeers: [Text]} /maintenance/restore headers {authorization: Text}
+  POST {version: Int, presence: [PresenceEntry], ackedIds: [AckedEntry], ackOverflow: [AckedEntry], deliveredIds: [DeliveredEntry], forwardFailures: [ForwardFailure], forwards: [ForwardEntry], forwardNonces: [ForwardNonce], blockedPeers: [Text], allowedPeers: [Text]} /maintenance/restore headers {authorization: Text}
     -> {ok: Bool, error: Text, presenceCount: Int, ackedIdsCount: Int, deliveredIdsCount: Int}
     = Restore
   -- Block a federation peer (rejects all inbound/outbound federation with this server)
@@ -974,7 +980,7 @@ route HealthApi where
 -- BREAKING CHANGE from flat format — existing scrapers must update field paths.
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {ok: Bool, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, messagesMax: Int, messagesPct: Int, totalMessageCount: Int, presence: Int, presenceMax: Int, presencePct: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool}}
+    -> {ok: Bool, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, messagesMax: Int, messagesPct: Int, totalMessageCount: Int, presence: Int, presenceMax: Int, presencePct: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int}}
     = Stats
   GET /stats/peers headers {authorization: Text}
     -> {peers: [PeerStatus], ok: Bool}
@@ -1060,6 +1066,10 @@ genToken = genTokenN tokenChunks
 
 tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> drop maxLen s != ""
+
+-- Truncate correlationId to maxCorrelationIdLen to prevent log flooding from malicious peers
+sanitizeCorrelationId : Text -> Text
+sanitizeCorrelationId = \cid -> take maxCorrelationIdLen cid
 
 isHexChar : Text -> Bool
 isHexChar = \c -> contains c "0123456789abcdef"
@@ -1453,6 +1463,27 @@ hasSessionForKey = \pubkey b ->
     if any bucket (\s -> s.pubkey == pubkey) then yield (True {})
     else hasSessionForKey pubkey (b + 1)
 
+-- Check if a pubkey has any non-expired session across all buckets (short-circuits on first match).
+hasActiveSessionForKey : PubkeyHex -> Timestamp -> Int -> IO Bool
+hasActiveSessionForKey = \pubkey t b ->
+  if b > 15 then yield (False {})
+  else do
+    bucket <- readSessionBucket b
+    if any bucket (\s -> s.pubkey == pubkey && s.expiresAt > t) then yield (True {})
+    else hasActiveSessionForKey pubkey t (b + 1)
+
+-- Filter a list of pubkeys to those with active (non-expired) sessions.
+-- Checks each key independently (short-circuits per key), avoids materializing all sessions.
+filterActiveSessionKeys : [PubkeyHex] -> Timestamp -> IO [PubkeyHex]
+filterActiveSessionKeys = \keys t ->
+  case headOf keys of
+    Nothing {} -> yield []
+    Just {value: k} -> do
+      let rest = do x <- keys; where x != k; yield x
+      hasActive <- hasActiveSessionForKey k t 0
+      remaining <- filterActiveSessionKeys rest t
+      if hasActive then yield (union [k] remaining) else yield remaining
+
 -- Count sessions for a specific pubkey across all buckets (avoids materializing full session list).
 -- Used in verify fast path to skip readAllSessions.
 countSessionsForKey : PubkeyHex -> IO Int
@@ -1466,6 +1497,19 @@ countSessionsInBucket = \pubkey b ->
     let n = count (do s <- bucket; where s.pubkey == pubkey; yield s)
     rest <- countSessionsInBucket pubkey (b + 1)
     yield (n + rest)
+
+-- Remove all sessions for a pubkey across all 16 buckets, returning total revoked.
+-- Each bucket is filtered in-place (avoids readAllSessions + writeAllSessions repartition).
+revokeSessionsForKey : PubkeyHex -> Int -> IO Int
+revokeSessionsForKey = \pubkey b ->
+  if b > 15 then yield 0
+  else do
+    bucket <- readSessionBucket b
+    let kept = do s <- bucket; where s.pubkey != pubkey; yield s
+    let removed = count bucket - count kept
+    when (removed > 0) (writeSessionBucket b kept)
+    rest <- revokeSessionsForKey pubkey (b + 1)
+    yield (removed + rest)
 
 -- Apply a filter/transform to every session bucket and return the total count.
 -- Combines transform + count in one pass, avoiding a redundant 16-bucket traversal.
@@ -2453,13 +2497,15 @@ fetchFederation = \server request -> do
   let latency = endTime - startTime
   when (latency > federationFetchTimeoutMs)
     (logWarn ("federation: slow response from " ++ server ++ " (" ++ show latency ++ "ms)"))
-  atomic do
+  -- Skip latency recording during startup probes (unauthenticated, expected to fail)
+  probing <- *startupProbeActive
+  when (not probing) (atomic do
     total <- *federationLatencyTotal
     cnt <- *federationLatencyCount
     mx <- *federationLatencyMax
     set *federationLatencyTotal = total + latency
     set *federationLatencyCount = cnt + 1
-    set *federationLatencyMax = if latency > mx then latency else mx
+    set *federationLatencyMax = if latency > mx then latency else mx)
   yield result
 
 clampTtl : Int<S> -> Int<S>
@@ -2485,7 +2531,7 @@ dedupMessageIds = \messageIds ->
   let capped = takeRelation maxMessageIds messageIds in
   fold (\acc mid ->
     if any acc (\a -> a == mid) then acc
-    else union acc [mid]) [] capped
+    else union [mid] acc) [] capped
 
 
 -- Constant-time comparison iteration count. Derived from tokenHexLen (48) + 16
@@ -3387,7 +3433,12 @@ forwardQueuedMessages = \targets t -> do
     relevantMessages <- readSelectedBuckets neededBuckets
     let candidates = forwardCandidates remoteTargets relevantMessages forwards t
     let totalFwdCount <- countAllForwards 0
-    let capped = takeRelation (maxForwardsEntries - totalFwdCount) candidates
+    -- Per-key cap: filter candidates to respect maxForwardsPerKey per recipient
+    let perKeyCapped = fold (\acc c ->
+      let existingForKey = count (do f <- forwards; where f.toKey == c.toKey; yield f)
+        + count (do a <- acc; where a.toKey == c.toKey; yield a)
+      in if existingForKey >= maxForwardsPerKey then acc else union acc [c]) [] candidates
+    let capped = takeRelation (maxForwardsEntries - totalFwdCount) perKeyCapped
     -- Write back only the affected forward buckets (not all 16)
     let combined = union forwards capped
     writeSelectedFwdBuckets neededFwdBuckets combined
@@ -3632,11 +3683,11 @@ pruneAndRetry = \t -> do
         set *lastPresenceRefresh = t
         yield {extendedActive: [], nearExpiryActive: [], refreshPeers: knownPeers, shouldRefresh: True {}}
       else do
-        -- Only read session buckets for pubkeys that have near-expiry presence
+        -- Check per-key session existence (avoids materializing all 16 session buckets)
         let nearExpiryPubkeys = fold (\acc p -> if any acc (\a -> a == p.pubkey) then acc else union acc [p.pubkey]) [] localNearExpiry
-        allSessions <- readAllSessions
-        let toExtend = do p <- localNearExpiry; where any allSessions (\s -> s.pubkey == p.pubkey && s.expiresAt > t); yield p
-        let notExtended = do p <- localNearExpiry; where none allSessions (\s -> s.pubkey == p.pubkey && s.expiresAt > t); yield p
+        activeKeys <- filterActiveSessionKeys nearExpiryPubkeys t
+        let toExtend = do p <- localNearExpiry; where any activeKeys (\k -> k == p.pubkey); yield p
+        let notExtended = do p <- localNearExpiry; where none activeKeys (\k -> k == p.pubkey); yield p
         when (count toExtend > 0) (do
           -- Only write to the affected presence buckets (not all 16)
           let affectedBuckets = uniqueBucketsFor toExtend (\e -> e.pubkey)
@@ -4309,7 +4360,11 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId messageTt
                   let remainingTtl = if messageTtl > 0 then max 0 (msgExpiresAt - t) else 0
                   let newFwds = do s <- remoteServers; where none fwdBkt (\f -> f.messageId == effectiveMsgId && f.toServer == s); yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: serverHostN, retries: 0, messageTtl: remainingTtl}
                   totalFwdCount <- countAllForwards 0
-                  let cappedFwds = takeRelation (maxForwardsEntries - totalFwdCount) newFwds
+                  let globalCap = maxForwardsEntries - totalFwdCount
+                  -- Per-key cap: prevents one key from consuming disproportionate forward slots
+                  let keyFwdCount = count (do f <- fwdBkt; where f.toKey == to; yield f)
+                  let keyCap = maxForwardsPerKey - keyFwdCount
+                  let cappedFwds = takeRelation (min globalCap keyCap) newFwds
                   writeFwdBucket fbi (union fwdBkt cappedFwds)
                   -- Return whether any forwards were actually enqueued (vs dropped by capacity cap)
                   yield (count cappedFwds > 0)
@@ -4649,7 +4704,7 @@ handleVerifyToken = \token scope clientIp respond -> do
 handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlationId authorization respond -> do
   t <- now
   let cappedHops = clamp 0 maxGossipHops hopsRemaining
-  let corrId = if correlationId != "" then correlationId else ""
+  let corrId = sanitizeCorrelationId correlationId
   when (corrId != "") (logInfo ("[CORR] " ++ corrId ++ " gossip from " ++ fromServer))
   withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (cappedHops >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (True {}) (do
     -- Per-peer gossip event volume limiting: counts total events (not just requests) per server.
@@ -4762,7 +4817,8 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
 -- twice) and forwardCandidates (won't re-forward to the same server).
 handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId messageTtl authorization respond -> do
   t <- now
-  when (correlationId != "") (logInfo ("[CORR] " ++ correlationId ++ " forward " ++ messageId ++ " from " ++ fromServer))
+  let corrId = sanitizeCorrelationId correlationId
+  when (corrId != "") (logInfo ("[CORR] " ++ corrId ++ " forward " ++ messageId ++ " from " ++ fromServer))
   withFederationAuth authorization t respond fromServer "forward" requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (True {}) (do
     when (fromServer != originServer)
       (logInfo ("forward: relay from " ++ fromServer ++ " (origin: " ++ originServer ++ ") for " ++ toKey))
@@ -4884,7 +4940,8 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
 -- recipient has no local presence and no other pending forwards for that message.
 handleFederationAck = \messageIds originServer fromServer requestTimestamp correlationId authorization respond -> do
   t <- now
-  when (correlationId != "") (logInfo ("[CORR] " ++ correlationId ++ " ack from " ++ fromServer))
+  let corrId = sanitizeCorrelationId correlationId
+  when (corrId != "") (logInfo ("[CORR] " ++ corrId ++ " ack from " ++ fromServer))
   -- Wrap respond to add ackedCount default for withFederationAuth error paths
   let ackRespond = \r -> respond {ok: r.ok, error: r.error, ackedCount: 0}
   -- clearOnAuth=False: defer clearFailure until we confirm the ack matched actual
@@ -4977,7 +5034,8 @@ handleDrain = \phase authorization respond -> do
       ff <- *forwardFailures
       fn <- readAllNonces
       bp <- *blockedPeers
-      yield {version: snapshotVersion, presence: drainResult.localEntries, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: flushState.forwards, forwardNonces: fn, blockedPeers: bp}
+      ap <- *allowedPeers
+      yield {version: snapshotVersion, presence: drainResult.localEntries, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: flushState.forwards, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap}
     println ("[SNAPSHOT_DATA] " ++ toJson drainSnapshot)
     atomic do set *prunesSinceSnapshot = 0
     logInfo ("drain: auto-snapshot exported (" ++ show (count drainResult.localEntries) ++ " presence, " ++ show (count flushState.forwards) ++ " forwards)")
@@ -5157,7 +5215,7 @@ handleHealth = \authorization respond -> do
                   watchdogHealthy: True {},
                   draining: result.isDraining})
 
-zeroStats = {ok: False {}, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}}}
+zeroStats = {ok: False {}, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0}}
 
 handleStats = \authorization respond -> do
   t <- now
@@ -5193,7 +5251,8 @@ handleStats = \authorization respond -> do
         ger <- *gossipEventRates
         vir <- *verifyIpRates
         ukir <- *uniqueKeyIpRates
-        yield {sc: sc, pc: pc, c: c, aCount: aCount, ao: ao, dCount: dCount, ff: ff, ap: ap, tmc: tmc, rc: rc, fi: fi, rg: rg, fnCount: fnCount, pac: pac, bp: bp, ger: ger, vir: vir, ukir: ukir}
+        se <- *senderExpirations
+        yield {sc: sc, pc: pc, c: c, aCount: aCount, ao: ao, dCount: dCount, ff: ff, ap: ap, tmc: tmc, rc: rc, fi: fi, rg: rg, fnCount: fnCount, pac: pac, bp: bp, ger: ger, vir: vir, ukir: ukir, se: se}
       counters <- atomic do
         sr <- *sendRates
         cr <- *challengeRates
@@ -5237,8 +5296,8 @@ handleStats = \authorization respond -> do
       yield (respond {ok: True {},
         capacity: {sessions: sessions, sessionsMax: maxSessions, sessionsPct: sessPct, messages: messages, messagesMax: maxMessages, messagesPct: msgPct, totalMessageCount: messages, presence: presence, presenceMax: maxPresenceEntries, presencePct: presPct, forwards: fwds, forwardsMax: maxForwardsEntries, forwardsPct: fwdPct, challenges: count core.c, challengesMax: maxChallenges, ackedIds: core.aCount, ackedIdsMax: maxAckedIds, ackOverflow: count core.ao, ackOverflowMax: maxAckOverflow, deliveredIds: core.dCount, deliveredIdsMax: maxDeliveredIds, forwardNonces: core.fnCount, forwardNoncesMax: maxForwardNonces, activePolls: count core.ap, activePollsMax: maxActivePolls, recipientCounts: count core.rc},
         federation: {enabled: federationEnabled, inFlight: count core.fi, hungSlots: hungFedSlots, avgLatencyMs: fedAvg, maxLatencyMs: counters.flm, callCount: counters.flc, forwardFailures: count core.ff, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, recentGossip: count core.rg, blockedPeers: count core.bp, drainCompletedAt: counters.dca, forwardServers: fwdServerCount, maxForwardQueueDepth: maxFwdDepth},
-        rates: {send: count counters.sr, challenge: count counters.cr, federation: count counters.fr, federationPair: count counters.fpr, global: counters.grc, ip: count counters.ir, lookup: count counters.lr, recv: count counters.rr, pair: count counters.prr, gossipEvent: count core.ger, verifyIp: count core.vir, uniqueKeyIp: count core.ukir, pendingAckCleanups: count core.pac},
-        timing: {pruneCount: counters.pc, pruneRunning: counters.pr, heartbeatCount: counters.hc, uptime: t - counters.sa, lastPruneAt: counters.lp, lastHeartbeatAt: counters.lh, draining: counters.dr > 0}})
+        rates: {send: count counters.sr, challenge: count counters.cr, federation: count counters.fr, federationPair: count counters.fpr, global: counters.grc, ip: count counters.ir, lookup: count counters.lr, recv: count counters.rr, pair: count counters.prr, gossipEvent: count core.ger, verifyIp: count core.vir, uniqueKeyIp: count core.ukir, pendingAckCleanups: count core.pac, senderExpirations: count core.se},
+        timing: {pruneCount: counters.pc, pruneRunning: counters.pr, heartbeatCount: counters.hc, uptime: t - counters.sa, lastPruneAt: counters.lp, lastHeartbeatAt: counters.lh, draining: counters.dr > 0, drainPhase: counters.dr}})
     else yield (respond zeroStats)
 
 handleStatsPeers = \authorization respond -> do
@@ -5326,7 +5385,7 @@ handleReady = \respond -> do
   let isReady = lastPrune > 0 && lastPrune >= sa
   yield (respond {ready: isReady})
 
-emptySnapshot = {ok: False {}, version: 0, presence: [], ackedIds: [], ackOverflow: [], deliveredIds: [], forwardFailures: [], forwards: [], forwardNonces: [], blockedPeers: []}
+emptySnapshot = {ok: False {}, version: 0, presence: [], ackedIds: [], ackOverflow: [], deliveredIds: [], forwardFailures: [], forwards: [], forwardNonces: [], blockedPeers: [], allowedPeers: []}
 
 -- GET /maintenance/snapshot: Export federation metadata for persistence.
 -- Reads all dedup state (ackedIds, deliveredIds), presence, peer failure records,
@@ -5346,26 +5405,27 @@ handleSnapshot = \authorization respond -> do
       f <- readAllForwards
       fn <- readAllNonces
       bp <- *blockedPeers
-      yield {presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: bp}
+      ap <- *allowedPeers
+      yield {presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap}
     atomic do
       set *lastSnapshotExportAt = t
       set *prunesSinceSnapshot = 0
-    logInfo ("snapshot: exported " ++ show (count result.presence) ++ " presence, " ++ show (count result.ackedIds) ++ " ackedIds, " ++ show (count result.deliveredIds) ++ " deliveredIds, " ++ show (count result.forwards) ++ " forwards, " ++ show (count result.forwardNonces) ++ " forwardNonces, " ++ show (count result.blockedPeers) ++ " blockedPeers")
-    yield (respond {ok: True {}, version: snapshotVersion, presence: result.presence, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, forwards: result.forwards, forwardNonces: result.forwardNonces, blockedPeers: result.blockedPeers})
+    logInfo ("snapshot: exported " ++ show (count result.presence) ++ " presence, " ++ show (count result.ackedIds) ++ " ackedIds, " ++ show (count result.deliveredIds) ++ " deliveredIds, " ++ show (count result.forwards) ++ " forwards, " ++ show (count result.forwardNonces) ++ " forwardNonces, " ++ show (count result.blockedPeers) ++ " blockedPeers, " ++ show (count result.allowedPeers) ++ " allowedPeers")
+    yield (respond {ok: True {}, version: snapshotVersion, presence: result.presence, ackedIds: result.ackedIds, ackOverflow: result.ackOverflow, deliveredIds: result.deliveredIds, forwardFailures: result.forwardFailures, forwards: result.forwards, forwardNonces: result.forwardNonces, blockedPeers: result.blockedPeers, allowedPeers: result.allowedPeers})
 
 -- POST /maintenance/restore: Import a previously-exported snapshot.
 -- Requires drain mode to prevent conflicts with live state. Merges imported data
 -- with existing state (dedup entries are unioned, presence is merged by freshness).
 -- After restore, call /maintenance/undrain to resume, then /maintenance/prune to
 -- trigger federation forward creation from messages + restored presence.
-handleRestore = \version presenceData ackedIdsData ackOverflowData deliveredIdsData forwardFailuresData forwardsData forwardNoncesData blockedPeersData authorization respond -> do
+handleRestore = \version presenceData ackedIdsData ackOverflowData deliveredIdsData forwardFailuresData forwardsData forwardNoncesData blockedPeersData allowedPeersData authorization respond -> do
   let authorized = verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, error: "unauthorized", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
   else do
     -- Version 0 = pre-versioning snapshot, version 1 = pre-forwardNonces, version 2 = pre-blockedPeers,
-    -- version 3 = pre-messageTtl in ForwardEntry (accept all for backwards compatibility;
-    -- missing fields default to empty list or 0)
-    if version != 0 && version != 1 && version != 2 && version != 3 && version != snapshotVersion then do
+    -- version 3 = pre-messageTtl in ForwardEntry, version 4 = pre-allowedPeers
+    -- (accept all for backwards compatibility; missing fields default to empty list or 0)
+    if version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != snapshotVersion then do
       logError ("restore: incompatible snapshot version " ++ show version ++ " (expected " ++ show snapshotVersion ++ ")")
       yield (respond {ok: False {}, error: "incompatible_version", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
     else do
@@ -5434,6 +5494,11 @@ handleRestore = \version presenceData ackedIdsData ackOverflowData deliveredIdsD
         let mergedBlocked = fold (\acc b -> if any acc (\x -> x == b) then acc else union acc [b]) blocked blockedPeersData
         let cappedBlocked = takeRelation maxBlockedPeers mergedBlocked
         set *blockedPeers = cappedBlocked
+        -- Restore allowed peers (union with existing, cap at maxAllowedPeers)
+        allowed <- *allowedPeers
+        let mergedAllowed = fold (\acc a -> if any acc (\x -> x == a) then acc else union acc [a]) allowed allowedPeersData
+        let cappedAllowed = takeRelation maxAllowedPeers mergedAllowed
+        set *allowedPeers = cappedAllowed
         yield {presenceCount: count cappedPresence, ackedIdsCount: count cappedAcked, deliveredIdsCount: count cappedDelivered}
       logInfo ("restore: imported " ++ show result.presenceCount ++ " presence, " ++ show result.ackedIdsCount ++ " ackedIds, " ++ show result.deliveredIdsCount ++ " deliveredIds")
       yield (respond {ok: True {}, error: "", presenceCount: result.presenceCount, ackedIdsCount: result.ackedIdsCount, deliveredIdsCount: result.deliveredIdsCount})
@@ -5830,11 +5895,10 @@ handleAdminRevokeSessions = \pubkey authorization respond -> do
   else do
     t <- now
     result <- atomic do
-      allSessions <- readAllSessions
-      let revokedCount = count (do s <- allSessions; where s.pubkey == pubkey; yield s)
-      let remaining = do s <- allSessions; where s.pubkey != pubkey; yield s
-      writeAllSessions remaining
-      set *totalSessionCount = count remaining
+      -- Filter each session bucket in-place (avoids readAllSessions + writeAllSessions repartition)
+      revokedCount <- revokeSessionsForKey pubkey 0
+      sc <- *totalSessionCount
+      set *totalSessionCount = max 0 (sc - revokedCount)
       -- Clear local presence
       let pb = pubkeyBucket pubkey
       presenceBkt <- readPresenceBucket pb
@@ -6065,7 +6129,7 @@ serveInner = \req -> case req of
   Shutdown {authorization, respond} -> handleShutdown authorization respond
   Undrain {authorization, respond} -> handleUndrain authorization respond
   Snapshot {authorization, respond} -> handleSnapshot authorization respond
-  Restore {version, presence, ackedIds, ackOverflow, deliveredIds, forwardFailures, forwards, forwardNonces, blockedPeers, authorization, respond} -> handleRestore version presence ackedIds ackOverflow deliveredIds forwardFailures forwards forwardNonces blockedPeers authorization respond
+  Restore {version, presence, ackedIds, ackOverflow, deliveredIds, forwardFailures, forwards, forwardNonces, blockedPeers, allowedPeers, authorization, respond} -> handleRestore version presence ackedIds ackOverflow deliveredIds forwardFailures forwards forwardNonces blockedPeers allowedPeers authorization respond
   BlockPeer {server, authorization, respond} -> handleBlockPeer server authorization respond
   UnblockPeer {server, authorization, respond} -> handleUnblockPeer server authorization respond
   ListBlocked {authorization, respond} -> handleListBlocked authorization respond
@@ -6264,7 +6328,8 @@ backgroundSnapshot = do
           f <- readAllForwards
           fn <- readAllNonces
           bp <- *blockedPeers
-          yield {version: snapshotVersion, presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: bp}
+          ap <- *allowedPeers
+          yield {version: snapshotVersion, presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: bp, allowedPeers: ap}
         println ("[SNAPSHOT_DATA] " ++ toJson exportData)
         atomic do
           set *lastAutoSnapshotExportAt = t
@@ -6322,8 +6387,10 @@ backgroundWatchdog = do
 -- Surfaces DNS, firewall, and TLS issues before the first real gossip cycle.
 -- Probes up to 10 peers sequentially (not forked) to avoid overwhelming the network.
 startupProbePeers = do
+  atomic do set *startupProbeActive = True {}
   knownPeers <- *knownPeerServers
   startupProbeNext knownPeers 0
+  atomic do set *startupProbeActive = False {}
 
 startupProbeNext = \peers probed ->
   if probed >= 10 then logInfo ("startup: probed " ++ show probed ++ " peers")
@@ -6346,15 +6413,6 @@ startupProbeNext = \peers probed ->
         Err e -> logWarn ("startup: peer " ++ server ++ " unreachable (" ++ show e ++ ") — check DNS/firewall/TLS")
         Ok r -> logInfo ("startup: peer " ++ server ++ " reachable (" ++ show latency ++ "ms)")
       startupProbeNext rest (probed + 1)
-
--- Reset federation latency metrics after startup probes so unauthenticated probe
--- results (expected "unauthorized" responses) don't skew initial /stats readings.
-resetFederationLatencyMetrics = atomic do
-  set *federationLatencyTotal = 0
-  set *federationLatencyCount = 0
-  set *federationLatencyMax = 0
-  t <- now
-  set *federationLatencyResetAt = t
 
 main = do
   let configOk = listenPort > 0 && maxMessages > 0 && maxMessagesPerRecipient > 0 && maxPresenceEntries > 0
@@ -6380,6 +6438,7 @@ main = do
         && ackGracePeriod < unackedMessageMaxAge
         && clockSkewTolerance < challengeExpiry
         && maxMessagesPerRecipient <= maxMessages
+        && maxForwardsPerKey <= maxForwardsEntries
         && maxSessionsPerKey <= maxSessions
         && maxChallengesPerKey <= maxChallenges
         && maxPollsPerKey <= maxActivePolls
@@ -6404,6 +6463,8 @@ main = do
         set *serverGeneration = t
       when (maintenanceSecret == "")
         (logWarn "maintenanceSecret is empty — /maintenance/* and /stats endpoints are disabled")
+      when (maintenanceSecret != "" && not (tooLong maintenanceSecret 15))
+        (logWarn "maintenanceSecret is shorter than 16 characters — use a longer secret for production deployments")
       when (maintenanceSecretPrevious != "")
         (logInfo "maintenanceSecretPrevious is set — both current and previous secrets are accepted (rotation mode)")
       when (matchesHostnameOrSubdomain serverHostN "localhost")
@@ -6420,7 +6481,7 @@ main = do
       logInfo ("  max messages: " ++ show maxMessages ++ " (per recipient: " ++ show maxMessagesPerRecipient ++ ")")
       logInfo ("  max sessions: " ++ show maxSessions ++ " (per key: " ++ show maxSessionsPerKey ++ ")")
       logInfo ("  max presence: " ++ show maxPresenceEntries)
-      logInfo ("  max forwards: " ++ show maxForwardsEntries)
+      logInfo ("  max forwards: " ++ show maxForwardsEntries ++ " (per key: " ++ show maxForwardsPerKey ++ ")")
       logInfo ("  session expiry: " ++ show sessionExpiry ++ "ms (max lifetime: " ++ show maxSessionLifetime ++ "ms)")
       logInfo ("  message max age: " ++ show messageMaxAge ++ "ms")
       logInfo ("  global rate limit: " ++ show maxGlobalRequestRate ++ "/" ++ show globalRateWindowMs ++ "ms")
@@ -6447,6 +6508,5 @@ main = do
       when federationEnabled (fork (do
         sleep 5000  -- wait for listener to be ready
         logInfo "startup: probing federation peers..."
-        startupProbePeers
-        resetFederationLatencyMetrics))
+        startupProbePeers))
       listen listenPort serve
