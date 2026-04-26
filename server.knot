@@ -177,17 +177,17 @@ federationLatencyWindowMs : Int<Ms>
 federationLatencyWindowMs = 300000 -- 5 minutes; reset latency metrics after this interval
 
 -- Snapshot format version (increment on schema changes to prevent corrupt restores)
-snapshotVersion = 11 -- bumped for Message.priority and ForwardEntry.priority fields
+snapshotVersion = 12 -- bumped for ForwardEntry.senderKey and federation forward priority
 
 -- Server build version: included in /health and /stats responses for deployment verification.
 -- Update this string when deploying a new build so operators can confirm which version is running.
-serverBuildVersion = "2026-04-26a"
+serverBuildVersion = "2026-04-26b"
 
 -- Federation protocol version: included in gossip/forward/ack requests.
 -- Peers log warnings when they receive requests from older versions.
 -- Backward compatible: older peers ignore unknown fields (Knot's JSON parser
 -- drops unknown keys). 0 = pre-versioning peer (field missing or unset).
-federationProtocolVersion = 11
+federationProtocolVersion = 12
 
 -- Snapshot checksum: deterministic hash of entry counts for integrity verification.
 -- Uses multiplicative hash to distinguish permutations of the same counts
@@ -419,7 +419,10 @@ type Message = {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHe
 -- Presence: tracks that a pubkey is online at a given server, with expiry
 type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Timestamp, timestamp: Timestamp}
 -- Queued federation forward: message waiting to be delivered to a remote server.
-type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, retries: Int, expiresAt: Timestamp, priority: Int}
+-- senderKey: pubkey of the authenticated sender (locally-originated only; "" for federation relays).
+-- Used by fedDeliveryReceipts to generate delivery receipts even if the original message was pruned.
+-- Pre-v12 snapshots without senderKey default to "" (Knot ignores missing Text fields).
+type ForwardEntry = {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, retries: Int, expiresAt: Timestamp, priority: Int, senderKey: Text}
 -- Tracks message IDs that were acked by a polling client, pending federation ack back to origin
 type AckedEntry = {messageId: MessageIdHex, toKey: PubkeyHex, ackedAt: Timestamp, originServer: ServerName, retries: Int}
 -- Terminal state: message delivered and ack confirmed (used for dedup after ack overflow)
@@ -1003,7 +1006,7 @@ route FederationApi where
     -- privacy model (the server never learns who sent a message). /messages/cancel for
     -- federated messages requires the client to include sender identity in the encrypted
     -- payload; the server cannot verify sender identity for federation-forwarded messages.
-    POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, expiresAt: Timestamp, protocolVersion: Int} /forward headers {authorization: Text}
+    POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, expiresAt: Timestamp, priority: Int, protocolVersion: Int} /forward headers {authorization: Text}
       -> {ok: Bool, error: Text}
       = ForwardMessage
     -- Acknowledge delivery of messages back to the origin server
@@ -1023,7 +1026,7 @@ route FederationApi where
     -- Batch forward: forward multiple messages in one request (reduces HTTP round-trips).
     -- Each message is processed independently; partial success is possible.
     -- Results are returned per-message so the sender knows which forwards succeeded.
-    POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, expiresAt: Timestamp}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /forward-batch headers {authorization: Text}
+    POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, expiresAt: Timestamp, priority: Int}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /forward-batch headers {authorization: Text}
       -> {ok: Bool, error: Text, results: [{messageId: MessageIdHex, ok: Bool}]}
       = FederationBatchForward
 
@@ -1531,6 +1534,8 @@ isBadServerName = \sn ->
   || containsSuffix ".ec2.internal" sn -- AWS EC2 internal DNS
   || containsSuffix ".amazonaws.com" sn -- AWS service endpoints (S3, SQS, etc.)
   || matchesHostname sn "metadata.google.internal" -- GCP metadata server
+  || containsSuffix ".internal.cloudapp.net" sn -- Azure VM internal DNS
+  || matchesHostname sn "metadata.azure.com" -- Azure Instance Metadata Service (IMDS v2)
   -- NOTE: Unicode/IDN defense is provided by containsBadUrlChar above, which rejects
   -- any character not in [0-9a-z-.:]  via isAllowedServerChar. This blocks homoglyph
   -- attacks (e.g., Greek omicron in "lοcalhost") assuming Knot's Text type preserves
@@ -3880,7 +3885,7 @@ incrementForwardRetries = \messageId toServer toKey -> atomic do
       tfc <- *totalForwardCount
       set *totalForwardCount = max 0 (tfc - 1)
       logWarn ("federation: dropping forward " ++ messageId ++ " to " ++ toServer ++ " after " ++ show maxForwardRetries ++ " retries")
-    else writeFwdBucket b (do f <- fwdBkt; yield (if f.messageId == messageId && f.toServer == toServer then {messageId: f.messageId, toServer: f.toServer, createdAt: f.createdAt, toKey: f.toKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, originServer: f.originServer, retries: f.retries + 1, expiresAt: f.expiresAt} else f))
+    else writeFwdBucket b (do f <- fwdBkt; yield (if f.messageId == messageId && f.toServer == toServer then {messageId: f.messageId, toServer: f.toServer, createdAt: f.createdAt, toKey: f.toKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, originServer: f.originServer, retries: f.retries + 1, expiresAt: f.expiresAt, priority: f.priority, senderKey: f.senderKey} else f))
 
 -- Retry forwards for a server using batch forward (1 HTTP round-trip per batch of maxBatchSize).
 -- Falls back to single forward if the peer returns an HTTP-level error (old peer without batch support).
@@ -3893,7 +3898,7 @@ retryForwardsForServer = \entries remaining ->
       t <- now
       auth <- generateFederationAuth "forward" server
       corrId <- genTokenN 1
-      let batchPayload = do f <- batch; yield {toKey: f.toKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, originServer: f.originServer, messageId: f.messageId, expiresAt: f.expiresAt}
+      let batchPayload = do f <- batch; yield {toKey: f.toKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, originServer: f.originServer, messageId: f.messageId, expiresAt: f.expiresAt, priority: f.priority}
       result <- fetchFederation server (FederationBatchForward {
         forwards: batchPayload, fromServer: serverHostN,
         requestTimestamp: t, authorization: auth, correlationId: corrId, protocolVersion: federationProtocolVersion})
@@ -4632,7 +4637,7 @@ forwardCandidates = \targets messages forwards t ->
       let origin = if m.originServer == "" then serverHostN else m.originServer
       yield {messageId: m.messageId, toServer: target.server, createdAt: t,
              toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp,
-             originServer: origin, retries: 0, expiresAt: m.expiresAt, priority: m.priority})) [] targets
+             originServer: origin, retries: 0, expiresAt: m.expiresAt, priority: m.priority, senderKey: m.senderKey})) [] targets
 
 
 -- Challenge-IP binding rules:
@@ -5041,7 +5046,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId expiresIn
                 let forwardsEnqueued = if federationEnabled && count remoteServers > 0 then do
                   let fbi = pubkeyBucket to
                   fwdBkt <- readFwdBucket fbi
-                  let newFwds = do s <- remoteServers; where none fwdBkt (\f -> f.messageId == effectiveMsgId && f.toServer == s); yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: serverHostN, retries: 0, expiresAt: msgExpiresAt, priority: msgPriority}
+                  let newFwds = do s <- remoteServers; where none fwdBkt (\f -> f.messageId == effectiveMsgId && f.toServer == s); yield {messageId: effectiveMsgId, toServer: s, createdAt: t, toKey: to, encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: serverHostN, retries: 0, expiresAt: msgExpiresAt, priority: msgPriority, senderKey: senderKey}
                   totalFwdCount <- *totalForwardCount
                   let globalCap = maxForwardsEntries - totalFwdCount
                   -- Per-key cap: prevents one key from consuming disproportionate forward slots
@@ -5065,8 +5070,8 @@ forkSendForwards = \effectiveMsgId to encryptedBlob clampedTs remoteServers ->
       fwdInfo <- atomic do
         fwdBkt <- readFwdBucket (pubkeyBucket to)
         case headOf (do f <- fwdBkt; where f.messageId == effectiveMsgId && f.toServer == server; yield f) of
-          Nothing {} -> yield {pending: False {}, fwdExpiresAt: 0}
-          Just {value: fe} -> yield {pending: True {}, fwdExpiresAt: fe.expiresAt}
+          Nothing {} -> yield {pending: False {}, fwdExpiresAt: 0, fwdPriority: 0}
+          Just {value: fe} -> yield {pending: True {}, fwdExpiresAt: fe.expiresAt, fwdPriority: fe.priority}
       when fwdInfo.pending (do
         fwdT <- now
         fwdAuth <- generateFederationAuth "forward" server
@@ -5076,7 +5081,7 @@ forkSendForwards = \effectiveMsgId to encryptedBlob clampedTs remoteServers ->
           timestamp: clampedTs, originServer: serverHostN, messageId: effectiveMsgId,
           fromServer: serverHostN, requestTimestamp: fwdT,
           authorization: fwdAuth, correlationId: fwdCorrId,
-          expiresAt: fwdInfo.fwdExpiresAt, protocolVersion: federationProtocolVersion})
+          expiresAt: fwdInfo.fwdExpiresAt, priority: fwdInfo.fwdPriority, protocolVersion: federationProtocolVersion})
         case fwdResult of
           Err e -> do
             logWarn ("federation: forward to " ++ server ++ " failed for " ++ effectiveMsgId ++ ": " ++ show e)
@@ -5098,8 +5103,8 @@ sendBatchForwardsSequential = \msgs server ->
       batchFwdInfo <- atomic do
         fwdBkt <- readFwdBucket (pubkeyBucket r.toKey)
         case headOf (do f <- fwdBkt; where f.messageId == r.messageId && f.toServer == server; yield f) of
-          Nothing {} -> yield {pending: False {}, fwdExpiresAt: 0}
-          Just {value: fe} -> yield {pending: True {}, fwdExpiresAt: fe.expiresAt}
+          Nothing {} -> yield {pending: False {}, fwdExpiresAt: 0, fwdPriority: 0}
+          Just {value: fe} -> yield {pending: True {}, fwdExpiresAt: fe.expiresAt, fwdPriority: fe.priority}
       when batchFwdInfo.pending (do
         fwdT <- now
         fwdAuth <- generateFederationAuth "forward" server
@@ -5109,7 +5114,7 @@ sendBatchForwardsSequential = \msgs server ->
           timestamp: r.ts, originServer: serverHostN, messageId: r.messageId,
           fromServer: serverHostN, requestTimestamp: fwdT,
           authorization: fwdAuth, correlationId: fwdCorrId,
-          expiresAt: batchFwdInfo.fwdExpiresAt, protocolVersion: federationProtocolVersion})
+          expiresAt: batchFwdInfo.fwdExpiresAt, priority: batchFwdInfo.fwdPriority, protocolVersion: federationProtocolVersion})
         case fwdResult of
           Err e -> do
             logWarn ("federation: forward to " ++ server ++ " failed for " ++ r.messageId ++ ": " ++ show e)
@@ -5519,7 +5524,7 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
 -- (fromServer != originServer) where an intermediate server re-forwards because
 -- the recipient moved. Cascade is bounded by dedup (same messageId won't be stored
 -- twice) and forwardCandidates (won't re-forward to the same server).
-handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt authorization respond -> do
+handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt priority authorization respond -> do
   t <- now
   let corrId = sanitizeCorrelationId correlationId
   when (corrId != "") (logInfo ("[CORR] " ++ corrId ++ " forward " ++ messageId ++ " from " ++ fromServer))
@@ -5606,9 +5611,10 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                       -- Use sender-specified TTL if provided and still in the future; clamp to local max.
                       -- expiresAt == 0 means pre-v10 peer or unset; fall back to server default.
                       let fwdExpiresAt = if expiresAt > 0 && expiresAt > t then min expiresAt (seqTs + unackedMessageMaxAge) else seqTs + unackedMessageMaxAge
+                      let clampedPriority = clamp 0 maxMessagePriority priority
                       writeMessageBucket bkt (union bucket
                         [{messageId: messageId, toKey: toKey,
-                          encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: 0}])
+                          encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: clampedPriority}])
                       set *totalMessageCount = totalMsgCount + 1
                       writeRcBucket bkt (adjustRecipientCount recipientCounts toKey 1)
                       signalMessageForKey toKey seqTs
@@ -5637,7 +5643,9 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
       _ -> respond {ok: True {}, error: ""}))
 
 -- Generate sender delivery receipts for messages confirmed delivered via federation ack.
--- Reads the original message from the origin server's mailbox to extract senderKey.
+-- Uses senderKey from the ForwardEntry directly (stored since v12), so receipts are
+-- generated even if the original message was already pruned from the mailbox.
+-- Falls back to message lookup for pre-v12 forward entries where senderKey is "".
 -- Per-bucket: only reads message buckets containing the acked recipients.
 fedDeliveryReceipts : [Int] -> [ForwardEntry] -> Timestamp -> IO ()
 fedDeliveryReceipts = \bucketIds forwards t -> case headOf bucketIds of
@@ -5645,15 +5653,22 @@ fedDeliveryReceipts = \bucketIds forwards t -> case headOf bucketIds of
   Just {value: b} -> do
     let rest = do x <- bucketIds; where x != b; yield x
     let bucketFwds = do f <- forwards; where pubkeyBucket f.toKey == b; yield f
-    atomic do
-      msgs <- readMessageBucket b
-      let deliveries = do f <- bucketFwds; m <- msgs; where m.messageId == f.messageId && m.toKey == f.toKey && m.senderKey != "" && m.originServer == ""; yield {senderKey: m.senderKey, messageId: m.messageId, toKey: m.toKey, deliveredAt: t}
-      when (count deliveries > 0) (do
-        sd <- *senderDeliveries
-        let combined = union sd deliveries
-        set *senderDeliveries = if count combined > maxSenderDeliveries
-          then evictOneOldest combined (\d -> d.deliveredAt)
-          else combined)
+    -- Fast path: forward entries with senderKey (v12+) don't need message lookup
+    let fromForwards = do f <- bucketFwds; where f.senderKey != ""; yield {senderKey: f.senderKey, messageId: f.messageId, toKey: f.toKey, deliveredAt: t}
+    -- Fallback: pre-v12 entries without senderKey — look up the original message
+    let needLookup = do f <- bucketFwds; where f.senderKey == ""; yield f
+    msgDeliveries <- if count needLookup > 0
+      then atomic do
+        msgs <- readMessageBucket b
+        yield (do f <- needLookup; m <- msgs; where m.messageId == f.messageId && m.toKey == f.toKey && m.senderKey != "" && m.originServer == ""; yield {senderKey: m.senderKey, messageId: m.messageId, toKey: m.toKey, deliveredAt: t})
+      else yield []
+    let deliveries = union fromForwards msgDeliveries
+    when (count deliveries > 0) (atomic do
+      sd <- *senderDeliveries
+      let combined = union sd deliveries
+      set *senderDeliveries = if count combined > maxSenderDeliveries
+        then evictOneOldest combined (\d -> d.deliveredAt)
+        else combined)
     fedDeliveryReceipts rest forwards t
 
 -- POST /federation/ack: Peer server confirms delivery of messages we originated.
@@ -5892,9 +5907,10 @@ forwardBatchInner = \entries fromServer t acc ->
                     let seqTs = nextSeqTs t seqCounter
                     set *seqCounter = seqTs
                     let fwdExpiresAt = if entry.expiresAt > 0 && entry.expiresAt > t then min entry.expiresAt (seqTs + unackedMessageMaxAge) else seqTs + unackedMessageMaxAge
+                    let batchClampedPriority = clamp 0 maxMessagePriority entry.priority
                     writeMessageBucket bkt (union bucket
                       [{messageId: entry.messageId, toKey: entry.toKey,
-                        encryptedBlob: entry.encryptedBlob, timestamp: clampedTs, originServer: entry.originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: 0}])
+                        encryptedBlob: entry.encryptedBlob, timestamp: clampedTs, originServer: entry.originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: batchClampedPriority}])
                     set *totalMessageCount = totalMsgCount + 1
                     writeRcBucket bkt (adjustRecipientCount recipientCounts entry.toKey 1)
                     signalMessageForKey entry.toKey seqTs
@@ -7462,8 +7478,8 @@ serveInner = \req -> case req of
   BatchLookupPresence {pubkeys, authorization, clientIp, respond} -> handleBatchLookupPresence pubkeys authorization clientIp respond
   RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> do
     warnOldProtocol fromServer protocolVersion; handleRecvGossip events hopsRemaining fromServer requestTimestamp correlationId authorization respond
-  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, correlationId, expiresAt, protocolVersion, authorization, respond} -> do
-    warnOldProtocol fromServer protocolVersion; handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt authorization respond
+  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, correlationId, expiresAt, priority, protocolVersion, authorization, respond} -> do
+    warnOldProtocol fromServer protocolVersion; handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt priority authorization respond
   FederationAck {messageIds, originServer, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> do
     warnOldProtocol fromServer protocolVersion; handleFederationAck messageIds originServer fromServer requestTimestamp correlationId authorization respond
   FederationCancel {messageId, toKey, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> do
@@ -7655,8 +7671,13 @@ backgroundPrune = do
     -- to clients with pre-jump cursors. Without a generation bump, these messages are
     -- silently skipped until real time catches up to the inflated timestamps.
     when (lp > 0 && t - lp > backgroundPruneInterval * 10) (do
-      logWarn ("clock forward jump detected — " ++ show (t - lp) ++ "ms since last prune (expected ~" ++ show backgroundPruneInterval ++ "ms), bumping server generation to reset client cursors")
-      set *serverGeneration = t)
+      logWarn ("clock forward jump detected — " ++ show (t - lp) ++ "ms since last prune (expected ~" ++ show backgroundPruneInterval ++ "ms), bumping server generation and resetting seqCounter")
+      set *serverGeneration = t
+      -- Also reset seqCounter: messages stored during the forward jump window have
+      -- inflated receivedAt timestamps from nextSeqTs using the jumped seqCounter.
+      -- Without this reset, new messages would continue getting inflated timestamps
+      -- until seqCounter is organically surpassed by real time.
+      set *seqCounter = t)
   -- Heartbeat watchdog: bump pollWakeup if heartbeat loop appears dead
   sa <- *startedAt
   lastHb <- *lastHeartbeatAt
@@ -7772,25 +7793,33 @@ backgroundSnapshot = do
       lastFp <- *lastSnapshotFingerprint
       let stateChanged = lastFp == 0 || fingerprint != lastFp
       when (hasState && stateChanged && (lastAutoExport == 0 || t - lastAutoExport >= autoSnapshotExportInterval)) (do
-        -- Split into per-collection reads to reduce contention (auto-export is best-effort;
-        -- slight inconsistency between collections is acceptable vs. one large atomic block
-        -- holding all 80+ bucket locks and competing with hot-path operations).
-        p <- atomic do pp <- readAllPresence; yield pp
-        a <- atomic do aa <- readAllAcked; yield aa
-        ao <- atomic do aao <- *ackOverflow; yield aao
-        d <- atomic do dd <- readAllDelivered; yield dd
-        ff <- atomic do fff <- *forwardFailures; yield fff
-        f <- atomic do ff2 <- readAllForwards; yield ff2
-        fn <- atomic do fnn <- readAllNonces; yield fnn
-        extraState <- atomic do
+        -- Single atomic read for consistent [SNAPSHOT_DATA] output (used for restore).
+        -- Previous per-collection reads caused inconsistencies (e.g., ackedIds referencing
+        -- messageIds from a different snapshot window). The contention cost is acceptable
+        -- since auto-export runs at most once per hour.
+        exportSnapshot <- atomic do
+          p <- readAllPresence
+          a <- readAllAcked
+          ao <- *ackOverflow
+          d <- readAllDelivered
+          ff <- *forwardFailures
+          f <- readAllForwards
+          fn <- readAllNonces
           bp <- *blockedPeers
           ap <- *allowedPeers
           pac <- *pendingAckCleanups
           se <- *senderExpirations
           sdl <- *senderDeliveries
-          yield {bp: bp, ap: ap, pac: pac, se: se, sdl: sdl}
+          yield {p: p, a: a, ao: ao, d: d, ff: ff, f: f, fn: fn, bp: bp, ap: ap, pac: pac, se: se, sdl: sdl}
+        let p = exportSnapshot.p
+        let a = exportSnapshot.a
+        let ao = exportSnapshot.ao
+        let d = exportSnapshot.d
+        let ff = exportSnapshot.ff
+        let f = exportSnapshot.f
+        let fn = exportSnapshot.fn
         let exportCs = snapshotChecksum (count p) (count a) (count d) (count f) (count fn)
-        let exportData = {version: snapshotVersion, checksum: exportCs, presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: extraState.bp, allowedPeers: extraState.ap, pendingAckCleanups: extraState.pac, senderExpirations: extraState.se, senderDeliveries: extraState.sdl}
+        let exportData = {version: snapshotVersion, checksum: exportCs, presence: p, ackedIds: a, ackOverflow: ao, deliveredIds: d, forwardFailures: ff, forwards: f, forwardNonces: fn, blockedPeers: exportSnapshot.bp, allowedPeers: exportSnapshot.ap, pendingAckCleanups: exportSnapshot.pac, senderExpirations: exportSnapshot.se, senderDeliveries: exportSnapshot.sdl}
         autoRtSec <- *runtimeMaintenanceSecret
         let autoEffSec = if autoRtSec != "" then autoRtSec else maintenanceSecret
         let autoTag = snapshotIntegrityTag exportCs autoEffSec
@@ -7852,6 +7881,24 @@ backgroundWatchdog = do
       logEvent "warn" "watchdog_hung_federation" (show (count hungSlots) ++ " servers with hung connections")
       logStaleInFlight hungSlots t)
     backgroundWatchdog
+
+-- Meta-watchdog: monitors the watchdog itself. The backgroundWatchdog can restart prune
+-- and heartbeat loops, but if the watchdog itself panics (e.g., a bug in hung-slot detection),
+-- no loop monitors it. This ultra-simple loop just checks lastWatchdogAt freshness and
+-- restarts backgroundWatchdog if stale. Runs infrequently (10x watchdog interval) to minimize cost.
+-- Cannot restart itself — a panic here surfaces as healthWatchdogMaxAge failure in /health.
+backgroundMetaWatchdog = do
+  sleep (backgroundPruneInterval * 50)
+  t <- now
+  sa <- *startedAt
+  let warmup = t - sa < backgroundPruneInterval * 60
+  if warmup then backgroundMetaWatchdog
+  else do
+    lastWd <- *lastWatchdogAt
+    when (lastWd > 0 && t - lastWd > healthWatchdogMaxAge * 3) (do
+      logError "meta-watchdog: watchdog loop appears dead, restarting"
+      fork backgroundWatchdog)
+    backgroundMetaWatchdog
 
 -- Startup connectivity probe: send an empty gossip to each known peer and log results.
 -- Surfaces DNS, firewall, and TLS issues before the first real gossip cycle.
@@ -7977,6 +8024,7 @@ main = do
       fork backgroundPrune
       fork pollHeartbeat
       fork backgroundWatchdog
+      fork backgroundMetaWatchdog
       when (autoSnapshotInterval > 0) (fork backgroundSnapshot)
       -- Startup peer connectivity check: probe known peers after a short delay
       -- to surface federation misconfigurations immediately (DNS, firewall, TLS).
