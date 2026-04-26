@@ -29,10 +29,16 @@ federationScheme = "https://" -- scheme for federation HTTP calls
 -- slow peer from consuming all concurrency slots, though truly hung connections still hold
 -- one slot until the forked task terminates.
 -- Message and data size limits
--- TODO: If Knot adds HTTP-layer configuration, enforce a request body size limit
--- (e.g., 256KB) to prevent large-payload DoS. Currently field-level length checks
--- (maxBlobLen, maxPubkeyLen, etc.) validate after parsing, so a multi-GB JSON body
--- would be fully parsed before rejection. A framework-level limit would reject early.
+-- IMPORTANT: Knot has no HTTP-layer request body size limit. Field-level length checks
+-- (maxBlobLen, maxPubkeyLen, etc.) validate after JSON parsing, so a multi-GB body is
+-- fully parsed before rejection. Deploy behind a reverse proxy with a body size limit:
+--   Caddy:  request_body { max_size 256KB }
+--   nginx:  client_max_body_size 256k;
+--   HAProxy: tune.maxrewrite 256k
+-- Without this, the server is vulnerable to large-payload DoS attacks. The maxBlobLen
+-- limit (64KB hex = 32KB binary) bounds legitimate message payloads; snapshots and
+-- batch requests may be larger but are authenticated via maintenance secret.
+-- TODO: If Knot adds HTTP-layer configuration, enforce a request body size limit natively.
 messageMaxAge : Int<Ms>
 messageMaxAge = 2592000000 -- 30 days
 maxPresenceTtl : Int<S>
@@ -102,6 +108,7 @@ federationPairRateWindowMs : Int<Ms>
 federationPairRateWindowMs = 60000 -- 1 minute
 maxFederationPairRateEntries = 5000
 -- Global request rate limiting
+maxActiveRequests = 500 -- max concurrent requests before rejecting with overloaded (0 = disable)
 maxGlobalRequestRate = 1000 -- max total requests per window
 globalRateWindowMs : Int<Ms>
 globalRateWindowMs = 1000
@@ -226,6 +233,12 @@ autoSnapshotInterval : Int<Ms>
 autoSnapshotInterval = 300000 -- 5 minutes; periodic state summary to stdout (0 to disable)
 -- Full snapshot auto-export interval: emit [SNAPSHOT_DATA] JSON to stdout for sidecar capture.
 -- 0 to disable. When enabled, a crash loses at most this interval of federation state.
+-- SECURITY: auto-exported snapshots contain unencrypted federation state (presence, acked
+-- message IDs, peer failure records, forward nonces). The data does not include message
+-- content (E2E encrypted blobs are ephemeral) but does reveal metadata: which pubkeys are
+-- online, which servers they federate with, and delivery timing. Ensure the log pipeline
+-- is access-controlled and encrypted at rest. Set to 0 in high-security deployments
+-- and use manual GET /maintenance/snapshot with authenticated access instead.
 -- Only emits when there's meaningful state to persist (presence/forwards/ackedIds > 0).
 autoSnapshotExportInterval : Int<Ms>
 autoSnapshotExportInterval = 3600000 -- 1 hour; full state export to stdout (0 to disable)
@@ -596,6 +609,11 @@ type SenderDelivery = {senderKey: Text, messageId: MessageIdHex, toKey: PubkeyHe
 -- NOTE: group only advances when shouldRefresh is true (enough time passed since
 -- lastPresenceRefresh), so skipped/delayed prune cycles don't cause bucket gaps.
 *presenceRefreshGroup : Int
+
+-- Round-robin nonce pruning: tracks which bucket group (0-3) to scan next.
+-- Each prune cycle scans 4 of 16 nonce buckets, cycling through all 16 over 4 cycles.
+-- Nonces have 60-day retention so 30-second pruning granularity is unnecessary.
+*noncePruneGroup : Int
 
 *challengeRates : [ChallengeRateEntry]
 
@@ -1176,6 +1194,15 @@ warnOldProtocol = \fromServer pv ->
   when (pv > 0 && pv < federationProtocolVersion)
     (logWarn ("federation: peer " ++ fromServer ++ " using protocol v" ++ show pv ++ " (current: v" ++ show federationProtocolVersion ++ ")"))
 
+-- Log per-server detail for stale in-flight entries (hung connection debugging).
+-- Emits one structured event per server with slot count and duration.
+logStaleInFlight = \entries t ->
+  case headOf entries of
+    Nothing {} -> yield {}
+    Just {value: r} -> do
+      logEvent "error" "stale_inflight" (r.server ++ " " ++ show r.count ++ " slots hung for " ++ show (t - r.firstStartedAt) ++ "ms")
+      logStaleInFlight (do e <- entries; where e.server != r.server; yield e) t
+
 -- Fast path: check if a string contains only safe JSON characters (hex digits,
 -- alphanumerics, common punctuation). If so, no escaping is needed.
 -- Returns False on the first unsafe character. Tail-recursive (TCO-safe in Knot).
@@ -1494,8 +1521,16 @@ isBadServerName = \sn ->
   || containsDoubleEncoding sn
   -- Kubernetes / service mesh internal DNS
   || containsSuffix ".svc" sn
+  || containsSuffix ".cluster.local" sn
   -- HashiCorp Consul service discovery
   || containsSuffix ".consul" sn
+  || containsSuffix ".node.consul" sn
+  || containsSuffix ".service.consul" sn
+  -- Cloud provider internal DNS (SSRF targets for metadata/internal services)
+  || containsSuffix ".compute.internal" sn -- GCP internal DNS
+  || containsSuffix ".ec2.internal" sn -- AWS EC2 internal DNS
+  || containsSuffix ".amazonaws.com" sn -- AWS service endpoints (S3, SQS, etc.)
+  || matchesHostname sn "metadata.google.internal" -- GCP metadata server
   -- NOTE: Unicode/IDN defense is provided by containsBadUrlChar above, which rejects
   -- any character not in [0-9a-z-.:]  via isAllowedServerChar. This blocks homoglyph
   -- attacks (e.g., Greek omicron in "lοcalhost") assuming Knot's Text type preserves
@@ -2476,7 +2511,7 @@ writeAllNonces = \nonces -> do
   writeNonceBucket 14 partitioned.b14
   writeNonceBucket 15 partitioned.b15
 
--- Prune nonces across all 16 buckets
+-- Prune nonces across all 16 buckets (used by flush and restore)
 pruneAllNonceBuckets : Int -> Timestamp -> IO ()
 pruneAllNonceBuckets = \b t ->
   if b > 15 then yield {}
@@ -2484,6 +2519,25 @@ pruneAllNonceBuckets = \b t ->
     bucket <- readNonceBucket b
     writeNonceBucket b (do n <- bucket; where t - n.seenAt < forwardNonceRetention; yield n)
     pruneAllNonceBuckets (b + 1) t
+
+-- Round-robin nonce pruning: scan 4 of 16 buckets per call.
+-- With 60-day retention and 30-second prune intervals, full coverage every ~2 minutes
+-- is sufficient. Reduces prune cycle cost by 75% vs scanning all 16 buckets.
+pruneNonceBucketsRoundRobin : Timestamp -> IO ()
+pruneNonceBucketsRoundRobin = \t -> do
+  group <- *noncePruneGroup
+  let startBucket = (group * 4) - ((group * 4) / 16) * 16
+  pruneNonceBucketRange startBucket (startBucket + 3) t
+  set *noncePruneGroup = if group >= 3 then 0 else group + 1
+
+pruneNonceBucketRange : Int -> Int -> Timestamp -> IO ()
+pruneNonceBucketRange = \b endB t ->
+  if b > endB || b > 15 then yield {}
+  else do
+    bucket <- readNonceBucket b
+    let pruned = do n <- bucket; where t - n.seenAt < forwardNonceRetention; yield n
+    when (count pruned < count bucket) (writeNonceBucket b pruned)
+    pruneNonceBucketRange (b + 1) endB t
 
 -- ============================================
 -- Forward Bucket Helpers
@@ -3262,10 +3316,16 @@ pruneExpired = \t -> do
   pruneAllAckedBuckets 0 retainCutoff
   -- DeliveredIds: per-bucket pruning (same pattern as acked)
   pruneAllDeliveredBuckets 0 retainCutoff
-  -- Overflow + failures: smaller collections, grouped together
+  -- Overflow + failures: smaller collections, grouped together.
+  -- Stale peer cleanup: servers still in knownPeerServers (have active presence) keep
+  -- their failure records for the full maxServerDowntime (24h). Servers with no presence
+  -- are pruned aggressively after 1h — they have no local keys to forward to and their
+  -- failure records just inflate circuit breaker counts.
   atomic do
     forwardFailures <- *forwardFailures
-    set *forwardFailures = do f <- forwardFailures; where t - f.failedAt < maxServerDowntime; yield f
+    peers <- *knownPeerServers
+    let isKnown = \server -> any peers (\p -> p == server)
+    set *forwardFailures = do f <- forwardFailures; where (if isKnown f.server then t - f.failedAt < maxServerDowntime else t - f.failedAt < sessionExpiry); yield f
     ackOverflow <- *ackOverflow
     set *ackOverflow = do a <- ackOverflow; where a.ackedAt > retainCutoff; yield a
   -- Prune rate limiters (split into smaller atomic blocks to reduce lock contention)
@@ -3319,8 +3379,15 @@ pruneExpired = \t -> do
     inFlight <- *federationInFlight
     let staleThreshold = federationFetchTimeoutMs * 5 / 4
     let staleInFlight = do r <- inFlight; where r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= staleThreshold; yield r
-    when (count staleInFlight > 0)
-      (logWarn ("pruneExpired: cleaning " ++ show (count staleInFlight) ++ " stale in-flight entries (leaked slots)"))
+    when (count staleInFlight > 0) (do
+      logWarn ("pruneExpired: cleaning " ++ show (count staleInFlight) ++ " stale in-flight entries (leaked slots)")
+      -- Per-server detail for debugging hung connections: log which peers are stuck and for how long
+      logStaleInFlight staleInFlight t)
+    -- Also warn about connections approaching the stale threshold (early detection)
+    let hungThreshold = federationFetchTimeoutMs
+    let hungInFlight = do r <- inFlight; where r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= hungThreshold && t - r.firstStartedAt < staleThreshold; yield r
+    when (count hungInFlight > 0)
+      (logEvent "warn" "hung_federation" ("connections approaching stale threshold: " ++ show (count hungInFlight) ++ " slots"))
     set *federationInFlight = do r <- inFlight; where r.count > 0 && (r.firstStartedAt == 0 || t - r.firstStartedAt < staleThreshold); yield r
     -- Prune stale federation replay dedup entries
     recentFedReqs <- *recentFederationRequests
@@ -3328,8 +3395,8 @@ pruneExpired = \t -> do
     -- Prune expired federation verification tokens
     pending <- *pendingVerifications
     set *pendingVerifications = do p <- pending; where t - p.createdAt < verificationTokenExpiry; yield p
-    -- Prune expired forward nonces per bucket (extended replay protection)
-    pruneAllNonceBuckets 0 t
+    -- Prune expired forward nonces (round-robin: 4 of 16 buckets per cycle)
+    pruneNonceBucketsRoundRobin t
     -- Prune gossip event rate entries
     gossipEventRates <- *gossipEventRates
     set *gossipEventRates = do r <- gossipEventRates; where t - r.windowStart < gossipEventRateWindowMs; yield r
@@ -3430,46 +3497,73 @@ mergeGossipPresence = \presence deduped trustedOffline fromServer t ->
    withinCapacity: capResult.withinCapacity}
 
 
--- Effective rate limit readers: return runtime override if set (> 0), else compile-time default
+-- Adaptive rate limiting: scale rate limits down when the server is under heavy load.
+-- Returns a scaling factor from 0 to 100 (percentage of full rate to allow).
+-- 100% at <=80% utilization, linearly decreasing to 10% at 100% utilization.
+-- Uses the highest utilization across messages, sessions, and presence as the
+-- bottleneck metric. 10% floor prevents complete lockout (admin can still act).
+adaptiveRateScale : Int -> Int -> Int -> Int
+adaptiveRateScale = \msgCount sessCount presCount ->
+  let msgPct = if maxMessages > 0 then msgCount * 100 / maxMessages else 0 in
+  let sessPct = if maxSessions > 0 then sessCount * 100 / maxSessions else 0 in
+  let presPct = if maxPresenceEntries > 0 then presCount * 100 / maxPresenceEntries else 0 in
+  let peak = max msgPct (max sessPct presPct) in
+  if peak <= 80 then 100
+  else max 10 (100 - (peak - 80) * 90 / 20)
+
+-- Apply adaptive scaling to a base rate limit. Reads cached counters (O(1), no bucket scans)
+-- and scales the rate proportionally. Returns at least 1 to prevent division-by-zero in callers.
+adaptiveRate : Int -> IO Int
+adaptiveRate = \baseRate -> do
+  tmc <- *totalMessageCount
+  sc <- *totalSessionCount
+  pc <- *totalPresenceCount
+  let scale = adaptiveRateScale tmc sc pc
+  yield (max 1 (baseRate * scale / 100))
+
+-- Effective rate limit readers: return runtime override if set (> 0), else compile-time default.
+-- All per-key and global rates are scaled by adaptiveRate under high utilization.
 effectiveGlobalRequestRate = do
   o <- *rateOverrideGlobalRequest
-  yield (if o > 0 then o else maxGlobalRequestRate)
+  adaptiveRate (if o > 0 then o else maxGlobalRequestRate)
 
 effectiveIpRate = do
   o <- *rateOverrideIpRate
-  yield (if o > 0 then o else maxIpRatePerIp)
+  adaptiveRate (if o > 0 then o else maxIpRatePerIp)
 
 effectiveSendRate = do
   o <- *rateOverrideSendRate
-  yield (if o > 0 then o else maxSendRatePerKey)
+  adaptiveRate (if o > 0 then o else maxSendRatePerKey)
 
 effectiveFederationRate = do
   o <- *rateOverrideFederationRate
+  -- Federation rates are NOT adaptively scaled: throttling federation under load
+  -- prevents ack delivery, causing origin servers to retry (amplification loop).
   yield (if o > 0 then o else maxFederationRatePerServer)
 
 effectiveAuthGlobalRate = do
   o <- *rateOverrideAuthGlobal
-  yield (if o > 0 then o else maxAuthGlobalRate)
+  adaptiveRate (if o > 0 then o else maxAuthGlobalRate)
 
 effectiveRecvRate = do
   o <- *rateOverrideRecvRate
-  yield (if o > 0 then o else maxRecvRatePerKey)
+  adaptiveRate (if o > 0 then o else maxRecvRatePerKey)
 
 effectiveChallengeRate = do
   o <- *rateOverrideChallengeRate
-  yield (if o > 0 then o else maxChallengeRatePerKey)
+  adaptiveRate (if o > 0 then o else maxChallengeRatePerKey)
 
 effectivePairRate = do
   o <- *rateOverridePairRate
-  yield (if o > 0 then o else maxPairRatePerPair)
+  adaptiveRate (if o > 0 then o else maxPairRatePerPair)
 
 effectiveLookupRate = do
   o <- *rateOverrideLookupRate
-  yield (if o > 0 then o else maxLookupRatePerKey)
+  adaptiveRate (if o > 0 then o else maxLookupRatePerKey)
 
 effectiveClientWriteRate = do
   o <- *rateOverrideClientWriteRate
-  yield (if o > 0 then o else maxClientWriteRatePerKey)
+  adaptiveRate (if o > 0 then o else maxClientWriteRatePerKey)
 
 checkFederationRate = \server t -> atomic do
   federationRates <- *federationRates
@@ -4375,11 +4469,12 @@ ackPolledMessages = \pubkey cursor t -> do
 
 pollNewEvents = \pubkey clampedCursor t -> do
   bucket <- readMessageBucket (pubkeyBucket pubkey)
-  -- NOTE: sortBy is technically redundant since receivedAt is monotonically increasing
-  -- (via nextSeqTs) and union appends new messages at the end. Kept as a defensive
-  -- measure in case bucket ordering assumptions are ever violated (e.g., by a future
-  -- bulk-import feature or runtime changes to list representation).
-  let allPollable = sortBy (\m -> m.receivedAt) (pollableMessages bucket pubkey clampedCursor t)
+  -- Priority-aware delivery: high-priority messages surface first within the maxPollEvents cap.
+  -- Sort key: (-priority * a large constant + receivedAt) ensures priority dominates while
+  -- preserving receivedAt order within the same priority level. The constant must exceed the
+  -- maximum possible receivedAt spread within one poll batch (bounded by messageMaxAge).
+  -- Priority 0 (default) sorts after all higher priorities.
+  let allPollable = sortBy (\m -> (0 - m.priority) * 10000000000000 + m.receivedAt) (pollableMessages bucket pubkey clampedCursor t)
   let limitedMsgs = takeRelation maxPollEvents allPollable
   let evts = do
     m <- limitedMsgs
@@ -5895,6 +5990,7 @@ handleDrain = \phase authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, drained: 0, phase: 0})
   else do
+    logEvent "audit" "drain" ("phase=" ++ show phase)
     -- Effective phase: 0 or >=2 means full drain (backward compat for clients sending empty body)
     let effectivePhase = if phase == 1 then 1 else 2
     -- Idempotency: if already at or above requested phase, return success.
@@ -5956,6 +6052,7 @@ handleDrain = \phase authorization respond -> do
     println "[SNAPSHOT_END]"
     atomic do set *prunesSinceSnapshot = 0
     logInfo ("drain: auto-snapshot exported (" ++ show (count drainResult.localEntries) ++ " presence, " ++ show (count flushState.forwards) ++ " forwards)")
+    logEvent "warn" "snapshot_unencrypted" "drain snapshot exported to stdout — ensure log pipeline is secured"
     -- Fork best-effort flush of pending federation ops, then gossip, then wait for in-flight.
     -- Operator polls /stats for drainCompletedAt > 0 to know when safe to stop.
     atomic do set *drainCompletedAt = 0
@@ -5999,6 +6096,7 @@ handleUndrain = \authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}})
   else do
+    logEvent "audit" "undrain" ""
     wasDraining <- atomic do
       d <- *drainPhase
       set *drainPhase = 0
@@ -6020,6 +6118,7 @@ handleShutdown = \authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, drained: 0})
   else do
+    logEvent "audit" "shutdown" ""
     dp <- *drainPhase
     if dp >= 2 then do
       -- Already draining, just set the shutdown flag
@@ -6048,6 +6147,7 @@ handleReconcile = \authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, messageDrift: 0, presenceDrift: 0, sessionDrift: 0})
   else do
+    logEvent "audit" "reconcile" ""
     presDrift <- atomic do
       actual <- countAllPresence
       stored <- *totalPresenceCount
@@ -6405,6 +6505,7 @@ handleRestore = \version checksumIn presenceData ackedIdsData ackOverflowData de
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, error: "unauthorized", presenceCount: 0, ackedIdsCount: 0, deliveredIdsCount: 0})
   else do
+    logEvent "audit" "restore" ("version=" ++ show version ++ " presence=" ++ show (count presenceData) ++ " forwards=" ++ show (count forwardsData))
     -- Minimum version: v6 (first version with checksum integrity verification).
     -- Pre-v6 snapshots (0-5) have no checksum and could be corrupted without detection.
     -- Versions 6-10 are accepted with backward compatibility (missing fields default to []/0).
@@ -6861,6 +6962,7 @@ handleBlockPeer = \server authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, blocked: 0})
   else do
+    logEvent "audit" "block_peer" server
     result <- atomic do
       blocked <- *blockedPeers
       if isBlockedPeer server blocked then yield {alreadyBlocked: True {}, total: count blocked}
@@ -6881,6 +6983,7 @@ handleUnblockPeer = \server authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, unblocked: False {}})
   else do
+    logEvent "audit" "unblock_peer" server
     removed <- atomic do
       blocked <- *blockedPeers
       let had = isBlockedPeer server blocked
@@ -6904,6 +7007,7 @@ handleAllowPeer = \server authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, allowed: 0})
   else do
+    logEvent "audit" "allow_peer" server
     result <- atomic do
       allowed <- *allowedPeers
       if any allowed (\a -> a == server) then yield {alreadyAllowed: True {}, total: count allowed}
@@ -6924,6 +7028,7 @@ handleUnallowPeer = \server authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, removed: False {}})
   else do
+    logEvent "audit" "unallow_peer" server
     removed <- atomic do
       allowed <- *allowedPeers
       let had = any allowed (\a -> a == server)
@@ -6985,6 +7090,7 @@ handleAdminRevokeSessions = \pubkey authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, revokedCount: 0})
   else do
+    logEvent "audit" "revoke_all_sessions" pubkey
     t <- now
     result <- atomic do
       -- Filter each session bucket in-place (avoids readAllSessions + writeAllSessions repartition)
@@ -7016,6 +7122,7 @@ handleAdminPurgeMessages = \pubkey authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, purgedCount: 0})
   else do
+    logEvent "audit" "purge_messages" pubkey
     t <- now
     purgeResult <- atomic do
       let b = pubkeyBucket pubkey
@@ -7063,8 +7170,10 @@ handleAdminPurgeMessages = \pubkey authorization respond -> do
 handleAdminRevokeIp = \ip authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0})
-  else if ip == "" then yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0})
   else do
+    logEvent "audit" "revoke_ip" ip
+    if ip == "" then yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0})
+    else do
     t <- now
     result <- revokeSessionsByIp ip 0 t {revokedCount: 0, affectedKeys: [], cleanups: []}
     -- Gossip offline for pubkeys that lost their last session
@@ -7152,6 +7261,7 @@ handleFlushNonces = \authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, flushedCount: 0})
   else do
+    logEvent "audit" "flush_nonces" ""
     flushedCount <- atomic do
       total <- countAllNonces 0
       writeAllNonces []
@@ -7165,20 +7275,22 @@ handleFlushNonces = \authorization respond -> do
 handleRotateSecret = \newSecret authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, error: "unauthorized"})
-  else if newSecret != "" && federationEnabled && not (tooLong newSecret 15) then do
-    logError "rotate-secret: rejected — secret must be at least 16 characters when federation is enabled"
-    yield (respond {ok: False {}, error: "secret_too_short"})
-  else if newSecret != "" && not (tooLong newSecret 31) then do
-    logWarn "rotate-secret: new secret is shorter than 32 characters — 32+ recommended for production"
-    atomic do set *runtimeMaintenanceSecret = newSecret
-    logInfo "rotate-secret: maintenance secret rotated (warning: short secret)"
-    yield (respond {ok: True {}, error: ""})
   else do
-    atomic do set *runtimeMaintenanceSecret = newSecret
-    if newSecret == ""
-      then logInfo "rotate-secret: reverted to compile-time maintenance secret"
-      else logInfo "rotate-secret: maintenance secret rotated"
-    yield (respond {ok: True {}, error: ""})
+    logEvent "audit" "rotate_secret" (if newSecret == "" then "revert_to_default" else "new_secret")
+    if newSecret != "" && federationEnabled && not (tooLong newSecret 15) then do
+      logError "rotate-secret: rejected — secret must be at least 16 characters when federation is enabled"
+      yield (respond {ok: False {}, error: "secret_too_short"})
+    else if newSecret != "" && not (tooLong newSecret 31) then do
+      logWarn "rotate-secret: new secret is shorter than 32 characters — 32+ recommended for production"
+      atomic do set *runtimeMaintenanceSecret = newSecret
+      logInfo "rotate-secret: maintenance secret rotated (warning: short secret)"
+      yield (respond {ok: True {}, error: ""})
+    else do
+      atomic do set *runtimeMaintenanceSecret = newSecret
+      if newSecret == ""
+        then logInfo "rotate-secret: reverted to compile-time maintenance secret"
+        else logInfo "rotate-secret: maintenance secret rotated"
+      yield (respond {ok: True {}, error: ""})
 
 -- GET /maintenance/rate-limits: Return current effective rate limits.
 handleGetRateLimits = \authorization respond -> do
@@ -7205,6 +7317,7 @@ handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal r
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}})
   else do
+    logEvent "audit" "set_rate_limits" ("global=" ++ show globalRequest ++ " ip=" ++ show ipRate ++ " send=" ++ show sendRate)
     atomic do
       set *rateOverrideGlobalRequest = max 0 globalRequest
       set *rateOverrideIpRate = max 0 ipRate
@@ -7390,13 +7503,86 @@ serveInner = \req -> case req of
   TopRecipients {limit, authorization, respond} -> handleTopRecipients limit authorization respond
   Ready {respond} -> handleReady respond
 
+-- Backpressure: check if the server is overloaded (too many concurrent requests).
+-- Health, Ready, and Maintenance endpoints are exempt so operators can always monitor
+-- and control the server even under extreme load.
+isOverloadExempt = \req -> case req of
+  Health {} -> True {}
+  Ready {} -> True {}
+  Prune {} -> True {}
+  Drain {} -> True {}
+  Shutdown {} -> True {}
+  Undrain {} -> True {}
+  Snapshot {} -> True {}
+  Restore {} -> True {}
+  Reconcile {} -> True {}
+  Stats {} -> True {}
+  StatsPeers {} -> True {}
+  StatsKey {} -> True {}
+  _ -> False {}
+
+-- Reject overloaded requests with appropriate empty/error responses per route type.
+-- Each response matches the handler's return shape with zeroed/empty fields.
+serveOverloaded = \req -> case req of
+  ReqChallenge {respond} -> respond {challenge: "", ok: False {}, expiresAt: 0, retryAfterMs: 1000, error: "overloaded"}
+  VerifyAuth {respond} -> respond {token: "", expiresAt: 0, error: "overloaded"}
+  RevokeSession {respond} -> respond {ok: False {}, authorized: False {}}
+  Logout {respond} -> respond {ok: False {}, authorized: False {}}
+  Poll {respond} -> respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: 0, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 1000, cursorReset: False {}, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: []}
+  SendMessage {respond} -> respond {status: MsRejected {}, messageId: "", retryAfterMs: 1000, error: "overloaded"}
+  MessageStatus {respond} -> respond {status: "", authorized: False {}}
+  AckMessages {respond} -> respond {ok: False {}, authorized: False {}, ackedCount: 0, error: "overloaded"}
+  SendBatch {respond} -> respond {results: [], authorized: False {}, retryAfterMs: 1000}
+  ListMessages {respond} -> respond {messages: [], authorized: False {}, count: 0, error: "overloaded"}
+  DeleteMessages {respond} -> respond {ok: False {}, authorized: False {}, deletedCount: 0, error: "overloaded"}
+  CancelMessage {respond} -> respond {ok: False {}, authorized: False {}, cancelled: False {}, error: "overloaded"}
+  CancelBatch {respond} -> respond {results: [], authorized: False {}, error: "overloaded"}
+  LookupPresence {respond} -> respond {server: "", authorized: False {}, error: "overloaded"}
+  BatchLookupPresence {respond} -> respond {results: [], authorized: False {}, error: "overloaded"}
+  RecvGossip {respond} -> respond {ok: False {}, error: "overloaded"}
+  ForwardMessage {respond} -> respond {ok: False {}, error: "overloaded"}
+  FederationAck {respond} -> respond {ok: False {}, error: "overloaded", ackedCount: 0, results: []}
+  FederationCancel {respond} -> respond {ok: False {}, error: "overloaded", cancelled: False {}}
+  FederationBatchCancel {respond} -> respond {ok: False {}, error: "overloaded", results: []}
+  FederationBatchForward {respond} -> respond {ok: False {}, error: "overloaded", results: []}
+  VerifyToken {respond} -> respond {ok: False {}}
+  TopRecipients {respond} -> respond {recipients: [], ok: False {}, total: 0}
+  BlockPeer {respond} -> respond {ok: False {}, blocked: 0}
+  UnblockPeer {respond} -> respond {ok: False {}, unblocked: False {}}
+  ListBlocked {respond} -> respond {peers: [], ok: False {}}
+  PingPeer {respond} -> respond {ok: False {}, latencyMs: 0, error: "overloaded"}
+  AdminListSessions {respond} -> respond {sessions: [], count: 0, ok: False {}}
+  AdminRevokeSessions {respond} -> respond {ok: False {}, revokedCount: 0}
+  AdminPurgeMessages {respond} -> respond {ok: False {}, purgedCount: 0}
+  AdminRevokeIp {respond} -> respond {ok: False {}, revokedCount: 0, affectedKeys: 0}
+  AdminListAllSessions {respond} -> respond {sessions: [], ok: False {}, total: 0}
+  GetRateLimits {respond} -> respond {ok: False {}, globalRequest: 0, ipRate: 0, sendRate: 0, federationRate: 0, authGlobal: 0, recvRate: 0, challengeRate: 0, pairRate: 0, lookupRate: 0, clientWriteRate: 0}
+  SetRateLimits {respond} -> respond {ok: False {}}
+  FlushNonces {respond} -> respond {ok: False {}, flushedCount: 0}
+  AllowPeer {respond} -> respond {ok: False {}, allowed: 0}
+  UnallowPeer {respond} -> respond {ok: False {}, removed: False {}}
+  ListAllowed {respond} -> respond {peers: [], ok: False {}}
+  RotateSecret {respond} -> respond {ok: False {}, error: "overloaded"}
+  -- Exempt routes handled by isOverloadExempt; this branch is unreachable
+  _ -> yield {}
+
 -- Access-logged request handler: wraps serveInner with timing and correlation ID.
 -- Logs all non-poll requests with a 6-hex-char request ID for log correlation.
 -- Polls are only logged when slow (> slowRequestThreshold) to avoid overwhelming
 -- logs with high-frequency long-poll traffic.
+-- Backpressure: rejects non-exempt requests when activeRequests >= maxActiveRequests.
 serve = \req -> do
   startTime <- now
   reqId <- genTokenN 1
+  -- Backpressure check: reject early if overloaded (exempt: health, ready, maintenance)
+  overloaded <- if maxActiveRequests <= 0 || isOverloadExempt req then yield (False {})
+    else do
+      ar <- *activeRequests
+      yield (ar >= maxActiveRequests)
+  if overloaded then do
+    logEvent "warn" "overloaded" (requestPath req)
+    serveOverloaded req
+  else do
   atomic do
     ar <- *activeRequests
     let newAr = ar + 1
@@ -7659,6 +7845,12 @@ backgroundWatchdog = do
       atomic do
         inFlight <- *federationInFlight
         set *federationActiveConnections = fold (\acc r -> acc + r.count) 0 inFlight)
+    -- Log hung federation connections even below the max threshold (early warning)
+    inFlight <- *federationInFlight
+    let hungSlots = do r <- inFlight; where r.count > 0 && r.firstStartedAt > 0 && t - r.firstStartedAt >= federationFetchTimeoutMs; yield r
+    when (count hungSlots > 0) (do
+      logEvent "warn" "watchdog_hung_federation" (show (count hungSlots) ++ " servers with hung connections")
+      logStaleInFlight hungSlots t)
     backgroundWatchdog
 
 -- Startup connectivity probe: send an empty gossip to each known peer and log results.
@@ -7753,6 +7945,7 @@ main = do
       when (federationEnabled && isBadServerName serverHostN)
         (logError ("serverHost '" ++ serverHost ++ "' would be rejected by isBadServerName — federation peers cannot forward messages here. Set serverHost to a public DNS name."))
       logInfo "IP binding is active — sessions created with a ClientIp header will reject requests without one"
+      logWarn "SECURITY: Knot has no HTTP-layer request body size limit. Deploy behind a reverse proxy with a body limit (e.g., Caddy: request_body { max_size 256KB }) to prevent large-payload DoS."
       when federationEnabled
         (logWarn "SECURITY: DNS rebinding risk — federation URLs resolve DNS at fetch time, not at validation time. A peer hostname passing isBadServerName could rebind to a private IP between validation and fetch. Mitigate by blocking outbound connections to RFC1918/link-local/CGNAT ranges at the firewall level.")
       logInfo ("Skrepka relay server starting on port " ++ show listenPort ++ "...")
@@ -7765,6 +7958,7 @@ main = do
       logInfo ("  max forwards: " ++ show maxForwardsEntries ++ " (per key: " ++ show maxForwardsPerKey ++ ")")
       logInfo ("  session expiry: " ++ show sessionExpiry ++ "ms (max lifetime: " ++ show maxSessionLifetime ++ "ms)")
       logInfo ("  message max age: " ++ show messageMaxAge ++ "ms")
+      logInfo ("  max active requests: " ++ if maxActiveRequests > 0 then show maxActiveRequests else "unlimited")
       logInfo ("  global rate limit: " ++ show maxGlobalRequestRate ++ "/" ++ show globalRateWindowMs ++ "ms")
       logInfo ("  auth rate limit: " ++ show maxAuthGlobalRate ++ "/" ++ show authGlobalRateWindowMs ++ "ms")
       logInfo ("  pair rate limit: " ++ show maxPairRatePerPair ++ "/" ++ show pairRateWindowMs ++ "ms per sender-recipient")
