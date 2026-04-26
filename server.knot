@@ -18,6 +18,13 @@ serverHost = "localhost:8080"
 listenPort = 8080
 maintenanceSecret = "" -- set to enable /maintenance/* and /stats endpoints
 federationScheme = "https://" -- scheme for federation HTTP calls
+-- Ed25519 federation signing keys (hex-encoded). When both are set, outbound federation
+-- requests are signed instead of using verify callbacks (eliminates the round-trip).
+-- Inbound requests with "Signed" auth are verified locally; "Bearer" auth falls back
+-- to the existing verify callback for backward compatibility with older peers.
+-- Empty = signing disabled, use verify callbacks only.
+serverFederationPrivateKeyHex = ""
+serverFederationPublicKeyHex = ""
 -- NOTE: listenHost is not configurable — Knot's listen primitive only accepts a port.
 -- To restrict the bind address (e.g., 127.0.0.1 behind a reverse proxy), use
 -- firewall rules (e.g., iptables -A INPUT -p tcp --dport 8080 -s 127.0.0.1 -j ACCEPT)
@@ -191,7 +198,7 @@ serverBuildVersion = "2026-04-26e"
 -- Peers log warnings when they receive requests from older versions.
 -- Backward compatible: older peers ignore unknown fields (Knot's JSON parser
 -- drops unknown keys). 0 = pre-versioning peer (field missing or unset).
-federationProtocolVersion = 12
+federationProtocolVersion = 13
 
 -- Max seenBy list length in gossip events (bounds memory and bandwidth per event)
 maxSeenByLen = 20
@@ -239,6 +246,12 @@ federationUrl = \server -> federationScheme ++ server
 maxPendingVerifications = 10000
 verificationTokenExpiry : Int<Ms>
 verificationTokenExpiry = 30000 -- 30 seconds
+-- Peer public key cache (for Ed25519 federation signing)
+maxPeerPublicKeys = 100
+peerKeyTtlMs : Int<Ms>
+peerKeyTtlMs = 86400000 -- 24 hours; peer keys change rarely (server restart or rotation)
+peerKeyRefetchCooldownMs : Int<Ms>
+peerKeyRefetchCooldownMs = 60000 -- 1 minute; minimum interval between re-fetch attempts per server
 -- IP-based rate limiting (reverse proxy sets ClientIp header)
 maxIpRatePerIp = 10 -- max auth requests per IP per window
 ipRateWindowMs : Int<Ms>
@@ -833,6 +846,11 @@ maxPeerLatencyEntries = 100
 -- Cached successful verify callbacks per-server (short-lived, reduces outbound HTTP calls)
 *verificationCache : [{server: Text, scope: Text, verifiedAt: Timestamp}]
 
+-- Cached peer Ed25519 public keys for signature-based federation auth.
+-- Fetched from GET /federation/pubkey on first contact, cached with peerKeyTtlMs TTL.
+-- failedAt tracks last failed fetch to enforce peerKeyRefetchCooldownMs.
+*peerPublicKeys : [{server: Text, pubkey: Text, fetchedAt: Timestamp, failedAt: Timestamp}]
+
 -- Per-IP unique key tracking: detects when a single IP authenticates many distinct pubkeys
 -- (key-rotation abuse bypassing per-key rate limits). Pruned with other rate limiters.
 *uniqueKeyIpRates : [UniqueKeyIpEntry]
@@ -1058,6 +1076,11 @@ route FederationApi where
 route FederationVerifyApi where
   POST {token: Text, scope: Text} /federation/verify headers {clientIp: Text} -> {ok: Bool} = VerifyToken
 
+-- Ed25519 federation public key endpoint: peers fetch this to verify signed requests.
+-- Unauthenticated (like /health and /ready). Rate-limited via health rate limiter.
+route FederationPubkeyApi where
+  GET /federation/pubkey -> {pubkey: Text, ok: Bool} = FederationPubkey
+
 -- Triggers pruning of expired state and retry of pending federation ops
 route MaintenanceApi where
   POST {} /maintenance/prune headers {authorization: Text}
@@ -1192,7 +1215,7 @@ route StatsApi where
 route ReadyApi where
   GET /ready -> {ready: Bool} = Ready
 
-route Api = AuthApi | ClientApi | FederationApi | FederationVerifyApi | MaintenanceApi | HealthApi | StatsApi | ReadyApi
+route Api = AuthApi | ClientApi | FederationApi | FederationVerifyApi | FederationPubkeyApi | MaintenanceApi | HealthApi | StatsApi | ReadyApi
 
 -- ============================================
 -- Helpers
@@ -1651,17 +1674,23 @@ isAllowedByAllowlist = \server allowed -> count allowed == 0 || any allowed (\a 
 -- Generate a single-use token for outbound federation auth.
 -- scope binds the token to a request type ("gossip", "forward", "ack") so a token
 -- issued for one operation cannot authorize a different one.
-generateFederationAuth : Text -> Text -> IO {network} Text
-generateFederationAuth = \scope server -> do
-    token <- genToken
-    t <- now
-    atomic do
-      pending <- *pendingVerifications
-      let updated = union pending [{token: token, createdAt: t, scope: scope}]
-      set *pendingVerifications = if count updated > maxPendingVerifications
-        then evictOneOldest updated (\p -> p.createdAt)
-        else updated
-    yield ("Bearer " ++ token)
+generateFederationAuth : Text -> Timestamp -> IO {network} Text
+generateFederationAuth = \scope requestTimestamp ->
+  if serverFederationPrivateKeyHex != ""
+    then do
+      let message = textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ serverHostN)
+      let sig = sign (bytesFromHex serverFederationPrivateKeyHex) message
+      yield ("Signed " ++ bytesToHex sig)
+    else do
+      token <- genToken
+      t <- now
+      atomic do
+        pending <- *pendingVerifications
+        let updated = union pending [{token: token, createdAt: t, scope: scope}]
+        set *pendingVerifications = if count updated > maxPendingVerifications
+          then evictOneOldest updated (\p -> p.createdAt)
+          else updated
+      yield ("Bearer " ++ token)
 
 -- Verify an inbound federation token. Checks a short-lived per-server cache first
 -- to reduce outbound HTTP calls (a peer sending N requests/second would otherwise
@@ -3600,6 +3629,9 @@ pruneExpired = \t -> do
     -- Prune expired federation verification tokens
     pending <- *pendingVerifications
     set *pendingVerifications = do p <- pending; where t - p.createdAt < verificationTokenExpiry; yield p
+    -- Prune expired peer public key cache entries
+    peerKeys <- *peerPublicKeys
+    set *peerPublicKeys = do k <- peerKeys; where t - k.fetchedAt < peerKeyTtlMs; yield k
     -- Prune expired forward nonces (round-robin: 4 of 16 buckets per cycle)
     pruneNonceBucketsRoundRobin t
     -- Prune gossip event rate entries
@@ -3657,7 +3689,7 @@ sendBatchedGossipToServer = \server allEvents hops ->
   in if count unseen == 0 then yield {}
   else forEachBatch unseen maxGossipEvents (\batch -> do
     t <- now
-    auth <- generateFederationAuth "gossip" server
+    auth <- generateFederationAuth "gossip" t
     corrId <- genTokenN 1
     result <- fetchFederation server (RecvGossip {
       authorization: auth,
@@ -3889,6 +3921,87 @@ checkPreAuth = \clientIp t -> do
       if ipLimited then yield "ip_rate_limited"
       else yield ""
 
+-- ============================================
+-- Ed25519 Federation Signing
+-- ============================================
+-- When serverFederationPrivateKeyHex is configured, outbound federation requests are
+-- signed with Ed25519 instead of using random tokens + verify callbacks. Inbound
+-- requests with "Signed" auth are verified locally using the sender's cached public key.
+-- "Bearer" auth falls back to the existing verify callback for backward compatibility.
+
+-- GET /federation/pubkey: Return this server's Ed25519 federation public key.
+-- Unauthenticated. Rate-limited via health rate limiter (same as /ready).
+handleFederationPubkey = \respond -> do
+  t <- now
+  healthLimited <- checkHealthRate t
+  if healthLimited then yield (respond {pubkey: "", ok: False {}})
+  else yield (respond {pubkey: serverFederationPublicKeyHex, ok: serverFederationPublicKeyHex != ""})
+
+-- Fetch and cache a peer's Ed25519 public key for signature verification.
+-- Returns the hex-encoded public key, or "" if unavailable.
+-- Checks cache first (peerKeyTtlMs TTL), fetches from /federation/pubkey on miss.
+-- Enforces peerKeyRefetchCooldownMs between re-fetch attempts to prevent DoS.
+fetchPeerPublicKey : Text -> Timestamp -> IO {network} Text
+fetchPeerPublicKey = \server t -> do
+  cached <- atomic do
+    keys <- *peerPublicKeys
+    yield (headOf (do k <- keys; where k.server == server; yield k))
+  case cached of
+    Just {value: entry} ->
+      if t - entry.fetchedAt < peerKeyTtlMs && entry.pubkey != ""
+        then yield entry.pubkey
+        else if entry.failedAt > 0 && t - entry.failedAt < peerKeyRefetchCooldownMs
+          then yield ""
+          else fetchAndCachePeerKey server t
+    Nothing {} -> fetchAndCachePeerKey server t
+
+-- Fetch a peer's public key from /federation/pubkey and cache the result.
+-- On failure, caches the failure timestamp to enforce cooldown.
+fetchAndCachePeerKey : Text -> Timestamp -> IO {network} Text
+fetchAndCachePeerKey = \server t -> do
+  result <- fetchFederation server (FederationPubkey {})
+  case result of
+    Err e -> do
+      logWarn ("federation: pubkey fetch from " ++ server ++ " failed: " ++ show e)
+      atomic do
+        keys <- *peerPublicKeys
+        let updated = union (do k <- keys; where k.server != server; yield k) [{server: server, pubkey: "", fetchedAt: t, failedAt: t}]
+        set *peerPublicKeys = if count updated > maxPeerPublicKeys then evictOneOldest updated (\k -> k.fetchedAt) else updated
+      yield ""
+    Ok r ->
+      if r.ok && r.pubkey != "" then do
+        atomic do
+          keys <- *peerPublicKeys
+          let updated = union (do k <- keys; where k.server != server; yield k) [{server: server, pubkey: r.pubkey, fetchedAt: t, failedAt: 0}]
+          set *peerPublicKeys = if count updated > maxPeerPublicKeys then evictOneOldest updated (\k -> k.fetchedAt) else updated
+        yield r.pubkey
+      else do
+        atomic do
+          keys <- *peerPublicKeys
+          let updated = union (do k <- keys; where k.server != server; yield k) [{server: server, pubkey: "", fetchedAt: t, failedAt: t}]
+          set *peerPublicKeys = if count updated > maxPeerPublicKeys then evictOneOldest updated (\k -> k.fetchedAt) else updated
+        yield ""
+
+-- Verify an inbound Ed25519 signed federation request.
+-- Reconstructs the signed message from (scope, requestTimestamp, fromServer),
+-- fetches the peer's public key (cached), and verifies the signature.
+-- On verification failure, re-fetches the key once (handles peer key rotation
+-- or restart with new key) and retries before rejecting.
+verifyFederationSignature : Text -> Text -> Text -> Timestamp -> IO {network} Bool
+verifyFederationSignature = \fromServer signatureHex scope requestTimestamp -> do
+  t <- now
+  pubkeyHex <- fetchPeerPublicKey fromServer t
+  if pubkeyHex == "" then yield (False {})
+  else do
+    let message = textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ fromServer)
+    let sigValid = verify (bytesFromHex pubkeyHex) message (bytesFromHex signatureHex)
+    if sigValid then yield (True {})
+    else do
+      -- Key may be stale (peer restarted with new key). Re-fetch once and retry.
+      refetched <- fetchAndCachePeerKey fromServer t
+      if refetched == "" || refetched == pubkeyHex then yield (False {})
+      else yield (verify (bytesFromHex refetched) message (bytesFromHex signatureHex))
+
 -- Federation auth wrapper. Intentionally does NOT call checkPreAuth because:
 -- (a) Soft drain (phase 1) blocks new client auth but must not block federation —
 --     peers need to deliver messages and acks to existing recipients during drain.
@@ -3897,7 +4010,7 @@ checkPreAuth = \clientIp t -> do
 -- (c) Federation routes don't carry a ClientIp header (peer-to-peer, not client-facing),
 --     so IP-based rate limiting doesn't apply.
 withFederationAuth = \authorization t respond fromServer scope requestTimestamp precondition clearOnAuth action -> do
-  -- Check blocklist and allowlist before spending resources on verification callback
+  -- Check blocklist and allowlist before spending resources on verification
   blocked <- *blockedPeers
   if isBlockedPeer fromServer blocked
     then do
@@ -3910,7 +4023,14 @@ withFederationAuth = \authorization t respond fromServer scope requestTimestamp 
       logWarn ("federation: peer " ++ fromServer ++ " not in allowlist, rejected")
       yield (respond {ok: False {}, error: "not_allowed"})
     else do
-  verified <- verifyFederationCallback fromServer authorization scope
+  -- Dispatch on auth scheme: "Signed " = Ed25519 signature, "Bearer " = verify callback
+  verified <- if take 7 authorization == "Signed "
+    then do
+      let signatureHex = drop 7 authorization
+      if signatureHex == "" || tooLong signatureHex maxSignatureLen
+        then yield (False {})
+        else verifyFederationSignature fromServer signatureHex scope requestTimestamp
+    else verifyFederationCallback fromServer authorization scope
   if not verified
     then yield (respond {ok: False {}, error: "unauthorized"})
     -- Replay protection: reject requests with timestamps too far from local clock.
@@ -4153,7 +4273,7 @@ retryForwardsForServer = \entries remaining ->
     let server = case headOf liveEntries of Just {value: f} -> f.toServer; Nothing {} -> ""
     forEachBatch liveEntries maxBatchSize (\batch -> do
       t <- now
-      auth <- generateFederationAuth "forward-batch" server
+      auth <- generateFederationAuth "forward-batch" t
       corrId <- genTokenN 1
       let batchPayload = do f <- batch; yield {toKey: f.toKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, originServer: f.originServer, messageId: f.messageId, expiresAt: f.expiresAt, priority: f.priority}
       result <- fetchFederation server (FederationBatchForward {
@@ -4198,7 +4318,7 @@ retryForwardsSingle = \batch server ->
     Just {value: f} -> do
       let rest = do x <- batch; where x.messageId != f.messageId; yield x
       t <- now
-      auth <- generateFederationAuth ("forward:" ++ f.messageId) server
+      auth <- generateFederationAuth ("forward:" ++ f.messageId) t
       corrId <- genTokenN 1
       result <- fetchFederation server (ForwardMessage {
         toKey: f.toKey, encryptedBlob: f.encryptedBlob,
@@ -4265,7 +4385,7 @@ circuitBreakerProbe = \failures t -> do
     Just {value: candidate} -> do
       logInfo ("federation: circuit breaker half-open probe to " ++ candidate.server)
       probeStart <- now
-      auth <- generateFederationAuth "gossip" candidate.server
+      auth <- generateFederationAuth "gossip" probeStart
       result <- fetchFederation candidate.server (RecvGossip {
         authorization: auth,
         events: [], hopsRemaining: 1, fromServer: serverHostN,
@@ -4375,7 +4495,7 @@ forwardQueuedMessages = \targets t -> do
 
 fetchFederationAck = \origin messageIds -> do
   t <- now
-  auth <- generateFederationAuth "ack" origin
+  auth <- generateFederationAuth "ack" t
   corrId <- genTokenN 1
   fetchFederation origin (FederationAck {
     authorization: auth,
@@ -4582,7 +4702,7 @@ retryPendingCancels = do
       let serverCancels = do c <- pending; where c.toServer == server; yield c
       forEachBatch serverCancels maxBatchSize (\batch -> do
         cancelT <- now
-        auth <- generateFederationAuth "cancel-batch" server
+        auth <- generateFederationAuth "cancel-batch" cancelT
         corrId <- genTokenN 1
         let payload = do c <- batch; yield {messageId: c.messageId, toKey: c.toKey}
         result <- fetchFederation server (FederationBatchCancel {
@@ -5569,7 +5689,7 @@ forkSendForwards = \effectiveMsgId to encryptedBlob clampedTs remoteServers ->
           Just {value: fe} -> yield {pending: True {}, fwdExpiresAt: fe.expiresAt, fwdPriority: fe.priority}
       when fwdInfo.pending (do
         fwdT <- now
-        fwdAuth <- generateFederationAuth ("forward:" ++ effectiveMsgId) server
+        fwdAuth <- generateFederationAuth ("forward:" ++ effectiveMsgId) fwdT
         fwdCorrId <- genTokenN 1
         fwdResult <- fetchFederation server (ForwardMessage {
           toKey: to, encryptedBlob: encryptedBlob,
@@ -5603,7 +5723,7 @@ sendBatchForwardsSequential = \msgs server ->
     if count pending == 0 then yield {}
     else do
       t <- now
-      auth <- generateFederationAuth "forward-batch" server
+      auth <- generateFederationAuth "forward-batch" t
       corrId <- genTokenN 1
       let batchPayload = do r <- pending; yield {toKey: r.toKey, encryptedBlob: r.blob, timestamp: r.ts, originServer: serverHostN, messageId: r.messageId, expiresAt: r.fwdExpiresAt, priority: r.fwdPriority}
       result <- fetchFederation server (FederationBatchForward {
@@ -5657,7 +5777,7 @@ sendBatchForwardsFallback = \msgs server ->
     Just {value: r} -> do
       let rest = do m <- msgs; where m.messageId != r.messageId; yield m
       fwdT <- now
-      fwdAuth <- generateFederationAuth ("forward:" ++ r.messageId) server
+      fwdAuth <- generateFederationAuth ("forward:" ++ r.messageId) fwdT
       fwdCorrId <- genTokenN 1
       fwdResult <- fetchFederation server (ForwardMessage {
         toKey: r.toKey, encryptedBlob: r.blob,
@@ -6601,7 +6721,7 @@ handleCancelBatch = \cancels authorization clientIp respond -> do
               let serverCancels = do c <- results.fedCancels; where any c.servers (\s -> s == server); yield {messageId: c.messageId, toKey: c.toKey}
               when (count serverCancels > 0) (do
                 cancelT <- now
-                cancelAuth <- generateFederationAuth "cancel-batch" server
+                cancelAuth <- generateFederationAuth "cancel-batch" cancelT
                 cancelCorrId <- genTokenN 1
                 cancelResult <- fetchFederation server (FederationBatchCancel {
                   cancels: serverCancels, fromServer: serverHostN,
@@ -6768,6 +6888,7 @@ handleUndrain = \authorization respond -> do
       -- Clear stale verification cache: entries cached during drain may reference
       -- peers whose trust state changed during the drain/undrain cycle.
       set *verificationCache = []
+      set *peerPublicKeys = []
       yield (d > 0)
     when wasDraining (logInfo "undrain: server resumed, accepting new requests")
     when (not wasDraining) (logInfo "undrain: server was not draining")
@@ -7468,7 +7589,7 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
           fork (when (federationEnabled && cancelResult.cancelled && count cancelResult.cancelServers > 0)
             (sendToEach cancelResult.cancelServers (\server -> do
               cancelT <- now
-              cancelAuth <- generateFederationAuth "cancel-batch" server
+              cancelAuth <- generateFederationAuth "cancel-batch" cancelT
               cancelCorrId <- genTokenN 1
               cancelFedResult <- fetchFederation server (FederationBatchCancel {
                 cancels: [{messageId: messageId, toKey: to}], fromServer: serverHostN,
@@ -7692,7 +7813,7 @@ handlePingPeer = \server authorization respond -> do
   if not authorized then yield (respond {ok: False {}, latencyMs: 0, error: "unauthorized"})
   else do
     startTime <- now
-    auth <- generateFederationAuth "gossip" server
+    auth <- generateFederationAuth "gossip" startTime
     pingCorrId <- genTokenN 1
     result <- fetchFederation server (RecvGossip {
       authorization: auth,
@@ -7992,6 +8113,7 @@ requestPath = \req -> case req of
   FederationBatchCancel {} -> "POST /federation/cancel-batch"
   FederationBatchForward {} -> "POST /federation/forward-batch"
   VerifyToken {} -> "POST /federation/verify"
+  FederationPubkey {} -> "GET /federation/pubkey"
   Prune {} -> "POST /maintenance/prune"
   Drain {} -> "POST /maintenance/drain"
   Shutdown {} -> "POST /maintenance/shutdown"
@@ -8077,6 +8199,7 @@ serveInner = \req -> case req of
   FederationBatchForward {forwards, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> do
     warnOldProtocol fromServer protocolVersion; handleFederationBatchForward forwards fromServer requestTimestamp correlationId authorization respond
   VerifyToken {token, scope, clientIp, respond} -> handleVerifyToken token scope clientIp respond
+  FederationPubkey {respond} -> handleFederationPubkey respond
   Prune {authorization, respond} -> handlePrune authorization respond
   Drain {phase, authorization, respond} -> handleDrain phase authorization respond
   Shutdown {authorization, respond} -> handleShutdown authorization respond
@@ -8155,6 +8278,7 @@ serveOverloaded = \req -> case req of
   FederationBatchCancel {respond} -> respond {ok: False {}, error: "overloaded:1000ms", results: []}
   FederationBatchForward {respond} -> respond {ok: False {}, error: "overloaded:1000ms", results: []}
   VerifyToken {respond} -> respond {ok: False {}}
+  FederationPubkey {respond} -> respond {pubkey: "", ok: False {}}
   -- Stats/admin routes (exempt routes handled by isOverloadExempt; these are fallbacks)
   TopRecipients {respond} -> respond {recipients: [], ok: False {}, total: 0}
   StatsForwards {respond} -> respond {servers: [], ok: False {}, total: 0}
@@ -8488,7 +8612,7 @@ startupProbeNext = \peers probed ->
           -- /federation/verify on this server to confirm the token, testing the full
           -- federation auth path in both directions.
           authStart <- now
-          auth <- generateFederationAuth "gossip" server
+          auth <- generateFederationAuth "gossip" authStart
           authResult <- fetchFederation server (RecvGossip {
             authorization: auth,
             events: [], hopsRemaining: 1, fromServer: serverHostN,
@@ -8574,6 +8698,14 @@ main = do
         (logWarn "SECURITY: DNS rebinding risk — federation URLs resolve DNS at fetch time, not at validation time. A peer hostname passing isBadServerName could rebind to a private IP between validation and fetch. Mitigate by blocking outbound connections to RFC1918/link-local/CGNAT ranges at the firewall level.")
       logInfo ("Skrepka relay server starting on port " ++ show listenPort ++ "...")
       logInfo ("  federation: " ++ if federationEnabled then "enabled (protocol v" ++ show federationProtocolVersion ++ ")" else "disabled")
+      when (serverFederationPrivateKeyHex != "" && serverFederationPublicKeyHex != "")
+        (logInfo "  federation auth: Ed25519 signing enabled")
+      when (serverFederationPrivateKeyHex == "" && federationEnabled)
+        (logInfo "  federation auth: verify callback (no signing key configured)")
+      when (serverFederationPrivateKeyHex != "" && serverFederationPublicKeyHex == "")
+        (logError "FATAL: serverFederationPrivateKeyHex is set but serverFederationPublicKeyHex is empty — both must be configured together")
+      when (serverFederationPrivateKeyHex == "" && serverFederationPublicKeyHex != "")
+        (logError "FATAL: serverFederationPublicKeyHex is set but serverFederationPrivateKeyHex is empty — both must be configured together")
       logInfo ("  prune interval: " ++ show backgroundPruneInterval ++ "ms")
       logInfo ("  poll timeout: " ++ show pollTimeoutMs ++ "ms")
       logInfo ("  max messages: " ++ show maxMessages ++ " (per recipient: " ++ show maxMessagesPerRecipient ++ ")")
