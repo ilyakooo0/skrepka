@@ -852,8 +852,8 @@ maxPeerLatencyEntries = 100
 -- Per-sender drop counters: tracks how many delivery receipts / expiration notifications
 -- were evicted before the sender could poll them. Keyed by senderKey so each sender sees
 -- only their own drops (not a global counter that conflates all senders). Drained on poll.
-*droppedDeliveryReceipts : [{senderKey: Text, count: Int}]
-*droppedExpirationNotifs : [{senderKey: Text, count: Int}]
+*droppedDeliveryReceipts : [{senderKey: Text, count: Int, lastUpdated: Timestamp}]
+*droppedExpirationNotifs : [{senderKey: Text, count: Int, lastUpdated: Timestamp}]
 
 -- Runtime maintenance secret: when non-empty, used instead of compile-time maintenanceSecret.
 -- Set via /maintenance/rotate-secret to enable zero-downtime secret rotation.
@@ -915,6 +915,9 @@ maxPeerLatencyEntries = 100
 *cachedHealthForwardQueue : Bool
 -- Cached count of federation peers with active failure records (degraded connectivity)
 *cachedHealthDegradedPeers : Int
+-- Cached count of destination servers with stale forward queues (updated during prune cycle).
+-- Used by health checks to avoid scanning all 16 forward buckets on every /health request.
+*cachedForwardStaleCount : Int
 
 -- ============================================
 -- Routes
@@ -1273,17 +1276,24 @@ max = \a b -> if a > b then a else b
 
 -- Per-sender drop counter helpers: increment a per-key counter and drain it for a specific key.
 -- Used to track per-sender delivery receipt / expiration notification drops.
-incrementDropCounter = \entries key n ->
+-- LRU eviction: when at capacity, evict the entry least recently updated (oldest lastUpdated).
+-- Previous strategy evicted by lowest count, which could discard active senders with few drops.
+incrementDropCounter = \entries key n t ->
   if any entries (\e -> e.senderKey == key)
-    then do e <- entries; yield (if e.senderKey == key then {senderKey: e.senderKey, count: e.count + n} else e)
+    then do e <- entries; yield (if e.senderKey == key then {senderKey: e.senderKey, count: e.count + n, lastUpdated: t} else e)
     else if count entries >= maxDroppedCountEntries
-      then union (evictOneOldest entries (\e -> e.count)) [{senderKey: key, count: n}]
-      else union entries [{senderKey: key, count: n}]
+      then union (evictOneOldest entries (\e -> e.lastUpdated)) [{senderKey: key, count: n, lastUpdated: t}]
+      else union entries [{senderKey: key, count: n, lastUpdated: t}]
 
 drainDropCounter = \entries key ->
   case headOf (do e <- entries; where e.senderKey == key; yield e) of
     Nothing {} -> {count: 0, remaining: entries}
     Just {value: e} -> {count: e.count, remaining: do x <- entries; where x.senderKey != key; yield x}
+-- NOTE: fold always traverses the full list even after finding the first element.
+-- This is O(n) where O(1) suffices, but Knot lacks list destructuring (case xs of
+-- (x : rest) -> ...) that would allow short-circuit. Used pervasively on hot paths
+-- (sendMessageCore, handleForwardMessage, gossip). If Knot adds list pattern matching
+-- or a built-in head/uncons primitive, replace this to eliminate the O(n) overhead.
 headOf = \items -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
   _ -> acc) Nothing {} items
@@ -1812,6 +1822,7 @@ hasSessionForKey = \pubkey b ->
     else hasSessionForKey pubkey (b + 1)
 
 -- Check if a pubkey has any non-expired session across all buckets (short-circuits on first match).
+-- Fast-path: returns False immediately when totalSessionCount is 0, avoiding 16 bucket reads.
 hasActiveSessionForKey : PubkeyHex -> Timestamp -> Int -> IO Bool
 hasActiveSessionForKey = \pubkey t b ->
   if b > 15 then yield (False {})
@@ -1822,9 +1833,12 @@ hasActiveSessionForKey = \pubkey t b ->
 
 -- Filter a list of pubkeys to those with active (non-expired) sessions.
 -- Checks each key independently (short-circuits per key), avoids materializing all sessions.
+-- Fast-path: returns empty list when no sessions exist (totalSessionCount == 0).
 filterActiveSessionKeys : [PubkeyHex] -> Timestamp -> IO [PubkeyHex]
 filterActiveSessionKeys = \keys t ->
-  case headOf keys of
+  totalSessions <- *totalSessionCount
+  if totalSessions == 0 then yield []
+  else case headOf keys of
     Nothing {} -> yield []
     Just {value: k} -> do
       let rest = do x <- keys; where x != k; yield x
@@ -2074,7 +2088,11 @@ writeSelectedPresenceBuckets = \buckets entries ->
       writePresenceBucket b bucketEntries
       writeSelectedPresenceBuckets rest entries
 
--- Single-pass partitioning: each entry's bucket is computed once (vs 16x in the list-comprehension approach)
+-- Single-pass partitioning: each entry's bucket is computed once (vs 16x in the list-comprehension approach).
+-- The per-element 16-field record allocation is unavoidable without Knot-level indexed arrays:
+-- the alternative (16 list-comprehension passes, each computing pubkeyBucket) is O(16n) bucket
+-- computations vs O(n) here, and sortBy-based splitting is O(n log n) vs O(n) here.
+-- This pattern is optimal given Knot's current data structure primitives.
 writeAllPresence : [PresenceEntry] -> IO ()
 writeAllPresence = \entries -> do
   let partitioned = fold (\acc p ->
@@ -2295,16 +2313,16 @@ pruneMessageBucket = \b t -> atomic do
         let eviction = evictSmallest combined evictCount (\e -> e.expiredAt)
         set *senderExpirations = eviction.kept
         den <- *droppedExpirationNotifs
-        let denAfterCap = fold (\acc ev -> incrementDropCounter acc ev.senderKey 1) den eviction.evicted
+        let denAfterCap = fold (\acc ev -> incrementDropCounter acc ev.senderKey 1 t) den eviction.evicted
         -- Also record per-key drops for senders that hit maxSenderExpirationsPerKey
         let perKeyDroppedEntries = do e <- localExpired; where none perKeyCapped (\c -> c.messageId == e.messageId && c.toKey == e.toKey); yield e
-        set *droppedExpirationNotifs = fold (\acc e -> incrementDropCounter acc e.senderKey 1) denAfterCap perKeyDroppedEntries
+        set *droppedExpirationNotifs = fold (\acc e -> incrementDropCounter acc e.senderKey 1 t) denAfterCap perKeyDroppedEntries
       else do
         set *senderExpirations = combined
         when (perKeyDropped > 0) (do
           den <- *droppedExpirationNotifs
           let perKeyDroppedEntries = do e <- localExpired; where none perKeyCapped (\c -> c.messageId == e.messageId && c.toKey == e.toKey); yield e
-          set *droppedExpirationNotifs = fold (\acc e -> incrementDropCounter acc e.senderKey 1) den perKeyDroppedEntries))
+          set *droppedExpirationNotifs = fold (\acc e -> incrementDropCounter acc e.senderKey 1 t) den perKeyDroppedEntries))
   else yield {}
 
 -- Prune all 16 message buckets with concurrency: fork first 15, run last in foreground.
@@ -3486,6 +3504,10 @@ pruneExpired = \t -> do
   -- with sendMessageCore which writes to forward buckets on the hot path.
   fwdSurvivorCount <- pruneAllFwdBuckets 0 retainCutoff federationEnabled 0
   atomic do set *totalForwardCount = fwdSurvivorCount
+  -- Cache forward queue stale count after pruning (forward buckets are clean now).
+  -- Health checks read this cached value instead of scanning all 16 buckets each time.
+  fwdStale <- countStaleForwardServers 0 t []
+  atomic do set *cachedForwardStaleCount = fwdStale
   -- AckedIds: per-bucket pruning (each bucket in its own atomic block to reduce lock
   -- contention with poll-ack paths that write to ackedIds concurrently).
   pruneAllAckedBuckets 0 retainCutoff
@@ -3662,10 +3684,16 @@ broadcastOfflineGossip = \t peerServers expiredLocal ->
 -- Build re-broadcast gossip events from validated entries. The seenBy list includes
 -- the fromServer (who sent us these events) and ourselves (serverHostN), so downstream
 -- peers that already have this gossip via either path won't receive it again.
-effectiveGossipEvents = \entries appliedKeys eventType seenBy -> do
-  e <- entries
-  where any appliedKeys (\a -> samePubkeyServer a e)
-  yield {eventType: eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl, seenBy: seenBy}
+-- Optimization: pre-extract unique pubkeys from appliedKeys for a fast-path rejection.
+-- Entries whose pubkey doesn't appear in any appliedKey skip the full samePubkeyServer
+-- check (two-field comparison). Helps when entries contain many pubkeys not in appliedKeys.
+effectiveGossipEvents = \entries appliedKeys eventType seenBy ->
+  let appliedPubkeys = fold (\acc a -> if any acc (\p -> p == a.pubkey) then acc else union [a.pubkey] acc) [] appliedKeys
+  in do
+    e <- entries
+    where any appliedPubkeys (\pk -> pk == e.pubkey)
+    where any appliedKeys (\a -> samePubkeyServer a e)
+    yield {eventType: eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl, seenBy: seenBy}
 
 mergeGossipPresence = \presence deduped trustedOffline fromServer t ->
   let trustedDeduped = trustedGossipEntries deduped presence fromServer t in
@@ -4864,10 +4892,10 @@ ackPolledMessages = \pubkey cursor t -> do
           let eviction = evictSmallest combined evictCount (\d -> d.deliveredAt)
           set *senderDeliveries = eviction.kept
           -- Track per-sender drop counts for all evicted entries
-          let dropCounts = fold (\acc e -> incrementDropCounter acc e.senderKey 1) [] eviction.evicted
+          let dropCounts = fold (\acc e -> incrementDropCounter acc e.senderKey 1 t) [] eviction.evicted
           when (count dropCounts > 0) (do
             ddr <- *droppedDeliveryReceipts
-            set *droppedDeliveryReceipts = fold (\acc dc -> incrementDropCounter acc dc.senderKey dc.count) ddr dropCounts)
+            set *droppedDeliveryReceipts = fold (\acc dc -> incrementDropCounter acc dc.senderKey dc.count t) ddr dropCounts)
         else set *senderDeliveries = combined)
       yield {pendingAcks: ackedFederated, evictedEntries: eviction.evicted}
     else yield {pendingAcks: [], evictedEntries: []}
@@ -5103,9 +5131,12 @@ trustedOfflineEvents = \events fromServer ->
 gossipTargets = \peerServers fromServer ->
   do s <- peerServers; where s != fromServer; yield s
 
--- Remote keys that just came online (triggers forwarding of queued messages)
+-- Remote keys that just came online (triggers forwarding of queued messages).
+-- Pre-extracts unique pubkeys from appliedKeys for fast-path rejection (same optimization
+-- as effectiveGossipEvents: skip full samePubkeyServer check when pubkey doesn't match).
 newlyOnlineRemoteKeys = \events appliedKeys ->
-  do e <- events; where any appliedKeys (\a -> samePubkeyServer a e); where not (isLocalServer e.server); yield {pubkey: e.pubkey, server: e.server}
+  let appliedPubkeys = fold (\acc a -> if any acc (\p -> p == a.pubkey) then acc else union [a.pubkey] acc) [] appliedKeys
+  in do e <- events; where any appliedPubkeys (\pk -> pk == e.pubkey); where any appliedKeys (\a -> samePubkeyServer a e); where not (isLocalServer e.server); yield {pubkey: e.pubkey, server: e.server}
 
 -- Trust gossip entries if they're first-party (server == fromServer) or updating
 -- an existing (pubkey, server) presence entry. Third-party gossip cannot create
@@ -6032,7 +6063,8 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                 then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}}
                 else do
                   recvRates <- *recvRates
-                  let recvResult = checkPubkeyRate recvRates toKey maxRecvRatePerKey recvRateWindowMs maxRecvRateEntries t
+                  recvRate <- effectiveRecvRate
+                  let recvResult = checkPubkeyRate recvRates toKey recvRate recvRateWindowMs maxRecvRateEntries t
                   if recvResult.limited
                     then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: True {}, noPresence: False {}}
                     else do
@@ -6114,7 +6146,7 @@ fedDeliveryReceipts = \bucketIds forwards t -> case headOf bucketIds of
           Nothing {} -> yield {}
           Just {value: ev} -> do
             ddr <- *droppedDeliveryReceipts
-            set *droppedDeliveryReceipts = incrementDropCounter ddr ev.senderKey 1
+            set *droppedDeliveryReceipts = incrementDropCounter ddr ev.senderKey 1 t
       else set *senderDeliveries = combined)
     fedDeliveryReceipts rest forwards t
 
@@ -6745,10 +6777,11 @@ computeAndCacheHealth = \t -> do
     let nonceOk = nonceCount * 10 <= maxForwardNonces * 9
     -- Count peers with active failure records (degraded federation connectivity)
     let degradedPeerCount = count (do f <- forwardFailures; where t - f.firstFailedAt < maxServerDowntime; yield f)
-    -- Forward queue age health: per-server awareness. Only flag unhealthy when
-    -- multiple destination servers have stale queues (oldest forward > healthForwardQueueMaxAge).
-    -- A single stuck peer shouldn't mark the server unhealthy — it's an isolated issue.
-    fwdStaleCount <- countStaleForwardServers 0 t []
+    -- Forward queue age health: use cached stale count from the last prune cycle
+    -- (updated every ~30s) instead of scanning all 16 forward buckets per health check.
+    -- Staleness of up to 30 seconds is acceptable for health monitoring; stale forwards
+    -- take >24 minutes (healthForwardQueueMaxAge) to appear, so they're always caught.
+    fwdStaleCount <- *cachedForwardStaleCount
     let fwdQueueOk = fwdStaleCount < healthForwardQueueMinStaleServers
     yield {pruneOk: warmup || (t - lastPrune < healthPruneMaxAge && not pruneStuck),
            heartbeatOk: warmup || t - lastHb < healthHeartbeatMaxAge,
@@ -7139,7 +7172,7 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
                   Nothing {} -> yield {}
                   Just {value: ev} -> do
                     ddr <- *droppedDeliveryReceipts
-                    set *droppedDeliveryReceipts = incrementDropCounter ddr ev.senderKey 1
+                    set *droppedDeliveryReceipts = incrementDropCounter ddr ev.senderKey 1 t
               else set *senderDeliveries = combined)
             yield {ackedCount: ackCount, pendingAcks: ackedFederated, evictedEntries: eviction.evicted}
           else yield {ackedCount: 0, pendingAcks: [], evictedEntries: []}
@@ -7243,7 +7276,7 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
                     Nothing {} -> yield {}
                     Just {value: ev} -> do
                       ddr <- *droppedDeliveryReceipts
-                      set *droppedDeliveryReceipts = incrementDropCounter ddr ev.senderKey 1
+                      set *droppedDeliveryReceipts = incrementDropCounter ddr ev.senderKey 1 t
                 else set *senderDeliveries = combinedDel)
               if count ackedFederated > 0 then do
                 ackedBkt <- readAckedBucket b
@@ -8421,8 +8454,11 @@ main = do
       atomic do
         set *startedAt = t
         set *serverGeneration = t
+      -- Empty maintenanceSecret is the recommended deployment path: use /maintenance/rotate-secret
+      -- at startup via deployment scripts for zero-knowledge secret management. Log at INFO level
+      -- since operators following the recommended path shouldn't see warnings on every startup.
       when (maintenanceSecret == "")
-        (logWarn "maintenanceSecret is empty — /maintenance/* and /stats endpoints are disabled")
+        (logInfo "maintenanceSecret is empty — use /maintenance/rotate-secret at startup to enable /maintenance/* and /stats endpoints")
       when (maintenanceSecret != "" && not (tooLong maintenanceSecret 15))
         (logWarn "maintenanceSecret is shorter than 16 characters — use a longer secret for production deployments")
       when (maintenanceSecret != "" && not (tooLong maintenanceSecret 31))
