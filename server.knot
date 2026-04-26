@@ -73,6 +73,7 @@ clockSkewTolerance : Int<Ms>
 clockSkewTolerance = 5000 -- 5 seconds tolerance for clock skew between federated servers
 maxForwardsEntries = 10000
 maxForwardsPerKey = 50 -- max pending forwards per recipient pubkey (prevents one key from starving others)
+maxForwardsPerSenderPerKey = 10 -- max pending forwards per sender-recipient pair (prevents one sender from monopolizing a recipient's queue)
 maxForwardsPerServer = 2000 -- max pending forwards per destination server (prevents one unreachable peer from starving others)
 maxServerNameLen = 128
 maxMessageIdLen = 128
@@ -212,6 +213,12 @@ maxGossipEventsPerServer = 500 -- max total gossip events per server per window
 gossipEventRateWindowMs : Int<Ms>
 gossipEventRateWindowMs = 60000 -- 1 minute
 maxGossipEventRateEntries = 100
+-- Gossip batch backoff: when a single gossip request carries more than this many fresh events,
+-- delay re-broadcast by a random interval up to gossipBatchBackoffMs. Prevents amplification
+-- storms when peers recover from downtime and send bursts of presence updates.
+gossipBatchBackoffThreshold = 50
+gossipBatchBackoffMs : Int<Ms>
+gossipBatchBackoffMs = 5000 -- max random delay before re-gossiping large batches
 -- Global federation connection cap (bounds total concurrent outbound connections across all paths)
 maxGlobalFederationConcurrency = 30
 -- Peer blocklist: max blocked servers tracked at runtime (managed via /maintenance/block, /maintenance/unblock)
@@ -256,6 +263,11 @@ peerKeyTtlMs : Int<Ms>
 peerKeyTtlMs = 86400000 -- 24 hours; peer keys change rarely (server restart or rotation)
 peerKeyRefetchCooldownMs : Int<Ms>
 peerKeyRefetchCooldownMs = 60000 -- 1 minute; minimum interval between re-fetch attempts per server
+-- Require ClientIp header on auth requests. When True, challenge requests with
+-- empty clientIp are rejected. Prevents unbound sessions if the reverse proxy is
+-- temporarily misconfigured (no ClientIp header forwarding). Sessions created without
+-- IP binding permanently accept requests from any IP.
+requireClientIp = True {}
 -- IP-based rate limiting (reverse proxy sets ClientIp header)
 maxIpRatePerIp = 10 -- max auth requests per IP per window
 ipRateWindowMs : Int<Ms>
@@ -827,6 +839,12 @@ maxPeerLatencyEntries = 100
 *nonceBucket14 : [ForwardNonce]
 *nonceBucket15 : [ForwardNonce]
 
+-- Nonce eviction replay protection: tracks the seenAt of the oldest retained nonce
+-- after LRU eviction. Forwards with timestamps older than this cutoff cannot be
+-- verified for dedup (their nonces may have been evicted) and are rejected.
+-- 0 = no eviction has occurred (all nonces retained), accept all timestamps.
+*nonceEvictionCutoff : Timestamp
+
 -- Federation verify per-IP rate limiting (tighter than general IP rate)
 *verifyIpRates : [IpRateEntry]
 
@@ -977,7 +995,7 @@ route AuthApi where
 route ClientApi where
   -- Long-poll for new messages; cursor tracks last-seen receivedAt timestamp
   POST {cursor: Timestamp, generation: Int, watchKeys: [PubkeyHex]} /poll headers {authorization: Text, clientIp: Text}
-    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, presenceUpdates: [{pubkey: PubkeyHex, online: Bool}], heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, messageExpirations: [{messageId: MessageIdHex, toKey: PubkeyHex, expiredAt: Timestamp}], messageDeliveries: [{messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}], droppedDeliveryReceipts: Int, droppedExpirationNotifs: Int}
+    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, presenceUpdates: [{pubkey: PubkeyHex, online: Bool}], heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, messageExpirations: [{messageId: MessageIdHex, toKey: PubkeyHex, expiredAt: Timestamp}], messageDeliveries: [{messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}], droppedDeliveryReceipts: Int, droppedExpirationNotifs: Int, loadPct: Int}
     = Poll
   /messages
     -- Send an E2E encrypted message to a recipient pubkey.
@@ -986,7 +1004,7 @@ route ClientApi where
     -- priority: optional urgency level (0 = normal, higher = more urgent, clamped to [0, maxMessagePriority]).
     -- High-priority messages are forwarded first during federation retries.
     POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId, expiresInMs: Int, priority: Int} / headers {authorization: Text, clientIp: Text}
-      -> {status: MessageStatus, messageId: OptionalMessageId, retryAfterMs: Int, error: Text}
+      -> {status: MessageStatus, messageId: OptionalMessageId, retryAfterMs: Int, error: Text, loadPct: Int}
       = SendMessage
     -- Check delivery status of a sent message (caller must know recipient to prove ownership)
     POST {to: PubkeyHex, messageId: MessageIdHex} /status headers {authorization: Text, clientIp: Text}
@@ -2743,6 +2761,14 @@ updateForwardNonce = \nb messageId toKey t -> do
         then case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> 0; Just {value: n} -> t - n.seenAt
         else 0
   writeNonceBucket nb evictedNonces
+  -- Update nonce eviction cutoff: the seenAt of the oldest retained nonce.
+  -- Forwards with timestamps older than this cannot be verified for dedup.
+  when (lruEvicted > 0) (do
+    let oldestRetainedSeenAt = case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> t; Just {value: n} -> n.seenAt
+    cutoff <- *nonceEvictionCutoff
+    -- Only advance the cutoff (never regress): a bucket with older retained nonces
+    -- shouldn't lower the cutoff set by a bucket with newer evictions.
+    when (oldestRetainedSeenAt > cutoff) (set *nonceEvictionCutoff = oldestRetainedSeenAt))
   yield {lruEvicted: lruEvicted, oldestRetainedAge: oldestRetainedAge}
 
 -- Log nonce LRU eviction if any occurred. Call outside atomic blocks.
@@ -4564,13 +4590,15 @@ forwardQueuedMessages = \targets t -> do
     relevantMessages <- readSelectedBuckets neededBuckets
     let candidates = forwardCandidates remoteTargets relevantMessages forwards t
     totalFwdCount <- *totalForwardCount
-    -- Per-key and per-server caps: filter candidates to respect both limits
+    -- Per-key, per-server, and per-sender-per-key caps: filter candidates to respect all limits.
+    -- Per-sender cap prevents a single sender from monopolizing a recipient's forward queue.
     let perKeyCapped = fold (\acc c ->
       let existingForKey = count (do f <- forwards; where f.toKey == c.toKey; yield f)
         + count (do a <- acc; where a.toKey == c.toKey; yield a)
       in let existingForServer = count (do f <- forwards; where f.toServer == c.toServer; yield f)
         + count (do a <- acc; where a.toServer == c.toServer; yield a)
-      in if existingForKey >= maxForwardsPerKey || existingForServer >= maxForwardsPerServer then acc else union acc [c]) [] candidates
+      in let existingForSenderKey = if c.senderKey != "" then count (do f <- forwards; where f.senderKey == c.senderKey && f.toKey == c.toKey; yield f) + count (do a <- acc; where a.senderKey == c.senderKey && a.toKey == c.toKey; yield a) else 0
+      in if existingForKey >= maxForwardsPerKey || existingForServer >= maxForwardsPerServer || (c.senderKey != "" && existingForSenderKey >= maxForwardsPerSenderPerKey) then acc else union acc [c]) [] candidates
     let capped = takeRelation (maxForwardsEntries - totalFwdCount) perKeyCapped
     -- Write back only the affected forward buckets (not all 16)
     let combined = union forwards capped
@@ -5426,6 +5454,13 @@ remoteOnlyTargets = \targets localOnline ->
 -- Rate-limited per key; globally capped. Challenge expires in 1 minute.
 handleChallenge = \pubkey clientIp respond -> do
   t <- now
+  -- Reject challenges without ClientIp when requireClientIp is enabled.
+  -- Prevents creating sessions with no IP binding (permanently accept from any IP).
+  if requireClientIp && clientIp == ""
+    then do
+      logEvent "warn" "missing_client_ip" ("endpoint=challenge key=" ++ pubkey)
+      yield (respond {challenge: "", ok: False {}, expiresAt: 0, retryAfterMs: 0, error: "client_ip_required"})
+    else do
   preAuth <- checkPreAuth clientIp t
   if preAuth != ""
     then do
@@ -5613,10 +5648,10 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
   -- Cursor staleness: cursor is older than message retention, so messages were missed.
   -- Different from cursorReset (server restart): staleness means client was offline too long.
   let cursorStale = effectiveCursor > 0 && t - effectiveCursor > unackedMessageMaxAge
-  if dp >= 2 then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0})
+  if dp >= 2 then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0})
   else do
   globalRateLimited <- checkGlobalRate t
-  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: globalRateWindowMs, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0})
+  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: globalRateWindowMs, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0})
   else do
     -- Capture presenceVersion before long-poll wait to skip unchanged lookups
     startPresenceVersion <- *presenceVersion
@@ -5678,7 +5713,10 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
         let deResult = drainDropCounter den result.pubkey
         when (deResult.count > 0) (set *droppedExpirationNotifs = deResult.remaining)
         yield {dr: drResult.count, de: deResult.count}
-    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: result.pollSlotFull, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat, retryAfterMs: pollRetryMs, cursorReset: cursorWasReset, hasMore: result.hasMore, cursorStale: cursorStale, messageExpirations: expirations, messageDeliveries: deliveries, droppedDeliveryReceipts: drops.dr, droppedExpirationNotifs: drops.de})
+    -- Expose server load to clients: 0 = healthy (<=80% capacity), up to 90 = near-full.
+    -- Clients can voluntarily reduce poll frequency or batch sends when loadPct > 0.
+    loadPct <- do scale <- *cachedAdaptiveScale; yield (if scale >= 100 then 0 else 100 - scale)
+    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: result.pollSlotFull, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat, retryAfterMs: pollRetryMs, cursorReset: cursorWasReset, hasMore: result.hasMore, cursorStale: cursorStale, messageExpirations: expirations, messageDeliveries: deliveries, droppedDeliveryReceipts: drops.dr, droppedExpirationNotifs: drops.de, loadPct: loadPct})
 
 -- Core send logic: dedup, rate limiting, store message, create forwards.
 -- Called inside an atomic block by both handleSendMessage and sendBatchInner.
@@ -5754,7 +5792,12 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId expiresIn
                   -- Per-key cap: prevents one key from consuming disproportionate forward slots
                   let keyFwdCount = count (do f <- fwdBkt; where f.toKey == to; yield f)
                   let keyCap = maxForwardsPerKey - keyFwdCount
-                  let cappedFwds = takeRelation (min globalCap keyCap) newFwds
+                  -- Per-sender-per-recipient cap: prevents a single sender from monopolizing
+                  -- a recipient's forward queue, ensuring at least (maxForwardsPerKey /
+                  -- maxForwardsPerSenderPerKey) distinct senders can queue forwards.
+                  let senderKeyFwdCount = if senderKey != "" then count (do f <- fwdBkt; where f.senderKey == senderKey && f.toKey == to; yield f) else 0
+                  let senderKeyCap = if senderKey != "" && senderKeyFwdCount >= maxForwardsPerSenderPerKey then 0 else min globalCap keyCap
+                  let cappedFwds = takeRelation senderKeyCap newFwds
                   writeFwdBucket fbi (union fwdBkt cappedFwds)
                   set *totalForwardCount = totalFwdCount + count cappedFwds
                   -- Return whether any forwards were actually enqueued (vs dropped by capacity cap)
@@ -5891,14 +5934,14 @@ handleSendMessage = \to encryptedBlob timestamp messageId expiresInMs priority a
   let clampedPriority = clamp 0 maxMessagePriority priority
   t <- now
   dp <- *drainPhase
-  if dp >= 2 then yield (respond {status: MsDraining {}, messageId: "", retryAfterMs: 0, error: "draining"})
+  if dp >= 2 then yield (respond {status: MsDraining {}, messageId: "", retryAfterMs: 0, error: "draining", loadPct: 0})
   else do
   globalRateLimited <- checkGlobalRate t
-  if globalRateLimited then yield (respond {status: MsRateLimited {}, messageId: "", retryAfterMs: 0, error: "rate_limited:" ++ show globalRateWindowMs ++ "ms"})
+  if globalRateLimited then yield (respond {status: MsRateLimited {}, messageId: "", retryAfterMs: 0, error: "rate_limited:" ++ show globalRateWindowMs ++ "ms", loadPct: 0})
   else do
     effectiveMsgId <- if messageId != "" then yield messageId else genToken
     if t - timestamp > messageMaxAge
-      then yield (respond {status: MsRejected {}, messageId: "", retryAfterMs: 0, error: "stale_timestamp"})
+      then yield (respond {status: MsRejected {}, messageId: "", retryAfterMs: 0, error: "stale_timestamp", loadPct: 0})
       else do
     when (timestamp > t + clockSkewTolerance)
       (logWarn ("sendMessage: future timestamp detected (+" ++ show (timestamp - t) ++ "ms ahead), clamping to now"))
@@ -5914,12 +5957,13 @@ handleSendMessage = \to encryptedBlob timestamp messageId expiresInMs priority a
       MsRejected {} -> when (result.retryAfterMs == 0) (logWarn ("sendMessage: rejected for " ++ effectiveMsgId ++ " (global capacity full)"))
       _ -> yield {}
     forkSendForwards effectiveMsgId to encryptedBlob clampedTs result.remoteServers
+    loadPct <- do scale <- *cachedAdaptiveScale; yield (if scale >= 100 then 0 else 100 - scale)
     yield (case result.status of
-      MsDuplicate {} -> respond {status: MsDuplicate {}, messageId: effectiveMsgId, retryAfterMs: 0, error: ""}
-      MsDelivered {} -> respond {status: MsDelivered {}, messageId: effectiveMsgId, retryAfterMs: 0, error: ""}
-      MsFederated {} -> respond {status: MsFederated {}, messageId: effectiveMsgId, retryAfterMs: 0, error: ""}
-      MsQueued {} -> respond {status: MsQueued {}, messageId: effectiveMsgId, retryAfterMs: 0, error: ""}
-      _ -> respond {status: result.status, messageId: "", retryAfterMs: result.retryAfterMs, error: "rejected"})
+      MsDuplicate {} -> respond {status: MsDuplicate {}, messageId: effectiveMsgId, retryAfterMs: 0, error: "", loadPct: loadPct}
+      MsDelivered {} -> respond {status: MsDelivered {}, messageId: effectiveMsgId, retryAfterMs: 0, error: "", loadPct: loadPct}
+      MsFederated {} -> respond {status: MsFederated {}, messageId: effectiveMsgId, retryAfterMs: 0, error: "", loadPct: loadPct}
+      MsQueued {} -> respond {status: MsQueued {}, messageId: effectiveMsgId, retryAfterMs: 0, error: "", loadPct: loadPct}
+      _ -> respond {status: result.status, messageId: "", retryAfterMs: result.retryAfterMs, error: "rejected", loadPct: loadPct})
 
 -- GET /lookup/:pubkey: Look up the best known server for a pubkey.
 -- Returns local server if key is online locally, otherwise the remote with latest expiry.
@@ -6267,6 +6311,14 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
     let newlyOnlineRemote = newlyOnlineRemoteKeys filteredOnline gossipResult.gm.appliedKeys
     fork (do
       when (cappedHops > 1 && federationEnabled && count freshEvents > 0) (do
+        -- Gossip batch backoff: when a large batch of fresh events arrives (e.g., peer
+        -- recovering from downtime), delay re-broadcast by a random interval to prevent
+        -- amplification storms. Multiple peers recovering simultaneously would otherwise
+        -- generate O(peers^2 * events) gossip traffic.
+        when (count freshEvents > gossipBatchBackoffThreshold) (do
+          backoff <- randomInt gossipBatchBackoffMs
+          logEvent "info" "gossip_batch_backoff" ("events=" ++ show (count freshEvents) ++ " from=" ++ fromServer ++ " backoffMs=" ++ show backoff)
+          sleep backoff)
         let targets = gossipTargets gossipResult.gm.gossipPeerServers fromServer
         -- Split first-party (from the sender) vs third-party (relayed) events.
         -- Third-party events get fewer hops to limit amplification from inflated hopsRemaining.
@@ -6330,7 +6382,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
       presenceBkt <- readPresenceBucket bkt
       let hasPresence = any presenceBkt (\p -> p.pubkey == toKey && p.expiresAt > t)
       if not hasPresence
-        then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: True {}}
+        then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: True {}, nonceCutoffRejected: False {}}
         else do
       bucket <- readMessageBucket bkt
       ackedBkt <- readAckedBucket bkt
@@ -6342,28 +6394,35 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
       -- messages (originServer="") whose nonces were recorded by sendMessageCore.
       let isDup = checkMessageDup bucket messageId toKey || hasMessage messageId toKey ackedBkt || hasMessage messageId toKey delivBkt || any nonceBkt (\n -> n.messageId == messageId && n.toKey == toKey)
       if isDup
-        then yield {forward: ForwardDuplicate {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}}
+        then yield {forward: ForwardDuplicate {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: False {}}
         else do
+          -- Nonce eviction replay protection: if LRU eviction has occurred, we cannot
+          -- verify dedup for messages whose nonces may have been evicted. Reject forwards
+          -- with timestamps older than the eviction cutoff as a safety measure.
+          nonceCutoff <- *nonceEvictionCutoff
+          if nonceCutoff > 0 && timestamp > 0 && timestamp < nonceCutoff
+            then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: True {}}
+            else do
           totalMsgCount <- *totalMessageCount
           if totalMsgCount >= maxMessages
-            then yield {forward: ForwardRejected {}, globalCapReached: True {}, recvRateLimited: False {}, noPresence: False {}}
+            then yield {forward: ForwardRejected {}, globalCapReached: True {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: False {}}
             else do
               recipientCounts <- readRcBucket bkt
               let recipientCount = getRecipientCount toKey recipientCounts
               if recipientCount >= maxMessagesPerRecipient
-                then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}}
+                then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: False {}}
                 else do
                   recvRates <- *recvRates
                   recvRate <- effectiveRecvRate
                   let recvResult = checkPubkeyRate recvRates toKey recvRate recvRateWindowMs maxRecvRateEntries t
                   if recvResult.limited
-                    then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: True {}, noPresence: False {}}
+                    then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: True {}, noPresence: False {}, nonceCutoffRejected: False {}}
                     else do
                       set *recvRates = recvResult.entries
                       federationPairRates <- *federationPairRates
                       let fedPairResult = checkServerRecipientRate federationPairRates fromServer toKey maxFederationPairRatePerPair federationPairRateWindowMs maxFederationPairRateEntries t
                       if fedPairResult.limited
-                        then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}}
+                        then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: False {}}
                         else do
                       set *federationPairRates = fedPairResult.entries
                       seqCounter <- *seqCounter
@@ -6381,21 +6440,23 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                       signalMessageForKey toKey seqTs
                       -- Record forward nonce for replay protection beyond message/ack dedup lifetime.
                       recordForwardNonce messageId toKey t
-                      yield {forward: ForwardStored {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}}
+                      yield {forward: ForwardStored {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: False {}}
     if result.noPresence then do
       logWarn ("forward: rejected for " ++ toKey ++ " — no active presence on this server (from " ++ fromServer ++ ")")
       yield (respond {ok: False {}, error: "no_presence"})
     else do
     case result.forward of
       ForwardRejected {} ->
-        if result.globalCapReached
+        if result.nonceCutoffRejected
+          then logEvent "warn" "forward_nonce_cutoff" ("messageId=" ++ messageId ++ " key=" ++ toKey ++ " from=" ++ fromServer ++ " — timestamp older than nonce eviction cutoff, possible replay")
+          else if result.globalCapReached
           then logWarn ("forward: global message cap reached (" ++ show maxMessages ++ "), rejecting for " ++ toKey)
           else if result.recvRateLimited
           then logEvent "warn" "rate_limited_recv" ("key=" ++ toKey ++ " limit=" ++ show maxRecvRatePerKey)
           else logWarn ("forward: rejected for " ++ toKey ++ " (mailbox full, max " ++ show maxMessagesPerRecipient ++ ")")
       _ -> yield {}
     yield (case result.forward of
-      ForwardRejected {} -> respond {ok: False {}, error: "mailbox_full"}
+      ForwardRejected {} -> respond {ok: False {}, error: if result.nonceCutoffRejected then "nonce_cutoff" else "mailbox_full"}
       _ -> respond {ok: True {}, error: ""}))
 
 -- Generate sender delivery receipts for messages confirmed delivered via federation ack.
@@ -6426,13 +6487,17 @@ fedDeliveryReceipts = \bucketIds forwards t -> case headOf bucketIds of
       let combined = union sd deduped
       let overCap = count combined > maxSenderDeliveries
       if overCap then do
-        let evicted = extractOldest combined (\d -> d.deliveredAt)
-        set *senderDeliveries = evicted.items
-        case evicted.candidate of
-          Nothing {} -> yield {}
-          Just {value: ev} -> do
-            ddr <- *droppedDeliveryReceipts
-            set *droppedDeliveryReceipts = incrementDropCounter ddr ev.senderKey 1 t
+        -- Batch eviction: evict 2% of capacity instead of 1 entry at a time.
+        -- Amortizes the O(n) scan cost across multiple inserts, reducing overhead
+        -- under sustained capacity pressure from O(n) per insert to O(n) per 2% fills.
+        let evictCount = max 1 (count combined - maxSenderDeliveries + maxSenderDeliveries / 50)
+        let eviction = evictSmallest combined evictCount (\d -> d.deliveredAt)
+        set *senderDeliveries = eviction.kept
+        -- Track per-sender drop counts for all evicted entries
+        let dropCounts = fold (\acc e -> incrementDropCounter acc e.senderKey 1 t) [] eviction.evicted
+        when (count dropCounts > 0) (do
+          ddr <- *droppedDeliveryReceipts
+          set *droppedDeliveryReceipts = fold (\acc dc -> incrementDropCounter acc dc.senderKey dc.count t) ddr dropCounts)
       else set *senderDeliveries = combined)
     fedDeliveryReceipts rest forwards t
 
@@ -6729,6 +6794,11 @@ forwardBucketGroupInner = \entries fromServer b t acc presenceBkt bucket ackedBk
           if isDup
             then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: True {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
             else do
+              -- Nonce eviction replay protection (matches handleForwardMessage)
+              nonceCutoff <- *nonceEvictionCutoff
+              if nonceCutoff > 0 && entry.timestamp > 0 && entry.timestamp < nonceCutoff
+                then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: False {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
+                else do
               totalMsgCount <- *totalMessageCount
               let recipientCount = getRecipientCount entry.toKey rc
               if totalMsgCount + msgStored >= maxMessages || recipientCount >= maxMessagesPerRecipient
@@ -7098,37 +7168,57 @@ computeAndCacheHealth = \t -> do
     set *cachedHealthDegradedPeers = result.degradedPeers
   yield result
 
+-- Return cached health state. Used for unauthenticated callers and rate-limited requests.
+-- Provides constant-time responses regardless of server state complexity.
+readCachedHealth = \respond -> do
+  cached <- atomic do
+    cOk <- *cachedHealthOk
+    cP <- *cachedHealthPrune
+    cH <- *cachedHealthHeartbeat
+    cC <- *cachedHealthCapacity
+    cF <- *cachedHealthFederation
+    cW <- *cachedHealthWatchdog
+    cN <- *cachedHealthNonce
+    cFQ <- *cachedHealthForwardQueue
+    cCW <- *cachedHealthCapacityWarning
+    cDP <- *cachedHealthDegradedPeers
+    dp <- *drainPhase
+    yield {ok: cOk && dp == 0, version: serverBuildVersion, pruneHealthy: cP, heartbeatHealthy: cH, capacityHealthy: cC, capacityWarning: cCW, federationHealthy: cF, watchdogHealthy: cW, nonceHealthy: cN, forwardQueueHealthy: cFQ, draining: dp > 0, degradedPeers: cDP}
+  yield (respond cached)
+
 handleHealth = \authorization respond -> do
   t <- now
   -- Health checks exempt from global rate limiting (monitoring traffic shouldn't starve real requests)
   -- but have their own dedicated rate limiter to prevent DDoS on /health from saturating reads.
   healthLimited <- checkHealthRate t
-  if healthLimited then do
-    -- Return cached last-known health (prevents DDoS on /health from masking real failures).
-    -- Cache is kept fresh by computeAndCacheHealth called from both here and background prune.
-    cached <- atomic do
-      cOk <- *cachedHealthOk
-      cP <- *cachedHealthPrune
-      cH <- *cachedHealthHeartbeat
-      cC <- *cachedHealthCapacity
-      cF <- *cachedHealthFederation
-      cW <- *cachedHealthWatchdog
-      cN <- *cachedHealthNonce
-      cFQ <- *cachedHealthForwardQueue
-      cCW <- *cachedHealthCapacityWarning
-      cDP <- *cachedHealthDegradedPeers
-      dp <- *drainPhase
-      yield {ok: cOk && dp == 0, version: serverBuildVersion, pruneHealthy: cP, heartbeatHealthy: cH, capacityHealthy: cC, capacityWarning: cCW, federationHealthy: cF, watchdogHealthy: cW, nonceHealthy: cN, forwardQueueHealthy: cFQ, draining: dp > 0, degradedPeers: cDP}
-    yield (respond cached)
+  if healthLimited then readCachedHealth respond
   else do
   isAuthed <- verifyMaintenanceAuth authorization
+  -- Unauthenticated callers always get cached results (constant-time, no live computation).
+  -- This prevents timing side-channels: an attacker cannot infer server load by measuring
+  -- response time differences between cached (fast) and computed (slow) health checks.
+  -- Cache is kept fresh by computeAndCacheHealth called from background prune (~30s).
+  -- Only authenticated callers trigger live computation + cache refresh.
+  if not isAuthed
+    then do
+      cached <- atomic do
+        cOk <- *cachedHealthOk
+        dp <- *drainPhase
+        yield {ok: cOk && dp == 0, draining: dp > 0}
+      yield (respond {ok: cached.ok, version: serverBuildVersion, pruneHealthy: True {},
+                  heartbeatHealthy: True {},
+                  capacityHealthy: True {},
+                  capacityWarning: False {},
+                  federationHealthy: True {},
+                  watchdogHealthy: True {},
+                  nonceHealthy: True {},
+                  forwardQueueHealthy: True {},
+                  draining: cached.draining,
+                  degradedPeers: 0})
+    else do
   result <- computeAndCacheHealth t
   let allOk = not result.isDraining && result.pruneOk && result.heartbeatOk && result.capacityOk && result.federationOk && result.watchdogOk && result.nonceOk && result.forwardQueueOk
-  -- Unauthenticated: return real ok boolean so load balancers can route around unhealthy nodes,
-  -- but hide subsystem breakdown to prevent targeted load-correlation attacks.
-  -- Draining status is always visible (load balancers need it for routing decisions).
-  if isAuthed
-    then yield (respond {ok: allOk, version: serverBuildVersion, pruneHealthy: result.pruneOk,
+  yield (respond {ok: allOk, version: serverBuildVersion, pruneHealthy: result.pruneOk,
                   heartbeatHealthy: result.heartbeatOk,
                   capacityHealthy: result.capacityOk,
                   capacityWarning: result.capacityWarning,
@@ -7138,16 +7228,6 @@ handleHealth = \authorization respond -> do
                   forwardQueueHealthy: result.forwardQueueOk,
                   draining: result.isDraining,
                   degradedPeers: result.degradedPeers})
-    else yield (respond {ok: allOk, version: serverBuildVersion, pruneHealthy: True {},
-                  heartbeatHealthy: True {},
-                  capacityHealthy: True {},
-                  capacityWarning: False {},
-                  federationHealthy: True {},
-                  watchdogHealthy: True {},
-                  nonceHealthy: True {},
-                  forwardQueueHealthy: True {},
-                  draining: result.isDraining,
-                  degradedPeers: 0})
 
 zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: 0, gossipSuccess: 0, gossipFail: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, totalEntries: 0, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0}}
 
@@ -8727,6 +8807,7 @@ main = do
         && clockSkewTolerance < challengeExpiry
         && maxMessagesPerRecipient <= maxMessages
         && maxForwardsPerKey <= maxForwardsEntries
+        && maxForwardsPerSenderPerKey <= maxForwardsPerKey
         && maxForwardsPerServer <= maxForwardsEntries
         && maxSessionsPerKey <= maxSessions
         && maxChallengesPerKey <= maxChallenges
@@ -8744,7 +8825,7 @@ main = do
   if not configOk
     then logError "FATAL: invalid configuration — capacity limits and intervals must be > 0, server not started"
     else if not configRelationsOk
-    then logError "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, sessionExpiry <= maxSessionLifetime, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, maxThirdPartyGossipHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, forwardNonceRetention >= messageMaxAge, maxGlobalFederationConcurrency >= maxFederationConcurrency, maxGossipEventsPerServer > maxGossipEvents, per-key/per-server limits <= global limits), server not started"
+    then logError "FATAL: invalid configuration — relationship invariants violated (check: unackedMessageMaxAge <= messageMaxAge, challengeExpiry < sessionExpiry, sessionExpiry <= maxSessionLifetime, retryBackoffBase <= retryBackoffMax, backgroundPruneInterval < healthPruneMaxAge, pollTimeoutMs < sessionExpiry, gossipDedupWindow < presenceRefreshInterval, federationFetchTimeoutMs <= backgroundPruneInterval, maxAckOverflow <= maxAckedIds, gossipOriginHops <= maxGossipHops, maxThirdPartyGossipHops <= maxGossipHops, verificationTokenExpiry <= federationFetchTimeoutMs, forwardNonceRetention >= messageMaxAge, maxGlobalFederationConcurrency >= maxFederationConcurrency, maxGossipEventsPerServer > maxGossipEvents, maxForwardsPerSenderPerKey <= maxForwardsPerKey, per-key/per-server limits <= global limits), server not started"
     else do
       t <- now
       atomic do
@@ -8767,7 +8848,9 @@ main = do
         (logWarn ("serverHost is " ++ serverHost ++ " — peers cannot reach this server for federation"))
       when (federationEnabled && isBadServerName serverHostN)
         (logError ("serverHost '" ++ serverHost ++ "' would be rejected by isBadServerName — federation peers cannot forward messages here. Set serverHost to a public DNS name."))
-      logInfo "IP binding is active — sessions created with a ClientIp header will reject requests without one"
+      if requireClientIp
+        then logInfo "IP binding: required — challenge requests without ClientIp header are rejected"
+        else logInfo "IP binding: optional — sessions created with a ClientIp header will reject requests without one"
       logWarn "SECURITY: Knot has no HTTP-layer request body size limit. Deploy behind a reverse proxy with a body limit (e.g., Caddy: request_body { max_size 256KB }) to prevent large-payload DoS."
       when federationEnabled
         (logWarn "SECURITY: DNS rebinding risk — federation URLs resolve DNS at fetch time, not at validation time. A peer hostname passing isBadServerName could rebind to a private IP between validation and fetch. Mitigate by blocking outbound connections to RFC1918/link-local/CGNAT ranges at the firewall level.")
@@ -8786,7 +8869,7 @@ main = do
       logInfo ("  max messages: " ++ show maxMessages ++ " (per recipient: " ++ show maxMessagesPerRecipient ++ ")")
       logInfo ("  max sessions: " ++ show maxSessions ++ " (per key: " ++ show maxSessionsPerKey ++ ")")
       logInfo ("  max presence: " ++ show maxPresenceEntries)
-      logInfo ("  max forwards: " ++ show maxForwardsEntries ++ " (per key: " ++ show maxForwardsPerKey ++ ", per server: " ++ show maxForwardsPerServer ++ ")")
+      logInfo ("  max forwards: " ++ show maxForwardsEntries ++ " (per key: " ++ show maxForwardsPerKey ++ ", per sender-key: " ++ show maxForwardsPerSenderPerKey ++ ", per server: " ++ show maxForwardsPerServer ++ ")")
       logInfo ("  session expiry: " ++ show sessionExpiry ++ "ms (max lifetime: " ++ show maxSessionLifetime ++ "ms)")
       logInfo ("  message max age: " ++ show messageMaxAge ++ "ms")
       logInfo ("  max active requests: " ++ if maxActiveRequests > 0 then show maxActiveRequests else "unlimited")
