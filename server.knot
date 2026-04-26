@@ -453,6 +453,26 @@ max = \a b -> if a > b then a else b
 -- Dedup: keeps first occurrence (O(n^2)).
 unique = \items -> fold (\acc x -> if any acc (\a -> a == x) then acc else union acc [x]) [] items
 
+-- Replace a ref's contents with the entries that satisfy `keep`. Caller controls atomicity.
+pruneRef = \ref keep -> do
+  cur <- *ref
+  set *ref = do x <- cur; where keep x; yield x
+
+-- Add `server` to the named list ref if absent. Returns the new total.
+addServerToList = \listRef server -> atomic do
+  current <- *listRef
+  if any current (\x -> x == server) then yield (count current)
+  else do
+    set *listRef = union current [server]
+    yield (count current + 1)
+
+-- Remove `server` from the named list ref. Returns whether it was present.
+removeServerFromList = \listRef server -> atomic do
+  current <- *listRef
+  let had = any current (\x -> x == server)
+  set *listRef = do x <- current; where x != server; yield x
+  yield had
+
 headOf = \items -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
   _ -> acc) Nothing {} items
@@ -573,6 +593,10 @@ verifyMaintenanceAuth = \authorization -> do
   case extractToken authorization of
     Just {value: token} -> yield (secret != "" && token == secret)
     _ -> yield False
+
+withMaintAuth = \authorization onUnauth onAuth -> do
+  authorized <- verifyMaintenanceAuth authorization
+  if authorized then onAuth else onUnauth
 
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
@@ -767,7 +791,7 @@ effectiveMessageTtl = \expiresInMs ->
   else clamp minMessageTtl unackedMessageMaxAge expiresInMs
 
 nextSeqTs : Timestamp -> Timestamp -> Timestamp
-nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
+nextSeqTs = \t seqCounter -> max t (seqCounter + 1)
 
 dedupMessageIds : [MessageIdHex] -> [MessageIdHex]
 dedupMessageIds = \ids -> takeRelation maxMessageIds (unique ids)
@@ -802,50 +826,25 @@ mergePresence = \existing incoming ->
 -- Pruning
 -- ============================================
 
-pruneExpired = \t -> do
-  expiredLocalKeys <- atomic do
-    -- challenges
-    ch <- *challenges
-    set *challenges = do x <- ch; where x.expiresAt > t; yield x
-    -- sessions
-    ses <- *sessions
-    set *sessions = do x <- ses; where x.expiresAt > t; yield x
-    -- messages
-    msgs <- *messages
-    set *messages = do m <- msgs; where m.expiresAt > t; yield m
-    -- forwards
-    fwds <- *forwards
-    set *forwards = do f <- fwds; where f.expiresAt > t; yield f
-    -- ackedIds, deliveredIds
-    aids <- *ackedIds
-    set *ackedIds = do a <- aids; where t - a.ackedAt < messageMaxAge; yield a
-    dids <- *deliveredIds
-    set *deliveredIds = do d <- dids; where t - d.deliveredAt < messageMaxAge; yield d
-    -- presence: remember locally-expired keys for offline gossip
-    pres <- *presence
-    let keptPres = do p <- pres; where p.expiresAt > t; yield p
-    let expiredLocal = do p <- pres; where p.expiresAt <= t && isLocalServer p.server && none keptPres (\k -> k.pubkey == p.pubkey && isLocalServer k.server); yield p
-    set *presence = keptPres
-    -- forwardFailures
-    ff <- *forwardFailures
-    set *forwardFailures = do f <- ff; where t - f.failedAt < 86400000; yield f
-    -- activePolls (clean up stale entries beyond 3x poll timeout)
-    aps <- *activePolls
-    set *activePolls = do p <- aps; where t - p.startedAt < pollTimeoutMs * 3; yield p
-    -- pendingVerifications
-    pv <- *pendingVerifications
-    set *pendingVerifications = do p <- pv; where t - p.createdAt < verificationTokenExpiry; yield p
-    -- sender notifications
-    se <- *senderExpirations
-    set *senderExpirations = do x <- se; where t - x.expiredAt < unackedMessageMaxAge; yield x
-    sd <- *senderDeliveries
-    set *senderDeliveries = do x <- sd; where t - x.deliveredAt < unackedMessageMaxAge; yield x
-    cn <- *cancelNotifications
-    set *cancelNotifications = do x <- cn; where t - x.cancelledAt < unackedMessageMaxAge; yield x
-    pfc <- *pendingFederationCancels
-    set *pendingFederationCancels = do x <- pfc; where t - x.createdAt < messageMaxAge; yield x
-    yield expiredLocal
-  yield expiredLocalKeys
+pruneExpired = \t -> atomic do
+  pruneRef challenges (\x -> x.expiresAt > t)
+  pruneRef sessions (\x -> x.expiresAt > t)
+  pruneRef messages (\m -> m.expiresAt > t)
+  pruneRef forwards (\f -> f.expiresAt > t)
+  pruneRef ackedIds (\a -> t - a.ackedAt < messageMaxAge)
+  pruneRef deliveredIds (\d -> t - d.deliveredAt < messageMaxAge)
+  pruneRef forwardFailures (\f -> t - f.failedAt < 86400000)
+  pruneRef activePolls (\p -> t - p.startedAt < pollTimeoutMs * 3)
+  pruneRef pendingVerifications (\p -> t - p.createdAt < verificationTokenExpiry)
+  pruneRef senderExpirations (\x -> t - x.expiredAt < unackedMessageMaxAge)
+  pruneRef senderDeliveries (\x -> t - x.deliveredAt < unackedMessageMaxAge)
+  pruneRef cancelNotifications (\x -> t - x.cancelledAt < unackedMessageMaxAge)
+  pruneRef pendingFederationCancels (\x -> t - x.createdAt < messageMaxAge)
+  -- presence: remember locally-expired keys for offline gossip
+  pres <- *presence
+  let keptPres = do p <- pres; where p.expiresAt > t; yield p
+  set *presence = keptPres
+  yield (do p <- pres; where p.expiresAt <= t && isLocalServer p.server && none keptPres (\k -> k.pubkey == p.pubkey && isLocalServer k.server); yield p)
 
 -- ============================================
 -- Federation gossip
@@ -1785,10 +1784,9 @@ zipPairs = \mids keys ->
 -- Maintenance handlers
 -- ============================================
 
-handleDrain = \phase authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, drained: 0, phase: 0})
-  else do
+handleDrain = \phase authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, drained: 0, phase: 0}))
+  (do
     let effectivePhase = if phase == 1 then 1 else 2
     t <- now
     drainResult <- atomic do
@@ -1804,21 +1802,19 @@ handleDrain = \phase authorization respond -> do
         yield {drainedCount: count localEntries, peers: peers, localKeys: localEntries}
     when (effectivePhase == 2 && count drainResult.localKeys > 0 && count drainResult.peers > 0 && federationEnabled)
       (fork (sendBatchedGossip drainResult.peers (do p <- drainResult.localKeys; yield {eventType: GossipOffline {}, pubkey: p.pubkey, server: serverHostN, timestamp: t, ttl: offlineGossipMinTtl, seenBy: [serverHostN]}) gossipOriginHops))
-    yield (respond {ok: True {}, drained: drainResult.drainedCount, phase: effectivePhase})
+    yield (respond {ok: True {}, drained: drainResult.drainedCount, phase: effectivePhase}))
 
-handleUndrain = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}})
-  else do
+handleUndrain = \authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}}))
+  (do
     atomic do
       set *drainPhase = 0
       set *drainCompletedAt = 0
-    yield (respond {ok: True {}})
+    yield (respond {ok: True {}}))
 
-handleShutdown = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, drained: 0})
-  else handleDrain 2 authorization (\r -> respond {ok: r.ok, drained: r.drained})
+handleShutdown = \authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, drained: 0}))
+  (handleDrain 2 authorization (\r -> respond {ok: r.ok, drained: r.drained}))
 
 handlePrune = \authorization respond -> do
   t <- now
@@ -1826,10 +1822,9 @@ handlePrune = \authorization respond -> do
   when authorized (fork (pruneAndRetry t))
   yield (respond {ok: authorized})
 
-handleReconcile = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, messageDrift: 0, presenceDrift: 0, sessionDrift: 0})
-  else yield (respond {ok: True {}, messageDrift: 0, presenceDrift: 0, sessionDrift: 0})
+handleReconcile = \authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, messageDrift: 0, presenceDrift: 0, sessionDrift: 0}))
+  (yield (respond {ok: True {}, messageDrift: 0, presenceDrift: 0, sessionDrift: 0}))
 
 handleHealth = \authorization respond -> do
   t <- now
@@ -1848,72 +1843,33 @@ handleReady = \respond -> do
   lastPrune <- *lastPrunedAt
   yield (respond {ready: lastPrune > 0 && lastPrune >= sa})
 
-handleBlockPeer = \server authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, blocked: 0})
-  else do
-    n <- atomic do
-      blocked <- *blockedPeers
-      if any blocked (\b -> b == server) then yield (count blocked)
-      else do
-        let updated = union blocked [server]
-        set *blockedPeers = updated
-        yield (count updated)
-    yield (respond {ok: True {}, blocked: n})
+handleBlockPeer = \server authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, blocked: 0}))
+  (do n <- addServerToList blockedPeers server; yield (respond {ok: True {}, blocked: n}))
 
-handleUnblockPeer = \server authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, unblocked: False {}})
-  else do
-    removed <- atomic do
-      blocked <- *blockedPeers
-      let had = any blocked (\b -> b == server)
-      set *blockedPeers = do b <- blocked; where b != server; yield b
-      yield had
-    yield (respond {ok: True {}, unblocked: removed})
+handleUnblockPeer = \server authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, unblocked: False {}}))
+  (do removed <- removeServerFromList blockedPeers server; yield (respond {ok: True {}, unblocked: removed}))
 
-handleListBlocked = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {peers: [], ok: False {}})
-  else do
-    blocked <- *blockedPeers
-    yield (respond {peers: blocked, ok: True {}})
+handleListBlocked = \authorization respond -> withMaintAuth authorization
+  (yield (respond {peers: [], ok: False {}}))
+  (do blocked <- *blockedPeers; yield (respond {peers: blocked, ok: True {}}))
 
-handleAllowPeer = \server authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, allowed: 0})
-  else do
-    n <- atomic do
-      allowed <- *allowedPeers
-      if any allowed (\a -> a == server) then yield (count allowed)
-      else do
-        let updated = union allowed [server]
-        set *allowedPeers = updated
-        yield (count updated)
-    yield (respond {ok: True {}, allowed: n})
+handleAllowPeer = \server authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, allowed: 0}))
+  (do n <- addServerToList allowedPeers server; yield (respond {ok: True {}, allowed: n}))
 
-handleUnallowPeer = \server authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, removed: False {}})
-  else do
-    removed <- atomic do
-      allowed <- *allowedPeers
-      let had = any allowed (\a -> a == server)
-      set *allowedPeers = do a <- allowed; where a != server; yield a
-      yield had
-    yield (respond {ok: True {}, removed: removed})
+handleUnallowPeer = \server authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, removed: False {}}))
+  (do removed <- removeServerFromList allowedPeers server; yield (respond {ok: True {}, removed: removed}))
 
-handleListAllowed = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {peers: [], ok: False {}})
-  else do
-    allowed <- *allowedPeers
-    yield (respond {peers: allowed, ok: True {}})
+handleListAllowed = \authorization respond -> withMaintAuth authorization
+  (yield (respond {peers: [], ok: False {}}))
+  (do allowed <- *allowedPeers; yield (respond {peers: allowed, ok: True {}}))
 
-handlePingPeer = \server authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, latencyMs: 0, error: "unauthorized"})
-  else do
+handlePingPeer = \server authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, latencyMs: 0, error: "unauthorized"}))
+  (do
     startTime <- now
     auth <- generateFederationAuth "gossip" startTime
     result <- fetch (federationUrl server) (RecvGossip {
@@ -1923,21 +1879,18 @@ handlePingPeer = \server authorization respond -> do
     endTime <- now
     case result of
       Err e -> yield (respond {ok: False {}, latencyMs: endTime - startTime, error: show e})
-      Ok r -> yield (respond {ok: r.ok, latencyMs: endTime - startTime, error: r.error})
+      Ok r -> yield (respond {ok: r.ok, latencyMs: endTime - startTime, error: r.error}))
 
-handleAdminListSessions = \pubkey authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {sessions: [], count: 0, ok: False {}})
-  else do
+handleAdminListSessions = \pubkey authorization respond -> withMaintAuth authorization
+  (yield (respond {sessions: [], count: 0, ok: False {}}))
+  (do
     ses <- *sessions
     let mine = do s <- ses; where s.pubkey == pubkey; yield {token: "***", expiresAt: s.expiresAt, ip: s.ip, createdAt: s.createdAt}
-    yield (respond {sessions: mine, count: count mine, ok: True {}})
+    yield (respond {sessions: mine, count: count mine, ok: True {}}))
 
-handleAdminRevokeSessions = \pubkey authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, revokedCount: 0})
-  else do
-    t <- now
+handleAdminRevokeSessions = \pubkey authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, revokedCount: 0}))
+  (do
     revoked <- atomic do
       ses <- *sessions
       let mine = do s <- ses; where s.pubkey == pubkey; yield s
@@ -1945,12 +1898,11 @@ handleAdminRevokeSessions = \pubkey authorization respond -> do
       pres <- *presence
       set *presence = do p <- pres; where p.pubkey != pubkey || not (isLocalServer p.server); yield p
       yield (count mine)
-    yield (respond {ok: True {}, revokedCount: revoked})
+    yield (respond {ok: True {}, revokedCount: revoked}))
 
-handleAdminPurgeMessages = \pubkey authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, purgedCount: 0})
-  else do
+handleAdminPurgeMessages = \pubkey authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, purgedCount: 0}))
+  (do
     t <- now
     purged <- atomic do
       msgs <- *messages
@@ -1962,25 +1914,23 @@ handleAdminPurgeMessages = \pubkey authorization respond -> do
       aids <- *ackedIds
       set *ackedIds = capList (union aids federated) maxAckedIds (\a -> a.ackedAt)
       yield (count mine)
-    yield (respond {ok: True {}, purgedCount: purged})
+    yield (respond {ok: True {}, purgedCount: purged}))
 
-handleAdminRevokeIp = \ip authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0})
-  else if ip == "" then yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0})
-  else do
+handleAdminRevokeIp = \ip authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0}))
+  (if ip == "" then yield (respond {ok: False {}, revokedCount: 0, affectedKeys: 0})
+   else do
     result <- atomic do
       ses <- *sessions
       let mine = do s <- ses; where s.ip == ip; yield s
       set *sessions = do s <- ses; where s.ip != ip; yield s
       let keys = unique (do s <- mine; yield s.pubkey)
       yield {revoked: count mine, keys: count keys}
-    yield (respond {ok: True {}, revokedCount: result.revoked, affectedKeys: result.keys})
+    yield (respond {ok: True {}, revokedCount: result.revoked, affectedKeys: result.keys}))
 
-handleAdminListAllSessions = \limit authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {sessions: [], ok: False {}, total: 0})
-  else do
+handleAdminListAllSessions = \limit authorization respond -> withMaintAuth authorization
+  (yield (respond {sessions: [], ok: False {}, total: 0}))
+  (do
     t <- now
     ses <- *sessions
     let active = do s <- ses; where s.expiresAt > t; yield s
@@ -1993,12 +1943,11 @@ handleAdminListAllSessions = \limit authorization respond -> do
              latestExpiry: fold (\acc s -> max acc s.expiresAt) 0 mine}
     let sorted = sortBy (\g -> 0 - g.count) grouped
     let effLimit = if limit <= 0 then 100 else clamp 1 500 limit
-    yield (respond {sessions: takeRelation effLimit sorted, ok: True {}, total: count grouped})
+    yield (respond {sessions: takeRelation effLimit sorted, ok: True {}, total: count grouped}))
 
-handleGetRateLimits = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, globalRequest: 0, ipRate: 0, sendRate: 0, federationRate: 0, authGlobal: 0, recvRate: 0, challengeRate: 0, pairRate: 0, lookupRate: 0, clientWriteRate: 0})
-  else yield (respond {ok: True {}, globalRequest: maxGlobalRequestRate, ipRate: maxIpRatePerIp, sendRate: maxSendRatePerKey, federationRate: maxFederationRatePerServer, authGlobal: maxAuthGlobalRate, recvRate: maxRecvRatePerKey, challengeRate: maxChallengeRatePerKey, pairRate: maxPairRatePerPair, lookupRate: maxLookupRatePerKey, clientWriteRate: maxClientWriteRatePerKey})
+handleGetRateLimits = \authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, globalRequest: 0, ipRate: 0, sendRate: 0, federationRate: 0, authGlobal: 0, recvRate: 0, challengeRate: 0, pairRate: 0, lookupRate: 0, clientWriteRate: 0}))
+  (yield (respond {ok: True {}, globalRequest: maxGlobalRequestRate, ipRate: maxIpRatePerIp, sendRate: maxSendRatePerKey, federationRate: maxFederationRatePerServer, authGlobal: maxAuthGlobalRate, recvRate: maxRecvRatePerKey, challengeRate: maxChallengeRatePerKey, pairRate: maxPairRatePerPair, lookupRate: maxLookupRatePerKey, clientWriteRate: maxClientWriteRatePerKey}))
 
 handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
@@ -2008,23 +1957,20 @@ handleFlushNonces = \authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   yield (respond {ok: authorized, flushedCount: 0})
 
-handleRotateSecret = \newSecret authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, error: "unauthorized"})
-  else do
+handleRotateSecret = \newSecret authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, error: "unauthorized"}))
+  (do
     atomic do set *runtimeMaintenanceSecret = newSecret
-    yield (respond {ok: True {}, error: ""})
+    yield (respond {ok: True {}, error: ""}))
 
-handleGetConfig = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, maxMessagesPerRecipient: 0, maxGossipHops: 0, pollTimeoutMs: 0, ackGracePeriod: 0})
-  else yield (respond {ok: True {}, maxMessagesPerRecipient: maxMessagesPerRecipient, maxGossipHops: maxGossipHops, pollTimeoutMs: pollTimeoutMs, ackGracePeriod: ackGracePeriod})
+handleGetConfig = \authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, maxMessagesPerRecipient: 0, maxGossipHops: 0, pollTimeoutMs: 0, ackGracePeriod: 0}))
+  (yield (respond {ok: True {}, maxMessagesPerRecipient: maxMessagesPerRecipient, maxGossipHops: maxGossipHops, pollTimeoutMs: pollTimeoutMs, ackGracePeriod: ackGracePeriod}))
 
 -- /stats: zero-fill all metric fields we no longer compute.
-handleStats = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond zeroStats)
-  else do
+handleStats = \authorization respond -> withMaintAuth authorization
+  (yield (respond zeroStats))
+  (do
     t <- now
     sa <- *startedAt
     sessions <- *sessions
@@ -2050,14 +1996,13 @@ handleStats = \authorization respond -> do
     let zeroRates = {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0, clientCancels: 0, federationCancels: 0}
     let cap = {sessions: sCount, sessionsMax: maxSessions, sessionsPct: if maxSessions > 0 then sCount * 100 / maxSessions else 0, messages: mCount, messagesMax: maxMessages, messagesPct: if maxMessages > 0 then mCount * 100 / maxMessages else 0, totalMessageCount: mCount, presence: pCount, presenceMax: maxPresenceEntries, presencePct: if maxPresenceEntries > 0 then pCount * 100 / maxPresenceEntries else 0, forwards: fCount, forwardsMax: maxForwardsEntries, forwardsPct: if maxForwardsEntries > 0 then fCount * 100 / maxForwardsEntries else 0, challenges: count chs, challengesMax: maxChallenges, ackedIds: count aids, ackedIdsMax: maxAckedIds, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: count dids, deliveredIdsMax: maxDeliveredIds, forwardNonces: 0, forwardNoncesMax: 0, nonceEvictions: 0, activePolls: count aps, activePollsMax: maxActivePolls, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0}
     let timing = {pruneCount: pc, pruneRunning: 0, heartbeatCount: hc, uptime: t - sa, lastPruneAt: lp, lastHeartbeatAt: lh, draining: dp > 0, drainPhase: dp, totalEntries: sCount + mCount + pCount + fCount, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, pollLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0, sendLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, authAvgMs: 0, authMaxMs: 0, authCount: 0}
-    yield (respond {ok: True {}, version: serverBuildVersion, capacity: cap, federation: zeroFed, rates: zeroRates, timing: timing})
+    yield (respond {ok: True {}, version: serverBuildVersion, capacity: cap, federation: zeroFed, rates: zeroRates, timing: timing}))
 
 zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, nonceEvictions: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: 0, gossipSuccess: 0, gossipFail: 0, latencyBuckets: {lt100: 0, lt500: 0, lt2000: 0, gte2000: 0}}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0, clientCancels: 0, federationCancels: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, totalEntries: 0, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, pollLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0, sendLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, authAvgMs: 0, authMaxMs: 0, authCount: 0}}
 
-handleStatsPeers = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {peers: [], ok: False {}})
-  else do
+handleStatsPeers = \authorization respond -> withMaintAuth authorization
+  (yield (respond {peers: [], ok: False {}}))
+  (do
     t <- now
     failures <- *forwardFailures
     fwds <- *forwards
@@ -2065,12 +2010,11 @@ handleStatsPeers = \authorization respond -> do
       f <- failures
       let pending = count (do x <- fwds; where x.toServer == f.server; yield x)
       yield {server: f.server, failures: f.failures, lastFailedAt: f.failedAt, firstFailedAt: f.firstFailedAt, backoffMs: retryBackoff f.failures, retriable: shouldRetryServer f.server t failures, pendingForwards: pending, avgLatencyMs: 0, maxLatencyMs: 0, latencySamples: 0, gossipEventsPerMin: 0}
-    yield (respond {peers: peers, ok: True {}})
+    yield (respond {peers: peers, ok: True {}}))
 
-handleStatsKey = \pubkey authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {messages: 0, presence: [], sessions: 0, forwards: 0, forwardDetails: [], activePolls: 0, ok: False {}})
-  else do
+handleStatsKey = \pubkey authorization respond -> withMaintAuth authorization
+  (yield (respond {messages: 0, presence: [], sessions: 0, forwards: 0, forwardDetails: [], activePolls: 0, ok: False {}}))
+  (do
     t <- now
     msgs <- *messages
     pres <- *presence
@@ -2084,24 +2028,22 @@ handleStatsKey = \pubkey authorization respond -> do
     let f = count myFwds
     let fd = do x <- myFwds; yield {server: x.toServer, retries: x.retries, createdAt: x.createdAt}
     let a = count (do x <- aps; where x.pubkey == pubkey; yield x)
-    yield (respond {messages: m, presence: p, sessions: s, forwards: f, forwardDetails: fd, activePolls: a, ok: True {}})
+    yield (respond {messages: m, presence: p, sessions: s, forwards: f, forwardDetails: fd, activePolls: a, ok: True {}}))
 
-handleTopRecipients = \limit authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {recipients: [], ok: False {}, total: 0})
-  else do
+handleTopRecipients = \limit authorization respond -> withMaintAuth authorization
+  (yield (respond {recipients: [], ok: False {}, total: 0}))
+  (do
     msgs <- *messages
     let counts = do
       pk <- unique (do m <- msgs; yield m.toKey)
       yield {pubkey: pk, count: count (do m <- msgs; where m.toKey == pk; yield m)}
     let sorted = sortBy (\c -> 0 - c.count) counts
     let effLimit = if limit <= 0 then 20 else clamp 1 100 limit
-    yield (respond {recipients: takeRelation effLimit sorted, ok: True {}, total: count counts})
+    yield (respond {recipients: takeRelation effLimit sorted, ok: True {}, total: count counts}))
 
-handleStatsForwards = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {servers: [], ok: False {}, total: 0})
-  else do
+handleStatsForwards = \authorization respond -> withMaintAuth authorization
+  (yield (respond {servers: [], ok: False {}, total: 0}))
+  (do
     t <- now
     fwds <- *forwards
     let servers = collectPeers fwds (\f -> f.toServer)
@@ -2111,12 +2053,11 @@ handleStatsForwards = \authorization respond -> do
       let oldest = case minBy svFwds (\f -> f.createdAt) of Nothing {} -> 0; Just {value: x} -> t - x.createdAt
       let retries = fold (\acc f -> acc + f.retries) 0 svFwds
       yield {server: s, count: count svFwds, oldestAge: oldest, totalRetries: retries}
-    yield (respond {servers: result, ok: True {}, total: count fwds})
+    yield (respond {servers: result, ok: True {}, total: count fwds}))
 
-handleStatsRates = \authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}, scalePct: 0, globalRequest: 0, ipRate: 0, sendRate: 0, federationRate: 0, authGlobal: 0, recvRate: 0, challengeRate: 0, pairRate: 0, lookupRate: 0, clientWriteRate: 0})
-  else yield (respond {ok: True {}, scalePct: 100, globalRequest: maxGlobalRequestRate, ipRate: maxIpRatePerIp, sendRate: maxSendRatePerKey, federationRate: maxFederationRatePerServer, authGlobal: maxAuthGlobalRate, recvRate: maxRecvRatePerKey, challengeRate: maxChallengeRatePerKey, pairRate: maxPairRatePerPair, lookupRate: maxLookupRatePerKey, clientWriteRate: maxClientWriteRatePerKey})
+handleStatsRates = \authorization respond -> withMaintAuth authorization
+  (yield (respond {ok: False {}, scalePct: 0, globalRequest: 0, ipRate: 0, sendRate: 0, federationRate: 0, authGlobal: 0, recvRate: 0, challengeRate: 0, pairRate: 0, lookupRate: 0, clientWriteRate: 0}))
+  (yield (respond {ok: True {}, scalePct: 100, globalRequest: maxGlobalRequestRate, ipRate: maxIpRatePerIp, sendRate: maxSendRatePerKey, federationRate: maxFederationRatePerServer, authGlobal: maxAuthGlobalRate, recvRate: maxRecvRatePerKey, challengeRate: maxChallengeRatePerKey, pairRate: maxPairRatePerPair, lookupRate: maxLookupRatePerKey, clientWriteRate: maxClientWriteRatePerKey}))
 
 handleMetrics = \authorization respond -> do
   t <- now
