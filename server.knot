@@ -868,11 +868,29 @@ maxPeerLatencyEntries = 100
 *nonceBucket14 : [ForwardNonce]
 *nonceBucket15 : [ForwardNonce]
 
--- Nonce eviction replay protection: tracks the seenAt of the oldest retained nonce
--- after LRU eviction. Forwards with timestamps older than this cutoff cannot be
--- verified for dedup (their nonces may have been evicted) and are rejected.
--- 0 = no eviction has occurred (all nonces retained), accept all timestamps.
-*nonceEvictionCutoff : Timestamp
+-- Nonce eviction replay protection: per-bucket cutoff tracking.
+-- Each bucket independently tracks the seenAt of its oldest retained nonce after LRU
+-- eviction. Forwards with timestamps older than the *bucket-specific* cutoff are rejected.
+-- Previous design used a single global cutoff, which incorrectly rejected valid forwards:
+-- bucket 3 evicting nonces from 5 min ago would set a cutoff that also rejected forwards
+-- for bucket 12 (which might have nonces from 30 days ago, all retained).
+-- 0 = no eviction has occurred in this bucket, accept all timestamps.
+*nonceEvictionCutoff0 : Timestamp
+*nonceEvictionCutoff1 : Timestamp
+*nonceEvictionCutoff2 : Timestamp
+*nonceEvictionCutoff3 : Timestamp
+*nonceEvictionCutoff4 : Timestamp
+*nonceEvictionCutoff5 : Timestamp
+*nonceEvictionCutoff6 : Timestamp
+*nonceEvictionCutoff7 : Timestamp
+*nonceEvictionCutoff8 : Timestamp
+*nonceEvictionCutoff9 : Timestamp
+*nonceEvictionCutoff10 : Timestamp
+*nonceEvictionCutoff11 : Timestamp
+*nonceEvictionCutoff12 : Timestamp
+*nonceEvictionCutoff13 : Timestamp
+*nonceEvictionCutoff14 : Timestamp
+*nonceEvictionCutoff15 : Timestamp
 
 -- Federation verify per-IP rate limiting (tighter than general IP rate)
 *verifyIpRates : [IpRateEntry]
@@ -946,6 +964,12 @@ maxPeerLatencyEntries = 100
 *rateOverrideLookupRate : Int
 *rateOverrideClientWriteRate : Int
 
+-- Runtime-configurable operational parameter overrides (0 = use compile-time default).
+-- Adjusted via /maintenance/config POST endpoint without recompile+restart.
+*configOverrideMaxMessagesPerRecipient : Int
+*configOverrideMaxGossipHops : Int
+*configOverridePollTimeoutMs : Int
+
 -- Rate-limit rejection counters: track how many requests were rejected by each rate limiter.
 -- Exposed via /stats for operators to tune rate limits without parsing logs.
 -- Reset on each federation latency window reset (same cadence as other metrics).
@@ -961,8 +985,12 @@ maxPeerLatencyEntries = 100
 
 -- Active request counter: tracks concurrent requests for backpressure visibility.
 -- Incremented at request start, decremented after handler completes.
+-- If serveInner panics (Knot lacks try-finally), the counter leaks. The prune cycle
+-- reconciles by checking lastRequestCompletedAt: if no request has completed in
+-- 3x pollTimeoutMs but activeRequests > 0, the counter is reset.
 *activeRequests : Int
 *peakActiveRequests : Int
+*lastRequestCompletedAt : Timestamp
 
 -- Client operation latency tracking (for /stats, reset with federation latency window)
 *clientPollLatencyTotal : Int<Ms>
@@ -1267,6 +1295,14 @@ route MaintenanceApi where
   POST {newSecret: Text} /maintenance/rotate-secret headers {authorization: Text}
     -> {ok: Bool, error: Text}
     = RotateSecret
+  -- Read current effective operational config (compile-time defaults + runtime overrides)
+  GET /maintenance/config headers {authorization: Text}
+    -> {ok: Bool, maxMessagesPerRecipient: Int, maxGossipHops: Int, pollTimeoutMs: Int}
+    = GetConfig
+  -- Update operational config at runtime (0 = reset to compile-time default)
+  POST {maxMessagesPerRecipient: Int, maxGossipHops: Int, pollTimeoutMs: Int} /maintenance/config headers {authorization: Text}
+    -> {ok: Bool}
+    = SetConfig
 
 route HealthApi where
   GET /health headers {authorization: Text} -> {ok: Bool, version: Text, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, capacityWarning: Bool, federationHealthy: Bool, watchdogHealthy: Bool, nonceHealthy: Bool, forwardQueueHealthy: Bool, requestPressureHealthy: Bool, draining: Bool, degradedPeers: Int} = Health
@@ -2851,6 +2887,54 @@ pruneNonceBucketRange = \b endB t ->
     when (count pruned < count bucket) (writeNonceBucket b pruned)
     pruneNonceBucketRange (b + 1) endB t
 
+-- Per-bucket nonce eviction cutoff read/write helpers.
+readNonceCutoff : Int -> IO Timestamp
+readNonceCutoff = \b ->
+  if b == 0 then do s <- *nonceEvictionCutoff0; yield s
+  else if b == 1 then do s <- *nonceEvictionCutoff1; yield s
+  else if b == 2 then do s <- *nonceEvictionCutoff2; yield s
+  else if b == 3 then do s <- *nonceEvictionCutoff3; yield s
+  else if b == 4 then do s <- *nonceEvictionCutoff4; yield s
+  else if b == 5 then do s <- *nonceEvictionCutoff5; yield s
+  else if b == 6 then do s <- *nonceEvictionCutoff6; yield s
+  else if b == 7 then do s <- *nonceEvictionCutoff7; yield s
+  else if b == 8 then do s <- *nonceEvictionCutoff8; yield s
+  else if b == 9 then do s <- *nonceEvictionCutoff9; yield s
+  else if b == 10 then do s <- *nonceEvictionCutoff10; yield s
+  else if b == 11 then do s <- *nonceEvictionCutoff11; yield s
+  else if b == 12 then do s <- *nonceEvictionCutoff12; yield s
+  else if b == 13 then do s <- *nonceEvictionCutoff13; yield s
+  else if b == 14 then do s <- *nonceEvictionCutoff14; yield s
+  else do s <- *nonceEvictionCutoff15; yield s
+
+writeNonceCutoff : Int -> Timestamp -> IO ()
+writeNonceCutoff = \b val ->
+  if b == 0 then set *nonceEvictionCutoff0 = val
+  else if b == 1 then set *nonceEvictionCutoff1 = val
+  else if b == 2 then set *nonceEvictionCutoff2 = val
+  else if b == 3 then set *nonceEvictionCutoff3 = val
+  else if b == 4 then set *nonceEvictionCutoff4 = val
+  else if b == 5 then set *nonceEvictionCutoff5 = val
+  else if b == 6 then set *nonceEvictionCutoff6 = val
+  else if b == 7 then set *nonceEvictionCutoff7 = val
+  else if b == 8 then set *nonceEvictionCutoff8 = val
+  else if b == 9 then set *nonceEvictionCutoff9 = val
+  else if b == 10 then set *nonceEvictionCutoff10 = val
+  else if b == 11 then set *nonceEvictionCutoff11 = val
+  else if b == 12 then set *nonceEvictionCutoff12 = val
+  else if b == 13 then set *nonceEvictionCutoff13 = val
+  else if b == 14 then set *nonceEvictionCutoff14 = val
+  else set *nonceEvictionCutoff15 = val
+
+-- Reset all 16 per-bucket nonce eviction cutoffs to 0 (accept all timestamps).
+-- Called by nonce flush to clear stale cutoffs when all nonces are removed.
+resetAllNonceCutoffs : Int -> IO ()
+resetAllNonceCutoffs = \b ->
+  if b > 15 then yield {}
+  else do
+    writeNonceCutoff b 0
+    resetAllNonceCutoffs (b + 1)
+
 -- Record a forward nonce and handle capacity eviction with LRU logging.
 -- Usable inside or outside atomic blocks (reads/writes nonce bucket refs).
 -- Returns eviction info for deferred logging when called inside atomic.
@@ -2866,28 +2950,14 @@ updateForwardNonce = \nb messageId toKey t -> do
         then case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> 0; Just {value: n} -> t - n.seenAt
         else 0
   writeNonceBucket nb evictedNonces
-  -- Update nonce eviction cutoff: recompute the global minimum oldest-retained-seenAt
-  -- across all 16 buckets. A per-bucket-only approach incorrectly ratchets the cutoff
-  -- upward — a bucket with newer evictions would mask older retained nonces in other buckets,
-  -- causing legitimate forwards with older timestamps to be rejected.
+  -- Update per-bucket nonce eviction cutoff: set to the oldest retained nonce in this bucket.
+  -- Per-bucket cutoffs are correct because each forward is checked against its own bucket's
+  -- cutoff (keyed by pubkeyBucket(toKey)). The previous global cutoff was wrong: bucket 3
+  -- evicting recent nonces would tighten the cutoff for bucket 12 (with older retained nonces).
   when (lruEvicted > 0) (do
-    globalMin <- computeGlobalNonceCutoff 0 0
-    set *nonceEvictionCutoff = globalMin)
+    let bucketMin = case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> 0; Just {value: n} -> n.seenAt
+    writeNonceCutoff nb bucketMin)
   yield {lruEvicted: lruEvicted, oldestRetainedAge: oldestRetainedAge}
-
--- Compute the global nonce eviction cutoff: the minimum oldest-retained-seenAt across
--- all 16 nonce buckets. Returns 0 if no bucket has undergone eviction (all nonces retained).
--- O(16 * bucket_size) scan, called only after LRU eviction (not on every insert).
-computeGlobalNonceCutoff : Int -> Timestamp -> IO Timestamp
-computeGlobalNonceCutoff = \b acc ->
-  if b > 15 then yield acc
-  else do
-    bucket <- readNonceBucket b
-    case minBy bucket (\n -> n.seenAt) of
-      Nothing {} -> computeGlobalNonceCutoff (b + 1) acc
-      Just {value: n} ->
-        let bucketMin = n.seenAt in
-        computeGlobalNonceCutoff (b + 1) (if acc == 0 then bucketMin else min acc bucketMin)
 
 -- Log nonce LRU eviction if any occurred. Call outside atomic blocks.
 logNonceEviction : Int -> Int -> Int -> IO ()
@@ -3429,7 +3499,7 @@ checkRateWindow = \entries matchKey makeNew updateCount rotateWindow getCount ge
         then let prevCount = case entry of Nothing {} -> 0; Just {value: r} -> getCount r
           in union (do r <- entries; where not (matchKey r); yield r) [rotateWindow (makeNew t) prevCount]
         else do r <- entries; yield (if matchKey r then updateCount r else r)
-      in {limited: False {}, entries: if count newEntries > maxEntries then (do r <- newEntries; where t - r.windowStart < windowMs; yield r) else newEntries, retryAfterMs: 0}
+      in {limited: False {}, entries: if count newEntries > maxEntries then (do r <- newEntries; where t - r.windowStart < windowMs * 2; yield r) else newEntries, retryAfterMs: 0}
 
 -- Rate limiter helpers: wrap common checkRateWindow patterns to reduce boilerplate.
 -- Each returns {limited, entries, retryAfterMs} — caller reads/writes the mutable ref.
@@ -3616,12 +3686,23 @@ mergeByKey = \sameKey getFreshness initial items ->
       else union [e]
         (do a <- acc; where not (sameKey a e); yield a)) initial items
 
--- Merge presence entries by (pubkey, server), keeping the one with the latest expiresAt
-mergeByPubkeyServer = mergeByKey samePubkeyServer (\x -> x.expiresAt)
+-- Merge presence entries by (pubkey, server), keeping the one with the latest expiresAt.
+-- Deterministic tiebreaker: when two entries for the same (pubkey, server) have equal
+-- expiresAt, prefer the one with the lexicographically smaller server name. Without a
+-- tiebreaker, the merge result depends on arrival order, causing presence oscillation
+-- when two peers gossip the same pubkey simultaneously with the same expiry.
+mergeByPubkeyServer = \initial items ->
+  fold (\acc e ->
+    if any acc (\a -> samePubkeyServer a e && (a.expiresAt > e.expiresAt || (a.expiresAt == e.expiresAt && a.server <= e.server)))
+      then acc
+      else union [e]
+        (do a <- acc; where not (samePubkeyServer a e); yield a)) initial items
 
--- Keep entries from setA that are not superseded by a newer-timestamped entry in setB
+-- Keep entries from setA that are not superseded by a newer-timestamped entry in setB.
+-- Deterministic tiebreaker: when timestamps are equal, the entry with the lexicographically
+-- smaller server name wins (consistent with mergeByPubkeyServer).
 resolveByTimestamp = \setA setB ->
-  do e <- setA; where none setB (\o -> samePubkeyServer o e && o.timestamp > e.timestamp); yield e
+  do e <- setA; where none setB (\o -> samePubkeyServer o e && (o.timestamp > e.timestamp || (o.timestamp == e.timestamp && o.server < e.server))); yield e
 
 -- Remove presence entries that have a corresponding offline event with a newer timestamp
 removeOffline = \presenceSet trustedOffline t ->
@@ -3793,18 +3874,23 @@ pruneExpired = \t -> do
     set *forwardFailures = do f <- forwardFailures; where (if isKnown f.server then t - f.failedAt < maxServerDowntime else t - f.failedAt < sessionExpiry); yield f
     ackOverflow <- *ackOverflow
     set *ackOverflow = do a <- ackOverflow; where a.ackedAt > retainCutoff; yield a
-  -- Prune rate limiters (split into smaller atomic blocks to reduce lock contention)
+  -- Prune rate limiters (split into smaller atomic blocks to reduce lock contention).
+  -- Retention is 2x windowMs because the sliding window algorithm uses prevCount from the
+  -- previous window for interpolation. Pruning at 1x windowMs discards prevCount prematurely,
+  -- allowing a brief 2x burst at the next window boundary — the exact problem sliding windows
+  -- solve. The entry rotates to a new window (resetting count, storing prevCount) at 1x; the
+  -- old prevCount is only irrelevant after 2x when the new window itself rotates.
   atomic do
     sendRates <- *sendRates
-    set *sendRates = do r <- sendRates; where t - r.windowStart < sendRateWindowMs; yield r
+    set *sendRates = do r <- sendRates; where t - r.windowStart < sendRateWindowMs * 2; yield r
     challengeRates <- *challengeRates
-    set *challengeRates = do r <- challengeRates; where t - r.windowStart < challengeRateWindowMs; yield r
+    set *challengeRates = do r <- challengeRates; where t - r.windowStart < challengeRateWindowMs * 2; yield r
     revokeRates <- *revokeRates
-    set *revokeRates = do r <- revokeRates; where t - r.windowStart < revokeRateWindowMs; yield r
+    set *revokeRates = do r <- revokeRates; where t - r.windowStart < revokeRateWindowMs * 2; yield r
     recvRates <- *recvRates
-    set *recvRates = do r <- recvRates; where t - r.windowStart < recvRateWindowMs; yield r
+    set *recvRates = do r <- recvRates; where t - r.windowStart < recvRateWindowMs * 2; yield r
     pairRates <- *pairRates
-    set *pairRates = do r <- pairRates; where t - r.windowStart < pairRateWindowMs; yield r
+    set *pairRates = do r <- pairRates; where t - r.windowStart < pairRateWindowMs * 2; yield r
     -- Reset auth-tier global rate window
     authWS <- *authGlobalRateWindowStart
     when (t - authWS >= authGlobalRateWindowMs) (do
@@ -3817,22 +3903,23 @@ pruneExpired = \t -> do
       set *healthRateCount = 0)
   atomic do
     federationRates <- *federationRates
-    set *federationRates = do r <- federationRates; where t - r.windowStart < federationRateWindowMs; yield r
+    set *federationRates = do r <- federationRates; where t - r.windowStart < federationRateWindowMs * 2; yield r
     federationPairRates <- *federationPairRates
-    set *federationPairRates = do r <- federationPairRates; where t - r.windowStart < federationPairRateWindowMs; yield r
+    set *federationPairRates = do r <- federationPairRates; where t - r.windowStart < federationPairRateWindowMs * 2; yield r
     ipRates <- *ipRates
-    set *ipRates = do r <- ipRates; where t - r.windowStart < ipRateWindowMs; yield r
+    set *ipRates = do r <- ipRates; where t - r.windowStart < ipRateWindowMs * 2; yield r
     lookupRates <- *lookupRates
-    set *lookupRates = do r <- lookupRates; where t - r.windowStart < lookupRateWindowMs; yield r
+    set *lookupRates = do r <- lookupRates; where t - r.windowStart < lookupRateWindowMs * 2; yield r
     clientWriteRates <- *clientWriteRates
-    set *clientWriteRates = do r <- clientWriteRates; where t - r.windowStart < clientWriteRateWindowMs; yield r
+    set *clientWriteRates = do r <- clientWriteRates; where t - r.windowStart < clientWriteRateWindowMs * 2; yield r
     verifyIpRates <- *verifyIpRates
-    set *verifyIpRates = do r <- verifyIpRates; where t - r.windowStart < verifyRateWindowMs; yield r
+    set *verifyIpRates = do r <- verifyIpRates; where t - r.windowStart < verifyRateWindowMs * 2; yield r
     uniqueKeyIpRates <- *uniqueKeyIpRates
-    set *uniqueKeyIpRates = do r <- uniqueKeyIpRates; where t - r.windowStart < uniqueKeyIpWindowMs; yield r
+    set *uniqueKeyIpRates = do r <- uniqueKeyIpRates; where t - r.windowStart < uniqueKeyIpWindowMs * 2; yield r
   atomic do
     activePolls <- *activePolls
-    set *activePolls = do p <- activePolls; where t - p.startedAt < pollTimeoutMs * 3; yield p
+    effPollTimeout <- effectivePollTimeoutMs
+    set *activePolls = do p <- activePolls; where t - p.startedAt < effPollTimeout * 3; yield p
     recentGossip <- *recentGossip
     set *recentGossip = do r <- recentGossip; where t - r.seenAt < gossipDedupWindow; yield r
     -- Clean up stale in-flight entries: remove zeroed entries and reset leaked slots
@@ -3867,7 +3954,7 @@ pruneExpired = \t -> do
     pruneNonceBucketsRoundRobin t
     -- Prune gossip event rate entries
     gossipEventRates <- *gossipEventRates
-    set *gossipEventRates = do r <- gossipEventRates; where t - r.windowStart < gossipEventRateWindowMs; yield r
+    set *gossipEventRates = do r <- gossipEventRates; where t - r.windowStart < gossipEventRateWindowMs * 2; yield r
     -- Prune stale deferred ack cleanups (older than messageMaxAge are never useful)
     pendingCleanups <- *pendingAckCleanups
     set *pendingAckCleanups = do c <- pendingCleanups; where t - c.cleanupAfter < messageMaxAge; yield c
@@ -4064,6 +4151,20 @@ effectiveLookupRate = do
 effectiveClientWriteRate = do
   o <- *rateOverrideClientWriteRate
   adaptiveRate (if o > 0 then o else maxClientWriteRatePerKey)
+
+-- Effective operational parameter readers: return runtime override if set (> 0), else compile-time default.
+-- These are NOT adaptively scaled (they are capacity limits, not rate limits).
+effectiveMaxMessagesPerRecipient = do
+  o <- *configOverrideMaxMessagesPerRecipient
+  yield (if o > 0 then o else maxMessagesPerRecipient)
+
+effectiveMaxGossipHops = do
+  o <- *configOverrideMaxGossipHops
+  yield (if o > 0 then o else maxGossipHops)
+
+effectivePollTimeoutMs = do
+  o <- *configOverridePollTimeoutMs
+  yield (if o > 0 then o else pollTimeoutMs)
 
 checkFederationRate = \server t -> atomic do
   federationRates <- *federationRates
@@ -5081,6 +5182,22 @@ pruneAndRetry = \t -> do
       yield (actual - stored)
     when (presDrift != 0 || sessDrift != 0 || fwdDrift != 0)
       (logInfo ("reconciliation: corrected drift — presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift ++ ", forwards: " ++ show fwdDrift)))
+  -- Active request counter reconciliation: detect leaked counters from panicked handlers.
+  -- Knot lacks try-finally, so if serveInner panics, the activeRequests decrement is skipped.
+  -- If no request has completed in 3x pollTimeoutMs (the longest a request should take)
+  -- but activeRequests > 0, the counter has leaked. Reset to 0 and log the recovery.
+  arqLeak <- atomic do
+    arq <- *activeRequests
+    if arq > 0 then do
+      lastCompleted <- *lastRequestCompletedAt
+      if lastCompleted > 0 && t - lastCompleted > pollTimeoutMs * 3
+        then do
+          set *activeRequests = 0
+          yield arq
+        else yield 0
+    else yield 0
+  when (arqLeak > 0)
+    (logWarn ("reconciliation: reset leaked activeRequests counter (was " ++ show arqLeak ++ ")"))
   -- Message reconciliation: cheap check first (sum rcBucket .count fields vs totalMessageCount).
   -- Full scan only when drift exceeds threshold or every Nth cycle.
   -- Small drifts from concurrent bucket pruning self-correct; only trigger the expensive
@@ -5853,7 +5970,8 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
         let capped = takeRelation maxSenderDeliveriesPerKey forKey
         yield capped
     -- Poll slot exhaustion: signal clients to back off for one poll cycle
-    let pollRetryMs = if result.pollSlotFull then pollTimeoutMs else 0
+    effPollTimeout <- effectivePollTimeoutMs
+    let pollRetryMs = if result.pollSlotFull then effPollTimeout else 0
     -- Read and drain per-sender drop counters so this sender knows if their receipts were lost.
     -- Each sender sees only their own drops (not a global counter conflating all senders).
     drops <- if not result.authorized || result.pubkey == "" then yield {dr: 0, de: 0}
@@ -5923,7 +6041,8 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId expiresIn
               -- Return MsQueued (not MsRejected) for per-recipient capacity: prevents
               -- an attacker from probing mailbox fullness for arbitrary pubkeys. Global
               -- capacity still returns MsRejected since it's not per-recipient.
-              if recipientCount >= maxMessagesPerRecipient then yield {status: MsQueued {}, remoteServers: [], retryAfterMs: 0}
+              effMaxPerRecipient <- effectiveMaxMessagesPerRecipient
+              if recipientCount >= effMaxPerRecipient then yield {status: MsQueued {}, remoteServers: [], retryAfterMs: 0}
               else do
                 recipientPresence <- readPresenceBucket (pubkeyBucket to)
                 seqCounter <- *seqCounter
@@ -6370,7 +6489,8 @@ handleVerifyToken = \token scope clientIp respond -> do
 -- when a remote key comes online.
 handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlationId authorization respond -> do
   t <- now
-  let cappedHops = clamp 0 maxGossipHops hopsRemaining
+  effMaxHops <- effectiveMaxGossipHops
+  let cappedHops = clamp 0 effMaxHops hopsRemaining
   let corrId = sanitizeCorrelationId correlationId
   when (corrId != "") (logInfo ("[CORR] " ++ corrId ++ " gossip from " ++ fromServer))
   -- Cap inbound seenBy lists and filter to known peers to prevent gossip suppression attacks
@@ -6396,7 +6516,7 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
             then let pc = case entry of Nothing {} -> 0; Just {value: r} -> r.count
               in union (do r <- ger; where r.server != fromServer; yield r) [{server: fromServer, windowStart: t, count: eventCount, prevCount: pc}]
             else do r <- ger; yield (if r.server == fromServer then {server: r.server, windowStart: r.windowStart, count: r.count + eventCount, prevCount: r.prevCount} else r)
-          set *gossipEventRates = if count newEntries > maxGossipEventRateEntries then (do r <- newEntries; where t - r.windowStart < gossipEventRateWindowMs; yield r) else newEntries
+          set *gossipEventRates = if count newEntries > maxGossipEventRateEntries then (do r <- newEntries; where t - r.windowStart < gossipEventRateWindowMs * 2; yield r) else newEntries
           yield (False {})
     if eventRateLimited then do
       logEvent "warn" "rate_limited_gossip_volume" ("peer=" ++ fromServer ++ " limit=" ++ show maxGossipEventsPerServer)
@@ -6560,10 +6680,12 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
       if isDup
         then yield {forward: ForwardDuplicate {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: False {}}
         else do
-          -- Nonce eviction replay protection: if LRU eviction has occurred, we cannot
-          -- verify dedup for messages whose nonces may have been evicted. Reject forwards
-          -- with timestamps older than the eviction cutoff as a safety measure.
-          nonceCutoff <- *nonceEvictionCutoff
+          -- Nonce eviction replay protection: if LRU eviction has occurred in this bucket,
+          -- we cannot verify dedup for messages whose nonces may have been evicted. Reject
+          -- forwards with timestamps older than this bucket's eviction cutoff.
+          -- Per-bucket cutoff (not global) ensures eviction in one bucket doesn't reject
+          -- valid forwards destined for a different bucket.
+          nonceCutoff <- readNonceCutoff bkt
           if nonceCutoff > 0 && timestamp > 0 && timestamp < nonceCutoff
             then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: True {}}
             else do
@@ -6573,7 +6695,8 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
             else do
               recipientCounts <- readRcBucket bkt
               let recipientCount = getRecipientCount toKey recipientCounts
-              if recipientCount >= maxMessagesPerRecipient
+              effMaxPerRecipient <- effectiveMaxMessagesPerRecipient
+              if recipientCount >= effMaxPerRecipient
                 then yield {forward: ForwardRejected {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}, nonceCutoffRejected: False {}}
                 else do
                   recvRates <- *recvRates
@@ -6966,14 +7089,15 @@ forwardBucketGroupInner = \entries fromServer b t acc presenceBkt bucket ackedBk
           if isDup
             then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: True {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
             else do
-              -- Nonce eviction replay protection (matches handleForwardMessage)
-              nonceCutoff <- *nonceEvictionCutoff
+              -- Nonce eviction replay protection (per-bucket cutoff, matches handleForwardMessage)
+              nonceCutoff <- readNonceCutoff b
               if nonceCutoff > 0 && entry.timestamp > 0 && entry.timestamp < nonceCutoff
                 then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: False {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
                 else do
               totalMsgCount <- *totalMessageCount
               let recipientCount = getRecipientCount entry.toKey rc
-              if totalMsgCount + msgStored >= maxMessages || recipientCount >= maxMessagesPerRecipient
+              effMaxPerRecipient <- effectiveMaxMessagesPerRecipient
+              if totalMsgCount + msgStored >= maxMessages || recipientCount >= effMaxPerRecipient
                 then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: False {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
                 else do
                   -- Per-recipient receive rate limiting (matches handleForwardMessage)
@@ -7021,58 +7145,51 @@ handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp
     if count messageIds != count toKeys
       then yield (respond {ok: False {}, error: "mismatched_lengths", receivedCount: 0, retryAfterMs: 0})
       else do
-    -- Look up senderKey for each message from the local message store.
-    -- Only locally-originated messages (originServer == "") have senderKey.
+    -- Zip parallel arrays into pairs upfront (O(n) once), then consume head-first.
+    -- Previous code used fold-to-index-N per element, making receiptsByBucket O(n^2).
     let capped = takeRelation maxMessageIds messageIds
-    receivedCount <- atomic do
-      deliveries <- fold (\acc mid ->
-        -- Find the matching toKey by position (parallel arrays)
-        let idx = count acc.checked in
-        let toKey = fold (\tacc tk -> if tacc.i == idx then {i: tacc.i + 1, key: tk} else {i: tacc.i + 1, key: tacc.key}) {i: 0, key: ""} toKeys in
-        if toKey.key == ""
-          then {checked: union acc.checked [mid], receipts: acc.receipts}
-          else do
-            let b = pubkeyBucket toKey.key
-            -- Check if we have the original message with senderKey
-            -- (message may have been pruned, but senderKey was already captured in forward entries by fedDeliveryReceipts)
-            {checked: union acc.checked [mid], receipts: union acc.receipts [{senderKey: "", messageId: mid, toKey: toKey.key, deliveredAt: t}]})
-        {checked: [], receipts: []} capped
-      -- For federation delivery receipts, we need to look up the senderKey from message store
-      -- Per-bucket: group by pubkeyBucket and look up senderKey from messages
-      let withSender = fold (\acc r ->
-        acc) [] deliveries.receipts
-      -- Simpler approach: record receipts with empty senderKey — the sender can match by messageId
-      -- (they know which messages they sent). This avoids the expensive per-message lookup.
-      -- Actually, we need senderKey to route receipts to the right sender's poll response.
-      -- Fall back to scanning message buckets for the senderKey.
-      yield (count deliveries.receipts)
-    -- Look up senderKey per-bucket for the receipt messages
-    receiptsByBucket capped toKeys t 0
-    yield (respond {ok: True {}, error: "", receivedCount: receivedCount, retryAfterMs: 0}))
+    let pairs = zipParallelArrays capped toKeys
+    -- Look up senderKey per-bucket and record delivery receipts
+    receiptsByBucket pairs t
+    yield (respond {ok: True {}, error: "", receivedCount: count pairs, retryAfterMs: 0}))
 
--- Look up senderKey from messages and record delivery receipts per-bucket.
-receiptsByBucket = \messageIds toKeys t idx ->
-  if idx >= count messageIds then yield {}
-  else do
-    -- Extract messageId and toKey at current index
-    let mid = fold (\acc m -> if acc.i == idx then {i: acc.i + 1, val: m} else {i: acc.i + 1, val: acc.val}) {i: 0, val: ""} messageIds
-    let tk = fold (\acc k -> if acc.i == idx then {i: acc.i + 1, val: k} else {i: acc.i + 1, val: acc.val}) {i: 0, val: ""} toKeys
-    when (mid.val != "" && tk.val != "") (do
-      let b = pubkeyBucket tk.val
+-- Zip two parallel arrays into a list of {messageId, toKey} pairs.
+-- Consumes both lists head-first in O(n), replacing the O(n^2) fold-to-index pattern.
+zipParallelArrays : [MessageIdHex] -> [PubkeyHex] -> [{messageId: MessageIdHex, toKey: PubkeyHex}]
+zipParallelArrays = \mids keys ->
+  case headOf mids of
+    Nothing {} -> []
+    Just {value: mid} ->
+      case headOf keys of
+        Nothing {} -> []
+        Just {value: key} ->
+          let restMids = do m <- mids; where m != mid; yield m in
+          let restKeys = do k <- keys; where k != key; yield k in
+          union [{messageId: mid, toKey: key}] (zipParallelArrays restMids restKeys)
+
+-- Look up senderKey from messages and record delivery receipts.
+-- Consumes pre-zipped pairs head-first (O(n) total, was O(n^2) with index-based access).
+receiptsByBucket : [{messageId: MessageIdHex, toKey: PubkeyHex}] -> Timestamp -> IO ()
+receiptsByBucket = \pairs t ->
+  case headOf pairs of
+    Nothing {} -> yield {}
+    Just {value: pair} -> do
+      let rest = do p <- pairs; where p.messageId != pair.messageId || p.toKey != pair.toKey; yield p
+      let b = pubkeyBucket pair.toKey
       atomic do
         bucket <- readMessageBucket b
-        let msg = headOf (do m <- bucket; where m.messageId == mid.val && m.toKey == tk.val && m.senderKey != "" && m.originServer == ""; yield m)
+        let msg = headOf (do m <- bucket; where m.messageId == pair.messageId && m.toKey == pair.toKey && m.senderKey != "" && m.originServer == ""; yield m)
         case msg of
           Nothing {} -> yield {}
           Just {value: m} -> do
             sd <- *senderDeliveries
-            let isDup = any sd (\d -> d.messageId == mid.val && d.toKey == tk.val)
+            let isDup = any sd (\d -> d.messageId == pair.messageId && d.toKey == pair.toKey)
             when (not isDup) (do
-              let combined = union sd [{senderKey: m.senderKey, messageId: mid.val, toKey: tk.val, deliveredAt: t}]
+              let combined = union sd [{senderKey: m.senderKey, messageId: pair.messageId, toKey: pair.toKey, deliveredAt: t}]
               set *senderDeliveries = if count combined > maxSenderDeliveries
                 then evictOneOldest combined (\d -> d.deliveredAt)
-                else combined))
-    receiptsByBucket messageIds toKeys t (idx + 1)
+                else combined)
+      receiptsByBucket rest t
 
 -- POST /messages/cancel-batch: Cancel multiple sent messages in one request.
 -- Auth checked once; each cancel processed independently. Partial success possible.
@@ -8485,6 +8602,8 @@ handleFlushNonces = \authorization respond -> do
     flushedCount <- atomic do
       total <- countAllNonces 0
       writeAllNonces []
+      -- Reset all per-bucket eviction cutoffs (no nonces remain, accept all timestamps)
+      resetAllNonceCutoffs 0
       yield total
     logInfo ("nonces/flush: flushed " ++ show flushedCount ++ " forward nonces")
     yield (respond {ok: True {}, flushedCount: flushedCount})
@@ -8552,6 +8671,32 @@ handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal r
     logInfo ("rate-limits: updated — global=" ++ show globalRequest ++ " ip=" ++ show ipRate ++ " send=" ++ show sendRate ++ " federation=" ++ show federationRate ++ " auth=" ++ show authGlobal ++ " recv=" ++ show recvRate ++ " challenge=" ++ show challengeRate ++ " pair=" ++ show pairRate ++ " lookup=" ++ show lookupRate ++ " clientWrite=" ++ show clientWriteRate ++ " (0 = default)")
     yield (respond {ok: True {}})
 
+-- GET /maintenance/config: Return current effective operational parameters.
+handleGetConfig = \authorization respond -> do
+  authorized <- verifyMaintenanceAuth authorization
+  if not authorized then yield (respond {ok: False {}, maxMessagesPerRecipient: 0, maxGossipHops: 0, pollTimeoutMs: 0})
+  else do
+    result <- atomic do
+      mpr <- effectiveMaxMessagesPerRecipient
+      mgh <- effectiveMaxGossipHops
+      ptm <- effectivePollTimeoutMs
+      yield {maxMessagesPerRecipient: mpr, maxGossipHops: mgh, pollTimeoutMs: ptm}
+    yield (respond {ok: True {}, maxMessagesPerRecipient: result.maxMessagesPerRecipient, maxGossipHops: result.maxGossipHops, pollTimeoutMs: result.pollTimeoutMs})
+
+-- POST /maintenance/config: Update operational parameters at runtime. 0 = reset to compile-time default.
+-- Changes take effect immediately for new requests. Existing long-polls continue with old values.
+handleSetConfig = \newMaxMessagesPerRecipient newMaxGossipHops newPollTimeoutMs authorization respond -> do
+  authorized <- verifyMaintenanceAuth authorization
+  if not authorized then yield (respond {ok: False {}})
+  else do
+    logEvent "audit" "set_config" ("maxMessagesPerRecipient=" ++ show newMaxMessagesPerRecipient ++ " maxGossipHops=" ++ show newMaxGossipHops ++ " pollTimeoutMs=" ++ show newPollTimeoutMs)
+    atomic do
+      set *configOverrideMaxMessagesPerRecipient = max 0 newMaxMessagesPerRecipient
+      set *configOverrideMaxGossipHops = max 0 newMaxGossipHops
+      set *configOverridePollTimeoutMs = max 0 newPollTimeoutMs
+    logInfo ("config: updated — maxMessagesPerRecipient=" ++ show newMaxMessagesPerRecipient ++ " maxGossipHops=" ++ show newMaxGossipHops ++ " pollTimeoutMs=" ++ show newPollTimeoutMs ++ " (0 = default)")
+    yield (respond {ok: True {}})
+
 -- Extract request path for access logging (excludes poll to reduce log volume)
 requestPath = \req -> case req of
   ReqChallenge {} -> "POST /auth/challenge"
@@ -8599,6 +8744,8 @@ requestPath = \req -> case req of
   ListAllowed {} -> "GET /maintenance/allowed"
   Reconcile {} -> "POST /maintenance/reconcile"
   RotateSecret {} -> "POST /maintenance/rotate-secret"
+  GetConfig {} -> "GET /maintenance/config"
+  SetConfig {} -> "POST /maintenance/config"
   Health {} -> "GET /health"
   Stats {} -> "GET /stats"
   StatsPeers {} -> "GET /stats/peers"
@@ -8688,6 +8835,8 @@ serveInner = \req -> case req of
   ListAllowed {authorization, respond} -> handleListAllowed authorization respond
   Reconcile {authorization, respond} -> handleReconcile authorization respond
   RotateSecret {newSecret, authorization, respond} -> handleRotateSecret newSecret authorization respond
+  GetConfig {authorization, respond} -> handleGetConfig authorization respond
+  SetConfig {maxMessagesPerRecipient, maxGossipHops, pollTimeoutMs, authorization, respond} -> handleSetConfig maxMessagesPerRecipient maxGossipHops pollTimeoutMs authorization respond
   Health {authorization, respond} -> handleHealth authorization respond
   Stats {authorization, respond} -> handleStats authorization respond
   StatsPeers {authorization, respond} -> handleStatsPeers authorization respond
@@ -8769,6 +8918,8 @@ serveOverloaded = \req -> case req of
   UnallowPeer {respond} -> respond {ok: False {}, removed: False {}}
   ListAllowed {respond} -> respond {peers: [], ok: False {}}
   RotateSecret {respond} -> respond {ok: False {}, error: "overloaded"}
+  GetConfig {respond} -> respond {ok: False {}, maxMessagesPerRecipient: 0, maxGossipHops: 0, pollTimeoutMs: 0}
+  SetConfig {respond} -> respond {ok: False {}}
   Metrics {respond} -> respond {metrics: "", ok: False {}}
   -- Exempt routes handled by isOverloadExempt; this branch is unreachable
   _ -> yield {}
@@ -8800,6 +8951,7 @@ serve = \req -> do
   atomic do
     ar <- *activeRequests
     set *activeRequests = max 0 (ar - 1)
+    set *lastRequestCompletedAt = startTime
   endTime <- now
   let latency = endTime - startTime
   -- Record client operation latency for /stats monitoring (windowed avg/max).
@@ -8996,12 +9148,13 @@ pollHeartbeat = do
   -- Adaptive poll timeout: scale heartbeat interval based on server load.
   -- adaptiveRateScale returns 10-100 (percentage). At 100% (normal): full pollTimeoutMs.
   -- At 10% (peak load): max(5000, pollTimeoutMs * 10 / 100) = 5000ms.
+  basePollTimeout <- effectivePollTimeoutMs
   scale <- atomic do
     tmc <- *totalMessageCount
     sc <- *totalSessionCount
     pc <- *totalPresenceCount
     yield (adaptiveRateScale tmc sc pc)
-  let effectiveTimeout = max 5000 (pollTimeoutMs * scale / 100)
+  let effectiveTimeout = max 5000 (basePollTimeout * scale / 100)
   jitter <- randomInt 2000
   sleep (effectiveTimeout + jitter)
   dp <- *drainPhase
