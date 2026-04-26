@@ -14,9 +14,8 @@
 -- ============================================
 
 -- Server identity and federation credentials
-serverHost = "localhost:8080"
+serverHost = "localhost"
 listenPort = 8080
-maintenanceSecret = "" -- set to enable /maintenance/* and /stats endpoints
 federationScheme = "https://" -- scheme for federation HTTP calls
 -- Ed25519 federation signing keys (hex-encoded). When both are set, outbound federation
 -- requests are signed instead of using verify callbacks (eliminates the round-trip).
@@ -946,9 +945,8 @@ maxPeerLatencyEntries = 100
 *droppedDeliveryReceipts : [{senderKey: Text, count: Int, lastUpdated: Timestamp}]
 *droppedExpirationNotifs : [{senderKey: Text, count: Int, lastUpdated: Timestamp}]
 
--- Runtime maintenance secret: when non-empty, used instead of compile-time maintenanceSecret.
--- Set via /maintenance/rotate-secret to enable zero-downtime secret rotation.
--- Empty = use compile-time maintenanceSecret (default).
+-- Maintenance secret: set via /maintenance/rotate-secret at startup.
+-- When empty, maintenance and stats endpoints are disabled.
 *runtimeMaintenanceSecret : Text
 
 -- Runtime-configurable rate limit overrides (0 = use compile-time default).
@@ -1833,14 +1831,13 @@ verifyAuthWith = \check authorization ->
     Nothing {} -> False {}
     Just {value: token} -> check token
 
--- Check maintenance auth: tries runtime secret first (if set), then compile-time secret.
--- This allows zero-downtime rotation: set the new secret via /maintenance/rotate-secret,
--- then update the compile-time config and restart at convenience.
+-- Check maintenance auth against the runtime secret set via /maintenance/rotate-secret.
+-- Returns False when no secret has been set (maintenance endpoints disabled).
 verifyMaintenanceAuth : Text -> IO Bool
 verifyMaintenanceAuth = \authorization -> do
-  runtimeSecret <- *runtimeMaintenanceSecret
-  let checkSecret = if runtimeSecret != "" then runtimeSecret else maintenanceSecret
-  yield (verifyAuthWith (\token -> verifySecret token checkSecret) authorization)
+  secret <- *runtimeMaintenanceSecret
+  if secret == "" then yield False
+  else yield (verifyAuthWith (\token -> verifySecret token secret) authorization)
 
 -- Check if a server is on the blocklist
 isBlockedPeer : Text -> [Text] -> Bool
@@ -3471,7 +3468,6 @@ dedupMessageIds = \messageIds ->
     if any acc (\a -> a == mid) then acc
     else union [mid] acc) [] capped
 
-
 -- Constant-time comparison iteration count. Must be >= the longest secret
 -- compared: session tokens are tokenHexLen (48) hex chars, but maintenance
 -- secrets can be up to maxTokenLen (256) chars (validated by extractToken).
@@ -4019,7 +4015,6 @@ pruneExpired = \t -> do
     set *federationActiveConnections = fold (\acc r -> acc + r.count) 0 inFlightRec
   yield presenceResult
 
-
 -- Skip the first N items of a list (list equivalent of Text's drop).
 -- O(n) single pass: fold counts items and only starts accumulating after N.
 skipRelation = \n items ->
@@ -4096,7 +4091,6 @@ broadcastOfflineGossip = \t peerServers expiredLocal ->
     let gossipEvents = mergeByKey (\a b -> a.pubkey == b.pubkey) (\x -> x.timestamp) [] (offlineGossipEvents cappedExpired)
     sendBatchedGossip peerServers gossipEvents gossipOriginHops)
 
-
 -- Build re-broadcast gossip events from validated entries. The seenBy list includes
 -- the fromServer (who sent us these events) and ourselves (serverHostN), so downstream
 -- peers that already have this gossip via either path won't receive it again.
@@ -4122,7 +4116,6 @@ mergeGossipPresence = \presence deduped trustedOffline fromServer t ->
    appliedKeys: union capResult.appliedOnline appliedOffline,
    gossipPeerServers: collectPeerServers capResult.finalPresence (\p -> p.server),
    withinCapacity: capResult.withinCapacity}
-
 
 -- Adaptive rate limiting: scale rate limits down when the server is under heavy load.
 -- Returns a scaling factor from 0 to 100 (percentage of full rate to allow).
@@ -5687,7 +5680,6 @@ forwardCandidates = \targets messages forwards t ->
       yield {messageId: m.messageId, toServer: target.server, createdAt: t,
              toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp,
              originServer: origin, retries: 0, expiresAt: m.expiresAt, priority: m.priority, senderKey: m.senderKey})) [] targets
-
 
 -- Challenge-IP binding rules:
 -- 1. Both sides have IPs: must match (standard proxy case)
@@ -8758,7 +8750,7 @@ handleRotateSecret = \newSecret authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
   if not authorized then yield (respond {ok: False {}, error: "unauthorized"})
   else do
-    logEvent "audit" "rotate_secret" (if newSecret == "" then "revert_to_default" else "new_secret")
+    logEvent "audit" "rotate_secret" (if newSecret == "" then "disabled" else "new_secret")
     if newSecret != "" && federationEnabled && not (tooLong newSecret 15) then do
       logError "rotate-secret: rejected — secret must be at least 16 characters when federation is enabled"
       yield (respond {ok: False {}, error: "secret_too_short"})
@@ -8770,7 +8762,7 @@ handleRotateSecret = \newSecret authorization respond -> do
     else do
       atomic do set *runtimeMaintenanceSecret = newSecret
       if newSecret == ""
-        then logInfo "rotate-secret: reverted to compile-time maintenance secret"
+        then logInfo "rotate-secret: maintenance secret cleared — maintenance endpoints disabled"
         else logInfo "rotate-secret: maintenance secret rotated"
       yield (respond {ok: True {}, error: ""})
 
@@ -9477,19 +9469,7 @@ main = do
       atomic do
         set *startedAt = t
         set *serverGeneration = t * 1000 + genJitter
-      -- Empty maintenanceSecret is the recommended deployment path: use /maintenance/rotate-secret
-      -- at startup via deployment scripts for zero-knowledge secret management. Log at INFO level
-      -- since operators following the recommended path shouldn't see warnings on every startup.
-      when (maintenanceSecret == "")
-        (logInfo "maintenanceSecret is empty — use /maintenance/rotate-secret at startup to enable /maintenance/* and /stats endpoints")
-      when (maintenanceSecret != "" && not (tooLong maintenanceSecret 15))
-        (logWarn "maintenanceSecret is shorter than 16 characters — use a longer secret for production deployments")
-      when (maintenanceSecret != "" && not (tooLong maintenanceSecret 31))
-        (logWarn "maintenanceSecret is shorter than 32 characters — 32+ character secrets recommended for production (128+ bits of entropy)")
-      when (maintenanceSecret != "" && federationEnabled && not (tooLong maintenanceSecret 15))
-        (logError "SECURITY: maintenanceSecret is weak and federation is enabled — maintenance endpoints control drain and peer blocking. Use a secret of at least 32 characters.")
-      when (maintenanceSecret != "")
-        (logWarn "SECURITY: maintenanceSecret is set as a compile-time constant. Avoid committing secrets to source control. Prefer setting maintenanceSecret to empty and using /maintenance/rotate-secret at startup via deployment scripts for zero-knowledge secret management.")
+      logInfo "maintenance secret not set — use /maintenance/rotate-secret at startup to enable /maintenance/* and /stats endpoints"
       when (matchesHostnameOrSubdomain serverHostN "localhost")
         (logWarn ("serverHost is " ++ serverHost ++ " — peers cannot reach this server for federation"))
       when (federationEnabled && isBadServerName serverHostN)
