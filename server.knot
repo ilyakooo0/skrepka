@@ -185,6 +185,10 @@ reconciliationFullCycleInterval = 50 -- full reconciliation every 50th prune cyc
 -- (sum of rcBucket totals vs totalMessageCount) exceeds this threshold. Small drifts from
 -- concurrent bucket pruning self-correct on the next cycle. 0 = always reconcile on drift.
 reconciliationDriftThreshold = 10
+-- Lightweight reconciliation interval: presence/session/forward counter reconciliation
+-- runs every Nth prune cycle. Between cycles, cached counters are trusted. Message
+-- reconciliation has its own interval (reconciliationFullCycleInterval).
+lightReconciliationInterval = 5
 
 -- Federation latency metric window
 federationLatencyWindowMs : Int<Ms>
@@ -937,6 +941,14 @@ maxPeerLatencyEntries = 100
 -- Used by health checks to avoid scanning all 16 forward buckets on every /health request.
 *cachedForwardStaleCount : Int
 
+-- Cached adaptive rate scale factor (0-100%). Updated every prune cycle.
+-- Avoids 3 STM reads per rate check on the hot path. 100 = no scaling (default).
+*cachedAdaptiveScale : Int
+
+-- Gossip send metrics (windowed, reset with federation latency metrics)
+*gossipSendSuccess : Int
+*gossipSendFail : Int
+
 -- ============================================
 -- Routes
 -- ============================================
@@ -1183,7 +1195,7 @@ route HealthApi where
 -- BREAKING CHANGE from flat format — existing scrapers must update field paths.
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, messagesMax: Int, messagesPct: Int, totalMessageCount: Int, presence: Int, presenceMax: Int, presencePct: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}], pendingCancels: Int}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int, senderDeliveries: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int}}
+    -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, messagesMax: Int, messagesPct: Int, totalMessageCount: Int, presence: Int, presenceMax: Int, presencePct: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int, messageBucketMax: Int, messageBucketMin: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}], pendingCancels: Int, gossipSuccess: Int, gossipFail: Int}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int, senderDeliveries: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int}}
     = Stats
   GET /stats/peers headers {authorization: Text}
     -> {peers: [PeerStatus], ok: Bool}
@@ -1671,16 +1683,31 @@ isBlockedPeer = \server blocked -> any blocked (\b -> b == server)
 isAllowedByAllowlist : Text -> [Text] -> Bool
 isAllowedByAllowlist = \server allowed -> count allowed == 0 || any allowed (\a -> a == server)
 
+-- Split text at the first colon. Returns {before, after}. Used to parse "Signed <sig>:<nonce>".
+-- Safe: signature hex and nonce are both [0-9a-f]+ (no colons), so exactly one colon separates them.
+splitOnColon : Text -> {before: Text, after: Text}
+splitOnColon = \s -> splitOnColonInner s 0
+
+splitOnColonInner : Text -> Int -> {before: Text, after: Text}
+splitOnColonInner = \s pos ->
+  if drop pos s == "" then {before: s, after: ""}
+  else if take 1 (drop pos s) == ":" then {before: take pos s, after: drop (pos + 1) s}
+  else splitOnColonInner s (pos + 1)
+
 -- Generate a single-use token for outbound federation auth.
 -- scope binds the token to a request type ("gossip", "forward", "ack") so a token
 -- issued for one operation cannot authorize a different one.
+-- When signing is enabled, includes a random nonce in the signed message to prevent
+-- replay attacks (two requests with the same timestamp+scope produce different signatures).
+-- Format: "Signed <sig>:<nonce>" — backward compatible (old format has no colon).
 generateFederationAuth : Text -> Timestamp -> IO {network} Text
 generateFederationAuth = \scope requestTimestamp ->
   if serverFederationPrivateKeyHex != ""
     then do
-      let message = textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ serverHostN)
+      nonce <- genTokenN 2
+      let message = textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ serverHostN ++ "|" ++ nonce)
       let sig = sign (bytesFromHex serverFederationPrivateKeyHex) message
-      yield ("Signed " ++ bytesToHex sig)
+      yield ("Signed " ++ bytesToHex sig ++ ":" ++ nonce)
     else do
       token <- genToken
       t <- now
@@ -2701,6 +2728,37 @@ pruneNonceBucketRange = \b endB t ->
     when (count pruned < count bucket) (writeNonceBucket b pruned)
     pruneNonceBucketRange (b + 1) endB t
 
+-- Record a forward nonce and handle capacity eviction with LRU logging.
+-- Usable inside or outside atomic blocks (reads/writes nonce bucket refs).
+-- Returns eviction info for deferred logging when called inside atomic.
+updateForwardNonce : Int -> MessageIdHex -> PubkeyHex -> Timestamp -> IO {lruEvicted: Int, oldestRetainedAge: Int}
+updateForwardNonce = \nb messageId toKey t -> do
+  fwdNonces <- readNonceBucket nb
+  let updatedNonces = union fwdNonces [{messageId: messageId, toKey: toKey, seenAt: t}]
+  let evictedNonces = if count updatedNonces > maxNoncesPerBucket
+        then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
+        else updatedNonces
+  let lruEvicted = count updatedNonces - count evictedNonces
+  let oldestRetainedAge = if lruEvicted > 0
+        then case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> 0; Just {value: n} -> t - n.seenAt
+        else 0
+  writeNonceBucket nb evictedNonces
+  yield {lruEvicted: lruEvicted, oldestRetainedAge: oldestRetainedAge}
+
+-- Log nonce LRU eviction if any occurred. Call outside atomic blocks.
+logNonceEviction : Int -> Int -> Int -> IO ()
+logNonceEviction = \nb lruEvicted oldestRetainedAge ->
+  when (lruEvicted > 0) (do
+    let level = if oldestRetainedAge < messageMaxAge then "error" else "warn"
+    logKV level "nonce_lru_eviction" ["bucket=" ++ show nb, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket, "oldestRetainedMs=" ++ show oldestRetainedAge])
+
+-- Full record-and-log helper for use outside atomic blocks.
+recordForwardNonce : MessageIdHex -> PubkeyHex -> Timestamp -> IO ()
+recordForwardNonce = \messageId toKey t -> do
+  let nb = pubkeyBucket toKey
+  result <- updateForwardNonce nb messageId toKey t
+  logNonceEviction nb result.lruEvicted result.oldestRetainedAge
+
 -- ============================================
 -- Forward Bucket Helpers
 -- ============================================
@@ -2771,6 +2829,19 @@ countAllForwards = \b ->
     bucket <- readFwdBucket b
     rest <- countAllForwards (b + 1)
     yield (count bucket + rest)
+
+-- Compute min and max message counts across all 16 buckets (for stats bucket skew detection).
+-- Returns {bucketMin, bucketMax}. O(16) bucket reads.
+messageBucketMinMax : IO {bucketMin: Int, bucketMax: Int}
+messageBucketMinMax = messageBucketMinMaxInner 0 999999999 0
+
+messageBucketMinMaxInner : Int -> Int -> Int -> IO {bucketMin: Int, bucketMax: Int}
+messageBucketMinMaxInner = \b currentMin currentMax ->
+  if b > 15 then yield {bucketMin: if currentMin == 999999999 then 0 else currentMin, bucketMax: currentMax}
+  else do
+    bucket <- readMessageBucket b
+    let c = count bucket
+    messageBucketMinMaxInner (b + 1) (min currentMin c) (max currentMax c)
 
 -- Compute forward stats per-bucket without materializing all forwards into one list.
 -- Returns total count, oldest age, unique server count, and max per-server queue depth.
@@ -3429,6 +3500,13 @@ hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey 
 -- inflate effective presence lifetime by up to clockSkewTolerance ms. Clamping to now removes
 -- this inflation: the peer's declared TTL is honored, but the expiry clock starts from now,
 -- not from a future timestamp.
+-- Filter seenBy entries to only known peers + ourselves. Unknown entries are dropped
+-- to prevent gossip suppression attacks (a malicious peer injecting arbitrary server
+-- names into seenBy to block propagation to those servers).
+filterSeenBy : [Text] -> [Text] -> [Text]
+filterSeenBy = \seenBy knownPeers ->
+  do s <- seenBy; where s == serverHostN || any knownPeers (\p -> p == s); yield s
+
 validGossipEvents : [GossipEvent] -> Timestamp -> {online: [ValidGossipEntry], offline: [ValidGossipEntry]}
 validGossipEvents = \events t ->
   let validate = \e ->
@@ -3517,15 +3595,9 @@ pruneExpired = \t -> do
     set *challenges = do x <- challenges; where x.expiresAt > t; yield x
   -- Prune sessions and count in a single pass (avoids redundant 16-bucket traversal).
   -- pruneAndCountAllSessions applies the filter to each bucket and sums the survivors.
-  oldSessionCount <- *totalSessionCount
   sessionCount <- pruneAndCountAllSessions (\bucket -> do x <- bucket; where x.expiresAt > t && t - x.createdAt < maxSessionLifetime; yield x)
   atomic do
     set *totalSessionCount = sessionCount
-    -- Bump presenceVersion when sessions are pruned: if a pubkey's last session expired,
-    -- its presence will be pruned in a subsequent cycle. Bumping here ensures polls
-    -- detect the transition sooner (within one prune interval) rather than waiting for
-    -- the presence entry's separate TTL to expire.
-    when (sessionCount < oldSessionCount) (set *presenceVersion = t)
   -- Prune messages across all 16 buckets concurrently. Each bucket prune is atomic
   -- and touches only its own message bucket + rcBucket. The only shared write is
   -- *totalMessageCount (a single Int), so STM contention is minimal.
@@ -3681,12 +3753,21 @@ forEachBatch = \items batchSize process ->
     forEachBatch split.rest batchSize process
 
 sendBatchedGossipToServer : ServerName -> [GossipEvent] -> Int -> IO {network} {}
-sendBatchedGossipToServer = \server allEvents hops ->
+sendBatchedGossipToServer = \server allEvents hops -> do
+  -- Check backoff before sending: skip servers that recently failed (same backoff as forwards).
+  -- Without this, gossip to a dead peer generates unbounded log spam every refresh cycle.
+  t0 <- now
+  failures <- *forwardFailures
+  inFlight <- *federationInFlight
+  blocked <- *blockedPeers
+  if not (shouldRetryServerEx server t0 failures inFlight blocked) then yield {}
+  else do
   -- Filter out events this server has already seen (via seenBy tracking).
   -- Add ourselves and the target server to seenBy so downstream relays skip both.
-  -- Cap seenBy at maxSeenByLen to bound per-event memory and bandwidth.
-  let unseen = do e <- allEvents; where none e.seenBy (\s -> s == server); yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl, seenBy: takeRelation maxSeenByLen (union e.seenBy [server])}
-  in if count unseen == 0 then yield {}
+  -- Cap seenBy at maxSeenByLen and filter to known peers (defense-in-depth against spoofed seenBy).
+  knownPeersForSeen <- *knownPeerServers
+  let unseen = do e <- allEvents; where none e.seenBy (\s -> s == server); yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl, seenBy: filterSeenBy (takeRelation maxSeenByLen (union e.seenBy [server])) knownPeersForSeen}
+  if count unseen == 0 then yield {}
   else forEachBatch unseen maxGossipEvents (\batch -> do
     t <- now
     auth <- generateFederationAuth "gossip" t
@@ -3696,8 +3777,13 @@ sendBatchedGossipToServer = \server allEvents hops ->
       events: batch, hopsRemaining: hops, fromServer: serverHostN,
       requestTimestamp: t, correlationId: corrId, protocolVersion: federationProtocolVersion})
     case result of
-      Err e -> logWarn ("federation: gossip to " ++ server ++ " failed: " ++ show e)
-      Ok _ -> yield {})
+      Err e -> do
+        logWarn ("federation: gossip to " ++ server ++ " failed: " ++ show e)
+        recordFailure server
+        atomic do gs <- *gossipSendFail; set *gossipSendFail = gs + 1
+      Ok _ -> do
+        clearFailure server
+        atomic do gs <- *gossipSendSuccess; set *gossipSendSuccess = gs + 1)
 
 -- Sends gossip events to each peer server. Per-server seenBy filtering happens inside
 -- sendBatchedGossipToServer: if all events for a server are already in its seenBy list,
@@ -3764,14 +3850,14 @@ adaptiveRateScale = \msgCount sessCount presCount ->
 
 -- Apply adaptive scaling to a base rate limit. Reads cached counters (O(1), no bucket scans)
 -- and scales the rate proportionally. Returns at least 1 to prevent division-by-zero in callers.
+-- Apply adaptive scaling to a base rate limit. Reads cached scale factor (O(1), updated
+-- every prune cycle) instead of 3 counter reads per call. Returns at least 1 to prevent
+-- division-by-zero in callers.
 adaptiveRate : Int -> IO Int
 adaptiveRate = \baseRate -> do
-  scale <- atomic do
-    tmc <- *totalMessageCount
-    sc <- *totalSessionCount
-    pc <- *totalPresenceCount
-    yield (adaptiveRateScale tmc sc pc)
-  yield (max 1 (baseRate * scale / 100))
+  scale <- *cachedAdaptiveScale
+  let effectiveScale = if scale <= 0 then 100 else scale
+  yield (max 1 (baseRate * effectiveScale / 100))
 
 -- Effective rate limit readers: return runtime override if set (> 0), else compile-time default.
 -- All per-key and global rates are scaled by adaptiveRate under high utilization.
@@ -3985,6 +4071,7 @@ fetchAndCachePeerKey = \server t -> do
 -- Verify an inbound Ed25519 signed federation request.
 -- Reconstructs the signed message from (scope, requestTimestamp, fromServer),
 -- fetches the peer's public key (cached), and verifies the signature.
+-- Verify signature without nonce (backward compatible with old peers).
 verifyFederationSignature : Text -> Text -> Text -> Timestamp -> IO {network} Bool
 verifyFederationSignature = \fromServer signatureHex scope requestTimestamp -> do
   t <- now
@@ -3992,6 +4079,16 @@ verifyFederationSignature = \fromServer signatureHex scope requestTimestamp -> d
   if pubkeyHex == "" then yield (False {})
   else do
     let message = textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ fromServer)
+    yield (verify (bytesFromHex pubkeyHex) message (bytesFromHex signatureHex))
+
+-- Verify signature with nonce (new format: prevents replay of same-millisecond requests).
+verifyFederationSignatureWithNonce : Text -> Text -> Text -> Text -> Timestamp -> IO {network} Bool
+verifyFederationSignatureWithNonce = \fromServer signatureHex nonce scope requestTimestamp -> do
+  t <- now
+  pubkeyHex <- fetchPeerPublicKey fromServer t
+  if pubkeyHex == "" then yield (False {})
+  else do
+    let message = textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ fromServer ++ "|" ++ nonce)
     yield (verify (bytesFromHex pubkeyHex) message (bytesFromHex signatureHex))
 
 -- Federation auth wrapper. Intentionally does NOT call checkPreAuth because:
@@ -4016,12 +4113,18 @@ withFederationAuth = \authorization t respond fromServer scope requestTimestamp 
       yield (respond {ok: False {}, error: "not_allowed"})
     else do
   -- Dispatch on auth scheme: "Signed " = Ed25519 signature, "Bearer " = verify callback
+  -- New format "Signed <sig>:<nonce>" includes a random nonce to prevent replay of
+  -- same-millisecond requests. Old format "Signed <sig>" (no colon) is backward compatible.
   verified <- if take 7 authorization == "Signed "
     then do
-      let signatureHex = drop 7 authorization
-      if signatureHex == "" || tooLong signatureHex maxSignatureLen
+      let payload = drop 7 authorization
+      if payload == "" || tooLong payload (maxSignatureLen + 13)
         then yield (False {})
-        else verifyFederationSignature fromServer signatureHex scope requestTimestamp
+        else
+          let parts = splitOnColon payload in
+          if parts.after != ""
+            then verifyFederationSignatureWithNonce fromServer parts.before parts.after scope requestTimestamp
+            else verifyFederationSignature fromServer payload scope requestTimestamp
     else verifyFederationCallback fromServer authorization scope
   if not verified
     then yield (respond {ok: False {}, error: "unauthorized"})
@@ -4752,7 +4855,12 @@ waitForInFlightDrain = \deadline -> do
       if activeCount <= 0 then yield {}
       else retry
   timedOut <- *drainTimedOut
-  when timedOut (logWarn "drain: timed out waiting for in-flight federation tasks")
+  when timedOut (do
+    logWarn "drain: timed out waiting for in-flight federation tasks"
+    t2 <- now
+    inFlight <- *federationInFlight
+    let hungSlots = do r <- inFlight; where r.count > 0; yield r
+    when (count hungSlots > 0) (logStaleInFlight hungSlots t2))
 
 -- Full maintenance cycle: prune expired state, retry pending forwards and acks,
 -- retry overflow acks, broadcast offline gossip, and refresh presence for local keys
@@ -4773,6 +4881,8 @@ pruneAndRetry = \t -> do
     sc <- *totalSessionCount
     pc <- *totalPresenceCount
     fc <- *totalForwardCount
+    -- Update cached adaptive rate scale (avoids 3 reads per rate check on hot path)
+    set *cachedAdaptiveScale = adaptiveRateScale tmc sc pc
     yield {messages: tmc, sessions: sc, presence: pc, forwards: fc}
   when (capacityCounts.messages * 4 >= maxMessages * 3)
     (logEvent "warn" "capacity_warning" ("messages at " ++ show (capacityCounts.messages * 100 / maxMessages) ++ "% (" ++ show capacityCounts.messages ++ "/" ++ show maxMessages ++ ")"))
@@ -4782,32 +4892,33 @@ pruneAndRetry = \t -> do
     (logEvent "warn" "capacity_warning" ("presence at " ++ show (capacityCounts.presence * 100 / maxPresenceEntries) ++ "% (" ++ show capacityCounts.presence ++ "/" ++ show maxPresenceEntries ++ ")"))
   when (capacityCounts.forwards * 4 >= maxForwardsEntries * 3)
     (logEvent "warn" "capacity_warning" ("forwards at " ++ show (capacityCounts.forwards * 100 / maxForwardsEntries) ++ "% (" ++ show capacityCounts.forwards ++ "/" ++ show maxForwardsEntries ++ ")"))
-  -- Counter reconciliation: reconcile all counters every prune cycle.
-  -- Presence and session counters are cheap (just counting list lengths across buckets).
-  -- Message reconciliation is heavier (reads all messages, rebuilds per-recipient counts)
-  -- but runs every cycle to minimize the drift window from concurrent bucket pruning.
-  presDrift <- atomic do
-    actual <- countAllPresence
-    stored <- *totalPresenceCount
-    set *totalPresenceCount = actual
-    yield (actual - stored)
-  sessDrift <- atomic do
-    actual <- countAllSessions
-    stored <- *totalSessionCount
-    set *totalSessionCount = actual
-    yield (actual - stored)
-  fwdDrift <- atomic do
-    actual <- countAllForwards 0
-    stored <- *totalForwardCount
-    set *totalForwardCount = actual
-    yield (actual - stored)
-  when (presDrift != 0 || sessDrift != 0 || fwdDrift != 0)
-    (logInfo ("reconciliation: corrected drift — presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift ++ ", forwards: " ++ show fwdDrift))
+  -- Counter reconciliation: presence/session/forward counters reconciled every Nth cycle
+  -- (lightReconciliationInterval). Between cycles, cached counters are trusted — drift
+  -- from concurrent operations is typically small and self-corrects.
+  pc <- *pruneCount
+  let isLightReconcCycle = pc > 0 && (pc - (pc / lightReconciliationInterval) * lightReconciliationInterval) == 0
+  when isLightReconcCycle (do
+    presDrift <- atomic do
+      actual <- countAllPresence
+      stored <- *totalPresenceCount
+      set *totalPresenceCount = actual
+      yield (actual - stored)
+    sessDrift <- atomic do
+      actual <- countAllSessions
+      stored <- *totalSessionCount
+      set *totalSessionCount = actual
+      yield (actual - stored)
+    fwdDrift <- atomic do
+      actual <- countAllForwards 0
+      stored <- *totalForwardCount
+      set *totalForwardCount = actual
+      yield (actual - stored)
+    when (presDrift != 0 || sessDrift != 0 || fwdDrift != 0)
+      (logInfo ("reconciliation: corrected drift — presence: " ++ show presDrift ++ ", sessions: " ++ show sessDrift ++ ", forwards: " ++ show fwdDrift)))
   -- Message reconciliation: cheap check first (sum rcBucket .count fields vs totalMessageCount).
   -- Full scan only when drift exceeds threshold or every Nth cycle.
   -- Small drifts from concurrent bucket pruning self-correct; only trigger the expensive
   -- full scan when drift is significant (> reconciliationDriftThreshold) or periodic.
-  pc <- *pruneCount
   let isFullCycle = pc > 0 && (pc - (pc / reconciliationFullCycleInterval) * reconciliationFullCycleInterval) == 0
   cheapMsgDrift <- atomic do
     rcTotal <- sumRcBucketTotals 0
@@ -4885,6 +4996,9 @@ pruneAndRetry = \t -> do
       set *verificationCache = do c <- cache; where t - c.verifiedAt < verificationCacheMaxMs; yield c
       -- Reset per-peer latency tracking with global window
       set *peerLatencies = []
+      -- Reset gossip send metrics (windowed with federation metrics)
+      set *gossipSendSuccess = 0
+      set *gossipSendFail = 0
       -- Reset client operation latency metrics (windowed with federation metrics)
       set *clientPollLatencyTotal = 0
       set *clientPollLatencyCount = 0
@@ -5050,7 +5164,6 @@ pollNewEvents = \pubkey clampedCursor t -> do
   let selectedLow = takeRelation reservedSlots sortedLow
   -- Merge and re-sort to maintain correct cursor advancement (lastReceivedAt must
   -- reflect the actual latest receivedAt across both pools for cursor consistency).
-  let allPollable = sortBy (\m -> (0 - m.priority) * 10000000000000 + m.receivedAt) raw
   let limitedMsgs = sortBy (\m -> (0 - m.priority) * 10000000000000 + m.receivedAt) (union selectedHigh selectedLow)
   let evts = do
     m <- limitedMsgs
@@ -5627,25 +5740,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId expiresIn
                 -- if the message expires from messages/ackedIds/deliveredIds and a federation
                 -- peer forwards it back. Without this, the nonce check in handleForwardMessage
                 -- would miss locally-originated messages entirely.
-                -- Sharded: writes only to the bucket for this recipient's pubkey.
-                let nb = pubkeyBucket to
-                fwdNonces <- readNonceBucket nb
-                let updatedNonces = union fwdNonces [{messageId: effectiveMsgId, toKey: to, seenAt: t}]
-                let evictedNonces = if count updatedNonces > maxNoncesPerBucket
-                      then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
-                      else updatedNonces
-                -- Log LRU nonce eviction: evicted nonces create a bounded replay window
-                -- where messages with those nonces could be re-accepted until natural expiry.
-                -- oldestRetainedAge: age of the oldest surviving nonce (new dedup coverage floor).
-                -- If > messageMaxAge, evicted nonces were in the extended-protection zone only
-                -- (message/acked/delivered dedup still covers the gap). If <= messageMaxAge,
-                -- some evicted nonces were still within primary dedup coverage (lower risk).
-                let lruEvicted = count updatedNonces - count evictedNonces
-                when (lruEvicted > 0) (do
-                  let oldestRetainedAge = case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> 0; Just {value: n} -> t - n.seenAt
-                  let level = if oldestRetainedAge < messageMaxAge then "error" else "warn"
-                  logKV level "nonce_lru_eviction" ["bucket=" ++ show nb, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket, "oldestRetainedMs=" ++ show oldestRetainedAge])
-                writeNonceBucket nb evictedNonces
+                recordForwardNonce effectiveMsgId to t
                 let toPresence = presenceForKey recipientPresence to t
                 let localOnline = hasLocalPresence toPresence
                 let remoteServers = collectPeerServers toPresence (\p -> p.server)
@@ -6044,16 +6139,13 @@ handleVerifyToken = \token scope clientIp respond -> do
   else do
   found <- atomic do
     pending <- *pendingVerifications
-    -- Pre-filter by scope, expiry, and first hex char before running expensive safeCompare.
-    -- Reduces scan from O(n) safeCompare calls to O(n/16) by filtering on token prefix.
-    -- The prefix filter is not constant-time, but single-use tokens with 24 bytes of randomness
-    -- make first-char leakage irrelevant (16^47 remaining possibilities in 30s window).
-    let firstChar = take 1 token
-    let isCandidate = \p -> p.scope == scope && t - p.createdAt < verificationTokenExpiry && take 1 p.token == firstChar
+    -- Filter by scope and expiry only — no token prefix optimization.
+    -- The previous first-char pre-filter leaked one hex digit via timing side-channel.
+    -- safeCompare must run on all candidates to prevent information leakage.
+    -- Bounded by maxPendingVerifications and further filtered by scope+expiry.
+    let isCandidate = \p -> p.scope == scope && t - p.createdAt < verificationTokenExpiry
     let candidates = do p <- pending; where isCandidate p; yield p
     let match = any candidates (\p -> safeCompare p.token token)
-    -- Optimized removal: run safeCompare only on candidates (O(n/16)) instead of
-    -- all pending (O(n)). Non-candidates are kept without constant-time comparison.
     when match (set *pendingVerifications = union
       (do p <- pending; where not (isCandidate p); yield p)
       (do p <- candidates; where not (safeCompare p.token token); yield p))
@@ -6073,8 +6165,9 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
   let cappedHops = clamp 0 maxGossipHops hopsRemaining
   let corrId = sanitizeCorrelationId correlationId
   when (corrId != "") (logInfo ("[CORR] " ++ corrId ++ " gossip from " ++ fromServer))
-  -- Cap inbound seenBy lists to prevent memory waste from malicious peers
-  let cappedEvents = do e <- events; yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl, seenBy: takeRelation maxSeenByLen e.seenBy}
+  -- Cap inbound seenBy lists and filter to known peers to prevent gossip suppression attacks
+  knownPeersForSeenBy <- *knownPeerServers
+  let cappedEvents = do e <- events; yield {eventType: e.eventType, pubkey: e.pubkey, server: e.server, timestamp: e.timestamp, ttl: e.ttl, seenBy: filterSeenBy (takeRelation maxSeenByLen e.seenBy) knownPeersForSeenBy}
   withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (cappedHops >= 1 && not (isLocalServer fromServer) && count cappedEvents <= maxGossipEvents) (True {}) (do
     -- Per-peer gossip event volume limiting: counts total events (not just requests) per server.
     -- A single gossip request carries up to maxGossipEvents entries; without this, a peer
@@ -6287,18 +6380,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                       writeRcBucket bkt (adjustRecipientCount recipientCounts toKey 1)
                       signalMessageForKey toKey seqTs
                       -- Record forward nonce for replay protection beyond message/ack dedup lifetime.
-                      -- Sharded: writes only to the bucket for this recipient's pubkey.
-                      fwdNonces <- readNonceBucket bkt
-                      let updatedNonces = union fwdNonces [{messageId: messageId, toKey: toKey, seenAt: t}]
-                      let evictedNonces = if count updatedNonces > maxNoncesPerBucket
-                            then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
-                            else updatedNonces
-                      let lruEvicted = count updatedNonces - count evictedNonces
-                      when (lruEvicted > 0) (do
-                        let oldestRetainedAge = case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> 0; Just {value: n} -> t - n.seenAt
-                        let level = if oldestRetainedAge < messageMaxAge then "error" else "warn"
-                        logKV level "nonce_lru_eviction" ["bucket=" ++ show bkt, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket, "oldestRetainedMs=" ++ show oldestRetainedAge])
-                      writeNonceBucket bkt evictedNonces
+                      recordForwardNonce messageId toKey t
                       yield {forward: ForwardStored {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}}
     if result.noPresence then do
       logWarn ("forward: rejected for " ++ toKey ++ " — no active presence on this server (from " ++ fromServer ++ ")")
@@ -7067,7 +7149,7 @@ handleHealth = \authorization respond -> do
                   draining: result.isDraining,
                   degradedPeers: 0})
 
-zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, totalEntries: 0, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0}}
+zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: 0, gossipSuccess: 0, gossipFail: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, totalEntries: 0, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0}}
 
 handleStats = \authorization respond -> do
   t <- now
@@ -7082,6 +7164,7 @@ handleStats = \authorization respond -> do
       -- Forward stats computed per-bucket to avoid materializing all 16 buckets into one list.
       -- Each bucket is read independently; counts and per-server stats are aggregated.
       fwdStats <- computeForwardStats 0 t
+      bucketStats <- messageBucketMinMax
       core <- atomic do
         sc <- *totalSessionCount
         pc <- *totalPresenceCount
@@ -7143,7 +7226,9 @@ handleStats = \authorization respond -> do
         cslt <- *clientSendLatencyTotal
         cslc <- *clientSendLatencyCount
         cslm <- *clientSendLatencyMax
-        yield {sr: sr, cr: cr, fr: fr, fpr: fpr, grc: grc, ir: ir, lr: lr, rr: rr, prr: prr, pc: pc, pr: pr, hc: hc, sa: sa, lp: lp, lh: lh, dr: dr, flt: flt, flc: flc, flm: flm, svc: svc, vfc: vfc, dca: dca, rlg: rlg, rli: rli, rla: rla, rlk: rlk, rlf: rlf, arq: arq, parq: parq, cplt: cplt, cplc: cplc, cplm: cplm, cslt: cslt, cslc: cslc, cslm: cslm}
+        gss <- *gossipSendSuccess
+        gsf <- *gossipSendFail
+        yield {sr: sr, cr: cr, fr: fr, fpr: fpr, grc: grc, ir: ir, lr: lr, rr: rr, prr: prr, pc: pc, pr: pr, hc: hc, sa: sa, lp: lp, lh: lh, dr: dr, flt: flt, flc: flc, flm: flm, svc: svc, vfc: vfc, dca: dca, rlg: rlg, rli: rli, rla: rla, rlk: rlk, rlf: rlf, arq: arq, parq: parq, cplt: cplt, cplc: cplc, cplm: cplm, cslt: cslt, cslc: cslc, cslm: cslm, gss: gss, gsf: gsf}
       -- Compute derived metrics
       let sessions = core.sc
       let messages = core.tmc
@@ -7168,8 +7253,8 @@ handleStats = \authorization respond -> do
       let pollAvg = if counters.cplc > 0 then counters.cplt / counters.cplc else 0
       let sendAvg = if counters.cslc > 0 then counters.cslt / counters.cslc else 0
       yield (respond {ok: True {}, version: serverBuildVersion,
-        capacity: {sessions: sessions, sessionsMax: maxSessions, sessionsPct: sessPct, messages: messages, messagesMax: maxMessages, messagesPct: msgPct, totalMessageCount: messages, presence: presence, presenceMax: maxPresenceEntries, presencePct: presPct, forwards: fwds, forwardsMax: maxForwardsEntries, forwardsPct: fwdPct, challenges: count core.c, challengesMax: maxChallenges, ackedIds: core.aCount, ackedIdsMax: maxAckedIds, ackOverflow: count core.ao, ackOverflowMax: maxAckOverflow, deliveredIds: core.dCount, deliveredIdsMax: maxDeliveredIds, forwardNonces: core.fnCount, forwardNoncesMax: maxForwardNonces, activePolls: count core.ap, activePollsMax: maxActivePolls, recipientCounts: count core.rc},
-        federation: {enabled: federationEnabled, inFlight: count core.fi, hungSlots: hungFedSlots, avgLatencyMs: fedAvg, maxLatencyMs: counters.flm, callCount: counters.flc, slowVerifies: counters.svc, verifyFailures: counters.vfc, forwardFailures: count core.ff, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, recentGossip: count core.rg, blockedPeers: count core.bp, drainCompletedAt: counters.dca, forwardServers: fwdServerCount, maxForwardQueueDepth: maxFwdDepth, topFailingPeers: topFailingPeers, pendingCancels: count core.pfc},
+        capacity: {sessions: sessions, sessionsMax: maxSessions, sessionsPct: sessPct, messages: messages, messagesMax: maxMessages, messagesPct: msgPct, totalMessageCount: messages, presence: presence, presenceMax: maxPresenceEntries, presencePct: presPct, forwards: fwds, forwardsMax: maxForwardsEntries, forwardsPct: fwdPct, challenges: count core.c, challengesMax: maxChallenges, ackedIds: core.aCount, ackedIdsMax: maxAckedIds, ackOverflow: count core.ao, ackOverflowMax: maxAckOverflow, deliveredIds: core.dCount, deliveredIdsMax: maxDeliveredIds, forwardNonces: core.fnCount, forwardNoncesMax: maxForwardNonces, activePolls: count core.ap, activePollsMax: maxActivePolls, recipientCounts: count core.rc, messageBucketMax: bucketStats.bucketMax, messageBucketMin: bucketStats.bucketMin},
+        federation: {enabled: federationEnabled, inFlight: count core.fi, hungSlots: hungFedSlots, avgLatencyMs: fedAvg, maxLatencyMs: counters.flm, callCount: counters.flc, slowVerifies: counters.svc, verifyFailures: counters.vfc, forwardFailures: count core.ff, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, recentGossip: count core.rg, blockedPeers: count core.bp, drainCompletedAt: counters.dca, forwardServers: fwdServerCount, maxForwardQueueDepth: maxFwdDepth, topFailingPeers: topFailingPeers, pendingCancels: count core.pfc, gossipSuccess: counters.gss, gossipFail: counters.gsf},
         rates: {send: count counters.sr, challenge: count counters.cr, federation: count counters.fr, federationPair: count counters.fpr, global: counters.grc, ip: count counters.ir, lookup: count counters.lr, recv: count counters.rr, pair: count counters.prr, gossipEvent: count core.ger, verifyIp: count core.vir, uniqueKeyIp: count core.ukir, pendingAckCleanups: count core.pac, senderExpirations: count core.se, senderDeliveries: count core.sdl, rejectedGlobal: counters.rlg, rejectedIp: counters.rli, rejectedAuth: counters.rla, rejectedPerKey: counters.rlk, rejectedFederation: counters.rlf},
         timing: {pruneCount: counters.pc, pruneRunning: counters.pr, heartbeatCount: counters.hc, uptime: t - counters.sa, lastPruneAt: counters.lp, lastHeartbeatAt: counters.lh, draining: counters.dr > 0, drainPhase: counters.dr, totalEntries: sessions + messages + presence + fwds + count core.c + core.aCount + count core.ao + core.dCount + core.fnCount + count core.ap + count core.fi, activeRequests: counters.arq, peakActiveRequests: counters.parq, pollAvgMs: pollAvg, pollMaxMs: counters.cplm, pollCount: counters.cplc, sendAvgMs: sendAvg, sendMaxMs: counters.cslm, sendCount: counters.cslc}})
     else yield (respond zeroStats)
@@ -7539,13 +7624,13 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
             bucket <- readMessageBucket b
             let toCancel = headOf (do m <- bucket; where m.messageId == messageId && m.toKey == to; yield m)
             case toCancel of
-              Nothing {} -> yield {cancelled: False {}, cancelServers: []}
+              Nothing {} -> yield {cancelled: False {}, cancelServers: [], nonceLruEvicted: 0, nonceOldestAge: 0}
               Just {value: msg} ->
                 -- Only allow cancelling locally-originated messages (originServer == "")
                 -- where the caller is the actual sender. Federation forwards have no
                 -- senderKey and should not be cancellable via this endpoint.
-                if msg.originServer != "" then yield {cancelled: False {}, cancelServers: []}
-                else if msg.senderKey != "" && msg.senderKey != senderKey then yield {cancelled: False {}, cancelServers: []}
+                if msg.originServer != "" then yield {cancelled: False {}, cancelServers: [], nonceLruEvicted: 0, nonceOldestAge: 0}
+                else if msg.senderKey != "" && msg.senderKey != senderKey then yield {cancelled: False {}, cancelServers: [], nonceLruEvicted: 0, nonceOldestAge: 0}
                 else do
                 writeMessageBucket b (do m <- bucket; where not (m.messageId == messageId && m.toKey == to); yield m)
                 tc <- *totalMessageCount
@@ -7568,12 +7653,10 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
                 -- Record cancel nonce: prevents replayed federation forwards of the
                 -- cancelled message from being accepted after the message is removed
                 -- from all dedup sets (messages, ackedIds, deliveredIds).
-                nonceBkt <- readNonceBucket b
-                let updatedNonces = union nonceBkt [{messageId: messageId, toKey: to, seenAt: t}]
-                writeNonceBucket b (if count updatedNonces > maxNoncesPerBucket
-                  then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
-                  else updatedNonces)
-                yield {cancelled: True {}, cancelServers: allCancelServers}
+                nonceResult <- updateForwardNonce b messageId to t
+                yield {cancelled: True {}, cancelServers: allCancelServers, nonceLruEvicted: nonceResult.lruEvicted, nonceOldestAge: nonceResult.oldestRetainedAge}
+          -- Log nonce eviction outside atomic block (println can't run inside STM)
+          logNonceEviction (pubkeyBucket to) cancelResult.nonceLruEvicted cancelResult.nonceOldestAge
           -- Send federation batch cancel to remote servers that may have the message.
           -- Uses FederationBatchCancel (single-entry batch) instead of FederationCancel
           -- for code path consistency with handleCancelBatch.
