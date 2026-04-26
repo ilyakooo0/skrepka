@@ -1366,11 +1366,6 @@ route Api = AuthApi | ClientApi | FederationApi | FederationVerifyApi | Federati
 -- Helpers
 -- ============================================
 
--- Structured log helpers (severity-prefixed for operator filtering)
-logInfo = \msg -> println ("[INFO] " ++ msg)
-logWarn = \msg -> println ("[WARN] " ++ msg)
-logError = \msg -> println ("[ERROR] " ++ msg)
-
 -- JSON structured log helper for machine-parseable events.
 -- Outputs: {"level":"<level>","event":"<event>","msg":"<message>"}
 -- Use for key operational events that monitoring pipelines need to parse
@@ -1378,7 +1373,11 @@ logError = \msg -> println ("[ERROR] " ++ msg)
 -- Plain-text logInfo/logWarn/logError remain for human-readable context.
 -- Values are escaped (quotes and backslashes) to produce valid JSON even
 -- when msg contains user-controlled data (e.g., error strings, server names).
-logEvent = \level event msg -> println ("{\"level\":\"" ++ escapeJsonString level ++ "\",\"event\":\"" ++ escapeJsonString event ++ "\",\"msg\":\"" ++ escapeJsonString msg ++ "\"}")
+logEvent = \level event msg ->
+  let formatted = "{\"level\":\"" ++ escapeJsonString level ++ "\",\"event\":\"" ++ escapeJsonString event ++ "\",\"msg\":\"" ++ escapeJsonString msg ++ "\"}"
+  in if level == "error" then logError formatted
+     else if level == "warn" then logWarn formatted
+     else logInfo formatted
 
 -- Structured key=value logging: formats message as "k1=v1 k2=v2 ..." for consistent
 -- machine-parseable log entries. Wraps logEvent with key-value pair formatting.
@@ -8244,7 +8243,7 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
                 -- from all dedup sets (messages, ackedIds, deliveredIds).
                 nonceResult <- updateForwardNonce b messageId to t
                 yield {cancelled: True {}, cancelServers: allCancelServers, nonceLruEvicted: nonceResult.lruEvicted, nonceOldestAge: nonceResult.oldestRetainedAge}
-          -- Log nonce eviction outside atomic block (println can't run inside STM)
+          -- Log nonce eviction outside atomic block (IO can't run inside STM)
           logNonceEviction (pubkeyBucket to) cancelResult.nonceLruEvicted cancelResult.nonceOldestAge
           -- Notify recipient that this message was retracted (delivered via next poll)
           when cancelResult.cancelled (do
@@ -8334,7 +8333,7 @@ sendBatchInner = \senderKey messages t acc ->
       sendBatchInner senderKey sameR.rest t (union acc results)
 
 -- Pre-generate message IDs and validate timestamps for a group of messages.
--- IO actions (genToken, logWarn) can't run inside atomic, so this runs outside.
+-- IO actions (genToken, logging) can't run inside atomic, so this runs outside.
 prepareBatchMessages = \messages t acc ->
   case headOf messages of
     Nothing {} -> yield acc
@@ -9119,11 +9118,11 @@ serve = \req -> do
   -- Polls only logged when slow (> slowRequestThreshold) to avoid log volume from long-poll traffic.
   if path != ""
     then do
-      println ("{\"level\":\"info\",\"event\":\"access\",\"req\":\"" ++ escapeJsonString reqId ++ "\",\"path\":\"" ++ escapeJsonString path ++ "\",\"ms\":" ++ show latency ++ (if ip != "" then ",\"ip\":\"" ++ escapeJsonString ip ++ "\"" else "") ++ "}")
+      logInfo ("{\"event\":\"access\",\"req\":\"" ++ escapeJsonString reqId ++ "\",\"path\":\"" ++ escapeJsonString path ++ "\",\"ms\":" ++ show latency ++ (if ip != "" then ",\"ip\":\"" ++ escapeJsonString ip ++ "\"" else "") ++ "}")
       when (latency > slowRequestThreshold)
         (logEvent "warn" "slow_request" (path ++ " " ++ show latency ++ "ms"))
     else when (latency > slowRequestThreshold) (do
-      println ("{\"level\":\"warn\",\"event\":\"access\",\"req\":\"" ++ escapeJsonString reqId ++ "\",\"path\":\"poll\",\"ms\":" ++ show latency ++ (if ip != "" then ",\"ip\":\"" ++ escapeJsonString ip ++ "\"" else "") ++ ",\"slow\":true}")
+      logWarn ("{\"event\":\"access\",\"req\":\"" ++ escapeJsonString reqId ++ "\",\"path\":\"poll\",\"ms\":" ++ show latency ++ (if ip != "" then ",\"ip\":\"" ++ escapeJsonString ip ++ "\"" else "") ++ ",\"slow\":true}")
       logEvent "warn" "slow_request" ("poll " ++ show latency ++ "ms"))
 
 -- ============================================
