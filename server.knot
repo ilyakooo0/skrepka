@@ -857,6 +857,12 @@ maxPeerLatencyEntries = 100
 -- Populated during ackPolledMessages and handleAckMessages for locally-originated messages.
 *senderDeliveries : [SenderDelivery]
 
+-- Tracks how many sender delivery receipts / expiration notifications were dropped
+-- due to capacity eviction before the sender could poll them. Reset per-sender on poll
+-- (drained with the notifications). Lets clients know they may have missed receipts.
+*droppedDeliveryReceipts : Int
+*droppedExpirationNotifs : Int
+
 -- Runtime maintenance secret: when non-empty, used instead of compile-time maintenanceSecret.
 -- Set via /maintenance/rotate-secret to enable zero-downtime secret rotation.
 -- Empty = use compile-time maintenanceSecret (default).
@@ -947,7 +953,7 @@ route AuthApi where
 route ClientApi where
   -- Long-poll for new messages; cursor tracks last-seen receivedAt timestamp
   POST {cursor: Timestamp, generation: Int, watchKeys: [PubkeyHex]} /poll headers {authorization: Text, clientIp: Text}
-    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, presenceUpdates: [{pubkey: PubkeyHex, online: Bool}], heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, messageExpirations: [{messageId: MessageIdHex, toKey: PubkeyHex, expiredAt: Timestamp}], messageDeliveries: [{messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}]}
+    -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, presenceUpdates: [{pubkey: PubkeyHex, online: Bool}], heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, messageExpirations: [{messageId: MessageIdHex, toKey: PubkeyHex, expiredAt: Timestamp}], messageDeliveries: [{messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}], droppedDeliveryReceipts: Int, droppedExpirationNotifs: Int}
     = Poll
   /messages
     -- Send an E2E encrypted message to a recipient pubkey.
@@ -1043,6 +1049,13 @@ route FederationApi where
 
 -- Federation callback verification: the receiving server calls back to the sender
 -- to confirm a request token is genuine. No shared secret needed.
+-- NOTE: Tokens are not bound to the caller's IP. A MITM that intercepts a token
+-- can replay it from a different IP within the 30-second TTL (verificationTokenExpiry).
+-- Mitigations: (1) tokens are single-use (consumed on first verify), (2) per-IP rate
+-- limiting (verifyIpRates) constrains brute-force probing, (3) the verify cache
+-- (verificationCacheMs=2s) limits the replay window after the first legitimate verify.
+-- Binding to IP would break federation through NAT/proxy topologies where the
+-- verifying server's egress IP differs from the initial request's source IP.
 route FederationVerifyApi where
   POST {token: Text, scope: Text} /federation/verify headers {clientIp: Text} -> {ok: Bool} = VerifyToken
 
@@ -2223,9 +2236,13 @@ pruneMessageBucket = \b t -> atomic do
     when (count localExpired > 0) (do
       se <- *senderExpirations
       let combined = union se localExpired
-      set *senderExpirations = if count combined > maxSenderExpirations
+      let overCap = count combined > maxSenderExpirations
+      set *senderExpirations = if overCap
         then evictOneOldest combined (\e -> e.expiredAt)
-        else combined)
+        else combined
+      when overCap (do
+        den <- *droppedExpirationNotifs
+        set *droppedExpirationNotifs = den + 1))
   else yield {}
 
 -- Prune all 16 message buckets with concurrency: fork first 15, run last in foreground.
@@ -3487,6 +3504,11 @@ sendBatchedGossipToServer = \server allEvents hops ->
       Err e -> logWarn ("federation: gossip to " ++ server ++ " failed: " ++ show e)
       Ok _ -> yield {})
 
+-- Sends gossip events to each peer server. Per-server seenBy filtering happens inside
+-- sendBatchedGossipToServer: if all events for a server are already in its seenBy list,
+-- the function returns immediately without making an HTTP call. Pre-filtering the target
+-- list here would save only function call overhead and complicate the seenBy set logic
+-- (seenBy is per-event, not per-batch), so we rely on the per-server early-exit instead.
 sendBatchedGossip : [ServerName] -> [GossipEvent] -> Int -> IO {network} {}
 sendBatchedGossip = \peerServers allEvents hops ->
   sendToEach peerServers (\server -> sendBatchedGossipToServer server allEvents hops)
@@ -3769,7 +3791,10 @@ withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
               -- since pubkey was already verified by authenticateSession above.
               let needsRefresh = any sessions (\s -> s.pubkey == pubkey && s.expiresAt - t < sessionExpiry / 2)
               when needsRefresh
-                (writeSessionBucket bucket (do s <- sessions; yield (if s.pubkey == pubkey && safeCompare s.token token then {token: s.token, pubkey: s.pubkey, expiresAt: t + sessionExpiry, ip: s.ip, createdAt: s.createdAt} else s)))
+                -- Pubkey pre-filter on safeCompare: only runs constant-time comparison for
+                -- sessions matching the authenticated pubkey (typically 1-2 per bucket),
+                -- skipping the expensive safeCompare for all unrelated sessions (~600/bucket).
+                (writeSessionBucket bucket (do s <- sessions; yield (if s.pubkey == pubkey && s.expiresAt - t < sessionExpiry / 2 && safeCompare s.token token then {token: s.token, pubkey: s.pubkey, expiresAt: t + sessionExpiry, ip: s.ip, createdAt: s.createdAt} else s)))
               onAuth pubkey
 
 -- Check if a pubkey has no remaining sessions and, if so, clean up local presence.
@@ -4511,9 +4536,13 @@ ackPolledMessages = \pubkey cursor t -> do
       when (count localDelivered > 0) (do
         sd <- *senderDeliveries
         let combined = union sd localDelivered
-        set *senderDeliveries = if count combined > maxSenderDeliveries
+        let overCap = count combined > maxSenderDeliveries
+        set *senderDeliveries = if overCap
           then evictOneOldest combined (\d -> d.deliveredAt)
-          else combined)
+          else combined
+        when overCap (do
+          ddr <- *droppedDeliveryReceipts
+          set *droppedDeliveryReceipts = ddr + 1))
       yield {pendingAcks: ackedFederated, evictedEntries: eviction.evicted}
     else yield {pendingAcks: [], evictedEntries: []}
 
@@ -4976,10 +5005,10 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
   -- Cursor staleness: cursor is older than message retention, so messages were missed.
   -- Different from cursorReset (server restart): staleness means client was offline too long.
   let cursorStale = effectiveCursor > 0 && t - effectiveCursor > unackedMessageMaxAge
-  if dp >= 2 then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: []})
+  if dp >= 2 then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0})
   else do
   globalRateLimited <- checkGlobalRate t
-  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: globalRateWindowMs, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: []})
+  if globalRateLimited then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: globalRateWindowMs, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0})
   else do
     -- Snapshot presenceVersion before long-poll wait to skip unchanged lookups
     startPresenceVersion <- *presenceVersion
@@ -5030,7 +5059,18 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
         yield capped
     -- Poll slot exhaustion: signal clients to back off for one poll cycle
     let pollRetryMs = if result.pollSlotFull then pollTimeoutMs else 0
-    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: result.pollSlotFull, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat, retryAfterMs: pollRetryMs, cursorReset: cursorWasReset, hasMore: result.hasMore, cursorStale: cursorStale, messageExpirations: expirations, messageDeliveries: deliveries})
+    -- Read and reset drop counters so clients know if they missed receipts/expirations.
+    -- Counters are global (not per-key) — a non-zero value means *some* receipts were
+    -- dropped due to capacity, though not necessarily for this sender. This is acceptable:
+    -- the client treats it as advisory ("some receipts may have been lost") rather than precise.
+    drops <- if not result.authorized then yield {dr: 0, de: 0}
+      else atomic do
+        dr <- *droppedDeliveryReceipts
+        de <- *droppedExpirationNotifs
+        when (dr > 0) (set *droppedDeliveryReceipts = 0)
+        when (de > 0) (set *droppedExpirationNotifs = 0)
+        yield {dr: dr, de: de}
+    yield (respond {events: result.events, cursor: result.cursor, authorized: result.authorized, rateLimited: result.pollSlotFull, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat, retryAfterMs: pollRetryMs, cursorReset: cursorWasReset, hasMore: result.hasMore, cursorStale: cursorStale, messageExpirations: expirations, messageDeliveries: deliveries, droppedDeliveryReceipts: drops.dr, droppedExpirationNotifs: drops.de})
 
 -- Core send logic: dedup, rate limiting, store message, create forwards.
 -- Called inside an atomic block by both handleSendMessage and sendBatchInner.
@@ -5726,9 +5766,13 @@ fedDeliveryReceipts = \bucketIds forwards t -> case headOf bucketIds of
     when (count deliveries > 0) (atomic do
       sd <- *senderDeliveries
       let combined = union sd deliveries
-      set *senderDeliveries = if count combined > maxSenderDeliveries
+      let overCap = count combined > maxSenderDeliveries
+      set *senderDeliveries = if overCap
         then evictOneOldest combined (\d -> d.deliveredAt)
-        else combined)
+        else combined
+      when overCap (do
+        ddr <- *droppedDeliveryReceipts
+        set *droppedDeliveryReceipts = ddr + 1))
     fedDeliveryReceipts rest forwards t
 
 -- POST /federation/ack: Peer server confirms delivery of messages we originated.
@@ -5874,42 +5918,52 @@ cancelBatchInner = \entries fromServer t acc ->
       -- Collect all entries targeting the same bucket
       let sameBucket = do e <- entries; where pubkeyBucket e.toKey == b; yield e
       let otherBuckets = do e <- entries; where pubkeyBucket e.toKey != b; yield e
-      -- Process the entire bucket group in one atomic block
-      results <- atomic do cancelBucketGroup sameBucket fromServer b t []
+      -- Process the entire bucket group in one atomic block.
+      -- Read buckets once upfront and thread state through the recursion.
+      results <- atomic do
+        bucket <- readMessageBucket b
+        fwdBkt <- readFwdBucket b
+        nonceBkt <- readNonceBucket b
+        rc <- readRcBucket b
+        r <- cancelBucketGroupInner sameBucket fromServer b t [] bucket fwdBkt nonceBkt rc 0 0
+        -- Write back all modified buckets once after processing all entries
+        writeMessageBucket b r.bucket
+        writeFwdBucket b r.fwdBkt
+        writeNonceBucket b r.nonceBkt
+        writeRcBucket b r.rc
+        -- Batch-adjust shared counters once (not per-entry)
+        when (r.msgRemoved > 0) (do
+          tc <- *totalMessageCount
+          set *totalMessageCount = max 0 (tc - r.msgRemoved))
+        when (r.fwdRemoved > 0) (do
+          tfc <- *totalForwardCount
+          set *totalForwardCount = max 0 (tfc - r.fwdRemoved))
+        yield r.acc
       cancelBatchInner otherBuckets fromServer t (union acc results)
 
 -- Process all cancel entries for a single bucket within one atomic block.
--- Reads messageBucket/fwdBucket once and applies all cancels, avoiding redundant reads.
-cancelBucketGroup = \entries fromServer b t acc ->
+-- Threads bucket state through recursion to avoid redundant per-entry reads.
+-- Accumulates removal counts for batch counter adjustment after the loop.
+cancelBucketGroupInner = \entries fromServer b t acc bucket fwdBkt nonceBkt rc msgRemoved fwdRemoved ->
   case headOf entries of
-    Nothing {} -> yield acc
+    Nothing {} -> yield {acc: acc, bucket: bucket, fwdBkt: fwdBkt, nonceBkt: nonceBkt, rc: rc, msgRemoved: msgRemoved, fwdRemoved: fwdRemoved}
     Just {value: entry} -> do
       let rest = do e <- entries; where e.messageId != entry.messageId || e.toKey != entry.toKey; yield e
-      bucket <- readMessageBucket b
       let toCancel = headOf (do m <- bucket; where m.messageId == entry.messageId && m.toKey == entry.toKey && m.originServer == fromServer; yield m)
-      result <- case toCancel of
-        Nothing {} -> yield {cancelled: False {}}
+      case toCancel of
+        Nothing {} ->
+          cancelBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, cancelled: False {}}]) bucket fwdBkt nonceBkt rc msgRemoved fwdRemoved
         Just {} -> do
-          writeMessageBucket b (do m <- bucket; where not (m.messageId == entry.messageId && m.toKey == entry.toKey); yield m)
-          tc <- *totalMessageCount
-          set *totalMessageCount = max 0 (tc - 1)
-          rc <- readRcBucket b
-          writeRcBucket b (adjustRecipientCount rc entry.toKey (0 - 1))
-          fwdBkt <- readFwdBucket b
-          let keptFwds = do f <- fwdBkt; where not (f.messageId == entry.messageId && f.toKey == entry.toKey); yield f
-          writeFwdBucket b keptFwds
-          let fwdRemoved = count fwdBkt - count keptFwds
-          when (fwdRemoved > 0) (do
-            tfc <- *totalForwardCount
-            set *totalForwardCount = max 0 (tfc - fwdRemoved))
-          -- Record cancel nonce for each cancelled message in the batch
-          nonceBkt <- readNonceBucket b
+          let newBucket = do m <- bucket; where not (m.messageId == entry.messageId && m.toKey == entry.toKey); yield m
+          let newRc = adjustRecipientCount rc entry.toKey (0 - 1)
+          let newFwdBkt = do f <- fwdBkt; where not (f.messageId == entry.messageId && f.toKey == entry.toKey); yield f
+          let entryFwdRemoved = count fwdBkt - count newFwdBkt
+          -- Record cancel nonce for replay protection
           let updatedNonces = union nonceBkt [{messageId: entry.messageId, toKey: entry.toKey, seenAt: t}]
-          writeNonceBucket b (if count updatedNonces > maxNoncesPerBucket
+          let newNonceBkt = if count updatedNonces > maxNoncesPerBucket
             then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
-            else updatedNonces)
-          yield {cancelled: True {}}
-      cancelBucketGroup rest fromServer b t (union acc [{messageId: entry.messageId, cancelled: result.cancelled}])
+            else updatedNonces
+          cancelBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, cancelled: True {}}]) newBucket newFwdBkt newNonceBkt newRc (msgRemoved + 1) (fwdRemoved + entryFwdRemoved)
 
 -- POST /federation/forward-batch: Receive multiple forwarded messages in one request.
 -- Each message is processed independently (same logic as handleForwardMessage).
@@ -5939,33 +5993,33 @@ forwardBatchInner = \entries fromServer t acc ->
     Nothing {} -> yield acc
     Just {value: first} -> do
       -- Pre-validate all entries: reject stale timestamps and untrusted relay origins.
-      -- Reads global state once (knownPeers, blocked, allowed) outside atomic blocks.
-      validated <- prevalidateForwardBatch entries fromServer t [] []
+      -- Read global state once before the loop (not per-entry) to avoid redundant IO.
+      knownPeers <- *knownPeerServers
+      blocked <- *blockedPeers
+      allowed <- *allowedPeers
+      let validated = prevalidateForwardBatch entries fromServer t knownPeers blocked allowed [] []
       -- Group validated entries by bucket
       forwardBatchByBucket validated.valid fromServer t (union acc validated.rejected)
 
 -- Pre-validate forward entries: reject stale timestamps and untrusted relay origins.
 -- Returns {valid: entries to store, rejected: per-message results for failed entries}.
-prevalidateForwardBatch = \entries fromServer t validAcc rejectedAcc ->
+-- Pure function: global state (knownPeers, blocked, allowed) is passed in by caller.
+prevalidateForwardBatch = \entries fromServer t knownPeers blocked allowed validAcc rejectedAcc ->
   case headOf entries of
-    Nothing {} -> yield {valid: validAcc, rejected: rejectedAcc}
-    Just {value: entry} -> do
-      let rest = do e <- entries; where e.messageId != entry.messageId || e.toKey != entry.toKey; yield e
+    Nothing {} -> {valid: validAcc, rejected: rejectedAcc}
+    Just {value: entry} ->
+      let rest = do e <- entries; where e.messageId != entry.messageId || e.toKey != entry.toKey; yield e in
       if isLocalServer entry.originServer || t - entry.timestamp > messageMaxAge
-        then prevalidateForwardBatch rest fromServer t validAcc (union rejectedAcc [{messageId: entry.messageId, ok: False {}}])
-        else do
+        then prevalidateForwardBatch rest fromServer t knownPeers blocked allowed validAcc (union rejectedAcc [{messageId: entry.messageId, ok: False {}}])
+        else
       -- Relay origin verification (same as handleForwardMessage)
-      originOk <- if fromServer == entry.originServer then yield (True {})
-        else do
-          knownPeers <- *knownPeerServers
-          blocked <- *blockedPeers
-          allowed <- *allowedPeers
-          yield (any knownPeers (\p -> p == entry.originServer)
-            && not (isBlockedPeer entry.originServer blocked)
-            && isAllowedByAllowlist entry.originServer allowed)
-      if not originOk
-        then prevalidateForwardBatch rest fromServer t validAcc (union rejectedAcc [{messageId: entry.messageId, ok: False {}}])
-        else prevalidateForwardBatch rest fromServer t (union validAcc [entry]) rejectedAcc
+      let originOk = if fromServer == entry.originServer then True {}
+        else any knownPeers (\p -> p == entry.originServer)
+          && not (isBlockedPeer entry.originServer blocked)
+          && isAllowedByAllowlist entry.originServer allowed
+      in if not originOk
+        then prevalidateForwardBatch rest fromServer t knownPeers blocked allowed validAcc (union rejectedAcc [{messageId: entry.messageId, ok: False {}}])
+        else prevalidateForwardBatch rest fromServer t knownPeers blocked allowed (union validAcc [entry]) rejectedAcc
 
 -- Group validated entries by pubkeyBucket and process each group in one atomic block.
 forwardBatchByBucket = \entries fromServer t acc ->
@@ -5975,66 +6029,79 @@ forwardBatchByBucket = \entries fromServer t acc ->
       let b = pubkeyBucket first.toKey
       let sameBucket = do e <- entries; where pubkeyBucket e.toKey == b; yield e
       let otherBuckets = do e <- entries; where pubkeyBucket e.toKey != b; yield e
-      -- Process the entire bucket group in one atomic block
-      results <- atomic do forwardBucketGroup sameBucket fromServer b t []
+      -- Process the entire bucket group in one atomic block.
+      -- Read bucket-local state once upfront and thread through the recursion.
+      results <- atomic do
+        presenceBkt <- readPresenceBucket b
+        bucket <- readMessageBucket b
+        ackedBkt <- readAckedBucket b
+        delivBkt <- readDelivBucket b
+        nonceBkt <- readNonceBucket b
+        rc <- readRcBucket b
+        r <- forwardBucketGroupInner sameBucket fromServer b t [] presenceBkt bucket ackedBkt delivBkt nonceBkt rc 0
+        -- Write back modified bucket-local state once after processing all entries
+        writeMessageBucket b r.bucket
+        writeNonceBucket b r.nonceBkt
+        writeRcBucket b r.rc
+        -- Batch-adjust totalMessageCount once (not per-entry)
+        when (r.msgStored > 0) (do
+          tc <- *totalMessageCount
+          set *totalMessageCount = tc + r.msgStored)
+        yield r.acc
       forwardBatchByBucket otherBuckets fromServer t (union acc results)
 
 -- Process all forward entries for a single bucket within one atomic block.
--- Reads presenceBucket/messageBucket/ackedBucket/deliveredBucket/nonceBucket once
--- and applies all forwards, avoiding redundant per-entry bucket reads.
-forwardBucketGroup = \entries fromServer b t acc ->
+-- Threads bucket-local state through recursion to avoid redundant per-entry reads.
+-- Shared state (recvRates, federationPairRates, seqCounter) is read per-entry since
+-- it's modified by each successful store and affects subsequent entries.
+forwardBucketGroupInner = \entries fromServer b t acc presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored ->
   case headOf entries of
-    Nothing {} -> yield acc
+    Nothing {} -> yield {acc: acc, bucket: bucket, nonceBkt: nonceBkt, rc: rc, msgStored: msgStored}
     Just {value: entry} -> do
       let rest = do e <- entries; where e.messageId != entry.messageId || e.toKey != entry.toKey; yield e
       let clampedTs = clampTimestamp entry.timestamp t
-      presenceBkt <- readPresenceBucket b
       let hasPresence = any presenceBkt (\p -> p.pubkey == entry.toKey && p.expiresAt > t)
-      result <- if not hasPresence then yield (False {})
+      if not hasPresence
+        then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: False {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
         else do
-          bucket <- readMessageBucket b
-          ackedBkt <- readAckedBucket b
-          delivBkt <- readDelivBucket b
-          nonceBkt <- readNonceBucket b
           let isDup = checkMessageDup bucket entry.messageId entry.toKey || hasMessage entry.messageId entry.toKey ackedBkt || hasMessage entry.messageId entry.toKey delivBkt || any nonceBkt (\n -> n.messageId == entry.messageId && n.toKey == entry.toKey)
-          if isDup then yield (True {})
-          else do
-            totalMsgCount <- *totalMessageCount
-            recipientCounts <- readRcBucket b
-            let recipientCount = getRecipientCount entry.toKey recipientCounts
-            if totalMsgCount >= maxMessages || recipientCount >= maxMessagesPerRecipient
-              then yield (False {})
-              else do
-                -- Per-recipient receive rate limiting (matches handleForwardMessage)
-                recvRates <- *recvRates
-                let recvResult = checkPubkeyRate recvRates entry.toKey maxRecvRatePerKey recvRateWindowMs maxRecvRateEntries t
-                if recvResult.limited then yield (False {})
+          if isDup
+            then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: True {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
+            else do
+              totalMsgCount <- *totalMessageCount
+              let recipientCount = getRecipientCount entry.toKey rc
+              if totalMsgCount + msgStored >= maxMessages || recipientCount >= maxMessagesPerRecipient
+                then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: False {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
                 else do
-                  set *recvRates = recvResult.entries
-                  -- Per-server-per-recipient rate limiting (matches handleForwardMessage)
-                  federationPairRates <- *federationPairRates
-                  let fedPairResult = checkServerRecipientRate federationPairRates fromServer entry.toKey maxFederationPairRatePerPair federationPairRateWindowMs maxFederationPairRateEntries t
-                  if fedPairResult.limited then yield (False {})
-                  else do
-                    set *federationPairRates = fedPairResult.entries
-                    seqCounter <- *seqCounter
-                    let seqTs = nextSeqTs t seqCounter
-                    set *seqCounter = seqTs
-                    let fwdExpiresAt = if entry.expiresAt > 0 && entry.expiresAt > t then min entry.expiresAt (seqTs + unackedMessageMaxAge) else seqTs + unackedMessageMaxAge
-                    let batchClampedPriority = clamp 0 maxMessagePriority entry.priority
-                    writeMessageBucket b (union bucket
-                      [{messageId: entry.messageId, toKey: entry.toKey,
-                        encryptedBlob: entry.encryptedBlob, timestamp: clampedTs, originServer: entry.originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: batchClampedPriority}])
-                    set *totalMessageCount = totalMsgCount + 1
-                    writeRcBucket b (adjustRecipientCount recipientCounts entry.toKey 1)
-                    signalMessageForKey entry.toKey seqTs
-                    fwdNonces <- readNonceBucket b
-                    let updatedNonces = union fwdNonces [{messageId: entry.messageId, toKey: entry.toKey, seenAt: t}]
-                    writeNonceBucket b (if count updatedNonces > maxNoncesPerBucket
-                      then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
-                      else updatedNonces)
-                    yield (True {})
-      forwardBucketGroup rest fromServer b t (union acc [{messageId: entry.messageId, ok: result}])
+                  -- Per-recipient receive rate limiting (matches handleForwardMessage)
+                  recvRates <- *recvRates
+                  let recvResult = checkPubkeyRate recvRates entry.toKey maxRecvRatePerKey recvRateWindowMs maxRecvRateEntries t
+                  if recvResult.limited
+                    then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: False {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
+                    else do
+                      set *recvRates = recvResult.entries
+                      -- Per-server-per-recipient rate limiting (matches handleForwardMessage)
+                      federationPairRates <- *federationPairRates
+                      let fedPairResult = checkServerRecipientRate federationPairRates fromServer entry.toKey maxFederationPairRatePerPair federationPairRateWindowMs maxFederationPairRateEntries t
+                      if fedPairResult.limited
+                        then forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: False {}}]) presenceBkt bucket ackedBkt delivBkt nonceBkt rc msgStored
+                        else do
+                          set *federationPairRates = fedPairResult.entries
+                          seqCounter <- *seqCounter
+                          let seqTs = nextSeqTs t seqCounter
+                          set *seqCounter = seqTs
+                          let fwdExpiresAt = if entry.expiresAt > 0 && entry.expiresAt > t then min entry.expiresAt (seqTs + unackedMessageMaxAge) else seqTs + unackedMessageMaxAge
+                          let batchClampedPriority = clamp 0 maxMessagePriority entry.priority
+                          let newBucket = union bucket
+                            [{messageId: entry.messageId, toKey: entry.toKey,
+                              encryptedBlob: entry.encryptedBlob, timestamp: clampedTs, originServer: entry.originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: batchClampedPriority}]
+                          let newRc = adjustRecipientCount rc entry.toKey 1
+                          signalMessageForKey entry.toKey seqTs
+                          let updatedNonces = union nonceBkt [{messageId: entry.messageId, toKey: entry.toKey, seenAt: t}]
+                          let newNonceBkt = if count updatedNonces > maxNoncesPerBucket
+                            then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
+                            else updatedNonces
+                          forwardBucketGroupInner rest fromServer b t (union acc [{messageId: entry.messageId, ok: True {}}]) presenceBkt newBucket ackedBkt delivBkt newNonceBkt newRc (msgStored + 1)
 
 -- POST /messages/cancel-batch: Cancel multiple sent messages in one request.
 -- Auth checked once; each cancel processed independently. Partial success possible.
@@ -6781,7 +6848,8 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
           yield rateResult.limited
         if ackRateLimited then yield (respond {ok: False {}, authorized: True {}, ackedCount: 0, error: "rate_limited"})
         else do
-        let dedupedIds = dedupMessageIds messageIds
+        -- Cap input size to prevent expensive scans from unbounded messageIds lists
+        let dedupedIds = dedupMessageIds (takeRelation maxMessageIds messageIds)
         result <- atomic do
           let b = pubkeyBucket pubkey
           bucket <- readMessageBucket b
@@ -6808,9 +6876,13 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
             when (count localDelivered > 0) (do
               sd <- *senderDeliveries
               let combined = union sd localDelivered
-              set *senderDeliveries = if count combined > maxSenderDeliveries
+              let overCap = count combined > maxSenderDeliveries
+              set *senderDeliveries = if overCap
                 then evictOneOldest combined (\d -> d.deliveredAt)
-                else combined)
+                else combined
+              when overCap (do
+                ddr <- *droppedDeliveryReceipts
+                set *droppedDeliveryReceipts = ddr + 1))
             yield {ackedCount: ackCount, pendingAcks: ackedFederated, evictedEntries: eviction.evicted}
           else yield {ackedCount: 0, pendingAcks: [], evictedEntries: []}
         fork (when federationEnabled (do
@@ -6877,7 +6949,8 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
           yield rateResult.limited
         if deleteRateLimited then yield (respond {ok: False {}, authorized: True {}, deletedCount: 0, error: "rate_limited"})
         else do
-          let dedupedIds = dedupMessageIds messageIds
+          -- Cap input size to prevent expensive scans from unbounded messageIds lists
+          let dedupedIds = dedupMessageIds (takeRelation maxMessageIds messageIds)
           deleteResult <- atomic do
             let b = pubkeyBucket pubkey
             bucket <- readMessageBucket b
@@ -6902,9 +6975,13 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
               when (count localDeleted > 0) (do
                 sd <- *senderDeliveries
                 let combinedDel = union sd localDeleted
-                set *senderDeliveries = if count combinedDel > maxSenderDeliveries
+                let overCapDel = count combinedDel > maxSenderDeliveries
+                set *senderDeliveries = if overCapDel
                   then evictOneOldest combinedDel (\d -> d.deliveredAt)
-                  else combinedDel)
+                  else combinedDel
+                when overCapDel (do
+                  ddr <- *droppedDeliveryReceipts
+                  set *droppedDeliveryReceipts = ddr + 1))
               if count ackedFederated > 0 then do
                 ackedBkt <- readAckedBucket b
                 let combinedAcked = union ackedBkt ackedFederated
@@ -7686,7 +7763,7 @@ serveOverloaded = \req -> case req of
   VerifyAuth {respond} -> respond {token: "", expiresAt: 0, error: "overloaded"}
   RevokeSession {respond} -> respond {ok: False {}, authorized: False {}}
   Logout {respond} -> respond {ok: False {}, authorized: False {}}
-  Poll {respond} -> respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: 0, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 1000, cursorReset: False {}, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: []}
+  Poll {respond} -> respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: 0, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 1000, cursorReset: False {}, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0}
   SendMessage {respond} -> respond {status: MsRejected {}, messageId: "", retryAfterMs: 1000, error: "overloaded"}
   MessageStatus {respond} -> respond {status: "", authorized: False {}}
   AckMessages {respond} -> respond {ok: False {}, authorized: False {}, ackedCount: 0, error: "overloaded"}
@@ -7937,6 +8014,11 @@ backgroundSnapshot = do
       lastFp <- *lastSnapshotFingerprint
       let stateChanged = lastFp == 0 || fingerprint != lastFp
       when (hasState && stateChanged && (lastAutoExport == 0 || t - lastAutoExport >= autoSnapshotExportInterval)) (do
+        -- NOTE: TOCTOU between the fingerprint/hasState check above and the atomic snapshot
+        -- below. State could change between the two reads (e.g., a message arrives, presence
+        -- is pruned). This is acceptable: worst case is one extra export (fingerprint changed
+        -- after we decided to export) or one skipped export (state became empty after we
+        -- decided to export). The next backgroundSnapshot cycle corrects either case.
         -- Single atomic read for consistent [SNAPSHOT_DATA] output (used for restore).
         -- Previous per-collection reads caused inconsistencies (e.g., ackedIds referencing
         -- messageIds from a different snapshot window). The contention cost is acceptable
