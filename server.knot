@@ -1310,11 +1310,6 @@ route MaintenanceApi where
   GET /maintenance/config headers {authorization: Text}
     -> {ok: Bool, maxMessagesPerRecipient: Int, maxGossipHops: Int, pollTimeoutMs: Int, ackGracePeriod: Int}
     = GetConfig
-  -- Update operational config at runtime (0 = reset to compile-time default)
-  POST {maxMessagesPerRecipient: Int, maxGossipHops: Int, pollTimeoutMs: Int, ackGracePeriod: Int} /maintenance/config headers {authorization: Text}
-    -> {ok: Bool}
-    = SetConfig
-
 route HealthApi where
   GET /health headers {authorization: Text} -> {ok: Bool, version: Text, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, capacityWarning: Bool, federationHealthy: Bool, watchdogHealthy: Bool, nonceHealthy: Bool, forwardQueueHealthy: Bool, requestPressureHealthy: Bool, draining: Bool, degradedPeers: Int} = Health
 
@@ -8832,21 +8827,6 @@ handleGetConfig = \authorization respond -> do
       yield {maxMessagesPerRecipient: mpr, maxGossipHops: mgh, pollTimeoutMs: ptm, ackGracePeriod: agp}
     yield (respond {ok: True {}, maxMessagesPerRecipient: result.maxMessagesPerRecipient, maxGossipHops: result.maxGossipHops, pollTimeoutMs: result.pollTimeoutMs, ackGracePeriod: result.ackGracePeriod})
 
--- POST /maintenance/config: Update operational parameters at runtime. 0 = reset to compile-time default.
--- Changes take effect immediately for new requests. Existing long-polls continue with old values.
-handleSetConfig = \newMaxMessagesPerRecipient newMaxGossipHops newPollTimeoutMs newAckGracePeriod authorization respond -> do
-  authorized <- verifyMaintenanceAuth authorization
-  if not authorized then yield (respond {ok: False {}})
-  else do
-    logEvent "audit" "set_config" ("maxMessagesPerRecipient=" ++ show newMaxMessagesPerRecipient ++ " maxGossipHops=" ++ show newMaxGossipHops ++ " pollTimeoutMs=" ++ show newPollTimeoutMs ++ " ackGracePeriod=" ++ show newAckGracePeriod)
-    atomic do
-      set *configOverrideMaxMessagesPerRecipient = max 0 newMaxMessagesPerRecipient
-      set *configOverrideMaxGossipHops = max 0 newMaxGossipHops
-      set *configOverridePollTimeoutMs = max 0 newPollTimeoutMs
-      set *configOverrideAckGracePeriod = max 0 newAckGracePeriod
-    logInfo ("config: updated — maxMessagesPerRecipient=" ++ show newMaxMessagesPerRecipient ++ " maxGossipHops=" ++ show newMaxGossipHops ++ " pollTimeoutMs=" ++ show newPollTimeoutMs ++ " ackGracePeriod=" ++ show newAckGracePeriod ++ " (0 = default)")
-    yield (respond {ok: True {}})
-
 -- Extract request path for access logging (excludes poll to reduce log volume)
 requestPath = \req -> case req of
   ReqChallenge {} -> "POST /auth/challenge"
@@ -8895,7 +8875,6 @@ requestPath = \req -> case req of
   Reconcile {} -> "POST /maintenance/reconcile"
   RotateSecret {} -> "POST /maintenance/rotate-secret"
   GetConfig {} -> "GET /maintenance/config"
-  SetConfig {} -> "POST /maintenance/config"
   Health {} -> "GET /health"
   Stats {} -> "GET /stats"
   StatsPeers {} -> "GET /stats/peers"
@@ -8986,7 +8965,6 @@ serveInner = \req -> case req of
   Reconcile {authorization, respond} -> handleReconcile authorization respond
   RotateSecret {newSecret, authorization, respond} -> handleRotateSecret newSecret authorization respond
   GetConfig {authorization, respond} -> handleGetConfig authorization respond
-  SetConfig {maxMessagesPerRecipient, maxGossipHops, pollTimeoutMs, ackGracePeriod, authorization, respond} -> handleSetConfig maxMessagesPerRecipient maxGossipHops pollTimeoutMs ackGracePeriod authorization respond
   Health {authorization, respond} -> handleHealth authorization respond
   Stats {authorization, respond} -> handleStats authorization respond
   StatsPeers {authorization, respond} -> handleStatsPeers authorization respond
@@ -9069,7 +9047,6 @@ serveOverloaded = \req -> case req of
   ListAllowed {respond} -> respond {peers: [], ok: False {}}
   RotateSecret {respond} -> respond {ok: False {}, error: "overloaded"}
   GetConfig {respond} -> respond {ok: False {}, maxMessagesPerRecipient: 0, maxGossipHops: 0, pollTimeoutMs: 0, ackGracePeriod: 0}
-  SetConfig {respond} -> respond {ok: False {}}
   Metrics {respond} -> respond {metrics: "", ok: False {}}
   -- Exempt routes handled by isOverloadExempt; this branch is unreachable
   _ -> yield {}
