@@ -443,10 +443,15 @@ any : [a] -> (a -> Bool) -> Bool
 any = \xs pred -> fold (\acc x -> if acc then acc else pred x) (False {}) xs
 none : [a] -> (a -> Bool) -> Bool
 none = \xs pred -> not (any xs pred)
+all : [a] -> (a -> Bool) -> Bool
+all = \xs pred -> none xs (\x -> not (pred x))
 when = \cond action -> if cond then action else yield {}
 clamp = \lo hi x -> if x < lo then lo else if x > hi then hi else x
 min = \a b -> if a < b then a else b
 max = \a b -> if a > b then a else b
+
+-- Dedup: keeps first occurrence (O(n^2)).
+unique = \items -> fold (\acc x -> if any acc (\a -> a == x) then acc else union acc [x]) [] items
 
 headOf = \items -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
@@ -511,21 +516,18 @@ tooLong = \s maxLen -> drop maxLen s != ""
 
 isValidHex : Text -> Bool
 isValidHex = \s ->
-  s != "" && drop 1 s != ""
-  && contains (take 1 s) "0123456789abcdef"
-  && contains (take 1 (drop 1 s)) "0123456789abcdef"
-  && (drop 2 s == "" || isValidHex (drop 2 s))
+  let n = count (chars s) in
+  n > 0 && n / 2 * 2 == n && all (chars s) (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
 
--- Strip all trailing dots by recursing left-to-right; once the tail is all dots, it's dropped.
 stripTrailingDot : Text -> Text
 stripTrailingDot = \s ->
-  if s == "" then ""
-  else if take 1 s != "." then take 1 s ++ stripTrailingDot (drop 1 s)
-  else let rest = stripTrailingDot (drop 1 s) in
-    if rest == "" then "" else "." ++ rest
+  let n = count (chars s) in
+  if n == 0 then ""
+  else if drop (n - 1) s == "." then stripTrailingDot (take (n - 1) s)
+  else s
 
 normalizeServerName : Text -> Text
 normalizeServerName = \s -> toLower (stripTrailingDot s)
@@ -541,26 +543,16 @@ containsSuffix = \suffix s ->
   let sLen = count (chars s) in
   sLen >= suffixLen && drop (sLen - suffixLen) s == suffix
 
--- Block private/reserved/internal hostnames (SSRF defense). Simplified vs original:
--- still rejects the high-value cases (loopback, RFC1918, link-local, metadata services)
--- but skips obscure encoding tricks (octal, hex, percent-encoding).
+-- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
+-- tricks (octal, hex, percent-encoding) but covers the high-value cases.
 isBadServerName : Text -> Bool
 isBadServerName = \sn ->
   let fc = take 1 sn in
   fc == "" || fc == "." || fc == ":" || fc == "["
-  || any (chars sn) (\c -> not (contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:"))
+  || not (all (chars sn) (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:"))
   || sn == "localhost"
-  || containsSuffix ".localhost" sn
-  || containsSuffix ".local" sn
-  || containsSuffix ".internal" sn
-  || containsSuffix ".arpa" sn
-  || containsSuffix ".onion" sn
-  || take 4 sn == "127."
-  || take 3 sn == "10."
-  || take 8 sn == "192.168."
-  || take 8 sn == "169.254."
-  || take 2 sn == "0."
-  || take 2 sn == "::"
+  || any [".localhost", ".local", ".internal", ".arpa", ".onion"] (\suf -> containsSuffix suf sn)
+  || any ["127.", "10.", "192.168.", "169.254.", "0.", "::"] (\pre -> take (count (chars pre)) sn == pre)
 
 -- ============================================
 -- Auth helpers
@@ -778,9 +770,7 @@ nextSeqTs : Timestamp -> Timestamp -> Timestamp
 nextSeqTs = \t seqCounter -> if t > seqCounter then t else seqCounter + 1
 
 dedupMessageIds : [MessageIdHex] -> [MessageIdHex]
-dedupMessageIds = \ids ->
-  let capped = takeRelation maxMessageIds ids in
-  fold (\acc mid -> if any acc (\a -> a == mid) then acc else union acc [mid]) [] capped
+dedupMessageIds = \ids -> takeRelation maxMessageIds (unique ids)
 
 presenceForKey = \presence pubkey t ->
   do p <- presence; where p.pubkey == pubkey && p.expiresAt > t; yield p
@@ -797,10 +787,7 @@ hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey 
 
 collectPeers : [a] -> (a -> Text) -> [Text]
 collectPeers = \items getServer ->
-  fold (\acc item ->
-    let s = getServer item in
-    if isLocalServer s || any acc (\a -> a == s) then acc
-    else union acc [s]) [] items
+  unique (do x <- items; let s = getServer x; where not (isLocalServer s); yield s)
 
 knownPeerServersFromPresence : [PresenceEntry] -> [Text]
 knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.server)
@@ -969,7 +956,7 @@ refreshLocalPresence = \t -> do
   refreshState <- atomic do
     sessions <- *sessions
     presence <- *presence
-    let activeKeys = fold (\acc s -> if any acc (\a -> a == s.pubkey) then acc else union acc [s.pubkey]) [] sessions
+    let activeKeys = unique (do s <- sessions; yield s.pubkey)
     let updated = do
       p <- presence
       yield (if isLocalServer p.server && any activeKeys (\k -> k == p.pubkey) && p.expiresAt - t < sessionExpiry / 2
@@ -1499,7 +1486,7 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
                     set *forwards = do f <- fwds; where not (f.messageId == messageId && f.toKey == to); yield f
                     pres <- *presence
                     let presServers = collectPeers (presenceForKey pres to t) (\p -> p.server)
-                    let allServers = fold (\acc s -> if any acc (\a -> a == s) then acc else union acc [s]) presServers fwdServers
+                    let allServers = unique (union presServers fwdServers)
                     cn <- *cancelNotifications
                     set *cancelNotifications = capList (union cn [{toKey: to, messageId: messageId, cancelledAt: t}]) 10000 (\c -> c.cancelledAt)
                     yield {cancelled: True {}, cancelServers: allServers}
@@ -1986,7 +1973,7 @@ handleAdminRevokeIp = \ip authorization respond -> do
       ses <- *sessions
       let mine = do s <- ses; where s.ip == ip; yield s
       set *sessions = do s <- ses; where s.ip != ip; yield s
-      let keys = fold (\acc s -> if any acc (\a -> a == s.pubkey) then acc else union acc [s.pubkey]) [] mine
+      let keys = unique (do s <- mine; yield s.pubkey)
       yield {revoked: count mine, keys: count keys}
     yield (respond {ok: True {}, revokedCount: result.revoked, affectedKeys: result.keys})
 
@@ -1997,10 +1984,13 @@ handleAdminListAllSessions = \limit authorization respond -> do
     t <- now
     ses <- *sessions
     let active = do s <- ses; where s.expiresAt > t; yield s
-    let grouped = fold (\acc s ->
-      if any acc (\a -> a.pubkey == s.pubkey)
-        then do a <- acc; yield (if a.pubkey == s.pubkey then {pubkey: a.pubkey, count: a.count + 1, ips: if any a.ips (\i -> i == s.ip) || s.ip == "" then a.ips else union a.ips [s.ip], latestExpiry: max a.latestExpiry s.expiresAt} else a)
-        else union acc [{pubkey: s.pubkey, count: 1, ips: if s.ip == "" then [] else [s.ip], latestExpiry: s.expiresAt}]) [] active
+    let grouped = do
+      pk <- unique (do s <- active; yield s.pubkey)
+      let mine = do s <- active; where s.pubkey == pk; yield s
+      yield {pubkey: pk,
+             count: count mine,
+             ips: unique (do s <- mine; where s.ip != ""; yield s.ip),
+             latestExpiry: fold (\acc s -> max acc s.expiresAt) 0 mine}
     let sorted = sortBy (\g -> 0 - g.count) grouped
     let effLimit = if limit <= 0 then 100 else clamp 1 500 limit
     yield (respond {sessions: takeRelation effLimit sorted, ok: True {}, total: count grouped})
@@ -2101,10 +2091,9 @@ handleTopRecipients = \limit authorization respond -> do
   if not authorized then yield (respond {recipients: [], ok: False {}, total: 0})
   else do
     msgs <- *messages
-    let counts = fold (\acc m ->
-      if any acc (\a -> a.pubkey == m.toKey)
-        then do a <- acc; yield (if a.pubkey == m.toKey then {pubkey: a.pubkey, count: a.count + 1} else a)
-        else union acc [{pubkey: m.toKey, count: 1}]) [] msgs
+    let counts = do
+      pk <- unique (do m <- msgs; yield m.toKey)
+      yield {pubkey: pk, count: count (do m <- msgs; where m.toKey == pk; yield m)}
     let sorted = sortBy (\c -> 0 - c.count) counts
     let effLimit = if limit <= 0 then 20 else clamp 1 100 limit
     yield (respond {recipients: takeRelation effLimit sorted, ok: True {}, total: count counts})
