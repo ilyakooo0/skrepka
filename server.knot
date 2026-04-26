@@ -3985,8 +3985,6 @@ fetchAndCachePeerKey = \server t -> do
 -- Verify an inbound Ed25519 signed federation request.
 -- Reconstructs the signed message from (scope, requestTimestamp, fromServer),
 -- fetches the peer's public key (cached), and verifies the signature.
--- On verification failure, re-fetches the key once (handles peer key rotation
--- or restart with new key) and retries before rejecting.
 verifyFederationSignature : Text -> Text -> Text -> Timestamp -> IO {network} Bool
 verifyFederationSignature = \fromServer signatureHex scope requestTimestamp -> do
   t <- now
@@ -3994,13 +3992,7 @@ verifyFederationSignature = \fromServer signatureHex scope requestTimestamp -> d
   if pubkeyHex == "" then yield (False {})
   else do
     let message = textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ fromServer)
-    let sigValid = verify (bytesFromHex pubkeyHex) message (bytesFromHex signatureHex)
-    if sigValid then yield (True {})
-    else do
-      -- Key may be stale (peer restarted with new key). Re-fetch once and retry.
-      refetched <- fetchAndCachePeerKey fromServer t
-      if refetched == "" || refetched == pubkeyHex then yield (False {})
-      else yield (verify (bytesFromHex refetched) message (bytesFromHex signatureHex))
+    yield (verify (bytesFromHex pubkeyHex) message (bytesFromHex signatureHex))
 
 -- Federation auth wrapper. Intentionally does NOT call checkPreAuth because:
 -- (a) Soft drain (phase 1) blocks new client auth but must not block federation —
