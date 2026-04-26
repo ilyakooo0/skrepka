@@ -52,6 +52,12 @@ maxBatchSize = 100 -- max messages per batch request (bounds recursion depth in 
 maxMessagePriority = 10 -- max priority value (clamped on ingress)
 maxGossipEvents = 100
 maxPollEvents = 50
+-- Fraction of maxPollEvents reserved for priority-0 messages (normal priority).
+-- Prevents high-priority floods from completely starving normal messages.
+-- With maxPollEvents=50 and reservedPollFraction=5, at least 10 slots (50/5)
+-- are reserved for priority-0 when both priority levels have pending messages.
+-- 0 = disable reservation (old behavior: strict priority ordering).
+reservedPollFraction = 5
 maxPresenceEntries = 10000
 maxMessagesPerRecipient = 500
 maxMessages = 100000 -- global cap on total stored messages across all recipients
@@ -177,11 +183,11 @@ federationLatencyWindowMs : Int<Ms>
 federationLatencyWindowMs = 300000 -- 5 minutes; reset latency metrics after this interval
 
 -- Snapshot format version (increment on schema changes to prevent corrupt restores)
-snapshotVersion = 12 -- bumped for ForwardEntry.senderKey and federation forward priority
+snapshotVersion = 13 -- bumped for double-hash snapshot integrity tag
 
 -- Server build version: included in /health and /stats responses for deployment verification.
 -- Update this string when deploying a new build so operators can confirm which version is running.
-serverBuildVersion = "2026-04-26b"
+serverBuildVersion = "2026-04-26c"
 
 -- Federation protocol version: included in gossip/forward/ack requests.
 -- Peers log warnings when they receive requests from older versions.
@@ -198,15 +204,18 @@ snapshotChecksum = \presenceCount ackedCount deliveredCount forwardCount nonceCo
   presenceCount * 100003 + ackedCount * 100019 + deliveredCount * 100043 + forwardCount * 100049 + nonceCount * 100057
 
 -- Snapshot integrity tag: combines checksum with maintenance secret to detect tampering.
--- Not cryptographic (no HMAC primitive in Knot), but catches naive modifications.
--- The tag includes the secret's hex representation hashed with the checksum, so an
--- attacker who modifies the snapshot but doesn't know the secret cannot recompute it.
+-- Not cryptographic (no HMAC primitive in Knot), but uses a double-hash scheme with
+-- independent seeds and multipliers to resist inversion attacks. An attacker who
+-- captures one valid (snapshot, tag) pair cannot derive the secretHash components
+-- independently because the final mixing step entangles them non-linearly.
 -- Returns 0 when no maintenance secret is configured (no integrity protection).
 snapshotIntegrityTag : Int -> Text -> Int
 snapshotIntegrityTag = \checksum secret ->
   if secret == "" then 0
-  else let secretHash = fold (\acc c -> acc * 31 + hexCharIndex c) 7 (chars (bytesToHex (textToBytes secret)))
-  in checksum * 100069 + secretHash * 100081
+  else let secretChars = chars (bytesToHex (textToBytes secret))
+  in let hash1 = fold (\acc c -> acc * 31 + hexCharIndex c) 7 secretChars
+  in let hash2 = fold (\acc c -> acc * 37 + hexCharIndex c) 13 secretChars
+  in (checksum * 100069 + hash1 * 100081) * 100003 + (checksum * 100057 + hash2 * 100019)
 
 -- Max seenBy list length in gossip events (bounds memory and bandwidth per event)
 maxSeenByLen = 20
@@ -907,6 +916,8 @@ maxPeerLatencyEntries = 100
 *cachedHealthWatchdog : Bool
 *cachedHealthNonce : Bool
 *cachedHealthCapacityWarning : Bool
+-- Cached count of federation peers with active failure records (degraded connectivity)
+*cachedHealthDegradedPeers : Int
 
 -- ============================================
 -- Routes
@@ -1139,7 +1150,7 @@ route MaintenanceApi where
     = RotateSecret
 
 route HealthApi where
-  GET /health headers {authorization: Text} -> {ok: Bool, version: Text, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, capacityWarning: Bool, federationHealthy: Bool, snapshotHealthy: Bool, watchdogHealthy: Bool, nonceHealthy: Bool, draining: Bool} = Health
+  GET /health headers {authorization: Text} -> {ok: Bool, version: Text, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, capacityWarning: Bool, federationHealthy: Bool, snapshotHealthy: Bool, watchdogHealthy: Bool, nonceHealthy: Bool, draining: Bool, degradedPeers: Int} = Health
 
 -- Returns counts of in-memory collections (requires maintenance secret)
 -- TODO: If Knot adds raw text response support, add a /metrics endpoint
@@ -2781,6 +2792,21 @@ pruneAllAckedBuckets = \b retainCutoff ->
       writeAckedBucket b (do a <- bucket; where a.ackedAt > retainCutoff; yield a)
     pruneAllAckedBuckets (b + 1) retainCutoff
 
+-- Per-bucket pruning for forward entries (avoids readAllForwards/writeAllForwards repartitioning).
+-- Each bucket is pruned in its own atomic block to reduce lock contention with sendMessageCore.
+-- Returns the total count of surviving entries for totalForwardCount reconciliation.
+pruneAllFwdBuckets : Int -> Timestamp -> Bool -> Int -> IO Int
+pruneAllFwdBuckets = \b retainCutoff fedEnabled acc ->
+  if b > 15 then yield acc
+  else do
+    kept <- atomic do
+      bucket <- readFwdBucket b
+      let pruned = if not fedEnabled then []
+        else do f <- bucket; where f.createdAt > retainCutoff; yield f
+      writeFwdBucket b pruned
+      yield (count pruned)
+    pruneAllFwdBuckets (b + 1) retainCutoff fedEnabled (acc + kept)
+
 -- Find the oldest (minimum) ackedAt timestamp across all 16 acked buckets.
 -- Returns 0 if no acked entries exist. Avoids materializing all buckets into one list.
 computeOldestAckedAt : Int -> IO Timestamp
@@ -3308,14 +3334,11 @@ pruneExpired = \t -> do
   -- Prune federation state (split into per-collection blocks to reduce lock contention
   -- with poll-ack paths that write to ackedIds/deliveredIds concurrently).
   let retainCutoff = t - messageMaxAge
-  -- Forwards: independent from acked/delivered, safe to prune separately
-  atomic do
-    forwards <- readAllForwards
-    -- Clear all forwards when federation is disabled (they can never be retried)
-    let prunedForwards = if not federationEnabled then []
-      else do f <- forwards; where f.createdAt > retainCutoff; yield f
-    writeAllForwards prunedForwards
-    set *totalForwardCount = count prunedForwards
+  -- Forwards: per-bucket pruning (same pattern as acked/delivered).
+  -- Each bucket is pruned in its own atomic block to reduce lock contention
+  -- with sendMessageCore which writes to forward buckets on the hot path.
+  fwdSurvivorCount <- pruneAllFwdBuckets 0 retainCutoff federationEnabled 0
+  atomic do set *totalForwardCount = fwdSurvivorCount
   -- AckedIds: per-bucket pruning (each bucket in its own atomic block to reduce lock
   -- contention with poll-ack paths that write to ackedIds concurrently).
   pruneAllAckedBuckets 0 retainCutoff
@@ -3950,11 +3973,23 @@ retryForwardsBatchResults = \batch results server ->
           incrementForwardRetries f.messageId server f.toKey
           retryForwardsBatchResults rest results server
 
+-- Collect forwards from all 16 buckets, but only for eligible servers.
+-- Reads one bucket at a time to avoid materializing all forwards simultaneously.
+collectEligibleForwards : Int -> [Text] -> IO [ForwardEntry]
+collectEligibleForwards = \b eligibleServers ->
+  if b > 15 then yield []
+  else do
+    bucket <- readFwdBucket b
+    let eligible = do f <- bucket; where any eligibleServers (\s -> s == f.toServer); yield f
+    rest <- collectEligibleForwards (b + 1) eligibleServers
+    yield (unionNE eligible rest)
+
 -- Retry all pending forwards, respecting per-server backoff. Skips servers that failed recently.
 -- Circuit breaker: skips entirely when too many peers are failing (likely local network issue).
-retryPendingForwards : [ForwardEntry] -> IO {network} {}
-retryPendingForwards = \pending -> do
-  let servers = collectPeerServers pending (\x -> x.toServer)
+-- Per-bucket: reads forward buckets one at a time, collecting only entries for eligible servers,
+-- instead of materializing all forwards into memory via readAllForwards.
+retryPendingForwardsFromBuckets : IO {network} {}
+retryPendingForwardsFromBuckets = do
   t <- now
   failures <- *forwardFailures
   if isFederationCircuitOpen failures t
@@ -3964,8 +3999,15 @@ retryPendingForwards = \pending -> do
     else do
   inFlight <- *federationInFlight
   blocked <- *blockedPeers
-  let eligibleServers = do s <- servers; where shouldRetryServerEx s t failures inFlight blocked; yield s
-  let eligibleForwards = do f <- pending; where any eligibleServers (\s -> s == f.toServer); yield f
+  -- Discover servers with pending forwards per-bucket (reuses computeForwardStats which
+  -- reads one bucket at a time), then filter to eligible servers before reading entries.
+  fwdStats <- computeForwardStats 0 t
+  let allServers = do sc <- fwdStats.serverCounts; yield sc.server
+  let eligibleServers = do s <- allServers; where shouldRetryServerEx s t failures inFlight blocked; yield s
+  if count eligibleServers == 0 then yield {}
+  else do
+  -- Read only entries for eligible servers (per-bucket, streaming)
+  eligibleForwards <- collectEligibleForwards 0 eligibleServers
   -- Prioritize forwards for recipients with active polls (currently online).
   -- These keys will receive the message sooner, improving delivery latency.
   -- Forwards for offline keys are retried after online-key forwards complete.
@@ -4286,7 +4328,6 @@ pruneAndRetry = \t -> do
       -- without the full per-bucket rebuild (O(16 bucket scans) vs O(all messages))
       rcTotal <- sumRcBucketTotals 0
       set *totalMessageCount = rcTotal)
-  pendingForwards <- atomic do f <- readAllForwards; yield f
   ackState <- atomic do
     ackedIds2 <- readAllAcked
     let pendingAcks = do a <- ackedIds2; where not (isLocalServer a.originServer); yield a
@@ -4358,12 +4399,12 @@ pruneAndRetry = \t -> do
     set *pendingAckCleanups = remaining
     yield ready
   when (count readyCleanups > 0) (ackCleanupForwards readyCleanups t)
-  let result = {pendingForwards: pendingForwards, pendingAcks: ackState.pendingAcks, pendingOverflow: ackState.pendingOverflow, extendedActive: refreshResult.extendedActive, nearExpiryActive: refreshResult.nearExpiryActive, refreshPeers: refreshResult.refreshPeers, shouldRefresh: refreshResult.shouldRefresh}
+  let result = {pendingAcks: ackState.pendingAcks, pendingOverflow: ackState.pendingOverflow, extendedActive: refreshResult.extendedActive, nearExpiryActive: refreshResult.nearExpiryActive, refreshPeers: refreshResult.refreshPeers, shouldRefresh: refreshResult.shouldRefresh}
   -- Fork federation I/O so hung peers don't block next prune cycle
   fork (do
     broadcastOfflineGossip t pr.peerServers pr.expiredLocal
     when federationEnabled (do
-      retryPendingForwards result.pendingForwards
+      retryPendingForwardsFromBuckets
       sendAcksAndClean result.pendingAcks
       retryOverflowAcks result.pendingOverflow))
   -- Only gossip extended sessions; keys nearing expiry without active sessions will naturally
@@ -4474,13 +4515,24 @@ ackPolledMessages = \pubkey cursor t -> do
 
 pollNewEvents = \pubkey clampedCursor t -> do
   bucket <- readMessageBucket (pubkeyBucket pubkey)
-  -- Priority-aware delivery: high-priority messages surface first within the maxPollEvents cap.
-  -- Sort key: (-priority * a large constant + receivedAt) ensures priority dominates while
-  -- preserving receivedAt order within the same priority level. The constant must exceed the
-  -- maximum possible receivedAt spread within one poll batch (bounded by messageMaxAge).
-  -- Priority 0 (default) sorts after all higher priorities.
-  let allPollable = sortBy (\m -> (0 - m.priority) * 10000000000000 + m.receivedAt) (pollableMessages bucket pubkey clampedCursor t)
-  let limitedMsgs = takeRelation maxPollEvents allPollable
+  let raw = pollableMessages bucket pubkey clampedCursor t
+  -- Priority-aware delivery with starvation prevention: reserve a fraction of
+  -- maxPollEvents for priority-0 messages so high-priority floods can't completely
+  -- starve normal messages. Reservation only activates when both pools have messages.
+  let priority0 = do m <- raw; where m.priority == 0; yield m
+  let highPri = do m <- raw; where m.priority > 0; yield m
+  let reservedSlots = if reservedPollFraction > 0 && count highPri > 0 && count priority0 > 0
+    then max 1 (maxPollEvents / reservedPollFraction)
+    else 0
+  let highPriSlots = maxPollEvents - reservedSlots
+  let sortedHigh = sortBy (\m -> (0 - m.priority) * 10000000000000 + m.receivedAt) highPri
+  let sortedLow = sortBy (\m -> m.receivedAt) priority0
+  let selectedHigh = takeRelation highPriSlots sortedHigh
+  let selectedLow = takeRelation reservedSlots sortedLow
+  -- Merge and re-sort to maintain correct cursor advancement (lastReceivedAt must
+  -- reflect the actual latest receivedAt across both pools for cursor consistency).
+  let allPollable = sortBy (\m -> (0 - m.priority) * 10000000000000 + m.receivedAt) raw
+  let limitedMsgs = sortBy (\m -> (0 - m.priority) * 10000000000000 + m.receivedAt) (union selectedHigh selectedLow)
   let evts = do
     m <- limitedMsgs
     yield {id: m.messageId, eventType: "message",
@@ -4490,7 +4542,7 @@ pollNewEvents = \pubkey clampedCursor t -> do
   let lastReceivedAt = fold (\acc m -> max acc m.receivedAt) clampedCursor limitedMsgs
   -- hasMore: tells clients there are additional messages beyond this batch,
   -- so they can immediately re-poll without waiting for the next heartbeat.
-  let hasMore = count allPollable > count limitedMsgs
+  let hasMore = count raw > count limitedMsgs
   yield {events: evts, cursor: lastReceivedAt, hasMore: hasMore}
 
 -- Execute a single long-poll cycle:
@@ -5691,10 +5743,14 @@ handleFederationAck = \messageIds originServer fromServer requestTimestamp corre
     -- Avoids the O(n) writeAllForwards repartitioning when only a few buckets are affected.
     removedForwards <- removeForwardsByServer fromServer dedupedIds 0 []
     let ackedCount = count removedForwards
-    -- Guard: warn if peer acks messages we had no forward entries for. This can indicate
-    -- a peer acking messages it never received (e.g., the forward response was lost but
-    -- the message was never stored), which would cause premature origin message deletion.
     let unmatched = count dedupedIds - ackedCount
+    -- Reject when ALL acked IDs are unmatched: the peer is acking messages we never
+    -- forwarded to it. Partial matches are accepted (some forwards may have been pruned).
+    if ackedCount == 0 && count dedupedIds > 0
+      then do
+        logWarn ("federation/ack: rejecting ack from " ++ fromServer ++ " — all " ++ show (count dedupedIds) ++ " messageIds unmatched (no forward entries)")
+        yield (respond {ok: False {}, error: "no_matching_forwards", ackedCount: 0, results: do mid <- dedupedIds; yield {messageId: mid, found: False {}}})
+      else do
     when (unmatched > 0)
       (logWarn ("federation/ack: " ++ fromServer ++ " acked " ++ show unmatched ++ " messageIds with no matching forward entries — skipping cleanup for those"))
     -- Only clear failure record when ALL acked IDs matched forward entries.
@@ -5771,6 +5827,13 @@ handleFederationCancel = \messageId toKey fromServer requestTimestamp correlatio
           when (fwdRemoved > 0) (do
             tfc <- *totalForwardCount
             set *totalForwardCount = max 0 (tfc - fwdRemoved))
+          -- Record cancel nonce: prevents replayed federation forwards of the
+          -- cancelled message from being accepted after dedup state expires.
+          nonceBkt <- readNonceBucket b
+          let updatedNonces = union nonceBkt [{messageId: messageId, toKey: toKey, seenAt: t}]
+          writeNonceBucket b (if count updatedNonces > maxNoncesPerBucket
+            then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
+            else updatedNonces)
           yield {cancelled: True {}}
     when result.cancelled
       (logInfo ("federation/cancel: cancelled " ++ messageId ++ " for " ++ toKey ++ " (from " ++ fromServer ++ ")"))
@@ -5802,12 +5865,12 @@ cancelBatchInner = \entries fromServer t acc ->
       let sameBucket = do e <- entries; where pubkeyBucket e.toKey == b; yield e
       let otherBuckets = do e <- entries; where pubkeyBucket e.toKey != b; yield e
       -- Process the entire bucket group in one atomic block
-      results <- atomic do cancelBucketGroup sameBucket fromServer b []
+      results <- atomic do cancelBucketGroup sameBucket fromServer b t []
       cancelBatchInner otherBuckets fromServer t (union acc results)
 
 -- Process all cancel entries for a single bucket within one atomic block.
 -- Reads messageBucket/fwdBucket once and applies all cancels, avoiding redundant reads.
-cancelBucketGroup = \entries fromServer b acc ->
+cancelBucketGroup = \entries fromServer b t acc ->
   case headOf entries of
     Nothing {} -> yield acc
     Just {value: entry} -> do
@@ -5829,8 +5892,14 @@ cancelBucketGroup = \entries fromServer b acc ->
           when (fwdRemoved > 0) (do
             tfc <- *totalForwardCount
             set *totalForwardCount = max 0 (tfc - fwdRemoved))
+          -- Record cancel nonce for each cancelled message in the batch
+          nonceBkt <- readNonceBucket b
+          let updatedNonces = union nonceBkt [{messageId: entry.messageId, toKey: entry.toKey, seenAt: t}]
+          writeNonceBucket b (if count updatedNonces > maxNoncesPerBucket
+            then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
+            else updatedNonces)
           yield {cancelled: True {}}
-      cancelBucketGroup rest fromServer b (union acc [{messageId: entry.messageId, cancelled: result.cancelled}])
+      cancelBucketGroup rest fromServer b t (union acc [{messageId: entry.messageId, cancelled: result.cancelled}])
 
 -- POST /federation/forward-batch: Receive multiple forwarded messages in one request.
 -- Each message is processed independently (same logic as handleForwardMessage).
@@ -5842,7 +5911,11 @@ handleFederationBatchForward = \forwards fromServer requestTimestamp correlation
   let batchRespond = \r -> respond {ok: r.ok, error: r.error, results: []}
   withFederationAuth authorization t batchRespond fromServer "forward" requestTimestamp (not (isLocalServer fromServer) && count forwards <= maxBatchSize) (True {}) (do
     let capped = takeRelation maxBatchSize forwards
-    results <- forwardBatchInner capped fromServer t []
+    -- Pre-deduplicate (messageId, toKey) pairs: a malicious peer could send 100 entries
+    -- for the same pair, each triggering a full atomic block (presence check, 5 bucket reads).
+    -- Dedup keeps the first occurrence; subsequent duplicates are silently dropped.
+    let deduped = fold (\acc f -> if any acc (\a -> a.messageId == f.messageId && a.toKey == f.toKey) then acc else union acc [f]) [] capped
+    results <- forwardBatchInner deduped fromServer t []
     let storedCount = count (do r <- results; where r.ok; yield r)
     when (storedCount > 0)
       (logInfo ("federation/forward-batch: stored " ++ show storedCount ++ "/" ++ show (count capped) ++ " messages from " ++ fromServer))
@@ -5991,6 +6064,13 @@ clientCancelBatchInner = \senderKey entries t resultAcc fedAcc ->
             presenceBkt <- readPresenceBucket b
             let remotePresence = collectPeerServers (presenceForKey presenceBkt entry.to t) (\p -> p.server)
             let allCancelServers = fold (\acc s -> if any acc (\a -> a == s) then acc else union [s] acc) remotePresence forwardTargetServers
+            -- Record cancel nonce: prevents replayed federation forwards of the
+            -- cancelled message from being accepted after dedup state expires.
+            nonceBkt <- readNonceBucket b
+            let updatedNonces = union nonceBkt [{messageId: entry.messageId, toKey: entry.to, seenAt: t}]
+            writeNonceBucket b (if count updatedNonces > maxNoncesPerBucket
+              then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
+              else updatedNonces)
             yield {cancelled: True {}, cancelServers: allCancelServers}
       let newFedAcc = if cancelResult.cancelled && count cancelResult.cancelServers > 0
         then union fedAcc [{messageId: entry.messageId, toKey: entry.to, servers: cancelResult.cancelServers}]
@@ -6085,7 +6165,7 @@ handleDrain = \phase authorization respond -> do
       -- Best-effort flush of pending forwards and acks before stopping
       when (federationEnabled && pendingForwardCount > 0) (do
         logInfo ("drain: flushing " ++ show pendingForwardCount ++ " pending forwards")
-        retryPendingForwards flushState.forwards)
+        retryPendingForwardsFromBuckets)
       when (federationEnabled && pendingAckCount > 0) (do
         logInfo ("drain: flushing " ++ show pendingAckCount ++ " pending acks")
         sendAcksAndClean flushState.pendingAcks)
@@ -6225,6 +6305,8 @@ computeAndCacheHealth = \t -> do
     let wdOk = warmup || t - sa < healthWatchdogMaxAge || (lastWd > 0 && t - lastWd < healthWatchdogMaxAge)
     nonceCount <- countAllNonces 0
     let nonceOk = nonceCount * 10 <= maxForwardNonces * 9
+    -- Count peers with active failure records (degraded federation connectivity)
+    let degradedPeerCount = count (do f <- forwardFailures; where t - f.firstFailedAt < maxServerDowntime; yield f)
     yield {pruneOk: warmup || (t - lastPrune < healthPruneMaxAge && not pruneStuck),
            heartbeatOk: warmup || t - lastHb < healthHeartbeatMaxAge,
            capacityOk: capacityOk,
@@ -6233,7 +6315,8 @@ computeAndCacheHealth = \t -> do
            snapshotOk: snapOk,
            watchdogOk: wdOk,
            nonceOk: nonceOk,
-           isDraining: dp > 0}
+           isDraining: dp > 0,
+           degradedPeers: degradedPeerCount}
   let allOk = not result.isDraining && result.pruneOk && result.heartbeatOk && result.capacityOk && result.federationOk && result.snapshotOk && result.watchdogOk && result.nonceOk
   atomic do
     set *cachedHealthOk = allOk
@@ -6245,6 +6328,7 @@ computeAndCacheHealth = \t -> do
     set *cachedHealthSnapshot = result.snapshotOk
     set *cachedHealthWatchdog = result.watchdogOk
     set *cachedHealthNonce = result.nonceOk
+    set *cachedHealthDegradedPeers = result.degradedPeers
   yield result
 
 handleHealth = \authorization respond -> do
@@ -6265,8 +6349,9 @@ handleHealth = \authorization respond -> do
       cW <- *cachedHealthWatchdog
       cN <- *cachedHealthNonce
       cCW <- *cachedHealthCapacityWarning
+      cDP <- *cachedHealthDegradedPeers
       dp <- *drainPhase
-      yield {ok: cOk && dp == 0, version: serverBuildVersion, pruneHealthy: cP, heartbeatHealthy: cH, capacityHealthy: cC, capacityWarning: cCW, federationHealthy: cF, snapshotHealthy: cS, watchdogHealthy: cW, nonceHealthy: cN, draining: dp > 0}
+      yield {ok: cOk && dp == 0, version: serverBuildVersion, pruneHealthy: cP, heartbeatHealthy: cH, capacityHealthy: cC, capacityWarning: cCW, federationHealthy: cF, snapshotHealthy: cS, watchdogHealthy: cW, nonceHealthy: cN, draining: dp > 0, degradedPeers: cDP}
     yield (respond cached)
   else do
   isAuthed <- verifyMaintenanceAuth authorization
@@ -6284,7 +6369,8 @@ handleHealth = \authorization respond -> do
                   snapshotHealthy: result.snapshotOk,
                   watchdogHealthy: result.watchdogOk,
                   nonceHealthy: result.nonceOk,
-                  draining: result.isDraining})
+                  draining: result.isDraining,
+                  degradedPeers: result.degradedPeers})
     else yield (respond {ok: allOk, version: serverBuildVersion, pruneHealthy: True {},
                   heartbeatHealthy: True {},
                   capacityHealthy: True {},
@@ -6293,7 +6379,8 @@ handleHealth = \authorization respond -> do
                   snapshotHealthy: True {},
                   watchdogHealthy: True {},
                   nonceHealthy: True {},
-                  draining: result.isDraining})
+                  draining: result.isDraining,
+                  degradedPeers: 0})
 
 zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: []}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, prunesSinceSnapshot: 0, totalEntries: 0, activeRequests: 0, peakActiveRequests: 0}}
 
@@ -6851,6 +6938,14 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
                 -- with presence servers (servers that already received and stored the message).
                 -- This ensures cancel reaches both pending and completed forward destinations.
                 let allCancelServers = fold (\acc s -> if any acc (\a -> a == s) then acc else union [s] acc) remotePresence forwardTargetServers
+                -- Record cancel nonce: prevents replayed federation forwards of the
+                -- cancelled message from being accepted after the message is removed
+                -- from all dedup sets (messages, ackedIds, deliveredIds).
+                nonceBkt <- readNonceBucket b
+                let updatedNonces = union nonceBkt [{messageId: messageId, toKey: to, seenAt: t}]
+                writeNonceBucket b (if count updatedNonces > maxNoncesPerBucket
+                  then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
+                  else updatedNonces)
                 yield {cancelled: True {}, cancelServers: allCancelServers}
           -- Send federation cancel to remote servers that may have the message
           fork (when (federationEnabled && cancelResult.cancelled && count cancelResult.cancelServers > 0)
