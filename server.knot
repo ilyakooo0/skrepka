@@ -464,12 +464,25 @@ maxBy = \items getKey -> fold (\acc x -> case acc of
 evictOldest = \items getKey ->
   case minBy items getKey of
     Nothing {} -> items
-    Just {value: oldest} ->
-      let k = getKey oldest in
-      do x <- items; where getKey x != k; yield x
+    Just {value: oldest} -> do x <- items; where getKey x != getKey oldest; yield x
 
 capList = \items maxN getKey ->
   if count items > maxN then evictOldest items getKey else items
+
+-- Sequence an IO action over each unique item (dedup by getKey).
+forEach = \items getKey action -> case headOf items of
+  Nothing {} -> yield {}
+  Just {value: x} -> do
+    action x
+    forEach (do y <- items; where getKey y != getKey x; yield y) getKey action
+
+-- Like forEach, but collects each action's result into a list.
+mapEach = \items getKey action -> case headOf items of
+  Nothing {} -> yield []
+  Just {value: x} -> do
+    r <- action x
+    rest <- mapEach (do y <- items; where getKey y != getKey x; yield y) getKey action
+    yield (union [r] rest)
 
 -- Hex tokens
 hexDigit : Int -> Text
@@ -498,11 +511,10 @@ tooLong = \s maxLen -> drop maxLen s != ""
 
 isValidHex : Text -> Bool
 isValidHex = \s ->
-  if s == "" then False {}
-  else if drop 1 s == "" then False {}
-  else if contains (take 1 s) "0123456789abcdef" && contains (take 1 (drop 1 s)) "0123456789abcdef"
-    then drop 2 s == "" || isValidHex (drop 2 s)
-  else False {}
+  s != "" && drop 1 s != ""
+  && contains (take 1 s) "0123456789abcdef"
+  && contains (take 1 (drop 1 s)) "0123456789abcdef"
+  && (drop 2 s == "" || isValidHex (drop 2 s))
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
@@ -852,24 +864,18 @@ pruneExpired = \t -> do
 -- Federation gossip
 -- ============================================
 
-sendBatchedGossip : [ServerName] -> [GossipEvent] -> Int -> IO {network} {}
-sendBatchedGossip = \peers events hops ->
-  case headOf peers of
-    Nothing {} -> yield {}
-    Just {value: server} -> do
-      let rest = do s <- peers; where s != server; yield s
-      t <- now
-      failures <- *forwardFailures
-      when (shouldRetryServer server t failures) (do
-        auth <- generateFederationAuth "gossip" t
-        result <- fetch (federationUrl server) (RecvGossip {
-          authorization: auth,
-          events: events, hopsRemaining: hops, fromServer: serverHostN,
-          requestTimestamp: t, correlationId: "", protocolVersion: federationProtocolVersion})
-        case result of
-          Err _ -> recordFailure server
-          Ok _ -> clearFailure server)
-      sendBatchedGossip rest events hops
+sendBatchedGossip = \peers events hops -> forEach peers (\s -> s) (\server -> do
+  t <- now
+  failures <- *forwardFailures
+  when (shouldRetryServer server t failures) (do
+    auth <- generateFederationAuth "gossip" t
+    result <- fetch (federationUrl server) (RecvGossip {
+      authorization: auth,
+      events: events, hopsRemaining: hops, fromServer: serverHostN,
+      requestTimestamp: t, correlationId: "", protocolVersion: federationProtocolVersion})
+    case result of
+      Err _ -> recordFailure server
+      Ok _ -> clearFailure server))
 
 broadcastOfflineGossip = \t expiredLocal -> do
   presence <- *presence
@@ -882,37 +888,21 @@ broadcastOfflineGossip = \t expiredLocal -> do
 -- Forward retries and acks
 -- ============================================
 
-retryPendingForwards : IO {network} {}
 retryPendingForwards = do
   t <- now
   fwds <- *forwards
   failures <- *forwardFailures
   blocked <- *blockedPeers
-  -- Group by server
-  let servers = collectPeers fwds (\f -> f.toServer)
-  let eligibleServers = do s <- servers; where shouldRetryServer s t failures && not (isBlockedPeer s blocked); yield s
-  retryServerForwards eligibleServers fwds
-
-retryServerForwards = \servers fwds ->
-  case headOf servers of
-    Nothing {} -> yield {}
-    Just {value: server} -> do
-      let rest = do s <- servers; where s != server; yield s
-      let serverFwds = takeRelation maxBatchSize (do f <- fwds; where f.toServer == server; yield f)
-      sendForwardsToServer serverFwds server
-      retryServerForwards rest fwds
-
-sendForwardsToServer = \fwds server ->
-  case headOf fwds of
-    Nothing {} -> yield {}
-    Just {value: f} -> do
-      let rest = do x <- fwds; where x.messageId != f.messageId; yield x
-      t <- now
-      auth <- generateFederationAuth ("forward:" ++ f.messageId) t
+  let servers = do s <- collectPeers fwds (\f -> f.toServer); where shouldRetryServer s t failures && not (isBlockedPeer s blocked); yield s
+  forEach servers (\s -> s) (\server -> do
+    let serverFwds = takeRelation maxBatchSize (do f <- fwds; where f.toServer == server; yield f)
+    forEach serverFwds (\f -> f.messageId) (\f -> do
+      t2 <- now
+      auth <- generateFederationAuth ("forward:" ++ f.messageId) t2
       result <- fetch (federationUrl server) (ForwardMessage {
         toKey: f.toKey, encryptedBlob: f.encryptedBlob,
         timestamp: f.timestamp, originServer: f.originServer, messageId: f.messageId,
-        fromServer: serverHostN, requestTimestamp: t,
+        fromServer: serverHostN, requestTimestamp: t2,
         authorization: auth, correlationId: "",
         expiresAt: f.expiresAt, priority: f.priority, protocolVersion: federationProtocolVersion})
       let success = case result of Ok r -> r.ok; _ -> False {}
@@ -923,37 +913,24 @@ sendForwardsToServer = \fwds server ->
           x <- cur
           where x.messageId != f.messageId || x.toServer != server || (not success && x.retries + 1 < maxForwardRetries)
           yield (if success || x.messageId != f.messageId || x.toServer != server then x
-                 else {messageId: x.messageId, toServer: x.toServer, createdAt: x.createdAt, toKey: x.toKey, encryptedBlob: x.encryptedBlob, timestamp: x.timestamp, originServer: x.originServer, retries: x.retries + 1, expiresAt: x.expiresAt, priority: x.priority, senderKey: x.senderKey})
-      sendForwardsToServer rest server
+                 else {messageId: x.messageId, toServer: x.toServer, createdAt: x.createdAt, toKey: x.toKey, encryptedBlob: x.encryptedBlob, timestamp: x.timestamp, originServer: x.originServer, retries: x.retries + 1, expiresAt: x.expiresAt, priority: x.priority, senderKey: x.senderKey})))
 
-sendAcksAndClean : [AckedEntry] -> IO {network} {}
 sendAcksAndClean = \pendingAcks ->
-  if count pendingAcks == 0 then yield {}
-  else do
-    let servers = collectPeers pendingAcks (\a -> a.originServer)
-    sendAcksToEach servers pendingAcks
-
-sendAcksToEach = \servers acks ->
-  case headOf servers of
-    Nothing {} -> yield {}
-    Just {value: server} -> do
-      let rest = do s <- servers; where s != server; yield s
-      let serverAcks = do a <- acks; where a.originServer == server; yield a
-      let mids = do a <- serverAcks; yield a.messageId
-      t <- now
-      auth <- generateFederationAuth "ack" t
-      result <- fetch (federationUrl server) (FederationAck {
-        authorization: auth,
-        messageIds: mids, originServer: server, fromServer: serverHostN,
-        requestTimestamp: t, correlationId: "", protocolVersion: federationProtocolVersion})
-      case result of
-        Err _ -> recordFailure server
-        Ok _ -> do
-          clearFailure server
-          atomic do
-            cur <- *ackedIds
-            set *ackedIds = do a <- cur; where not (a.originServer == server && any mids (\m -> m == a.messageId)); yield a
-      sendAcksToEach rest acks
+  forEach (collectPeers pendingAcks (\a -> a.originServer)) (\s -> s) (\server -> do
+    let mids = do a <- pendingAcks; where a.originServer == server; yield a.messageId
+    t <- now
+    auth <- generateFederationAuth "ack" t
+    result <- fetch (federationUrl server) (FederationAck {
+      authorization: auth,
+      messageIds: mids, originServer: server, fromServer: serverHostN,
+      requestTimestamp: t, correlationId: "", protocolVersion: federationProtocolVersion})
+    case result of
+      Err _ -> recordFailure server
+      Ok _ -> do
+        clearFailure server
+        atomic do
+          cur <- *ackedIds
+          set *ackedIds = do a <- cur; where not (a.originServer == server && any mids (\m -> m == a.messageId)); yield a)
 
 -- Forward queued messages to a server when a remote key comes online.
 forwardQueuedToServer = \pubkey server t -> atomic do
@@ -1322,36 +1299,32 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs msg
                 yield {status: status, remoteServers: remoteServers}
 
 forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers ->
-  case headOf servers of
-    Nothing {} -> yield {}
-    Just {value: server} -> do
-      let rest = do s <- servers; where s != server; yield s
-      info <- atomic do
-        fwds <- *forwards
-        case headOf (do f <- fwds; where f.messageId == effMsgId && f.toServer == server; yield f) of
-          Nothing {} -> yield Nothing {}
-          Just {value: f} -> yield (Just {value: {expiresAt: f.expiresAt, priority: f.priority}})
-      case info of
-        Nothing {} -> yield {}
-        Just {value: i} -> do
-          t <- now
-          auth <- generateFederationAuth ("forward:" ++ effMsgId) t
-          result <- fetch (federationUrl server) (ForwardMessage {
-            toKey: to, encryptedBlob: encryptedBlob,
-            timestamp: clampedTs, originServer: serverHostN, messageId: effMsgId,
-            fromServer: serverHostN, requestTimestamp: t,
-            authorization: auth, correlationId: "",
-            expiresAt: i.expiresAt, priority: i.priority, protocolVersion: federationProtocolVersion})
-          case result of
-            Err _ -> recordFailure server
-            Ok r ->
-              if r.ok then do
-                clearFailure server
-                atomic do
-                  fwds <- *forwards
-                  set *forwards = do f <- fwds; where not (f.messageId == effMsgId && f.toServer == server); yield f
-              else yield {}
-      forkForwardsTo effMsgId to encryptedBlob clampedTs rest
+  forEach servers (\s -> s) (\server -> do
+    info <- atomic do
+      fwds <- *forwards
+      case headOf (do f <- fwds; where f.messageId == effMsgId && f.toServer == server; yield f) of
+        Nothing {} -> yield Nothing {}
+        Just {value: f} -> yield (Just {value: {expiresAt: f.expiresAt, priority: f.priority}})
+    case info of
+      Nothing {} -> yield {}
+      Just {value: i} -> do
+        t <- now
+        auth <- generateFederationAuth ("forward:" ++ effMsgId) t
+        result <- fetch (federationUrl server) (ForwardMessage {
+          toKey: to, encryptedBlob: encryptedBlob,
+          timestamp: clampedTs, originServer: serverHostN, messageId: effMsgId,
+          fromServer: serverHostN, requestTimestamp: t,
+          authorization: auth, correlationId: "",
+          expiresAt: i.expiresAt, priority: i.priority, protocolVersion: federationProtocolVersion})
+        case result of
+          Err _ -> recordFailure server
+          Ok r ->
+            if r.ok then do
+              clearFailure server
+              atomic do
+                fwds <- *forwards
+                set *forwards = do f <- fwds; where not (f.messageId == effMsgId && f.toServer == server); yield f
+            else yield {})
 
 -- ============================================
 -- Handler: lookup
@@ -1535,24 +1508,17 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
           yield (respond {ok: True {}, authorized: True {}, cancelled: result.cancelled, error: ""}))
 
 sendCancelToEach = \messageId to servers ->
-  case headOf servers of
-    Nothing {} -> yield {}
-    Just {value: server} -> do
-      let rest = do s <- servers; where s != server; yield s
-      t <- now
-      auth <- generateFederationAuth ("cancel:" ++ messageId) t
-      result <- fetch (federationUrl server) (FederationCancel {
-        messageId: messageId, toKey: to, fromServer: serverHostN,
-        requestTimestamp: t, correlationId: "", authorization: auth,
-        protocolVersion: federationProtocolVersion})
-      case result of
-        Err _ -> atomic do
-          pfc <- *pendingFederationCancels
-          set *pendingFederationCancels = capList (union pfc [{messageId: messageId, toKey: to, toServer: server, createdAt: t, retries: 0}]) 10000 (\c -> c.createdAt)
-        Ok r -> when (not r.ok) (atomic do
-          pfc <- *pendingFederationCancels
-          set *pendingFederationCancels = capList (union pfc [{messageId: messageId, toKey: to, toServer: server, createdAt: t, retries: 0}]) 10000 (\c -> c.createdAt))
-      sendCancelToEach messageId to rest
+  forEach servers (\s -> s) (\server -> do
+    t <- now
+    auth <- generateFederationAuth ("cancel:" ++ messageId) t
+    result <- fetch (federationUrl server) (FederationCancel {
+      messageId: messageId, toKey: to, fromServer: serverHostN,
+      requestTimestamp: t, correlationId: "", authorization: auth,
+      protocolVersion: federationProtocolVersion})
+    let failed = case result of Err _ -> True {}; Ok r -> not r.ok
+    when failed (atomic do
+      pfc <- *pendingFederationCancels
+      set *pendingFederationCancels = capList (union pfc [{messageId: messageId, toKey: to, toServer: server, createdAt: t, retries: 0}]) 10000 (\c -> c.createdAt)))
 
 handleCancelBatch = \cancels authorization clientIp respond -> do
   t <- now
@@ -1567,31 +1533,24 @@ handleCancelBatch = \cancels authorization clientIp respond -> do
         lim <- checkPubkeyRateGate clientWriteRates senderKey maxClientWriteRatePerKey clientWriteRateWindowMs t
         if lim then yield (respond {results: [], authorized: True {}, error: "rate_limited"})
         else do
-          let capped = takeRelation maxBatchSize cancels
-          results <- cancelEach senderKey capped t []
+          results <- mapEach (takeRelation maxBatchSize cancels) (\e -> e.messageId) (\e -> do
+            r <- atomic do
+              msgs <- *messages
+              let target = headOf (do m <- msgs; where m.messageId == e.messageId && m.toKey == e.to; yield m)
+              case target of
+                Nothing {} -> yield False
+                Just {value: msg} ->
+                  if msg.originServer != "" || msg.senderKey == "" || msg.senderKey != senderKey
+                    then yield False
+                    else do
+                      set *messages = do m <- msgs; where not (m.messageId == e.messageId && m.toKey == e.to); yield m
+                      fwds <- *forwards
+                      set *forwards = do f <- fwds; where not (f.messageId == e.messageId && f.toKey == e.to); yield f
+                      cn <- *cancelNotifications
+                      set *cancelNotifications = capList (union cn [{toKey: e.to, messageId: e.messageId, cancelledAt: t}]) 10000 (\c -> c.cancelledAt)
+                      yield True
+            yield {messageId: e.messageId, cancelled: r})
           yield (respond {results: results, authorized: True {}, error: ""}))
-
-cancelEach = \senderKey entries t acc ->
-  case headOf entries of
-    Nothing {} -> yield acc
-    Just {value: e} -> do
-      let rest = do x <- entries; where x.messageId != e.messageId; yield x
-      r <- atomic do
-        msgs <- *messages
-        let target = headOf (do m <- msgs; where m.messageId == e.messageId && m.toKey == e.to; yield m)
-        case target of
-          Nothing {} -> yield False
-          Just {value: msg} ->
-            if msg.originServer != "" || msg.senderKey == "" || msg.senderKey != senderKey
-              then yield False
-              else do
-                set *messages = do m <- msgs; where not (m.messageId == e.messageId && m.toKey == e.to); yield m
-                fwds <- *forwards
-                set *forwards = do f <- fwds; where not (f.messageId == e.messageId && f.toKey == e.to); yield f
-                cn <- *cancelNotifications
-                set *cancelNotifications = capList (union cn [{toKey: e.to, messageId: e.messageId, cancelledAt: t}]) 10000 (\c -> c.cancelledAt)
-                yield True
-      cancelEach senderKey rest t (union acc [{messageId: e.messageId, cancelled: r}])
 
 handleSendBatch = \messages authorization clientIp respond -> do
   t <- now
@@ -1603,24 +1562,17 @@ handleSendBatch = \messages authorization clientIp respond -> do
     else withSessionAuth authorization t clientIp
       (yield (respond {results: [], authorized: False {}, retryAfterMs: 0}))
       (\senderKey -> do
-        let capped = takeRelation maxBatchSize messages
-        results <- sendBatchEach senderKey capped t []
-        yield (respond {results: do r <- results; yield {messageId: r.messageId, status: r.status}, authorized: True {}, retryAfterMs: 0}))
-
-sendBatchEach = \senderKey msgs t acc ->
-  case headOf msgs of
-    Nothing {} -> yield acc
-    Just {value: m} -> do
-      let rest = do x <- msgs; where x != m; yield x
-      effMsgId <- if m.messageId != "" then yield m.messageId else genToken
-      let clampedTs = clampTimestamp m.timestamp t
-      let clampedPri = clamp 0 maxMessagePriority m.priority
-      r <- if t - m.timestamp > messageMaxAge
-        then yield {status: MsRejected {}, remoteServers: []}
-        else atomic do sendMessageCore senderKey m.to m.encryptedBlob clampedTs effMsgId m.expiresInMs clampedPri t
-      when (federationEnabled && count r.remoteServers > 0)
-        (fork (forkForwardsTo effMsgId m.to m.encryptedBlob clampedTs r.remoteServers))
-      sendBatchEach senderKey rest t (union acc [{messageId: effMsgId, status: r.status}])
+        results <- mapEach (takeRelation maxBatchSize messages) (\m -> m) (\m -> do
+          effMsgId <- if m.messageId != "" then yield m.messageId else genToken
+          let clampedTs = clampTimestamp m.timestamp t
+          let clampedPri = clamp 0 maxMessagePriority m.priority
+          r <- if t - m.timestamp > messageMaxAge
+            then yield {status: MsRejected {}, remoteServers: []}
+            else atomic do sendMessageCore senderKey m.to m.encryptedBlob clampedTs effMsgId m.expiresInMs clampedPri t
+          when (federationEnabled && count r.remoteServers > 0)
+            (fork (forkForwardsTo effMsgId m.to m.encryptedBlob clampedTs r.remoteServers))
+          yield {messageId: effMsgId, status: r.status})
+        yield (respond {results: results, authorized: True {}, retryAfterMs: 0}))
 
 -- ============================================
 -- Handler: federation receive
@@ -1678,12 +1630,7 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
     yield (respond {ok: True {}, error: "", retryAfterMs: 0}))
 
 forwardForNewlyOnline = \targets t ->
-  case headOf targets of
-    Nothing {} -> yield {}
-    Just {value: tgt} -> do
-      let rest = do x <- targets; where x.pubkey != tgt.pubkey || x.server != tgt.server; yield x
-      forwardQueuedToServer tgt.pubkey tgt.server t
-      forwardForNewlyOnline rest t
+  forEach targets (\tgt -> tgt.pubkey ++ "|" ++ tgt.server) (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t)
 
 handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt priority authorization respond -> do
   t <- now
@@ -1774,15 +1721,7 @@ handleFederationBatchCancel = \cancels fromServer requestTimestamp correlationId
   t <- now
   let batchRespond = \r -> respond {ok: r.ok, error: r.error, results: [], retryAfterMs: r.retryAfterMs}
   withFederationAuth authorization t batchRespond fromServer "cancel-batch" requestTimestamp (not (isLocalServer fromServer) && count cancels <= maxBatchSize) (do
-    let capped = takeRelation maxBatchSize cancels
-    results <- federationCancelEach capped fromServer t []
-    yield (respond {ok: True {}, error: "", results: results, retryAfterMs: 0}))
-
-federationCancelEach = \entries fromServer t acc ->
-  case headOf entries of
-    Nothing {} -> yield acc
-    Just {value: e} -> do
-      let rest = do x <- entries; where x.messageId != e.messageId; yield x
+    results <- mapEach (takeRelation maxBatchSize cancels) (\e -> e.messageId) (\e -> do
       cancelled <- atomic do
         msgs <- *messages
         let target = headOf (do m <- msgs; where m.messageId == e.messageId && m.toKey == e.toKey && m.originServer == fromServer; yield m)
@@ -1793,21 +1732,14 @@ federationCancelEach = \entries fromServer t acc ->
             fwds <- *forwards
             set *forwards = do f <- fwds; where not (f.messageId == e.messageId && f.toKey == e.toKey); yield f
             yield True
-      federationCancelEach rest fromServer t (union acc [{messageId: e.messageId, cancelled: cancelled}])
+      yield {messageId: e.messageId, cancelled: cancelled})
+    yield (respond {ok: True {}, error: "", results: results, retryAfterMs: 0}))
 
 handleFederationBatchForward = \forwards fromServer requestTimestamp correlationId authorization respond -> do
   t <- now
   let batchRespond = \r -> respond {ok: r.ok, error: r.error, results: [], retryAfterMs: r.retryAfterMs}
   withFederationAuth authorization t batchRespond fromServer "forward-batch" requestTimestamp (not (isLocalServer fromServer) && count forwards <= maxBatchSize) (do
-    let capped = takeRelation maxBatchSize forwards
-    results <- federationForwardEach capped fromServer t []
-    yield (respond {ok: True {}, error: "", results: results, retryAfterMs: 0}))
-
-federationForwardEach = \entries fromServer t acc ->
-  case headOf entries of
-    Nothing {} -> yield acc
-    Just {value: e} -> do
-      let rest = do x <- entries; where x.messageId != e.messageId; yield x
+    results <- mapEach (takeRelation maxBatchSize forwards) (\e -> e.messageId) (\e -> do
       ok <- if isLocalServer e.originServer || t - e.timestamp > messageMaxAge then yield False
         else atomic do
           pres <- *presence
@@ -1835,7 +1767,8 @@ federationForwardEach = \entries fromServer t acc ->
                 set *messages = union msgs [{messageId: e.messageId, toKey: e.toKey, encryptedBlob: e.encryptedBlob, timestamp: clampedTs, originServer: e.originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: clampedPri}]
                 set *pollWakeup = seqTs
                 yield True
-      federationForwardEach rest fromServer t (union acc [{messageId: e.messageId, ok: ok}])
+      yield {messageId: e.messageId, ok: ok})
+    yield (respond {ok: True {}, error: "", results: results, retryAfterMs: 0}))
 
 handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp correlationId authorization respond -> do
   t <- now
@@ -1857,10 +1790,9 @@ handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp
         yield (respond {ok: True {}, error: "", receivedCount: count pairs, retryAfterMs: 0}))
 
 -- Pair up parallel lists by index. Builds index arrays and joins on i (O(n*m) but trivial code).
+withIndex = \xs -> (fold (\acc x -> {i: acc.i + 1, out: union acc.out [{i: acc.i, v: x}]}) {i: 0, out: []} xs).out
 zipPairs = \mids keys ->
-  let mIdx = (fold (\acc m -> {i: acc.i + 1, out: union acc.out [{i: acc.i, v: m}]}) {i: 0, out: []} mids).out in
-  let kIdx = (fold (\acc k -> {i: acc.i + 1, out: union acc.out [{i: acc.i, v: k}]}) {i: 0, out: []} keys).out in
-  do mp <- mIdx; kp <- kIdx; where mp.i == kp.i; yield {messageId: mp.v, toKey: kp.v}
+  do mp <- withIndex mids; kp <- withIndex keys; where mp.i == kp.i; yield {messageId: mp.v, toKey: kp.v}
 
 -- ============================================
 -- Maintenance handlers
