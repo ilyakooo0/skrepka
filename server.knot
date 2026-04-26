@@ -2967,10 +2967,15 @@ logNonceEviction = \nb lruEvicted oldestRetainedAge ->
     logKV level "nonce_lru_eviction" ["bucket=" ++ show nb, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket, "oldestRetainedMs=" ++ show oldestRetainedAge])
 
 -- Full record-and-log helper for use outside atomic blocks.
+-- Wraps updateForwardNonce in atomic to prevent lost nonces from concurrent calls.
+-- Without this, two concurrent sendMessageCore calls (via handleSendMessage) can both
+-- read the same nonce bucket, each append their nonce, and the second write silently
+-- drops the first nonce — reopening a replay window for that message.
+-- Safe when called from inside an existing atomic block (Knot atomic is reentrant).
 recordForwardNonce : MessageIdHex -> PubkeyHex -> Timestamp -> IO ()
 recordForwardNonce = \messageId toKey t -> do
   let nb = pubkeyBucket toKey
-  result <- updateForwardNonce nb messageId toKey t
+  result <- atomic do updateForwardNonce nb messageId toKey t
   logNonceEviction nb result.lruEvicted result.oldestRetainedAge
 
 -- ============================================
@@ -3972,6 +3977,13 @@ pruneExpired = \t -> do
     -- Prune old cancel notifications (same retention as delivery receipts)
     cancelNotifs <- *cancelNotifications
     set *cancelNotifications = do c <- cancelNotifs; where t - c.cancelledAt < unackedMessageMaxAge; yield c
+    -- Prune stale per-sender drop counters. Without this, drop counters for senders who
+    -- disconnect permanently persist until capacity eviction pushes them out. Same retention
+    -- as delivery receipts since drop counters track lost receipts/expirations.
+    ddr <- *droppedDeliveryReceipts
+    set *droppedDeliveryReceipts = do d <- ddr; where t - d.lastUpdated < unackedMessageMaxAge; yield d
+    den <- *droppedExpirationNotifs
+    set *droppedExpirationNotifs = do d <- den; where t - d.lastUpdated < unackedMessageMaxAge; yield d
     -- Reconcile global federation connection counter with actual in-flight state
     -- (self-heals drift from leaked slots where a forked task died without decrementing)
     inFlightRec <- *federationInFlight
@@ -7155,6 +7167,10 @@ handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp
 
 -- Zip two parallel arrays into a list of {messageId, toKey} pairs.
 -- Consumes both lists head-first in O(n), replacing the O(n^2) fold-to-index pattern.
+-- Uses skipRelation 1 instead of filter-not-equal to correctly handle duplicate values:
+-- filter (where m != mid) removes ALL occurrences of mid, corrupting the pairing when
+-- the same messageId appears multiple times (e.g., same message sent to different recipients).
+-- skipRelation 1 removes only the first element regardless of duplicates.
 zipParallelArrays : [MessageIdHex] -> [PubkeyHex] -> [{messageId: MessageIdHex, toKey: PubkeyHex}]
 zipParallelArrays = \mids keys ->
   case headOf mids of
@@ -7163,33 +7179,47 @@ zipParallelArrays = \mids keys ->
       case headOf keys of
         Nothing {} -> []
         Just {value: key} ->
-          let restMids = do m <- mids; where m != mid; yield m in
-          let restKeys = do k <- keys; where k != key; yield k in
-          union [{messageId: mid, toKey: key}] (zipParallelArrays restMids restKeys)
+          union [{messageId: mid, toKey: key}] (zipParallelArrays (skipRelation 1 mids) (skipRelation 1 keys))
 
 -- Look up senderKey from messages and record delivery receipts.
--- Consumes pre-zipped pairs head-first (O(n) total, was O(n^2) with index-based access).
+-- Groups pairs by pubkeyBucket so each message bucket is read once per group instead
+-- of once per receipt. With 10 receipts targeting the same bucket, this reduces bucket
+-- reads from 10 to 1 (and senderDeliveries reads/writes from 10 to 1).
 receiptsByBucket : [{messageId: MessageIdHex, toKey: PubkeyHex}] -> Timestamp -> IO ()
 receiptsByBucket = \pairs t ->
   case headOf pairs of
     Nothing {} -> yield {}
-    Just {value: pair} -> do
-      let rest = do p <- pairs; where p.messageId != pair.messageId || p.toKey != pair.toKey; yield p
-      let b = pubkeyBucket pair.toKey
+    Just {value: first} -> do
+      let b = pubkeyBucket first.toKey
+      let sameBucket = do p <- pairs; where pubkeyBucket p.toKey == b; yield p
+      let otherBuckets = do p <- pairs; where pubkeyBucket p.toKey != b; yield p
+      -- Process all pairs for this bucket in a single atomic block
       atomic do
         bucket <- readMessageBucket b
-        let msg = headOf (do m <- bucket; where m.messageId == pair.messageId && m.toKey == pair.toKey && m.senderKey != "" && m.originServer == ""; yield m)
-        case msg of
-          Nothing {} -> yield {}
-          Just {value: m} -> do
-            sd <- *senderDeliveries
-            let isDup = any sd (\d -> d.messageId == pair.messageId && d.toKey == pair.toKey)
-            when (not isDup) (do
-              let combined = union sd [{senderKey: m.senderKey, messageId: pair.messageId, toKey: pair.toKey, deliveredAt: t}]
-              set *senderDeliveries = if count combined > maxSenderDeliveries
-                then evictOneOldest combined (\d -> d.deliveredAt)
-                else combined)
-      receiptsByBucket rest t
+        sd <- *senderDeliveries
+        let updatedSd = receiptsBucketInner sameBucket bucket sd t
+        set *senderDeliveries = updatedSd
+      receiptsByBucket otherBuckets t
+
+-- Process all receipt pairs for one bucket within a single atomic read.
+-- Threads senderDeliveries through so each new receipt sees previous ones (dedup).
+receiptsBucketInner : [{messageId: MessageIdHex, toKey: PubkeyHex}] -> [Message] -> [SenderDelivery] -> Timestamp -> [SenderDelivery]
+receiptsBucketInner = \pairs bucket sd t ->
+  case headOf pairs of
+    Nothing {} -> sd
+    Just {value: pair} ->
+      let rest = do p <- pairs; where p.messageId != pair.messageId || p.toKey != pair.toKey; yield p in
+      let msg = headOf (do m <- bucket; where m.messageId == pair.messageId && m.toKey == pair.toKey && m.senderKey != "" && m.originServer == ""; yield m) in
+      case msg of
+        Nothing {} -> receiptsBucketInner rest bucket sd t
+        Just {value: m} ->
+          let isDup = any sd (\d -> d.messageId == pair.messageId && d.toKey == pair.toKey) in
+          if isDup then receiptsBucketInner rest bucket sd t
+          else let combined = union sd [{senderKey: m.senderKey, messageId: pair.messageId, toKey: pair.toKey, deliveredAt: t}] in
+            let updatedSd = if count combined > maxSenderDeliveries
+              then evictOneOldest combined (\d -> d.deliveredAt)
+              else combined
+            in receiptsBucketInner rest bucket updatedSd t
 
 -- POST /messages/cancel-batch: Cancel multiple sent messages in one request.
 -- Auth checked once; each cancel processed independently. Partial success possible.
@@ -8877,7 +8907,7 @@ serveOverloaded = \req -> case req of
   RevokeSession {respond} -> respond {ok: False {}, authorized: False {}}
   Logout {respond} -> respond {ok: False {}, authorized: False {}}
   -- Client routes
-  Poll {respond} -> respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: 0, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 1000, cursorReset: False {}, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0}
+  Poll {respond} -> respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: 0, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 1000, cursorReset: False {}, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: []}
   SendMessage {respond} -> respond {status: MsRejected {}, messageId: "", retryAfterMs: 1000, error: "overloaded", loadPct: 0}
   MessageStatus {respond} -> respond {status: "", authorized: False {}}
   AckMessages {respond} -> respond {ok: False {}, authorized: False {}, ackedCount: 0, error: "overloaded"}
@@ -8999,6 +9029,20 @@ serve = \req -> do
       set *clientAuthLatencyCount = cnt + 1
       set *clientAuthLatencyMax = if latency > mx then latency else mx
     VerifyAuth {} -> atomic do
+      total <- *clientAuthLatencyTotal
+      cnt <- *clientAuthLatencyCount
+      mx <- *clientAuthLatencyMax
+      set *clientAuthLatencyTotal = total + latency
+      set *clientAuthLatencyCount = cnt + 1
+      set *clientAuthLatencyMax = if latency > mx then latency else mx
+    RevokeSession {} -> atomic do
+      total <- *clientAuthLatencyTotal
+      cnt <- *clientAuthLatencyCount
+      mx <- *clientAuthLatencyMax
+      set *clientAuthLatencyTotal = total + latency
+      set *clientAuthLatencyCount = cnt + 1
+      set *clientAuthLatencyMax = if latency > mx then latency else mx
+    Logout {} -> atomic do
       total <- *clientAuthLatencyTotal
       cnt <- *clientAuthLatencyCount
       mx <- *clientAuthLatencyMax
