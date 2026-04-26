@@ -185,7 +185,7 @@ federationLatencyWindowMs = 300000 -- 5 minutes; reset latency metrics after thi
 
 -- Server build version: included in /health and /stats responses for deployment verification.
 -- Update this string when deploying a new build so operators can confirm which version is running.
-serverBuildVersion = "2026-04-26d"
+serverBuildVersion = "2026-04-26e"
 
 -- Federation protocol version: included in gossip/forward/ack requests.
 -- Peers log warnings when they receive requests from older versions.
@@ -1160,7 +1160,7 @@ route HealthApi where
 -- BREAKING CHANGE from flat format — existing scrapers must update field paths.
 route StatsApi where
   GET /stats headers {authorization: Text}
-    -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, messagesMax: Int, messagesPct: Int, totalMessageCount: Int, presence: Int, presenceMax: Int, presencePct: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}]}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int, senderDeliveries: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int}}
+    -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, messagesMax: Int, messagesPct: Int, totalMessageCount: Int, presence: Int, presenceMax: Int, presencePct: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}], pendingCancels: Int}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int, senderDeliveries: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int}}
     = Stats
   GET /stats/peers headers {authorization: Text}
     -> {peers: [PeerStatus], ok: Bool}
@@ -5524,9 +5524,15 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId expiresIn
                       else updatedNonces
                 -- Log LRU nonce eviction: evicted nonces create a bounded replay window
                 -- where messages with those nonces could be re-accepted until natural expiry.
+                -- oldestRetainedAge: age of the oldest surviving nonce (new dedup coverage floor).
+                -- If > messageMaxAge, evicted nonces were in the extended-protection zone only
+                -- (message/acked/delivered dedup still covers the gap). If <= messageMaxAge,
+                -- some evicted nonces were still within primary dedup coverage (lower risk).
                 let lruEvicted = count updatedNonces - count evictedNonces
-                when (lruEvicted > 0)
-                  (logKV "warn" "nonce_lru_eviction" ["bucket=" ++ show nb, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket])
+                when (lruEvicted > 0) (do
+                  let oldestRetainedAge = case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> 0; Just {value: n} -> t - n.seenAt
+                  let level = if oldestRetainedAge < messageMaxAge then "error" else "warn"
+                  logKV level "nonce_lru_eviction" ["bucket=" ++ show nb, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket, "oldestRetainedMs=" ++ show oldestRetainedAge])
                 writeNonceBucket nb evictedNonces
                 let toPresence = presenceForKey recipientPresence to t
                 let localOnline = hasLocalPresence toPresence
@@ -5582,40 +5588,94 @@ forkSendForwards = \effectiveMsgId to encryptedBlob clampedTs remoteServers ->
             else
               logKV "warn" "federation_forward_rejected" ["server=" ++ server, "messageId=" ++ effectiveMsgId, "error=" ++ response.error]))))
 
--- Send all batch forwards for one server sequentially (no per-message fork overhead).
--- Used by handleSendBatch; reduces fork count from O(messages * servers) to O(servers).
--- Uses pre-computed fwdExpiresAt/fwdPriority from the batch result to avoid re-reading
--- the forward bucket for those values; only checks if the forward entry still exists
--- (it could be removed by a concurrent poll/ack between creation and this forked send).
+-- Send all batch forwards for one server using FederationBatchForward (1 HTTP round-trip).
+-- Used by handleSendBatch; reduces both fork count (O(servers) not O(messages * servers))
+-- and HTTP round-trips (1 per server not 1 per message).
+-- Falls back to individual ForwardMessage if the peer rejects the batch (old peer without
+-- batch support), same as retryForwardsForServer.
+-- Pre-filters to still-pending forwards: concurrent poll/ack between message creation
+-- and this forked send may have already removed the forward entry.
 sendBatchForwardsSequential = \msgs server ->
+  if count msgs == 0 then yield {}
+  else do
+    -- Filter to messages still pending in forward buckets
+    pending <- filterPendingBatchForwards msgs server []
+    if count pending == 0 then yield {}
+    else do
+      t <- now
+      auth <- generateFederationAuth "forward-batch" server
+      corrId <- genTokenN 1
+      let batchPayload = do r <- pending; yield {toKey: r.toKey, encryptedBlob: r.blob, timestamp: r.ts, originServer: serverHostN, messageId: r.messageId, expiresAt: r.fwdExpiresAt, priority: r.fwdPriority}
+      result <- fetchFederation server (FederationBatchForward {
+        forwards: batchPayload, fromServer: serverHostN,
+        requestTimestamp: t, authorization: auth, correlationId: corrId, protocolVersion: federationProtocolVersion})
+      case result of
+        Err e -> do
+          logKV "warn" "federation_batch_forward_failed" ["server=" ++ server, "batchSize=" ++ show (count pending), "error=" ++ show e]
+          recordFailure server
+        Ok response ->
+          if response.ok then do
+            clearFailure server
+            processBatchForwardResults pending response.results server
+          else do
+            logKV "warn" "federation_batch_forward_rejected" ["server=" ++ server, "error=" ++ response.error]
+            -- Fall back to individual forwards (old peer without /federation/forward-batch)
+            sendBatchForwardsFallback pending server
+
+-- Filter batch messages to those still pending in forward buckets.
+-- Concurrent poll/ack may have removed the forward entry between creation and send.
+filterPendingBatchForwards = \msgs server acc ->
   case headOf msgs of
-    Nothing {} -> yield {}
+    Nothing {} -> yield acc
     Just {value: r} -> do
       let rest = do m <- msgs; where m.messageId != r.messageId; yield m
       stillPending <- atomic do
         fwdBkt <- readFwdBucket (pubkeyBucket r.toKey)
         yield (any fwdBkt (\f -> f.messageId == r.messageId && f.toServer == server))
-      when stillPending (do
-        fwdT <- now
-        fwdAuth <- generateFederationAuth ("forward:" ++ r.messageId) server
-        fwdCorrId <- genTokenN 1
-        fwdResult <- fetchFederation server (ForwardMessage {
-          toKey: r.toKey, encryptedBlob: r.blob,
-          timestamp: r.ts, originServer: serverHostN, messageId: r.messageId,
-          fromServer: serverHostN, requestTimestamp: fwdT,
-          authorization: fwdAuth, correlationId: fwdCorrId,
-          expiresAt: r.fwdExpiresAt, priority: r.fwdPriority, protocolVersion: federationProtocolVersion})
-        case fwdResult of
-          Err e -> do
-            logKV "warn" "federation_forward_failed" ["server=" ++ server, "messageId=" ++ r.messageId, "error=" ++ show e]
-            recordFailure server
-          Ok response ->
-            if response.ok then do
-              removeForward r.messageId server r.toKey
-              clearFailure server
-            else
-              logKV "warn" "federation_forward_rejected" ["server=" ++ server, "messageId=" ++ r.messageId, "error=" ++ response.error])
-      sendBatchForwardsSequential rest server
+      filterPendingBatchForwards rest server (if stillPending then union acc [r] else acc)
+
+-- Process per-message results from a batch forward response (initial send path).
+-- Removes succeeded forward entries; logs rejections (no retry increment on initial send —
+-- the background prune cycle handles retries with proper backoff).
+processBatchForwardResults = \pending results server ->
+  case headOf pending of
+    Nothing {} -> yield {}
+    Just {value: r} -> do
+      let rest = do m <- pending; where m.messageId != r.messageId; yield m
+      let msgResult = headOf (do res <- results; where res.messageId == r.messageId; yield res)
+      case msgResult of
+        Just {value: res} ->
+          when res.ok (removeForward r.messageId server r.toKey)
+        Nothing {} -> yield {}
+      processBatchForwardResults rest results server
+
+-- Fallback: send forwards individually when batch forward is rejected (old peer).
+-- Same logic as the original sequential path but only runs when batch fails.
+sendBatchForwardsFallback = \msgs server ->
+  case headOf msgs of
+    Nothing {} -> yield {}
+    Just {value: r} -> do
+      let rest = do m <- msgs; where m.messageId != r.messageId; yield m
+      fwdT <- now
+      fwdAuth <- generateFederationAuth ("forward:" ++ r.messageId) server
+      fwdCorrId <- genTokenN 1
+      fwdResult <- fetchFederation server (ForwardMessage {
+        toKey: r.toKey, encryptedBlob: r.blob,
+        timestamp: r.ts, originServer: serverHostN, messageId: r.messageId,
+        fromServer: serverHostN, requestTimestamp: fwdT,
+        authorization: fwdAuth, correlationId: fwdCorrId,
+        expiresAt: r.fwdExpiresAt, priority: r.fwdPriority, protocolVersion: federationProtocolVersion})
+      case fwdResult of
+        Err e -> do
+          logKV "warn" "federation_forward_failed" ["server=" ++ server, "messageId=" ++ r.messageId, "error=" ++ show e]
+          recordFailure server
+        Ok response ->
+          if response.ok then do
+            removeForward r.messageId server r.toKey
+            clearFailure server
+          else
+            logKV "warn" "federation_forward_rejected" ["server=" ++ server, "messageId=" ++ r.messageId, "error=" ++ response.error]
+      sendBatchForwardsFallback rest server
 
 -- POST /messages: Send an encrypted message to a recipient.
 -- Deduplicates by messageId across messages, ackedIds, and deliveredIds.
@@ -6122,8 +6182,10 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                             then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
                             else updatedNonces
                       let lruEvicted = count updatedNonces - count evictedNonces
-                      when (lruEvicted > 0)
-                        (logKV "warn" "nonce_lru_eviction" ["bucket=" ++ show bkt, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket])
+                      when (lruEvicted > 0) (do
+                        let oldestRetainedAge = case minBy evictedNonces (\n -> n.seenAt) of Nothing {} -> 0; Just {value: n} -> t - n.seenAt
+                        let level = if oldestRetainedAge < messageMaxAge then "error" else "warn"
+                        logKV level "nonce_lru_eviction" ["bucket=" ++ show bkt, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket, "oldestRetainedMs=" ++ show oldestRetainedAge])
                       writeNonceBucket bkt evictedNonces
                       yield {forward: ForwardStored {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}}
     if result.noPresence then do
@@ -6785,20 +6847,24 @@ computeAndCacheHealth = \t -> do
     tmc <- *totalMessageCount
     lastFedSuccess <- *lastFederationSuccessAt
     forwardFailures <- *forwardFailures
+    pendingCancels <- *pendingFederationCancels
     pruneRun <- *pruneRunning
     dp <- *drainPhase
     let warmup = t - sa < healthPruneMaxAge
     let pruneStuck = pruneRun > 0 && t - pruneRun > backgroundPruneInterval * 5
+    let cancelCount = count pendingCancels
     let capacityOk = tmc * 10 <= maxMessages * 9
       && presenceCount * 10 <= maxPresenceEntries * 9
       && forwardCount * 10 <= maxForwardsEntries * 9
       && sessionCount * 10 <= maxSessions * 9
       && count activePolls * 10 <= maxActivePolls * 9
+      && cancelCount * 10 <= maxPendingCancels * 9
     -- 75% capacity early warning (fires before the 90% health check failure)
     let capacityWarn = tmc * 4 >= maxMessages * 3
       || presenceCount * 4 >= maxPresenceEntries * 3
       || forwardCount * 4 >= maxForwardsEntries * 3
       || sessionCount * 4 >= maxSessions * 3
+      || cancelCount * 4 >= maxPendingCancels * 3
     let fedOk = not federationEnabled || warmup
       || count forwardFailures == 0
       || (lastFedSuccess > 0 && t - lastFedSuccess < backgroundPruneInterval * 5)
@@ -6888,7 +6954,7 @@ handleHealth = \authorization respond -> do
                   draining: result.isDraining,
                   degradedPeers: 0})
 
-zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: []}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, totalEntries: 0, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0}}
+zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: 0}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, totalEntries: 0, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0}}
 
 handleStats = \authorization respond -> do
   t <- now
@@ -6926,7 +6992,8 @@ handleStats = \authorization respond -> do
         ukir <- *uniqueKeyIpRates
         se <- *senderExpirations
         sdl <- *senderDeliveries
-        yield {sc: sc, pc: pc, c: c, aCount: aCount, ao: ao, dCount: dCount, ff: ff, ap: ap, tmc: tmc, rc: rc, fi: fi, rg: rg, fnCount: fnCount, pac: pac, bp: bp, ger: ger, vir: vir, ukir: ukir, se: se, sdl: sdl}
+        pfc <- *pendingFederationCancels
+        yield {sc: sc, pc: pc, c: c, aCount: aCount, ao: ao, dCount: dCount, ff: ff, ap: ap, tmc: tmc, rc: rc, fi: fi, rg: rg, fnCount: fnCount, pac: pac, bp: bp, ger: ger, vir: vir, ukir: ukir, se: se, sdl: sdl, pfc: pfc}
       counters <- atomic do
         sr <- *sendRates
         cr <- *challengeRates
@@ -6989,7 +7056,7 @@ handleStats = \authorization respond -> do
       let sendAvg = if counters.cslc > 0 then counters.cslt / counters.cslc else 0
       yield (respond {ok: True {}, version: serverBuildVersion,
         capacity: {sessions: sessions, sessionsMax: maxSessions, sessionsPct: sessPct, messages: messages, messagesMax: maxMessages, messagesPct: msgPct, totalMessageCount: messages, presence: presence, presenceMax: maxPresenceEntries, presencePct: presPct, forwards: fwds, forwardsMax: maxForwardsEntries, forwardsPct: fwdPct, challenges: count core.c, challengesMax: maxChallenges, ackedIds: core.aCount, ackedIdsMax: maxAckedIds, ackOverflow: count core.ao, ackOverflowMax: maxAckOverflow, deliveredIds: core.dCount, deliveredIdsMax: maxDeliveredIds, forwardNonces: core.fnCount, forwardNoncesMax: maxForwardNonces, activePolls: count core.ap, activePollsMax: maxActivePolls, recipientCounts: count core.rc},
-        federation: {enabled: federationEnabled, inFlight: count core.fi, hungSlots: hungFedSlots, avgLatencyMs: fedAvg, maxLatencyMs: counters.flm, callCount: counters.flc, slowVerifies: counters.svc, verifyFailures: counters.vfc, forwardFailures: count core.ff, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, recentGossip: count core.rg, blockedPeers: count core.bp, drainCompletedAt: counters.dca, forwardServers: fwdServerCount, maxForwardQueueDepth: maxFwdDepth, topFailingPeers: topFailingPeers},
+        federation: {enabled: federationEnabled, inFlight: count core.fi, hungSlots: hungFedSlots, avgLatencyMs: fedAvg, maxLatencyMs: counters.flm, callCount: counters.flc, slowVerifies: counters.svc, verifyFailures: counters.vfc, forwardFailures: count core.ff, oldestForwardAge: oldestFwdAge, oldestAckAge: oldestAckAge, recentGossip: count core.rg, blockedPeers: count core.bp, drainCompletedAt: counters.dca, forwardServers: fwdServerCount, maxForwardQueueDepth: maxFwdDepth, topFailingPeers: topFailingPeers, pendingCancels: count core.pfc},
         rates: {send: count counters.sr, challenge: count counters.cr, federation: count counters.fr, federationPair: count counters.fpr, global: counters.grc, ip: count counters.ir, lookup: count counters.lr, recv: count counters.rr, pair: count counters.prr, gossipEvent: count core.ger, verifyIp: count core.vir, uniqueKeyIp: count core.ukir, pendingAckCleanups: count core.pac, senderExpirations: count core.se, senderDeliveries: count core.sdl, rejectedGlobal: counters.rlg, rejectedIp: counters.rli, rejectedAuth: counters.rla, rejectedPerKey: counters.rlk, rejectedFederation: counters.rlf},
         timing: {pruneCount: counters.pc, pruneRunning: counters.pr, heartbeatCount: counters.hc, uptime: t - counters.sa, lastPruneAt: counters.lp, lastHeartbeatAt: counters.lh, draining: counters.dr > 0, drainPhase: counters.dr, totalEntries: sessions + messages + presence + fwds + count core.c + core.aCount + count core.ao + core.dCount + core.fnCount + count core.ap + count core.fi, activeRequests: counters.arq, peakActiveRequests: counters.parq, pollAvgMs: pollAvg, pollMaxMs: counters.cplm, pollCount: counters.cplc, sendAvgMs: sendAvg, sendMaxMs: counters.cslm, sendCount: counters.cslc}})
     else yield (respond zeroStats)
@@ -8386,8 +8453,11 @@ backgroundMetaWatchdog = do
       fork backgroundWatchdog)
     backgroundMetaWatchdog
 
--- Startup connectivity probe: send an empty gossip to each known peer and log results.
--- Surfaces DNS, firewall, and TLS issues before the first real gossip cycle.
+-- Startup connectivity probe: two-phase check for each peer.
+-- Phase 1: unauthenticated probe tests TCP/TLS/HTTP connectivity.
+-- Phase 2: authenticated probe tests the verify callback round-trip — the critical
+-- federation auth path. Catches misconfigured reverse proxies that pass HTTP but block
+-- the /federation/verify callback, which would cause all federation requests to fail.
 -- Probes up to 10 peers sequentially (not forked) to avoid overwhelming the network.
 startupProbePeers = do
   atomic do set *startupProbeActive = True {}
@@ -8402,10 +8472,7 @@ startupProbeNext = \peers probed ->
     Just {value: server} -> do
       let rest = do p <- peers; where p != server; yield p
       startTime <- now
-      -- Unauthenticated probe: tests TCP/TLS/HTTP connectivity without generating
-      -- federation auth tokens. Peers reject with "unauthorized" (expected), which
-      -- still confirms reachability. Avoids leaking single-use tokens to potentially
-      -- untrusted peers during startup (DNS spoofing window before first real gossip).
+      -- Phase 1: unauthenticated probe (TCP/TLS/HTTP connectivity)
       result <- fetchFederation server (RecvGossip {
         authorization: "",
         events: [], hopsRemaining: 1, fromServer: serverHostN,
@@ -8414,7 +8481,25 @@ startupProbeNext = \peers probed ->
       let latency = endTime - startTime
       case result of
         Err e -> logWarn ("startup: peer " ++ server ++ " unreachable (" ++ show e ++ ") — check DNS/firewall/TLS")
-        Ok r -> logInfo ("startup: peer " ++ server ++ " reachable (" ++ show latency ++ "ms)")
+        Ok r -> do
+          logInfo ("startup: peer " ++ server ++ " reachable (" ++ show latency ++ "ms)")
+          -- Phase 2: authenticated probe (verify callback round-trip).
+          -- Sends an empty gossip with a real auth token. The peer will call back to
+          -- /federation/verify on this server to confirm the token, testing the full
+          -- federation auth path in both directions.
+          authStart <- now
+          auth <- generateFederationAuth "gossip" server
+          authResult <- fetchFederation server (RecvGossip {
+            authorization: auth,
+            events: [], hopsRemaining: 1, fromServer: serverHostN,
+            requestTimestamp: authStart, correlationId: "", protocolVersion: federationProtocolVersion})
+          authEnd <- now
+          let authLatency = authEnd - authStart
+          case authResult of
+            Err e -> logWarn ("startup: peer " ++ server ++ " verify callback failed (" ++ show e ++ ") — check reverse proxy allows /federation/verify")
+            Ok ar -> if ar.ok
+              then logInfo ("startup: peer " ++ server ++ " verify callback OK (" ++ show authLatency ++ "ms)")
+              else logWarn ("startup: peer " ++ server ++ " verify callback rejected: " ++ ar.error ++ " — check /federation/verify is reachable from peer")
       startupProbeNext rest (probed + 1)
 
 main = do
