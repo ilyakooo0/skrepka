@@ -1212,6 +1212,14 @@ logError = \msg -> println ("[ERROR] " ++ msg)
 -- when msg contains user-controlled data (e.g., error strings, server names).
 logEvent = \level event msg -> println ("{\"level\":\"" ++ escapeJsonString level ++ "\",\"event\":\"" ++ escapeJsonString event ++ "\",\"msg\":\"" ++ escapeJsonString msg ++ "\"}")
 
+-- Structured key=value logging: formats message as "k1=v1 k2=v2 ..." for consistent
+-- machine-parseable log entries. Wraps logEvent with key-value pair formatting.
+-- Use for events where individual fields need to be extracted by log pipelines.
+logKV = \level event kvs ->
+  logEvent level event (joinKVPairs kvs)
+
+joinKVPairs = \kvs -> fold (\acc kv -> if acc == "" then kv else acc ++ " " ++ kv) "" kvs
+
 -- Log a warning when a federation peer sends a request with an older protocol version.
 -- protocolVersion == 0 means pre-versioning peer (field missing). Only logs once per
 -- request — callers invoke this before delegating to the handler.
@@ -4025,6 +4033,9 @@ ackCleanupForwards = \entries t ->
   let bucketIds = uniqueBucketsFor entries (\e -> e.toKey) in
   ackCleanupByBucket bucketIds entries t
 
+-- Two-pass ack cleanup: first filter entries to those eligible for cleanup,
+-- then single-pass filter messages. Avoids O(entries * messages) nested scan
+-- from the fold-with-shrinking-accumulator pattern.
 ackCleanupByBucket = \bucketIds entries t -> case headOf bucketIds of
   Nothing {} -> yield {}
   Just {value: b} -> do
@@ -4037,17 +4048,20 @@ ackCleanupByBucket = \bucketIds entries t -> case headOf bucketIds of
       msgs <- readMessageBucket b
       tc <- *totalMessageCount
       rc <- readRcBucket b
-      let cleanup = fold (\acc rf ->
-        let hasLocal = any bucketPresence (\p -> p.pubkey == rf.toKey && isLocalServer p.server && p.expiresAt > t) in
-        let hasOtherFwds = any fwdBkt (\f -> f.messageId == rf.messageId && f.toKey == rf.toKey) in
-        if hasLocal || hasOtherFwds then acc
-        else case headOf (do m <- acc.msgs; where m.messageId == rf.messageId && m.toKey == rf.toKey && t - m.receivedAt >= ackGracePeriod; yield m) of
-          Nothing {} -> acc
-          Just {} -> {msgs: (do m <- acc.msgs; where not (m.messageId == rf.messageId && m.toKey == rf.toKey); yield m), removed: acc.removed + 1, rc: adjustRecipientCount acc.rc rf.toKey (0 - 1)}
-        ) {msgs: msgs, removed: 0, rc: rc} bucketEntries
-      writeMessageBucket b cleanup.msgs
-      set *totalMessageCount = max 0 (tc - cleanup.removed)
-      writeRcBucket b cleanup.rc
+      -- Phase 1: filter to entries eligible for cleanup (no local presence, no pending forwards)
+      let eligible = do rf <- bucketEntries
+            where not (any bucketPresence (\p -> p.pubkey == rf.toKey && isLocalServer p.server && p.expiresAt > t))
+            where not (any fwdBkt (\f -> f.messageId == rf.messageId && f.toKey == rf.toKey))
+            yield rf
+      -- Phase 2: single pass over messages — remove those matching any eligible entry past grace period
+      let shouldRemove = \m -> any eligible (\rf -> m.messageId == rf.messageId && m.toKey == rf.toKey && t - m.receivedAt >= ackGracePeriod)
+      let cleanMsgs = do m <- msgs; where not (shouldRemove m); yield m
+      let removedMsgs = do m <- msgs; where shouldRemove m; yield m
+      let removedCount = count removedMsgs
+      let newRc = fold (\accRc m -> adjustRecipientCount accRc m.toKey (0 - 1)) rc removedMsgs
+      writeMessageBucket b cleanMsgs
+      set *totalMessageCount = max 0 (tc - removedCount)
+      writeRcBucket b newRc
     ackCleanupByBucket remainingBuckets entries t
 
 pow2 : Int -> Int
@@ -4088,12 +4102,18 @@ isFederationCircuitOpen = \failures t ->
 
 recordFailure = \server -> do
   t <- now
+  -- Random jitter (0-25% of base backoff) prevents synchronized retries when
+  -- multiple operations to the same peer fail in quick succession. Shifts failedAt
+  -- forward, delaying when shouldRetryServer allows the next attempt. Combined with
+  -- the deterministic per-server spread in retryBackoffFor, this breaks both
+  -- cross-server and same-server retry correlation (thundering herd).
+  jitter <- randomInt (retryBackoffBase / 4)
   atomic do
     failures <- *forwardFailures
     let existing = headOf (do f <- failures; where f.server == server; yield f)
     let updated = case existing of
-      Nothing {} -> union failures [{server: server, failedAt: t, failures: 1, firstFailedAt: t}]
-      Just {value: f} -> union (do x <- failures; where x.server != server; yield x) [{server: server, failedAt: t, failures: min (f.failures + 1) 10, firstFailedAt: f.firstFailedAt}]
+      Nothing {} -> union failures [{server: server, failedAt: t + jitter, failures: 1, firstFailedAt: t}]
+      Just {value: f} -> union (do x <- failures; where x.server != server; yield x) [{server: server, failedAt: t + jitter, failures: min (f.failures + 1) 10, firstFailedAt: f.firstFailedAt}]
     set *forwardFailures = if count updated > maxForwardFailures then evictOneOldest updated (\x -> x.failedAt) else updated
 
 clearFailure = \server -> do
@@ -4113,7 +4133,7 @@ incrementForwardRetries = \messageId toServer toKey -> atomic do
       writeFwdBucket b (do f <- fwdBkt; where not (f.messageId == messageId && f.toServer == toServer); yield f)
       tfc <- *totalForwardCount
       set *totalForwardCount = max 0 (tfc - 1)
-      logWarn ("federation: dropping forward " ++ messageId ++ " to " ++ toServer ++ " after " ++ show maxForwardRetries ++ " retries")
+      logKV "warn" "federation_forward_dropped" ["messageId=" ++ messageId, "server=" ++ toServer, "retries=" ++ show maxForwardRetries]
     else writeFwdBucket b (do f <- fwdBkt; yield (if f.messageId == messageId && f.toServer == toServer then {messageId: f.messageId, toServer: f.toServer, createdAt: f.createdAt, toKey: f.toKey, encryptedBlob: f.encryptedBlob, timestamp: f.timestamp, originServer: f.originServer, retries: f.retries + 1, expiresAt: f.expiresAt, priority: f.priority, senderKey: f.senderKey} else f))
 
 -- Retry forwards for a server using batch forward (1 HTTP round-trip per batch of maxBatchSize).
@@ -4141,7 +4161,7 @@ retryForwardsForServer = \entries remaining ->
         requestTimestamp: t, authorization: auth, correlationId: corrId, protocolVersion: federationProtocolVersion})
       case result of
         Err e -> do
-          logWarn ("federation: batch forward to " ++ server ++ " failed: " ++ show e)
+          logKV "warn" "federation_batch_forward_failed" ["server=" ++ server, "batchSize=" ++ show (count batch), "error=" ++ show e]
           recordFailure server
           -- HTTP-level failure (connectivity, timeout): don't increment per-message retries.
           -- The messages weren't rejected — the server was unreachable. Server backoff
@@ -4154,7 +4174,7 @@ retryForwardsForServer = \entries remaining ->
             -- Process per-message results: remove succeeded, increment retries for failed
             retryForwardsBatchResults batch response.results server
           else do
-            logWarn ("federation: batch forward to " ++ server ++ " rejected: " ++ response.error ++ ", falling back to single-message forwards")
+            logKV "warn" "federation_batch_forward_rejected" ["server=" ++ server, "error=" ++ response.error]
             -- Application-level batch rejection (old peer, invalid request): fall back to
             -- sequential single-message forwards instead of burning retries. The peer likely
             -- doesn't support /federation/forward-batch, so individual forwards may succeed.
@@ -4188,7 +4208,7 @@ retryForwardsSingle = \batch server ->
         expiresAt: f.expiresAt, priority: f.priority, protocolVersion: federationProtocolVersion})
       case result of
         Err e -> do
-          logWarn ("federation: single forward to " ++ server ++ " failed for " ++ f.messageId ++ ": " ++ show e)
+          logKV "warn" "federation_single_forward_failed" ["server=" ++ server, "messageId=" ++ f.messageId, "error=" ++ show e]
           recordFailure server
         Ok response ->
           if response.ok then do
@@ -5499,9 +5519,15 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effectiveMsgId expiresIn
                 let nb = pubkeyBucket to
                 fwdNonces <- readNonceBucket nb
                 let updatedNonces = union fwdNonces [{messageId: effectiveMsgId, toKey: to, seenAt: t}]
-                writeNonceBucket nb (if count updatedNonces > maxNoncesPerBucket
-                  then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
-                  else updatedNonces)
+                let evictedNonces = if count updatedNonces > maxNoncesPerBucket
+                      then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
+                      else updatedNonces
+                -- Log LRU nonce eviction: evicted nonces create a bounded replay window
+                -- where messages with those nonces could be re-accepted until natural expiry.
+                let lruEvicted = count updatedNonces - count evictedNonces
+                when (lruEvicted > 0)
+                  (logKV "warn" "nonce_lru_eviction" ["bucket=" ++ show nb, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket])
+                writeNonceBucket nb evictedNonces
                 let toPresence = presenceForKey recipientPresence to t
                 let localOnline = hasLocalPresence toPresence
                 let remoteServers = collectPeerServers toPresence (\p -> p.server)
@@ -5547,14 +5573,14 @@ forkSendForwards = \effectiveMsgId to encryptedBlob clampedTs remoteServers ->
           expiresAt: fwdInfo.fwdExpiresAt, priority: fwdInfo.fwdPriority, protocolVersion: federationProtocolVersion})
         case fwdResult of
           Err e -> do
-            logWarn ("federation: forward to " ++ server ++ " failed for " ++ effectiveMsgId ++ ": " ++ show e)
+            logKV "warn" "federation_forward_failed" ["server=" ++ server, "messageId=" ++ effectiveMsgId, "error=" ++ show e]
             recordFailure server
           Ok response ->
             if response.ok then do
               removeForward effectiveMsgId server to
               clearFailure server
             else
-              logWarn ("federation: forward to " ++ server ++ " rejected for " ++ effectiveMsgId ++ ": " ++ response.error)))))
+              logKV "warn" "federation_forward_rejected" ["server=" ++ server, "messageId=" ++ effectiveMsgId, "error=" ++ response.error]))))
 
 -- Send all batch forwards for one server sequentially (no per-message fork overhead).
 -- Used by handleSendBatch; reduces fork count from O(messages * servers) to O(servers).
@@ -5581,14 +5607,14 @@ sendBatchForwardsSequential = \msgs server ->
           expiresAt: r.fwdExpiresAt, priority: r.fwdPriority, protocolVersion: federationProtocolVersion})
         case fwdResult of
           Err e -> do
-            logWarn ("federation: forward to " ++ server ++ " failed for " ++ r.messageId ++ ": " ++ show e)
+            logKV "warn" "federation_forward_failed" ["server=" ++ server, "messageId=" ++ r.messageId, "error=" ++ show e]
             recordFailure server
           Ok response ->
             if response.ok then do
               removeForward r.messageId server r.toKey
               clearFailure server
             else
-              logWarn ("federation: forward to " ++ server ++ " rejected for " ++ r.messageId ++ ": " ++ response.error))
+              logKV "warn" "federation_forward_rejected" ["server=" ++ server, "messageId=" ++ r.messageId, "error=" ++ response.error])
       sendBatchForwardsSequential rest server
 
 -- POST /messages: Send an encrypted message to a recipient.
@@ -6092,9 +6118,13 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
                       -- Sharded: writes only to the bucket for this recipient's pubkey.
                       fwdNonces <- readNonceBucket bkt
                       let updatedNonces = union fwdNonces [{messageId: messageId, toKey: toKey, seenAt: t}]
-                      writeNonceBucket bkt (if count updatedNonces > maxNoncesPerBucket
-                        then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
-                        else updatedNonces)
+                      let evictedNonces = if count updatedNonces > maxNoncesPerBucket
+                            then evictNonces updatedNonces maxNoncesPerBucket forwardNonceRetention t
+                            else updatedNonces
+                      let lruEvicted = count updatedNonces - count evictedNonces
+                      when (lruEvicted > 0)
+                        (logKV "warn" "nonce_lru_eviction" ["bucket=" ++ show bkt, "evicted=" ++ show lruEvicted, "capacity=" ++ show maxNoncesPerBucket])
+                      writeNonceBucket bkt evictedNonces
                       yield {forward: ForwardStored {}, globalCapReached: False {}, recvRateLimited: False {}, noPresence: False {}}
     if result.noPresence then do
       logWarn ("forward: rejected for " ++ toKey ++ " — no active presence on this server (from " ++ fromServer ++ ")")
@@ -7922,9 +7952,12 @@ requestPath = \req -> case req of
   StatsKey {} -> "GET /stats/key"
   TopRecipients {} -> "POST /stats/top-recipients"
   StatsForwards {} -> "GET /stats/forwards"
+  StatsRates {} -> "GET /stats/rates"
   Ready {} -> "GET /ready"
 
--- Extract client IP for access logging (empty for federation/maintenance routes)
+-- Extract client IP for access logging (empty for federation/maintenance/stats routes).
+-- Client-facing routes extract clientIp; all others use catch-all to avoid enumerating
+-- every federation/maintenance/stats route (reduces maintenance burden on new routes).
 requestClientIp = \req -> case req of
   ReqChallenge {clientIp} -> clientIp
   VerifyAuth {clientIp} -> clientIp
@@ -7942,40 +7975,7 @@ requestClientIp = \req -> case req of
   LookupPresence {clientIp} -> clientIp
   BatchLookupPresence {clientIp} -> clientIp
   VerifyToken {clientIp} -> clientIp
-  RecvGossip {} -> ""
-  ForwardMessage {} -> ""
-  FederationAck {} -> ""
-  FederationCancel {} -> ""
-  FederationBatchCancel {} -> ""
-  FederationBatchForward {} -> ""
-  Prune {} -> ""
-  Drain {} -> ""
-  Shutdown {} -> ""
-  Undrain {} -> ""
-  BlockPeer {} -> ""
-  UnblockPeer {} -> ""
-  ListBlocked {} -> ""
-  PingPeer {} -> ""
-  AdminListSessions {} -> ""
-  AdminRevokeSessions {} -> ""
-  AdminListAllSessions {} -> ""
-  AdminPurgeMessages {} -> ""
-  AdminRevokeIp {} -> ""
-  GetRateLimits {} -> ""
-  SetRateLimits {} -> ""
-  FlushNonces {} -> ""
-  AllowPeer {} -> ""
-  UnallowPeer {} -> ""
-  ListAllowed {} -> ""
-  Reconcile {} -> ""
-  RotateSecret {} -> ""
-  Health {} -> ""
-  Stats {} -> ""
-  StatsPeers {} -> ""
-  StatsKey {} -> ""
-  TopRecipients {} -> ""
-  StatsForwards {} -> ""
-  Ready {} -> ""
+  _ -> ""
 
 -- Slow request threshold for access logging (ms)
 slowRequestThreshold : Int<Ms>
@@ -8295,9 +8295,21 @@ backgroundPrune = do
 
 -- Background loop: periodically bumps pollWakeup to unblock long-polls that have been
 -- waiting too long (heartbeat). Ensures polls return within pollTimeoutMs even if no messages arrive.
+-- Adaptive: under high load (>80% capacity), the heartbeat fires more frequently
+-- (down to 5s at peak) to release poll slots faster and reduce connection hold time.
+-- Normal load uses the full pollTimeoutMs (~25s).
 pollHeartbeat = do
+  -- Adaptive poll timeout: scale heartbeat interval based on server load.
+  -- adaptiveRateScale returns 10-100 (percentage). At 100% (normal): full pollTimeoutMs.
+  -- At 10% (peak load): max(5000, pollTimeoutMs * 10 / 100) = 5000ms.
+  scale <- atomic do
+    tmc <- *totalMessageCount
+    sc <- *totalSessionCount
+    pc <- *totalPresenceCount
+    yield (adaptiveRateScale tmc sc pc)
+  let effectiveTimeout = max 5000 (pollTimeoutMs * scale / 100)
   jitter <- randomInt 2000
-  sleep (pollTimeoutMs + jitter)
+  sleep (effectiveTimeout + jitter)
   dp <- *drainPhase
   shutdownReq <- *shutdownRequested
   dca <- *drainCompletedAt
