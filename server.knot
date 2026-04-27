@@ -572,6 +572,8 @@ serverHostN : Text
 serverHostN = normalizeServerName serverHost
 isLocalServer : Text -> Bool
 isLocalServer = \s -> s == serverHostN
+isRemote : Text -> Bool
+isRemote = \s -> not (isLocalServer s)
 
 hasPrefix : Text -> Text -> Bool
 hasPrefix = \pre s -> take (count (chars pre)) s == pre
@@ -697,14 +699,13 @@ withFederationAuth = \authorization t respond fromServer scope requestTimestamp 
 -- ============================================
 
 -- Returns {limited, entries}. Increments count when the key fits within the window.
--- Simplified: drop any stale/matching entry, then either reject or insert a fresh entry.
-checkRate = \entries key maxRate windowMs maxEntries t ->
+checkRate = \entries key maxRate windowMs t ->
   let cur = case findFirst entries (\r -> r.key == key && t - r.windowStart < windowMs) of
         Just {value: r} -> {windowStart: r.windowStart, count: r.count + 1}
         _ -> {windowStart: t, count: 1} in
   if cur.count > maxRate
     then {limited: True {}, entries: entries}
-    else {limited: False {}, entries: capList (union (removeWhere entries (\x -> x.key == key)) [{key: key, windowStart: cur.windowStart, count: cur.count}]) maxEntries (\r -> r.windowStart)}
+    else {limited: False {}, entries: capList (union (removeWhere entries (\x -> x.key == key)) [{key: key, windowStart: cur.windowStart, count: cur.count}]) 5000 (\r -> r.windowStart)}
 
 checkWindowRate = \windowRef countRef windowMs maxRate t -> atomic do
   ws <- *windowRef
@@ -728,7 +729,7 @@ checkIpRateGate = \ip t ->
 -- Non-atomic version: caller must wrap in `atomic do`.
 chargeRate = \rateRef key maxRate windowMs t -> do
   rates <- *rateRef
-  let r = checkRate rates key maxRate windowMs 5000 t
+  let r = checkRate rates key maxRate windowMs t
   set *rateRef = r.entries
   yield r.limited
 
@@ -767,10 +768,10 @@ recordFailure = \server -> do
     failures <- *forwardFailures
     let same = \f -> f.server == server
     let prev = case findFirst failures same of
-          Just {value: f} -> {count: f.failures + 1, firstFailedAt: f.firstFailedAt}
-          _ -> {count: 1, firstFailedAt: t}
+          Just {value: f} -> {failures: f.failures + 1, firstFailedAt: f.firstFailedAt}
+          _ -> {failures: 1, firstFailedAt: t}
     set *forwardFailures = union (removeWhere failures same)
-      [{server: server, failedAt: t, failures: prev.count, firstFailedAt: prev.firstFailedAt}]
+      [{server: server, failedAt: t, failures: prev.failures, firstFailedAt: prev.firstFailedAt}]
 
 clearFailure = \server -> atomic (pruneRef forwardFailures (\f -> f.server != server))
 
@@ -811,7 +812,7 @@ isDuplicateMessage = \mid toKey msgs aids dids ->
 
 collectPeers : [a] -> (a -> Text) -> [Text]
 collectPeers = \items getServer ->
-  unique (filter (pluck items getServer) (\s -> not (isLocalServer s)))
+  unique (filter (pluck items getServer) isRemote)
 
 knownPeerServersFromPresence : [PresenceEntry] -> [Text]
 knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.server)
@@ -882,7 +883,7 @@ cancelOne = \mid to ownerPred t -> atomic do
   msgs <- *messages
   let matches = \x -> x.messageId == mid && x.toKey == to
   let owns = any msgs (\m -> matches m && ownerPred m)
-  when owns (do _ <- applyCancel msgs matches to mid t; yield {})
+  when owns (do applyCancel msgs matches to mid t; yield {})
   yield owns
 
 sendBatchedGossip = \peers events hops -> forEach peers (\server -> do
@@ -969,7 +970,7 @@ pruneAndRetry = \t -> do
   when federationEnabled (do
     fork retryPendingForwards
     aids <- *ackedIds
-    fork (sendAcksAndClean (filter aids (\a -> not (isLocalServer a.originServer))))
+    fork (sendAcksAndClean (filter aids (\a -> isRemote a.originServer)))
     lastRefresh <- *lastPresenceRefresh
     when (t - lastRefresh >= presenceRefreshInterval) (do
       atomic do set *lastPresenceRefresh = t
@@ -981,7 +982,7 @@ refreshLocalPresence = \t -> do
     presence <- *presence
     let sessionKeys = unique (pluck sessions (\s -> s.pubkey))
     let needsRefresh = \p -> isLocalServer p.server && elem sessionKeys p.pubkey && p.expiresAt - t < sessionExpiry / 2
-    let refreshed = pluck (filter presence needsRefresh) (\p -> {pubkey: p.pubkey, server: p.server, expiresAt: t + sessionExpiry, timestamp: t})
+    let refreshed = mapWhere presence needsRefresh (\p -> {pubkey: p.pubkey, server: p.server, expiresAt: t + sessionExpiry, timestamp: t})
     let updated = union (removeWhere presence needsRefresh) refreshed
     set *presence = updated
     yield {refreshed: refreshed, peers: knownPeerServersFromPresence updated}
@@ -1377,12 +1378,12 @@ handleFederationPubkey = \respond -> do
 
 handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorization respond -> do
   t <- now
-  withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (clamp 0 maxGossipHops hopsRemaining >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (do
+  withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (clamp 0 maxGossipHops hopsRemaining >= 1 && isRemote fromServer && count events <= maxGossipEvents) (do
     newlyOnline <- atomic do
       pres <- *presence
       let validEvents = do
         e <- events
-        where not (isLocalServer e.server) && e.timestamp <= t + clockSkewTolerance
+        where isRemote e.server && e.timestamp <= t + clockSkewTolerance
         let expiresAt = min e.timestamp t + clampTtl e.ttl * 1000
         where expiresAt > t
         yield {pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, eventType: e.eventType}
@@ -1421,7 +1422,7 @@ storeFederated = \toKey encryptedBlob timestamp originServer messageId expiresAt
 
 handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp expiresAt priority authorization respond -> do
   t <- now
-  withFederationAuth authorization t respond fromServer ("forward:" ++ messageId) requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
+  withFederationAuth authorization t respond fromServer ("forward:" ++ messageId) requestTimestamp (isRemote originServer && isRemote fromServer) (do
     if t - timestamp > messageMaxAge
       then yield (respond {ok: False {}, error: "stale_timestamp", retryAfterMs: 0})
       else do
@@ -1431,7 +1432,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
 handleFederationAck = \messageIds originServer fromServer requestTimestamp authorization respond -> do
   t <- now
   let ackRespond = \r -> respond {ok: r.ok, error: r.error, ackedCount: 0, results: [], retryAfterMs: r.retryAfterMs}
-  withFederationAuth authorization t ackRespond fromServer "ack" requestTimestamp (isLocalServer originServer && not (isLocalServer fromServer)) (do
+  withFederationAuth authorization t ackRespond fromServer "ack" requestTimestamp (isLocalServer originServer && isRemote fromServer) (do
     let dedupedIds = dedupMessageIds messageIds
     result <- atomic do
       fwds <- *forwards
@@ -1454,14 +1455,14 @@ handleFederationAck = \messageIds originServer fromServer requestTimestamp autho
 handleFederationCancel = \messageId toKey fromServer requestTimestamp authorization respond -> do
   t <- now
   let cancelRespond = \r -> respond {ok: r.ok, error: r.error, cancelled: False {}, retryAfterMs: r.retryAfterMs}
-  withFederationAuth authorization t cancelRespond fromServer ("cancel:" ++ messageId) requestTimestamp (not (isLocalServer fromServer)) (do
+  withFederationAuth authorization t cancelRespond fromServer ("cancel:" ++ messageId) requestTimestamp (isRemote fromServer) (do
     cancelled <- cancelOne messageId toKey (\m -> m.originServer == fromServer) t
     yield (respond {ok: True {}, error: "", cancelled: cancelled, retryAfterMs: 0}))
 
 handleFederationBatchCancel = \cancels fromServer requestTimestamp authorization respond -> do
   t <- now
   let batchRespond = \r -> respond {ok: r.ok, error: r.error, results: [], retryAfterMs: r.retryAfterMs}
-  withFederationAuth authorization t batchRespond fromServer "cancel-batch" requestTimestamp (not (isLocalServer fromServer) && count cancels <= maxBatchSize) (do
+  withFederationAuth authorization t batchRespond fromServer "cancel-batch" requestTimestamp (isRemote fromServer && count cancels <= maxBatchSize) (do
     results <- mapEach (takeRelation maxBatchSize cancels) (\e -> do
       cancelled <- cancelOne e.messageId e.toKey (\m -> m.originServer == fromServer) t
       yield {messageId: e.messageId, cancelled: cancelled})
@@ -1470,7 +1471,7 @@ handleFederationBatchCancel = \cancels fromServer requestTimestamp authorization
 handleFederationBatchForward = \forwards fromServer requestTimestamp authorization respond -> do
   t <- now
   let batchRespond = \r -> respond {ok: r.ok, error: r.error, results: [], retryAfterMs: r.retryAfterMs}
-  withFederationAuth authorization t batchRespond fromServer "forward-batch" requestTimestamp (not (isLocalServer fromServer) && count forwards <= maxBatchSize) (do
+  withFederationAuth authorization t batchRespond fromServer "forward-batch" requestTimestamp (isRemote fromServer && count forwards <= maxBatchSize) (do
     results <- mapEach (takeRelation maxBatchSize forwards) (\e -> do
       ok <- if isLocalServer e.originServer || t - e.timestamp > messageMaxAge then yield False
         else do
@@ -1482,7 +1483,7 @@ handleFederationBatchForward = \forwards fromServer requestTimestamp authorizati
 handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp authorization respond -> do
   t <- now
   let receiptRespond = \r -> respond {ok: r.ok, error: r.error, receivedCount: 0, retryAfterMs: r.retryAfterMs}
-  withFederationAuth authorization t receiptRespond fromServer "delivery-receipt" requestTimestamp (not (isLocalServer fromServer) && count messageIds <= maxMessageIds) (do
+  withFederationAuth authorization t receiptRespond fromServer "delivery-receipt" requestTimestamp (isRemote fromServer && count messageIds <= maxMessageIds) (do
     if count messageIds != count toKeys
       then yield (respond {ok: False {}, error: "mismatched_lengths", receivedCount: 0, retryAfterMs: 0})
       else do
@@ -1612,7 +1613,7 @@ handleAdminRevokeSessions = \pubkey authorization respond -> withMaintAuth autho
       ses <- *sessions
       let same = \s -> s.pubkey == pubkey
       set *sessions = removeWhere ses same
-      pruneRef presence (\p -> p.pubkey != pubkey || not (isLocalServer p.server))
+      pruneRef presence (\p -> p.pubkey != pubkey || isRemote p.server)
       yield (countWhere ses same)
     yield (respond {ok: True {}, revokedCount: revoked}))
 
@@ -1652,7 +1653,7 @@ handleAdminListAllSessions = \limit authorization respond -> withMaintAuth autho
        count: count mine,
        ips: unique (mapWhere mine (\s -> s.ip != "") (\s -> s.ip)),
        latestExpiry: fold (\acc s -> max acc s.expiresAt) 0 mine})
-    let cap = if limit <= 0 then 100 else clamp 1 500 limit
+    let cap = clamp 1 500 (if limit <= 0 then 100 else limit)
     let top = takeRelation cap (sortBy (\g -> 0 - g.count) grouped)
     yield (respond {sessions: top, ok: True {}, total: count grouped}))
 
@@ -1746,7 +1747,7 @@ handleTopRecipients = \limit authorization respond -> withMaintAuth authorizatio
   (do
     msgs <- *messages
     let counts = pluck (unique (pluck msgs (\m -> m.toKey))) (\pk -> {pubkey: pk, count: countWhere msgs (\m -> m.toKey == pk)})
-    let cap = if limit <= 0 then 20 else clamp 1 100 limit
+    let cap = clamp 1 100 (if limit <= 0 then 20 else limit)
     let top = takeRelation cap (sortBy (\c -> 0 - c.count) counts)
     yield (respond {recipients: top, ok: True {}, total: count counts}))
 
