@@ -545,22 +545,16 @@ mapEach = \items getKey action -> case headOf items of
     rest <- mapEach (filter items (\y -> getKey y != getKey x)) getKey action
     yield (union [r] rest)
 
--- Hex tokens (callers just pass raw bits).
+-- Hex tokens: one random hex char per recursive call.
 hexDigit : Int -> Text
 hexDigit = \n -> take 1 (drop (mod n 16) "0123456789abcdef")
 
-byteToHex : Int -> Text
-byteToHex = \n -> hexDigit (n / 16) ++ hexDigit n
-
-intTo3Hex : Int -> Text
-intTo3Hex = \n -> byteToHex (n / 65536) ++ byteToHex (n / 256) ++ byteToHex n
-
 genTokenN = \n -> if n <= 0 then yield "" else do
-  chunk <- randomInt 16777216
+  d <- randomInt 16
   rest <- genTokenN (n - 1)
-  yield (intTo3Hex chunk ++ rest)
+  yield (hexDigit d ++ rest)
 
-genToken = genTokenN 8
+genToken = genTokenN 48
 
 tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
@@ -568,7 +562,8 @@ tooLong = \s maxLen -> count (chars s) > maxLen
 isValidHex : Text -> Bool
 isValidHex = \s ->
   let cs = chars s in
-  count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
+  let n = count cs in
+  n > 0 && mod n 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
@@ -660,7 +655,7 @@ generateFederationAuth : Text -> Timestamp -> IO {network} Text
 generateFederationAuth = \scope requestTimestamp ->
   if serverFederationPrivateKeyHex != ""
     then do
-      nonce <- genTokenN 8
+      nonce <- genTokenN 48
       let message = textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ serverHostN ++ "|" ++ nonce)
       let sig = sign (bytesFromHex serverFederationPrivateKeyHex) message
       yield ("Signed " ++ bytesToHex sig ++ ":" ++ nonce)
@@ -1888,7 +1883,15 @@ handleMetrics = \authorization respond -> do
   aps <- *activePolls
   sa <- *startedAt
   dp <- *drainPhase
-  let metrics = "skrepka_messages_total " ++ show (count msgs) ++ "\nskrepka_sessions_total " ++ show (count ses) ++ "\nskrepka_presence_total " ++ show (count pres) ++ "\nskrepka_forwards_total " ++ show (count fwds) ++ "\nskrepka_active_polls " ++ show (count aps) ++ "\nskrepka_uptime_seconds " ++ show ((t - sa) / 1000) ++ "\nskrepka_draining " ++ (if dp > 0 then "1" else "0") ++ "\n"
+  let rows = [
+    {k: "skrepka_messages_total", v: count msgs},
+    {k: "skrepka_sessions_total", v: count ses},
+    {k: "skrepka_presence_total", v: count pres},
+    {k: "skrepka_forwards_total", v: count fwds},
+    {k: "skrepka_active_polls", v: count aps},
+    {k: "skrepka_uptime_seconds", v: (t - sa) / 1000},
+    {k: "skrepka_draining", v: if dp > 0 then 1 else 0}]
+  let metrics = fold (\acc r -> acc ++ r.k ++ " " ++ show r.v ++ "\n") "" rows
   yield (respond {metrics: metrics, ok: True {}})
 
 -- ============================================
