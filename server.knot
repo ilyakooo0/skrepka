@@ -464,6 +464,9 @@ abs = \x -> if x < 0 then 0 - x else x
 -- Dedup: keeps first occurrence (O(n^2)).
 unique = \items -> fold (\acc x -> if elem acc x then acc else union acc [x]) [] items
 
+-- Pair each element with its 0-based index.
+withIndex = fold (\acc x -> union acc [{i: count acc, v: x}]) []
+
 -- Replace a ref's contents with the entries that satisfy `keep`. Caller controls atomicity.
 pruneRef = \ref keep -> do
   cur <- *ref
@@ -489,9 +492,8 @@ removeServerFromList = \listRef server -> atomic do
 
 headOf = \items -> fold (\_ x -> Just {value: x}) Nothing {} (take 1 items)
 
--- Cap to maxN by dropping the single entry with the smallest key (LRU-style).
-capList = \items maxN getKey ->
-  if count items > maxN then drop 1 (sortBy getKey items) else items
+-- Cap to maxN by dropping the smallest-key entries (LRU-style). Always sorts.
+capList = \items maxN getKey -> drop (max 0 (count items - maxN)) (sortBy getKey items)
 
 -- Integer percentage with zero-denominator guard.
 pct = \cur maxN -> if maxN > 0 then cur * 100 / maxN else 0
@@ -625,16 +627,13 @@ gateAuth = \checkDrain auth ip t respond mkErr onAuth -> do
   else withSessionAuth auth t ip (err "unauthorized") onAuth
 
 -- gateAuth + per-key rate gate. `rateResp` is the response value when the per-key gate trips.
-gateRated = \checkDrain auth ip rateRef maxRate windowMs t respond mkErr rateResp onAuth ->
+gateRated = \rateRef maxRate windowMs checkDrain auth ip t respond mkErr rateResp onAuth ->
   gateAuth checkDrain auth ip t respond mkErr (\pk -> do
     lim <- checkPubkeyRateGate rateRef pk maxRate windowMs t
     if lim then yield (respond rateResp) else onAuth pk)
 
-gateClientWrite = \auth ip t respond mkErr rateResp onAuth ->
-  gateRated (True {}) auth ip clientWriteRates maxClientWriteRatePerKey clientWriteRateWindowMs t respond mkErr rateResp onAuth
-
-gateLookup = \auth ip t respond mkErr rateResp onAuth ->
-  gateRated (False {}) auth ip lookupRates maxLookupRatePerKey lookupRateWindowMs t respond mkErr rateResp onAuth
+gateClientWrite = gateRated clientWriteRates maxClientWriteRatePerKey clientWriteRateWindowMs (True {})
+gateLookup = gateRated lookupRates maxLookupRatePerKey lookupRateWindowMs (False {})
 
 withSessionAuth = \authorization t clientIp onUnauth onAuth ->
   case extractToken authorization of
@@ -683,17 +682,20 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
 withFederationAuth = \authorization t respond fromServer scope requestTimestamp precondition action -> do
   blocked <- *blockedPeers
   allowed <- *allowedPeers
-  let err = \e -> yield (respond {ok: False {}, error: e, retryAfterMs: 0})
-  if elem blocked fromServer then err "blocked"
-  else if count allowed > 0 && not (elem allowed fromServer) then err "not_allowed"
-  else if not precondition then err "invalid_request"
-  else if requestTimestamp > 0 && abs (requestTimestamp - t) > clockSkewTolerance then err "clock_skew"
+  let err = \e r -> yield (respond {ok: False {}, error: e, retryAfterMs: r})
+  let preErr =
+        if elem blocked fromServer then "blocked"
+        else if count allowed > 0 && not (elem allowed fromServer) then "not_allowed"
+        else if not precondition then "invalid_request"
+        else if requestTimestamp > 0 && abs (requestTimestamp - t) > clockSkewTolerance then "clock_skew"
+        else ""
+  if preErr != "" then err preErr 0
   else do
     verified <- verifyFederationAuth authorization fromServer scope requestTimestamp
-    if not verified then err "unauthorized"
+    if not verified then err "unauthorized" 0
     else do
       limited <- checkServerRateGate fromServer t
-      if limited then yield (respond {ok: False {}, error: "rate_limited", retryAfterMs: federationRateWindowMs})
+      if limited then err "rate_limited" federationRateWindowMs
       else action
 
 -- ============================================
@@ -1288,7 +1290,7 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
 handleListMessages = \offset authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {messages: [], authorized: False {}, count: 0, error: if e == "rate_limited" then "rate_limited" else ""}
-  gateRated (True {}) authorization clientIp lookupRates maxLookupRatePerKey lookupRateWindowMs t respond mkErr
+  gateRated lookupRates maxLookupRatePerKey lookupRateWindowMs (True {}) authorization clientIp t respond mkErr
     {messages: [], authorized: True {}, count: 0, error: "rate_limited"} (\pubkey -> do
       msgs <- *messages
       let myMsgs = sortBy (\m -> m.receivedAt) (filter msgs (\m -> m.toKey == pubkey && m.expiresAt > t))
@@ -1507,9 +1509,6 @@ handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp
             where m.messageId == p.messageId && m.toKey == p.toKey && m.senderKey != "" && m.originServer == ""
             yield {senderKey: m.senderKey, messageId: p.messageId, toKey: p.toKey, deliveredAt: t}) 10000 (\d -> d.deliveredAt)
         yield (respond {ok: True {}, error: "", receivedCount: count pairs, retryAfterMs: 0}))
-
--- Index a list (1-based by virtue of `count` of the partial fold).
-withIndex = fold (\acc x -> union acc [{i: count acc, v: x}]) []
 
 -- ============================================
 -- Maintenance handlers
