@@ -540,7 +540,7 @@ mapEach = \items getKey action -> case headOf items of
 
 -- Hex tokens: one random hex char per recursive call.
 hexDigit : Int -> Text
-hexDigit = \n -> take 1 (drop (mod n 16) "0123456789abcdef")
+hexDigit = \n -> take 1 (drop n "0123456789abcdef")
 
 genTokenN = \n -> if n <= 0 then yield "" else do
   d <- randomInt 16
@@ -553,7 +553,7 @@ tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
-isValidHex = \s -> let cs = chars s in count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
+isValidHex = \s -> count (chars s) > 0 && mod (count (chars s)) 2 == 0 && all (chars s) (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
@@ -574,8 +574,7 @@ hasPrefix = \pre s -> take (count (chars pre)) s == pre
 
 containsSuffix : Text -> Text -> Bool
 containsSuffix = \suffix s ->
-  let d = count (chars s) - count (chars suffix) in
-  d >= 0 && drop d s == suffix
+  drop (max 0 (count (chars s) - count (chars suffix))) s == suffix
 
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
 -- tricks (octal, hex, percent-encoding) but covers the high-value cases.
@@ -826,9 +825,8 @@ knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.serve
 -- Last-write-wins merge by (pubkey, server), keeping the entry with the larger expiresAt.
 mergePresence = \existing incoming ->
   fold (\acc e ->
-    let same = \x -> x.pubkey == e.pubkey && x.server == e.server in
-    if any acc (\x -> same x && x.expiresAt >= e.expiresAt) then acc
-    else union (removeWhere acc same) [e]) existing incoming
+    if any acc (\x -> x.pubkey == e.pubkey && x.server == e.server && x.expiresAt >= e.expiresAt) then acc
+    else union (removeWhere acc (\x -> x.pubkey == e.pubkey && x.server == e.server)) [e]) existing incoming
 
 -- ============================================
 -- Pruning
