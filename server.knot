@@ -497,6 +497,24 @@ evictOldest = \items getKey -> drop 1 (sortBy getKey items)
 capList = \items maxN getKey ->
   if count items > maxN then evictOldest items getKey else items
 
+-- Integer percentage with zero-denominator guard.
+pct = \cur maxN -> if maxN > 0 then cur * 100 / maxN else 0
+
+-- Read entries matching `pred` (transformed by `extract`) and prune them in one step.
+collectAndPrune = \ref pred extract -> do
+  items <- *ref
+  let mine = mapWhere items pred extract
+  pruneRef ref (\x -> not (pred x))
+  yield mine
+
+-- Common ack/delete tail: pull matching messages, drop them and their forwards.
+removeForKey = \pred -> do
+  msgs <- *messages
+  let toRemove = filter msgs pred
+  set *messages = removeWhere msgs pred
+  pruneRef forwards (\f -> not (pred f))
+  yield toRemove
+
 -- If `pred` matches at least maxN items, drop the oldest matching one.
 capPerKey = \items pred maxN getKey ->
   let mine = filter items pred in
@@ -526,12 +544,12 @@ mapEach = \items getKey action -> case headOf items of
     rest <- mapEach (filter items (\y -> getKey y != getKey x)) getKey action
     yield (union [r] rest)
 
--- Hex tokens
+-- Hex tokens (modulo lives inside hexDigit, so callers just pass raw bits).
 hexDigit : Int -> Text
-hexDigit = \n -> take 1 (drop (clamp 0 15 n) "0123456789abcdef")
+hexDigit = \n -> take 1 (drop (n - n / 16 * 16) "0123456789abcdef")
 
 byteToHex : Int -> Text
-byteToHex = \n -> let m = n - n / 256 * 256 in hexDigit (m / 16) ++ hexDigit (m - m / 16 * 16)
+byteToHex = \n -> hexDigit (n / 16) ++ hexDigit n
 
 intTo3Hex : Int -> Text
 intTo3Hex = \n -> byteToHex (n / 65536) ++ byteToHex (n / 256) ++ byteToHex n
@@ -1135,15 +1153,9 @@ pollOnce = \token cursor cursorWasReset watchKeys clientIp serverGen respond t -
               yield (pluck watchKeys (\k -> {pubkey: k, online: count (presenceForKey pres k t2) > 0}))
             else yield []
           drains <- atomic do
-            se <- *senderExpirations
-            let myExp = mapWhere se (\x -> x.senderKey == s.pubkey) (\x -> {messageId: x.messageId, toKey: x.toKey, expiredAt: x.expiredAt})
-            pruneRef senderExpirations (\x -> x.senderKey != s.pubkey)
-            sd <- *senderDeliveries
-            let myDel = mapWhere sd (\x -> x.senderKey == s.pubkey) (\x -> {messageId: x.messageId, toKey: x.toKey, deliveredAt: x.deliveredAt})
-            pruneRef senderDeliveries (\x -> x.senderKey != s.pubkey)
-            cn <- *cancelNotifications
-            let myCancels = mapWhere cn (\x -> x.toKey == s.pubkey) (\x -> {messageId: x.messageId, cancelledAt: x.cancelledAt})
-            pruneRef cancelNotifications (\x -> x.toKey != s.pubkey)
+            myExp <- collectAndPrune senderExpirations (\x -> x.senderKey == s.pubkey) (\x -> {messageId: x.messageId, toKey: x.toKey, expiredAt: x.expiredAt})
+            myDel <- collectAndPrune senderDeliveries (\x -> x.senderKey == s.pubkey) (\x -> {messageId: x.messageId, toKey: x.toKey, deliveredAt: x.deliveredAt})
+            myCancels <- collectAndPrune cancelNotifications (\x -> x.toKey == s.pubkey) (\x -> {messageId: x.messageId, cancelledAt: x.cancelledAt})
             yield {expirations: myExp, deliveries: myDel, cancellations: myCancels}
           let isHeartbeat = pollResult.authorized && count pollResult.events == 0
           yield (respond {events: pollResult.events, cursor: pollResult.cursor, authorized: pollResult.authorized, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: pollResult.hasMore, cursorStale: False {}, messageExpirations: drains.expirations, messageDeliveries: drains.deliveries, droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: drains.cancellations})
@@ -1312,10 +1324,7 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
       let dedupedIds = dedupMessageIds messageIds
       let matches = \x -> x.toKey == pubkey && elem dedupedIds x.messageId
       result <- atomic do
-        msgs <- *messages
-        let toAck = filter msgs matches
-        set *messages = removeWhere msgs matches
-        pruneRef forwards (\f -> not (matches f))
+        toAck <- removeForKey matches
         ackedFed <- recordAcksAndDeliveries toAck t
         yield {ackedCount: count toAck, pendingAcks: ackedFed}
       fork (when federationEnabled (sendAcksAndClean result.pendingAcks))
@@ -1340,10 +1349,7 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
       let dedupedIds = dedupMessageIds messageIds
       let matches = \x -> x.toKey == pubkey && elem dedupedIds x.messageId
       result <- atomic do
-        msgs <- *messages
-        let toDel = filter msgs matches
-        set *messages = removeWhere msgs matches
-        pruneRef forwards (\f -> not (matches f))
+        toDel <- removeForKey matches
         let ackedFed = mapWhere toDel (\m -> m.originServer != "") (\m -> mkAckedEntry m t)
         appendCapped ackedIds ackedFed maxAckedIds (\a -> a.ackedAt)
         yield {deletedCount: count toDel, pendingAcks: ackedFed}
@@ -1812,7 +1818,7 @@ handleStats = \authorization respond -> withMaintAuth authorization
     let fCount = count fwds
     let zeroFed = {enabled: federationEnabled, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: count bp, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: count pfc, gossipSuccess: 0, gossipFail: 0, latencyBuckets: {lt100: 0, lt500: 0, lt2000: 0, gte2000: 0}}
     let zeroRates = {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0, clientCancels: 0, federationCancels: 0}
-    let cap = {sessions: sCount, sessionsMax: maxSessions, sessionsPct: if maxSessions > 0 then sCount * 100 / maxSessions else 0, messages: mCount, messagesMax: maxMessages, messagesPct: if maxMessages > 0 then mCount * 100 / maxMessages else 0, totalMessageCount: mCount, presence: pCount, presenceMax: maxPresenceEntries, presencePct: if maxPresenceEntries > 0 then pCount * 100 / maxPresenceEntries else 0, forwards: fCount, forwardsMax: maxForwardsEntries, forwardsPct: if maxForwardsEntries > 0 then fCount * 100 / maxForwardsEntries else 0, challenges: count chs, challengesMax: maxChallenges, ackedIds: count aids, ackedIdsMax: maxAckedIds, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: count dids, deliveredIdsMax: maxDeliveredIds, forwardNonces: 0, forwardNoncesMax: 0, nonceEvictions: 0, activePolls: count aps, activePollsMax: maxActivePolls, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0}
+    let cap = {sessions: sCount, sessionsMax: maxSessions, sessionsPct: pct sCount maxSessions, messages: mCount, messagesMax: maxMessages, messagesPct: pct mCount maxMessages, totalMessageCount: mCount, presence: pCount, presenceMax: maxPresenceEntries, presencePct: pct pCount maxPresenceEntries, forwards: fCount, forwardsMax: maxForwardsEntries, forwardsPct: pct fCount maxForwardsEntries, challenges: count chs, challengesMax: maxChallenges, ackedIds: count aids, ackedIdsMax: maxAckedIds, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: count dids, deliveredIdsMax: maxDeliveredIds, forwardNonces: 0, forwardNoncesMax: 0, nonceEvictions: 0, activePolls: count aps, activePollsMax: maxActivePolls, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0}
     let timing = {pruneCount: pc, pruneRunning: 0, heartbeatCount: hc, uptime: t - sa, lastPruneAt: lp, lastHeartbeatAt: lh, draining: dp > 0, drainPhase: dp, totalEntries: sCount + mCount + pCount + fCount, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, pollLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0, sendLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, authAvgMs: 0, authMaxMs: 0, authCount: 0}
     yield (respond {ok: True {}, version: serverBuildVersion, capacity: cap, federation: zeroFed, rates: zeroRates, timing: timing}))
 
@@ -1864,8 +1870,7 @@ handleStatsForwards = \authorization respond -> withMaintAuth authorization
     let servers = collectPeers fwds (\f -> f.toServer)
     let result = pluck servers (\s ->
       let svFwds = filter fwds (\f -> f.toServer == s) in
-      let oldest = case minBy svFwds (\f -> f.createdAt) of Nothing {} -> 0; Just {value: x} -> t - x.createdAt in
-      {server: s, count: count svFwds, oldestAge: oldest, totalRetries: fold (\acc f -> acc + f.retries) 0 svFwds})
+      {server: s, count: count svFwds, oldestAge: t - fold (\acc f -> min acc f.createdAt) t svFwds, totalRetries: fold (\acc f -> acc + f.retries) 0 svFwds})
     yield (respond {servers: result, ok: True {}, total: count fwds}))
 
 handleStatsRates = \authorization respond -> do
