@@ -450,7 +450,7 @@ any = \xs pred -> countWhere xs pred > 0
 none : [a] -> (a -> Bool) -> Bool
 none = \xs pred -> not (any xs pred)
 all : [a] -> (a -> Bool) -> Bool
-all = \xs pred -> countWhere xs pred == count xs
+all = \xs pred -> none xs (\x -> not (pred x))
 elem = \xs x -> any xs (\y -> y == x)
 findFirst = \xs pred -> headOf (filter xs pred)
 when = \cond action -> if cond then action else yield {}
@@ -647,9 +647,7 @@ generateFederationAuth = \scope requestTimestamp ->
     else do
       token <- genToken
       t <- now
-      atomic do
-        pending <- *pendingVerifications
-        set *pendingVerifications = capList (union pending [{token: token, createdAt: t, scope: scope}]) maxPendingVerifications (\p -> p.createdAt)
+      atomic (appendCapped pendingVerifications [{token: token, createdAt: t, scope: scope}] maxPendingVerifications (\p -> p.createdAt))
       yield ("Bearer " ++ token)
 
 -- Verify a federation request: signed (Ed25519 over scope|ts|fromServer|nonce) or callback Bearer token.
@@ -980,7 +978,7 @@ refreshLocalPresence = \t -> do
   refreshState <- atomic do
     sessions <- *sessions
     presence <- *presence
-    let sessionKeys = unique (pluck sessions (\s -> s.pubkey))
+    let sessionKeys = pluck sessions (\s -> s.pubkey)
     let needsRefresh = \p -> isLocalServer p.server && elem sessionKeys p.pubkey && p.expiresAt - t < sessionExpiry / 2
     let refreshed = mapWhere presence needsRefresh (\p -> {pubkey: p.pubkey, server: p.server, expiresAt: t + sessionExpiry, timestamp: t})
     let updated = union (removeWhere presence needsRefresh) refreshed
