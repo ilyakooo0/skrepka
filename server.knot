@@ -562,7 +562,7 @@ tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
-isValidHex = \s -> let cs = chars s in let n = count cs in n > 0 && mod n 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
+isValidHex = \s -> count (chars s) > 0 && mod (count (chars s)) 2 == 0 && all (chars s) (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
@@ -602,9 +602,8 @@ isBadServerName = \sn ->
 matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
 extractToken = \authHeader ->
-  let token = drop 7 authHeader in
-  if hasPrefix "Bearer " authHeader && token != "" && not (tooLong token maxTokenLen)
-    then Just {value: token}
+  if hasPrefix "Bearer " authHeader && drop 7 authHeader != "" && not (tooLong (drop 7 authHeader) maxTokenLen)
+    then Just {value: drop 7 authHeader}
     else Nothing {}
 
 verifyMaintenanceAuth : Text -> IO Bool
@@ -771,11 +770,10 @@ recordFailure = \server -> do
   t <- now
   atomic do
     failures <- *forwardFailures
-    let same = \f -> f.server == server
-    let prev = case findFirst failures same of
+    let prev = case findFirst failures (\f -> f.server == server) of
           Just {value: f} -> {count: f.failures, firstFailedAt: f.firstFailedAt}
           _ -> {count: 0, firstFailedAt: t}
-    set *forwardFailures = union (removeWhere failures same)
+    set *forwardFailures = union (removeWhere failures (\f -> f.server == server))
       [{server: server, failedAt: t, failures: min (prev.count + 1) 10, firstFailedAt: prev.firstFailedAt}]
 
 clearFailure = \server -> atomic (pruneRef forwardFailures (\f -> f.server != server))
@@ -804,9 +802,8 @@ presenceForKey = \presence pubkey t ->
 
 -- Resolve a key's server for client lookup, masking remote identities behind "remote".
 maskedServer = \pres pubkey t ->
-  let entries = presenceForKey pres pubkey t in
-  if any entries (\p -> isLocalServer p.server) then serverHostN
-  else if count entries > 0 then "remote"
+  if any (presenceForKey pres pubkey t) (\p -> isLocalServer p.server) then serverHostN
+  else if count (presenceForKey pres pubkey t) > 0 then "remote"
   else ""
 
 hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
@@ -825,9 +822,8 @@ knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.serve
 -- Last-write-wins merge by (pubkey, server), keeping the entry with the larger expiresAt.
 mergePresence = \existing incoming ->
   fold (\acc e ->
-    let same = \x -> x.pubkey == e.pubkey && x.server == e.server in
-    if any acc (\x -> same x && x.expiresAt >= e.expiresAt) then acc
-    else union (removeWhere acc same) [e]) existing incoming
+    if any acc (\x -> x.pubkey == e.pubkey && x.server == e.server && x.expiresAt >= e.expiresAt) then acc
+    else union (removeWhere acc (\x -> x.pubkey == e.pubkey && x.server == e.server)) [e]) existing incoming
 
 -- ============================================
 -- Pruning
@@ -1282,10 +1278,8 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
   let mkErr = \e -> {ok: False {}, authorized: False {}, ackedCount: 0, error: e}
   gateClientWrite authorization clientIp t respond mkErr
     {ok: False {}, authorized: True {}, ackedCount: 0, error: "rate_limited"} (\pubkey -> do
-      let dedupedIds = dedupMessageIds messageIds
-      let matches = \x -> x.toKey == pubkey && elem dedupedIds x.messageId
       result <- atomic do
-        toAck <- removeForKey matches
+        toAck <- removeForKey (\x -> x.toKey == pubkey && elem (dedupMessageIds messageIds) x.messageId)
         ackedFed <- recordAcksAndDeliveries toAck t
         yield {ackedCount: count toAck, pendingAcks: ackedFed}
       when federationEnabled (fork (sendAcksAndClean result.pendingAcks))
@@ -1307,10 +1301,8 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
   let mkErr = \e -> {ok: False {}, authorized: False {}, deletedCount: 0, error: if e == "draining" then "" else e}
   gateClientWrite authorization clientIp t respond mkErr
     {ok: False {}, authorized: True {}, deletedCount: 0, error: "rate_limited"} (\pubkey -> do
-      let dedupedIds = dedupMessageIds messageIds
-      let matches = \x -> x.toKey == pubkey && elem dedupedIds x.messageId
       result <- atomic do
-        toDel <- removeForKey matches
+        toDel <- removeForKey (\x -> x.toKey == pubkey && elem (dedupMessageIds messageIds) x.messageId)
         let ackedFed = mapWhere toDel (\m -> m.originServer != "") (\m -> mkAckedEntry m t)
         appendCapped ackedIds ackedFed maxAckedIds (\a -> a.ackedAt)
         yield {deletedCount: count toDel, pendingAcks: ackedFed}
