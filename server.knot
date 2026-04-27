@@ -442,7 +442,7 @@ id = \x -> x
 filter = \xs pred -> do x <- xs; where pred x; yield x
 removeWhere = \xs pred -> filter xs (\x -> not (pred x))
 pluck = \xs f -> do x <- xs; yield (f x)
-mapWhere = \xs pred f -> pluck (filter xs pred) f
+mapWhere = \xs pred -> pluck (filter xs pred)
 countWhere = \xs pred -> count (filter xs pred)
 any : [a] -> (a -> Bool) -> Bool
 any = \xs pred -> countWhere xs pred > 0
@@ -550,8 +550,7 @@ tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
 isValidHex = \s ->
-  let cs = chars s in
-  count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
+  count (chars s) > 0 && mod (count (chars s)) 2 == 0 && all (chars s) (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
@@ -708,8 +707,8 @@ checkWindowRate = \windowRef countRef windowMs maxRate t -> atomic do
     set *countRef = c + 1
     yield False
 
-checkGlobalRate = \t -> checkWindowRate globalRateWindowStart globalRateCount globalRateWindowMs maxGlobalRequestRate t
-checkAuthGlobalRate = \t -> checkWindowRate authGlobalRateWindowStart authGlobalRateCount authGlobalRateWindowMs maxAuthGlobalRate t
+checkGlobalRate = checkWindowRate globalRateWindowStart globalRateCount globalRateWindowMs maxGlobalRequestRate
+checkAuthGlobalRate = checkWindowRate authGlobalRateWindowStart authGlobalRateCount authGlobalRateWindowMs maxAuthGlobalRate
 
 checkIpRateGate = \ip t ->
   if ip == "" then yield False
@@ -828,8 +827,7 @@ pruneExpired = \t -> atomic do
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   pruneRef presence (\p -> p.expiresAt > t)
-  newPres <- *presence
-  yield (filter pres (\p -> p.expiresAt <= t && isLocalServer p.server && none newPres (\k -> isLocalServer k.server && k.pubkey == p.pubkey)))
+  yield (filter pres (\p -> p.expiresAt <= t && isLocalServer p.server && none pres (\k -> isLocalServer k.server && k.pubkey == p.pubkey && k.expiresAt > t)))
 
 -- ============================================
 -- Federation gossip
@@ -875,9 +873,8 @@ sendBatchedGossip = \peers events hops -> forEach peers id (\server -> do
 
 broadcastOfflineGossip = \t expiredLocal -> do
   presence <- *presence
-  let peers = knownPeerServersFromPresence presence
   when (federationEnabled && count expiredLocal > 0)
-    (sendBatchedGossip peers (pluck expiredLocal (\p -> mkGossip (GossipOffline {}) p.pubkey t offlineGossipMinTtl)) gossipOriginHops)
+    (sendBatchedGossip (knownPeerServersFromPresence presence) (pluck expiredLocal (\p -> mkGossip (GossipOffline {}) p.pubkey t offlineGossipMinTtl)) gossipOriginHops)
 
 -- ============================================
 -- Forward retries and acks
@@ -1026,24 +1023,21 @@ handleRevoke = \targetToken authorization clientIp respond -> do
 
 handleLogout = \authorization clientIp respond -> do
   t <- now
-  case extractToken authorization of
-    Nothing {} -> yield (respond {ok: False {}, authorized: False {}})
-    Just {value: token} -> do
-      removed <- atomic (withSessionAuth authorization t clientIp
-        (yield {ok: False {}, pubkey: "", peers: []})
-        (\pubkey -> do
-          ses <- *sessions
-          set *sessions = removeWhere ses (\s -> s.token == token)
-          after <- *sessions
-          peers <- if any after (\s -> s.pubkey == pubkey) then yield []
-            else do
-              pres <- *presence
-              set *presence = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
-              yield (knownPeerServersFromPresence pres)
-          yield {ok: True {}, pubkey: pubkey, peers: peers}))
-      when (removed.ok && federationEnabled)
-        (fork (sendBatchedGossip removed.peers [mkGossip (GossipOffline {}) removed.pubkey t offlineGossipMinTtl] gossipOriginHops))
-      yield (respond {ok: removed.ok, authorized: removed.ok})
+  removed <- atomic (withSessionAuth authorization t clientIp
+    (yield {ok: False {}, pubkey: "", peers: []})
+    (\pubkey -> do
+      ses <- *sessions
+      set *sessions = removeWhere ses (\s -> Just {value: s.token} == extractToken authorization)
+      after <- *sessions
+      peers <- if any after (\s -> s.pubkey == pubkey) then yield []
+        else do
+          pres <- *presence
+          set *presence = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
+          yield (knownPeerServersFromPresence pres)
+      yield {ok: True {}, pubkey: pubkey, peers: peers}))
+  when (removed.ok && federationEnabled)
+    (fork (sendBatchedGossip removed.peers [mkGossip (GossipOffline {}) removed.pubkey t offlineGossipMinTtl] gossipOriginHops))
+  yield (respond {ok: removed.ok, authorized: removed.ok})
 
 -- ============================================
 -- Handler: poll
@@ -1057,7 +1051,7 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
   let cursorWasReset = generation != serverGen && cursor > 0
   if dp >= 2 then yield (respond (emptyPollResp 0 (True {}) (False {}) (True {}) serverGen 0 cursorWasReset))
   else if g then yield (respond (emptyPollResp 0 (False {}) (True {}) (False {}) serverGen globalRateWindowMs cursorWasReset))
-  else pollOnce authorization (if generation != serverGen then 0 else cursor) cursorWasReset (takeRelation maxWatchKeys watchKeys) clientIp serverGen respond t
+  else pollOnce authorization (if cursorWasReset then 0 else cursor) cursorWasReset (takeRelation maxWatchKeys watchKeys) clientIp serverGen respond t
 
 pollOnce = \authorization cursor cursorWasReset watchKeys clientIp serverGen respond t -> do
   setup <- atomic (withSessionAuth authorization t clientIp
@@ -1330,10 +1324,9 @@ handleSendBatch = \messages authorization clientIp respond -> do
     results <- mapEach (takeRelation maxBatchSize messages) id (\m -> do
       effMsgId <- if m.messageId != "" then yield m.messageId else genToken
       let clampedTs = clampTimestamp m.timestamp t
-      let clampedPri = clamp 0 maxMessagePriority m.priority
       r <- if t - m.timestamp > messageMaxAge
         then yield {status: MsRejected {}, remoteServers: []}
-        else atomic do sendMessageCore senderKey m.to m.encryptedBlob clampedTs effMsgId m.expiresInMs clampedPri t
+        else atomic do sendMessageCore senderKey m.to m.encryptedBlob clampedTs effMsgId m.expiresInMs (clamp 0 maxMessagePriority m.priority) t
       when federationEnabled
         (fork (forkForwardsTo effMsgId m.to m.encryptedBlob clampedTs r.remoteServers))
       yield {messageId: effMsgId, status: r.status})
@@ -1373,7 +1366,7 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
       let online = mapWhere validEvents (\v -> case v.eventType of GossipOnline {} -> True {}; _ -> False {}) (\v -> {pubkey: v.pubkey, server: v.server, expiresAt: v.expiresAt, timestamp: v.timestamp})
       let offline = mapWhere validEvents (\v -> case v.eventType of GossipOffline {} -> True {}; _ -> False {}) (\v -> {pubkey: v.pubkey, server: v.server, timestamp: v.timestamp})
       set *presence = capList (mergePresence (filter pres (\p -> none offline (\o -> o.pubkey == p.pubkey && o.server == p.server && o.timestamp > p.timestamp))) online) maxPresenceEntries (\p -> p.expiresAt)
-      yield (mapWhere online (\e -> not (isLocalServer e.server) && none pres (\p -> p.pubkey == e.pubkey && p.server == e.server && p.expiresAt >= e.expiresAt)) (\e -> {pubkey: e.pubkey, server: e.server}))
+      yield (mapWhere online (\e -> none pres (\p -> p.pubkey == e.pubkey && p.server == e.server && p.expiresAt >= e.expiresAt)) (\e -> {pubkey: e.pubkey, server: e.server}))
     fork (forEach newlyOnline (\tgt -> tgt.pubkey ++ "|" ++ tgt.server) (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t))
     yield (respond {ok: True {}, error: "", retryAfterMs: 0}))
 
@@ -1496,7 +1489,7 @@ handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp
         yield (respond {ok: True {}, error: "", receivedCount: count pairs, retryAfterMs: 0}))
 
 -- Index a list (1-based by virtue of `count` of the partial fold).
-withIndex = \xs -> fold (\acc x -> union acc [{i: count acc, v: x}]) [] xs
+withIndex = fold (\acc x -> union acc [{i: count acc, v: x}]) []
 
 -- ============================================
 -- Maintenance handlers
@@ -1740,8 +1733,7 @@ handleTopRecipients = \limit authorization respond -> withMaintAuth authorizatio
   (do
     msgs <- *messages
     let counts = pluck (unique (pluck msgs (\m -> m.toKey))) (\pk -> {pubkey: pk, count: countWhere msgs (\m -> m.toKey == pk)})
-    let sorted = sortBy (\c -> 0 - c.count) counts
-    yield (respond {recipients: takeRelation (if limit <= 0 then 20 else clamp 1 100 limit) sorted, ok: True {}, total: count counts}))
+    yield (respond {recipients: takeRelation (if limit <= 0 then 20 else clamp 1 100 limit) (sortBy (\c -> 0 - c.count) counts), ok: True {}, total: count counts}))
 
 handleStatsForwards = \authorization respond -> withMaintAuth authorization
   (yield (respond {servers: [], ok: False {}, total: 0}))
