@@ -513,14 +513,14 @@ forEach = \items getKey action -> case headOf items of
   Nothing {} -> yield {}
   Just {value: x} -> do
     action x
-    forEach (do y <- items; where getKey y != getKey x; yield y) getKey action
+    forEach (filter items (\y -> getKey y != getKey x)) getKey action
 
 -- Like forEach, but collects each action's result into a list.
 mapEach = \items getKey action -> case headOf items of
   Nothing {} -> yield []
   Just {value: x} -> do
     r <- action x
-    rest <- mapEach (do y <- items; where getKey y != getKey x; yield y) getKey action
+    rest <- mapEach (filter items (\y -> getKey y != getKey x)) getKey action
     yield (union [r] rest)
 
 -- Hex tokens
@@ -612,21 +612,15 @@ withMaintAuth = \authorization onUnauth onAuth -> do
   authorized <- verifyMaintenanceAuth authorization
   if authorized then onAuth else onUnauth
 
--- Common gate for client handlers: drain check, global rate, session auth.
+-- Common gate for handlers: optional drain check, global rate, session auth.
 -- mkErr is called with one of: "draining", "rate_limited", "unauthorized".
-gateAuth = \auth ip t respond mkErr onAuth -> do
+gateAuth = \checkDrain auth ip t respond mkErr onAuth -> do
   dp <- *drainPhase
-  if dp >= 2 then yield (respond (mkErr "draining"))
+  if checkDrain && dp >= 2 then yield (respond (mkErr "draining"))
   else do
     g <- checkGlobalRate t
     if g then yield (respond (mkErr "rate_limited"))
     else withSessionAuth auth t ip (yield (respond (mkErr "unauthorized"))) onAuth
-
--- Variant without the drain check (used by lookup/status handlers).
-gateAuthNoDrain = \auth ip t respond mkErr onAuth -> do
-  g <- checkGlobalRate t
-  if g then yield (respond (mkErr "rate_limited"))
-  else withSessionAuth auth t ip (yield (respond (mkErr "unauthorized"))) onAuth
 
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
@@ -764,6 +758,14 @@ checkPreAuth = \clientIp t -> do
     else if i then "ip_rate_limited"
     else "")
 
+-- Pre-auth check + auth-global rate. Returns "" when ok, else an error code.
+authPreCheck = \clientIp t -> do
+  p <- checkPreAuth clientIp t
+  if p != "" then yield p
+  else do
+    a <- checkAuthGlobalRate t
+    yield (if a then "auth_rate_limited" else "")
+
 -- ============================================
 -- Federation failure tracking (simple, no circuit breaker)
 -- ============================================
@@ -856,8 +858,9 @@ pruneExpired = \t -> atomic do
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   let keptPres = filter pres (\p -> p.expiresAt > t)
+  let stillLocal = filter keptPres (\k -> isLocalServer k.server)
   set *presence = keptPres
-  yield (filter pres (\p -> p.expiresAt <= t && isLocalServer p.server && none keptPres (\k -> k.pubkey == p.pubkey && isLocalServer k.server)))
+  yield (filter pres (\p -> p.expiresAt <= t && isLocalServer p.server && none stillLocal (\k -> k.pubkey == p.pubkey)))
 
 -- ============================================
 -- Federation gossip
@@ -996,14 +999,11 @@ refreshLocalPresence = \t -> do
 
 handleChallenge = \pubkey clientIp respond -> do
   t <- now
-  if requireClientIp && clientIp == ""
-    then yield (respond {challenge: "", ok: False {}, expiresAt: 0, retryAfterMs: 0, error: "client_ip_required"})
-    else do
-  preAuth <- checkPreAuth clientIp t
-  if preAuth != "" then yield (respond {challenge: "", ok: False {}, expiresAt: 0, retryAfterMs: 0, error: preAuth})
+  let mkResp = \err -> respond {challenge: "", ok: False {}, expiresAt: 0, retryAfterMs: 0, error: err}
+  if requireClientIp && clientIp == "" then yield (mkResp "client_ip_required")
   else do
-    authLimited <- checkAuthGlobalRate t
-    if authLimited then yield (respond {challenge: "", ok: False {}, expiresAt: 0, retryAfterMs: 0, error: "auth_rate_limited"})
+    preErr <- authPreCheck clientIp t
+    if preErr != "" then yield (mkResp preErr)
     else do
       challenge <- genToken
       result <- atomic do
@@ -1025,44 +1025,41 @@ handleChallenge = \pubkey clientIp respond -> do
 
 handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> do
   t <- now
-  preAuth <- checkPreAuth clientIp t
-  if preAuth != "" then yield (respond {token: "", expiresAt: 0, error: preAuth})
+  preErr <- authPreCheck clientIp t
+  if preErr != "" then yield (respond {token: "", expiresAt: 0, error: preErr})
   else do
-    authLimited <- checkAuthGlobalRate t
-    if authLimited then yield (respond {token: "", expiresAt: 0, error: "auth_rate_limited"})
-    else do
-      let expiry = t + sessionExpiry
-      token <- genToken
-      result <- atomic do
-        ch <- *challenges
-        let hasMatch = any ch (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t && matchIp clientIp c.ip)
-        if not hasMatch then yield {valid: False {}, peers: []}
-        else
-          if not (verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature))
-            then yield {valid: False {}, peers: []}
+    let expiry = t + sessionExpiry
+    token <- genToken
+    result <- atomic do
+      ch <- *challenges
+      let hasMatch = any ch (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t && matchIp clientIp c.ip)
+      if not hasMatch then yield {valid: False {}, peers: []}
+      else
+        if not (verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature))
+          then yield {valid: False {}, peers: []}
+          else do
+            set *challenges = removeWhere ch (\c -> c.pubkey == pubkey && c.challenge == challenge)
+            dp <- *drainPhase
+            if dp >= 1 then yield {valid: False {}, peers: []}
             else do
-              set *challenges = removeWhere ch (\c -> c.pubkey == pubkey && c.challenge == challenge)
-              dp <- *drainPhase
-              if dp >= 1 then yield {valid: False {}, peers: []}
-              else do
-                ses <- *sessions
-                let kept = if revokeOthers then removeWhere ses (\s -> s.pubkey == pubkey) else ses
-                let forKey = filter kept (\s -> s.pubkey == pubkey)
-                let afterPerKey = if count forKey >= maxSessionsPerKey
-                      then union (removeWhere kept (\s -> s.pubkey == pubkey)) (evictOldest forKey (\s -> s.expiresAt))
-                      else kept
-                let newSession = {token: token, pubkey: pubkey, expiresAt: expiry, ip: clientIp, createdAt: t}
-                set *sessions = capList (union afterPerKey [newSession]) maxSessions (\s -> s.expiresAt)
-                pres <- *presence
-                let withoutLocal = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
-                let newPres = capList (union withoutLocal [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]) maxPresenceEntries (\p -> p.expiresAt)
-                set *presence = newPres
-                yield {valid: True {}, peers: knownPeerServersFromPresence newPres}
-      if not result.valid then yield (respond {token: "", expiresAt: 0, error: "invalid"})
-      else do
-        when federationEnabled
-          (fork (sendBatchedGossip result.peers [mkGossip (GossipOnline {}) pubkey t onlineGossipTtl] gossipOriginHops))
-        yield (respond {token: token, expiresAt: expiry, error: ""})
+              ses <- *sessions
+              let kept = if revokeOthers then removeWhere ses (\s -> s.pubkey == pubkey) else ses
+              let forKey = filter kept (\s -> s.pubkey == pubkey)
+              let afterPerKey = if count forKey >= maxSessionsPerKey
+                    then union (removeWhere kept (\s -> s.pubkey == pubkey)) (evictOldest forKey (\s -> s.expiresAt))
+                    else kept
+              let newSession = {token: token, pubkey: pubkey, expiresAt: expiry, ip: clientIp, createdAt: t}
+              set *sessions = capList (union afterPerKey [newSession]) maxSessions (\s -> s.expiresAt)
+              pres <- *presence
+              let withoutLocal = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
+              let newPres = capList (union withoutLocal [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]) maxPresenceEntries (\p -> p.expiresAt)
+              set *presence = newPres
+              yield {valid: True {}, peers: knownPeerServersFromPresence newPres}
+    if not result.valid then yield (respond {token: "", expiresAt: 0, error: "invalid"})
+    else do
+      when federationEnabled
+        (fork (sendBatchedGossip result.peers [mkGossip (GossipOnline {}) pubkey t onlineGossipTtl] gossipOriginHops))
+      yield (respond {token: token, expiresAt: expiry, error: ""})
 
 handleRevoke = \targetToken authorization clientIp respond -> do
   t <- now
@@ -1306,7 +1303,7 @@ forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers ->
 handleLookupPresence = \pubkey authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {server: "", authorized: False {}, error: if e == "rate_limited" then "rate_limited" else ""}
-  gateAuthNoDrain authorization clientIp t respond mkErr (\senderKey -> do
+  gateAuth (False {}) authorization clientIp t respond mkErr (\senderKey -> do
     lim <- checkPubkeyRateGate lookupRates senderKey maxLookupRatePerKey lookupRateWindowMs t
     if lim then yield (respond {server: "", authorized: True {}, error: "rate_limited"})
     else do
@@ -1318,7 +1315,7 @@ handleLookupPresence = \pubkey authorization clientIp respond -> do
 handleBatchLookupPresence = \pubkeys authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {results: [], authorized: False {}, error: if e == "rate_limited" then "rate_limited" else ""}
-  gateAuthNoDrain authorization clientIp t respond mkErr (\senderKey -> do
+  gateAuth (False {}) authorization clientIp t respond mkErr (\senderKey -> do
     lim <- checkPubkeyRateGate lookupRates senderKey maxLookupRatePerKey lookupRateWindowMs t
     if lim then yield (respond {results: [], authorized: True {}, error: "rate_limited"})
     else do
@@ -1333,7 +1330,7 @@ handleBatchLookupPresence = \pubkeys authorization clientIp respond -> do
 handleMessageStatus = \to messageId authorization clientIp respond -> do
   t <- now
   let mkErr = \_ -> {status: "", authorized: False {}}
-  gateAuthNoDrain authorization clientIp t respond mkErr (\_ -> do
+  gateAuth (False {}) authorization clientIp t respond mkErr (\_ -> do
     msgs <- *messages
     fwds <- *forwards
     aids <- *ackedIds
@@ -1352,7 +1349,7 @@ handleMessageStatus = \to messageId authorization clientIp respond -> do
 handleAckMessages = \messageIds authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {ok: False {}, authorized: False {}, ackedCount: 0, error: e}
-  gateAuth authorization clientIp t respond mkErr (\pubkey -> do
+  gateAuth (True {}) authorization clientIp t respond mkErr (\pubkey -> do
     lim <- checkPubkeyRateGate clientWriteRates pubkey maxClientWriteRatePerKey clientWriteRateWindowMs t
     if lim then yield (respond {ok: False {}, authorized: True {}, ackedCount: 0, error: "rate_limited"})
     else do
@@ -1371,7 +1368,7 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
 handleListMessages = \offset authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {messages: [], authorized: False {}, count: 0, error: if e == "rate_limited" then "rate_limited" else ""}
-  gateAuth authorization clientIp t respond mkErr (\pubkey -> do
+  gateAuth (True {}) authorization clientIp t respond mkErr (\pubkey -> do
     lim <- checkPubkeyRateGate lookupRates pubkey maxLookupRatePerKey lookupRateWindowMs t
     if lim then yield (respond {messages: [], authorized: True {}, count: 0, error: "rate_limited"})
     else do
@@ -1386,7 +1383,7 @@ handleListMessages = \offset authorization clientIp respond -> do
 handleDeleteMessages = \messageIds authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {ok: False {}, authorized: False {}, deletedCount: 0, error: if e == "draining" then "" else e}
-  gateAuth authorization clientIp t respond mkErr (\pubkey -> do
+  gateAuth (True {}) authorization clientIp t respond mkErr (\pubkey -> do
     lim <- checkPubkeyRateGate clientWriteRates pubkey maxClientWriteRatePerKey clientWriteRateWindowMs t
     if lim then yield (respond {ok: False {}, authorized: True {}, deletedCount: 0, error: "rate_limited"})
     else do
@@ -1406,7 +1403,7 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
 handleCancelMessage = \messageId to authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {ok: False {}, authorized: False {}, cancelled: False {}, error: if e == "draining" then "" else e}
-  gateAuth authorization clientIp t respond mkErr (\senderKey -> do
+  gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
     lim <- checkPubkeyRateGate clientWriteRates senderKey maxClientWriteRatePerKey clientWriteRateWindowMs t
     if lim then yield (respond {ok: False {}, authorized: True {}, cancelled: False {}, error: "rate_limited"})
     else do
@@ -1446,7 +1443,7 @@ sendCancelToEach = \messageId to servers ->
 handleCancelBatch = \cancels authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {results: [], authorized: False {}, error: if e == "draining" then "" else e}
-  gateAuth authorization clientIp t respond mkErr (\senderKey -> do
+  gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
     lim <- checkPubkeyRateGate clientWriteRates senderKey maxClientWriteRatePerKey clientWriteRateWindowMs t
     if lim then yield (respond {results: [], authorized: True {}, error: "rate_limited"})
     else do
@@ -1470,7 +1467,7 @@ handleCancelBatch = \cancels authorization clientIp respond -> do
 handleSendBatch = \messages authorization clientIp respond -> do
   t <- now
   let mkErr = \_ -> {results: [], authorized: False {}, retryAfterMs: 0}
-  gateAuth authorization clientIp t respond mkErr (\senderKey -> do
+  gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
     results <- mapEach (takeRelation maxBatchSize messages) id (\m -> do
       effMsgId <- if m.messageId != "" then yield m.messageId else genToken
       let clampedTs = clampTimestamp m.timestamp t
@@ -1528,11 +1525,8 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
       let newlyOnline = mapWhere online (\e -> not (isLocalServer e.server) && none pres (\p -> p.pubkey == e.pubkey && p.server == e.server && p.expiresAt >= e.expiresAt)) (\e -> {pubkey: e.pubkey, server: e.server})
       yield {newlyOnline: newlyOnline}
     when (count valid.newlyOnline > 0)
-      (fork (forwardForNewlyOnline valid.newlyOnline t))
+      (fork (forEach valid.newlyOnline (\tgt -> tgt.pubkey ++ "|" ++ tgt.server) (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t)))
     yield (respond {ok: True {}, error: "", retryAfterMs: 0}))
-
-forwardForNewlyOnline = \targets t ->
-  forEach targets (\tgt -> tgt.pubkey ++ "|" ++ tgt.server) (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t)
 
 handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt priority authorization respond -> do
   t <- now
