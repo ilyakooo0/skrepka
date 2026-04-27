@@ -491,12 +491,18 @@ headOf = \items -> fold (\acc x -> case acc of
 -- Sort then take head: O(n log n) but no fold-with-Maybe boilerplate.
 minBy = \items getKey -> headOf (sortBy getKey items)
 
--- Drop entries with the oldest key (LRU-style eviction; ties drop together).
--- O(n^2): keep entries that have something strictly smaller below them.
-evictOldest = \items getKey -> filter items (\x -> any items (\y -> getKey y < getKey x))
+-- LRU-style eviction: drop the single entry with the smallest key.
+evictOldest = \items getKey -> drop 1 (sortBy getKey items)
 
 capList = \items maxN getKey ->
   if count items > maxN then evictOldest items getKey else items
+
+-- If `pred` matches at least maxN items, drop the oldest matching one.
+capPerKey = \items pred maxN getKey ->
+  let mine = filter items pred in
+  if count mine >= maxN
+    then union (removeWhere items pred) (evictOldest mine getKey)
+    else items
 
 -- Shared empty/error shape for /poll. Only a few fields ever vary.
 emptyPollResp = \cursor authorized rateLimited draining gen retryAfterMs cursorWasReset ->
@@ -525,15 +531,10 @@ hexDigit : Int -> Text
 hexDigit = \n -> take 1 (drop (clamp 0 15 n) "0123456789abcdef")
 
 byteToHex : Int -> Text
-byteToHex = \n -> hexDigit (n / 16) ++ hexDigit (n - (n / 16) * 16)
+byteToHex = \n -> let m = n - n / 256 * 256 in hexDigit (m / 16) ++ hexDigit (m - m / 16 * 16)
 
 intTo3Hex : Int -> Text
-intTo3Hex = \n ->
-  let b0 = n / 65536 in
-  let r0 = n - b0 * 65536 in
-  let b1 = r0 / 256 in
-  let b2 = r0 - b1 * 256 in
-  byteToHex b0 ++ byteToHex b1 ++ byteToHex b2
+intTo3Hex = \n -> byteToHex (n / 65536) ++ byteToHex (n / 256) ++ byteToHex n
 
 genTokenN = \n -> if n <= 0 then yield "" else do
   chunk <- randomInt 16777216
@@ -596,9 +597,9 @@ extractToken = \authHeader ->
 verifyMaintenanceAuth : Text -> IO Bool
 verifyMaintenanceAuth = \authorization -> do
   secret <- *runtimeMaintenanceSecret
-  case extractToken authorization of
-    Just {value: token} -> yield (secret != "" && token == secret)
-    _ -> yield False
+  yield (case extractToken authorization of
+    Just {value: token} -> secret != "" && token == secret
+    _ -> False)
 
 withMaintAuth = \authorization onUnauth onAuth -> do
   authorized <- verifyMaintenanceAuth authorization
@@ -697,13 +698,12 @@ withFederationAuth = \authorization t respond fromServer scope requestTimestamp 
 -- Returns {limited, entries}. Increments count when the key fits within the window.
 -- Simplified: drop any stale/matching entry, then either reject or insert a fresh entry.
 checkRate = \entries key maxRate windowMs maxEntries t ->
-  let cur = findFirst entries (\r -> r.key == key && t - r.windowStart < windowMs) in
-  let nextCount = case cur of Just {value: r} -> r.count + 1; _ -> 1 in
-  if nextCount > maxRate
+  let cur = case findFirst entries (\r -> r.key == key && t - r.windowStart < windowMs) of
+        Just {value: r} -> {windowStart: r.windowStart, count: r.count + 1}
+        _ -> {windowStart: t, count: 1} in
+  if cur.count > maxRate
     then {limited: True {}, entries: entries}
-    else
-      let windowStart = case cur of Just {value: r} -> r.windowStart; _ -> t in
-      {limited: False {}, entries: capList (union (removeWhere entries (\x -> x.key == key)) [{key: key, windowStart: windowStart, count: nextCount}]) maxEntries (\r -> r.windowStart)}
+    else {limited: False {}, entries: capList (union (removeWhere entries (\x -> x.key == key)) [{key: key, windowStart: cur.windowStart, count: cur.count}]) maxEntries (\r -> r.windowStart)}
 
 checkWindowRate = \windowRef countRef windowMs maxRate t -> atomic do
   ws <- *windowRef
@@ -989,10 +989,7 @@ handleChallenge = \pubkey clientIp respond -> do
     result <- atomic do
       ch <- *challenges
       let active = filter ch (\c -> c.expiresAt > t)
-      let mine = filter active (\c -> c.pubkey == pubkey)
-      let cappedActive = if count mine >= maxChallengesPerKey
-            then union (removeWhere active (\c -> c.pubkey == pubkey)) (evictOldest mine (\c -> c.expiresAt))
-            else active
+      let cappedActive = capPerKey active (\c -> c.pubkey == pubkey) maxChallengesPerKey (\c -> c.expiresAt)
       rates <- *challengeRates
       let r = checkRate rates pubkey maxChallengeRatePerKey challengeRateWindowMs 5000 t
       if count cappedActive >= maxChallenges then yield {ok: False {}, error: "capacity"}
@@ -1020,10 +1017,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
         set *challenges = removeWhere ch (\c -> c.pubkey == pubkey && c.challenge == challenge)
         ses <- *sessions
         let kept = if revokeOthers then removeWhere ses (\s -> s.pubkey == pubkey) else ses
-        let forKey = filter kept (\s -> s.pubkey == pubkey)
-        let afterPerKey = if count forKey >= maxSessionsPerKey
-              then union (removeWhere kept (\s -> s.pubkey == pubkey)) (evictOldest forKey (\s -> s.expiresAt))
-              else kept
+        let afterPerKey = capPerKey kept (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt)
         set *sessions = capList (union afterPerKey [{token: token, pubkey: pubkey, expiresAt: expiry, ip: clientIp, createdAt: t}]) maxSessions (\s -> s.expiresAt)
         pres <- *presence
         let withoutLocal = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
