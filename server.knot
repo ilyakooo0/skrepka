@@ -454,9 +454,9 @@ all = \xs pred -> none xs (\x -> not (pred x))
 elem = \xs x -> any xs (\y -> y == x)
 findFirst = \xs pred -> headOf (filter xs pred)
 when = \cond action -> if cond then action else yield {}
-clamp = \lo hi x -> if x < lo then lo else if x > hi then hi else x
 min = \a b -> if a < b then a else b
 max = \a b -> if a > b then a else b
+clamp = \lo hi x -> max lo (min hi x)
 
 -- Dedup: keeps first occurrence (O(n^2)).
 unique = \items -> fold (\acc x -> if elem acc x then acc else union acc [x]) [] items
@@ -490,13 +490,10 @@ headOf = \items -> fold (\acc x -> case acc of
 
 -- Sort then take head: O(n log n) but no fold-with-Maybe boilerplate.
 minBy = \items getKey -> headOf (sortBy getKey items)
-maxBy = \items getKey -> headOf (sortBy (\x -> 0 - getKey x) items)
 
--- Drop entries with the oldest key (LRU-style eviction; ties drop together)
-evictOldest = \items getKey ->
-  case minBy items getKey of
-    Nothing {} -> items
-    Just {value: oldest} -> filter items (\x -> getKey x != getKey oldest)
+-- Drop entries with the oldest key (LRU-style eviction; ties drop together).
+-- O(n^2): keep entries that have something strictly smaller below them.
+evictOldest = \items getKey -> filter items (\x -> any items (\y -> getKey y < getKey x))
 
 capList = \items maxN getKey ->
   if count items > maxN then evictOldest items getKey else items
@@ -761,9 +758,7 @@ retryBackoff = \failures -> min retryBackoffMax (retryBackoffBase * max 1 failur
 
 shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
 shouldRetryServer = \server t failures ->
-  case findFirst failures (\f -> f.server == server) of
-    Nothing {} -> True {}
-    Just {value: f} -> t - f.failedAt >= retryBackoff f.failures
+  all failures (\f -> f.server != server || t - f.failedAt >= retryBackoff f.failures)
 
 recordFailure = \server -> do
   t <- now
@@ -953,8 +948,8 @@ pruneAndRetry = \t -> do
   atomic do set *lastPrunedAt = t
   expiredLocal <- pruneExpired t
   fork (broadcastOfflineGossip t expiredLocal)
-  when federationEnabled (fork retryPendingForwards)
   when federationEnabled (do
+    fork retryPendingForwards
     aids <- *ackedIds
     let pendingAcks = filter aids (\a -> not (isLocalServer a.originServer))
     fork (sendAcksAndClean pendingAcks))
