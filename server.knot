@@ -488,22 +488,25 @@ headOf = \items -> fold (\acc x -> case acc of
   Nothing {} -> Just {value: x}
   _ -> acc) Nothing {} items
 
-minBy = \items getKey -> fold (\acc x -> case acc of
-  Nothing {} -> Just {value: x}
-  Just {value: v} -> if getKey x < getKey v then Just {value: x} else acc) Nothing {} items
-
-maxBy = \items getKey -> fold (\acc x -> case acc of
-  Nothing {} -> Just {value: x}
-  Just {value: v} -> if getKey x > getKey v then Just {value: x} else acc) Nothing {} items
+-- Sort then take head: O(n log n) but no fold-with-Maybe boilerplate.
+minBy = \items getKey -> headOf (sortBy getKey items)
+maxBy = \items getKey -> headOf (sortBy (\x -> 0 - getKey x) items)
 
 -- Drop entries with the oldest key (LRU-style eviction; ties drop together)
 evictOldest = \items getKey ->
   case minBy items getKey of
     Nothing {} -> items
-    Just {value: oldest} -> do x <- items; where getKey x != getKey oldest; yield x
+    Just {value: oldest} -> filter items (\x -> getKey x != getKey oldest)
 
 capList = \items maxN getKey ->
   if count items > maxN then evictOldest items getKey else items
+
+-- Shared empty/error shape for /poll. Only a few fields ever vary.
+emptyPollResp = \cursor authorized rateLimited draining gen retryAfterMs cursorWasReset ->
+  {events: [], cursor: cursor, authorized: authorized, rateLimited: rateLimited, draining: draining, generation: gen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: retryAfterMs, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: []}
+
+-- Shared error shape for /messages send.
+sendErrResp = \status err -> {status: status, messageId: "", retryAfterMs: 0, error: err, loadPct: 0}
 
 -- Sequence an IO action over each unique item (dedup by getKey).
 forEach = \items getKey action -> case headOf items of
@@ -1111,12 +1114,12 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
   let cursorWasReset = generationMismatch && cursor > 0
   let cappedWatchKeys = takeRelation maxWatchKeys watchKeys
   dp <- *drainPhase
-  if dp >= 2 then yield (respond {events: [], cursor: 0, authorized: True {}, rateLimited: False {}, draining: True {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: []})
+  if dp >= 2 then yield (respond (emptyPollResp 0 (True {}) (False {}) (True {}) serverGen 0 cursorWasReset))
   else do
     g <- checkGlobalRate t
-    if g then yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: globalRateWindowMs, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: []})
+    if g then yield (respond (emptyPollResp 0 (False {}) (True {}) (False {}) serverGen globalRateWindowMs cursorWasReset))
     else case extractToken authorization of
-      Nothing {} -> yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: []})
+      Nothing {} -> yield (respond (emptyPollResp 0 (False {}) (False {}) (False {}) serverGen 0 cursorWasReset))
       Just {value: token} -> pollOnce token effectiveCursor cursorWasReset cappedWatchKeys clientIp serverGen respond t
 
 pollOnce = \token cursor cursorWasReset watchKeys clientIp serverGen respond t -> do
@@ -1132,7 +1135,7 @@ pollOnce = \token cursor cursorWasReset watchKeys clientIp serverGen respond t -
           startWakeup <- *pollWakeup
           yield (Just {value: {pubkey: pubkey, clampedCursor: clampedCursor, startWakeup: startWakeup, pendingAcks: ackResult.pendingAcks}})
   case setup of
-    Nothing {} -> yield (respond {events: [], cursor: 0, authorized: False {}, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: []})
+    Nothing {} -> yield (respond (emptyPollResp 0 (False {}) (False {}) (False {}) serverGen 0 cursorWasReset))
     Just {value: s} -> do
       acquired <- atomic do
         aps <- *activePolls
@@ -1141,7 +1144,7 @@ pollOnce = \token cursor cursorWasReset watchKeys clientIp serverGen respond t -
           appendCapped activePolls [{pubkey: s.pubkey, startedAt: t}] maxActivePolls (\p -> p.startedAt)
           yield True
       if not acquired
-        then yield (respond {events: [], cursor: cursor, authorized: True {}, rateLimited: True {}, draining: False {}, generation: serverGen, presenceUpdates: [], heartbeat: False {}, retryAfterMs: pollTimeoutMs, cursorReset: cursorWasReset, hasMore: False {}, cursorStale: False {}, messageExpirations: [], messageDeliveries: [], droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: []})
+        then yield (respond (emptyPollResp cursor (True {}) (True {}) (False {}) serverGen pollTimeoutMs cursorWasReset))
         else do
           pollResult <- doPoll s t
           atomic (pruneRef activePolls (\p -> p.pubkey != s.pubkey))
@@ -1209,14 +1212,14 @@ handleSendMessage = \to encryptedBlob timestamp messageId expiresInMs priority a
   let clampedPriority = clamp 0 maxMessagePriority priority
   t <- now
   dp <- *drainPhase
-  if dp >= 2 then yield (respond {status: MsDraining {}, messageId: "", retryAfterMs: 0, error: "draining", loadPct: 0})
+  if dp >= 2 then yield (respond (sendErrResp (MsDraining {}) "draining"))
   else do
     g <- checkGlobalRate t
-    if g then yield (respond {status: MsRateLimited {}, messageId: "", retryAfterMs: 0, error: "rate_limited", loadPct: 0})
+    if g then yield (respond (sendErrResp (MsRateLimited {}) "rate_limited"))
     else do
       effMsgId <- if messageId != "" then yield messageId else genToken
       if t - timestamp > messageMaxAge
-        then yield (respond {status: MsRejected {}, messageId: "", retryAfterMs: 0, error: "stale_timestamp", loadPct: 0})
+        then yield (respond (sendErrResp (MsRejected {}) "stale_timestamp"))
         else do
           let clampedTs = clampTimestamp timestamp t
           result <- atomic do
