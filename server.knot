@@ -742,11 +742,15 @@ checkIpRateGate = \ip t ->
   if ip == "" then yield False
   else checkPubkeyRateGate ipRates ip maxIpRatePerIp ipRateWindowMs t
 
-checkPubkeyRateGate = \rateRef pubkey maxRate windowMs t -> atomic do
+-- Non-atomic version: caller must wrap in `atomic do`.
+chargeRate = \rateRef key maxRate windowMs t -> do
   rates <- *rateRef
-  let r = checkRate rates pubkey maxRate windowMs 5000 t
+  let r = checkRate rates key maxRate windowMs 5000 t
   set *rateRef = r.entries
   yield r.limited
+
+checkPubkeyRateGate = \rateRef pubkey maxRate windowMs t -> atomic
+  (chargeRate rateRef pubkey maxRate windowMs t)
 
 checkServerRateGate = \server t ->
   checkPubkeyRateGate federationRates server maxFederationRatePerServer federationRateWindowMs t
@@ -1069,11 +1073,9 @@ handleRevoke = \targetToken authorization clientIp respond -> do
     (\caller -> do
       result <- atomic do
         ses <- *sessions
-        let found = any ses (\s -> s.pubkey == caller && s.token == targetToken)
-        if not found then yield False
-        else do
-          set *sessions = removeWhere ses (\s -> s.pubkey == caller && s.token == targetToken)
-          yield True
+        let pred = \s -> s.pubkey == caller && s.token == targetToken
+        set *sessions = removeWhere ses pred
+        yield (any ses pred)
       yield (respond {ok: result, authorized: True {}}))
 
 handleLogout = \authorization clientIp respond -> do
@@ -1240,21 +1242,14 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs msg
   let isDup = (effMsgId != "" && any msgs (\m -> m.messageId == effMsgId && m.toKey == to))
             || hasMessage effMsgId to aids
             || hasMessage effMsgId to dids
-  sendRates <- *sendRates
-  let sr = checkRate sendRates senderKey maxSendRatePerKey sendRateWindowMs 5000 t
-  set *sendRates = sr.entries
-  pairRates <- *pairRates
-  let pr = checkRate pairRates (senderKey ++ "|" ++ to) maxPairRatePerPair pairRateWindowMs 5000 t
-  set *pairRates = pr.entries
-  recvRates <- *recvRates
-  let rr = checkRate recvRates to maxRecvRatePerKey recvRateWindowMs 5000 t
-  set *recvRates = rr.entries
-  let recipientCount = countWhere msgs (\m -> m.toKey == to)
+  srLim <- chargeRate sendRates senderKey maxSendRatePerKey sendRateWindowMs t
+  prLim <- chargeRate pairRates (senderKey ++ "|" ++ to) maxPairRatePerPair pairRateWindowMs t
+  rrLim <- chargeRate recvRates to maxRecvRatePerKey recvRateWindowMs t
   if senderKey == to then yield {status: MsRejected {}, remoteServers: []}
   else if isDup then yield {status: MsDuplicate {}, remoteServers: []}
-  else if sr.limited || pr.limited || rr.limited then yield {status: MsRateLimited {}, remoteServers: []}
+  else if srLim || prLim || rrLim then yield {status: MsRateLimited {}, remoteServers: []}
   else if count msgs >= maxMessages then yield {status: MsRejected {}, remoteServers: []}
-  else if recipientCount >= maxMessagesPerRecipient then yield {status: MsQueued {}, remoteServers: []}
+  else if countWhere msgs (\m -> m.toKey == to) >= maxMessagesPerRecipient then yield {status: MsQueued {}, remoteServers: []}
   else do
     pres <- *presence
     seq <- *seqCounter
@@ -1366,12 +1361,10 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
       result <- atomic do
         msgs <- *messages
         let toAck = filter msgs matches
-        if count toAck == 0 then yield {ackedCount: 0, pendingAcks: []}
-        else do
-          set *messages = removeWhere msgs matches
-          pruneRef forwards (\f -> not (matches f))
-          ackedFed <- recordAcksAndDeliveries toAck t
-          yield {ackedCount: count toAck, pendingAcks: ackedFed}
+        set *messages = removeWhere msgs matches
+        pruneRef forwards (\f -> not (matches f))
+        ackedFed <- recordAcksAndDeliveries toAck t
+        yield {ackedCount: count toAck, pendingAcks: ackedFed}
       fork (when federationEnabled (sendAcksAndClean result.pendingAcks))
       yield (respond {ok: True {}, authorized: True {}, ackedCount: result.ackedCount, error: ""}))
 
@@ -1402,13 +1395,11 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
       result <- atomic do
         msgs <- *messages
         let toDel = filter msgs matches
-        if count toDel == 0 then yield {deletedCount: 0, pendingAcks: []}
-        else do
-          set *messages = removeWhere msgs matches
-          pruneRef forwards (\f -> not (matches f))
-          let ackedFed = mapWhere toDel (\m -> m.originServer != "") (\m -> mkAckedEntry m t)
-          appendCapped ackedIds ackedFed maxAckedIds (\a -> a.ackedAt)
-          yield {deletedCount: count toDel, pendingAcks: ackedFed}
+        set *messages = removeWhere msgs matches
+        pruneRef forwards (\f -> not (matches f))
+        let ackedFed = mapWhere toDel (\m -> m.originServer != "") (\m -> mkAckedEntry m t)
+        appendCapped ackedIds ackedFed maxAckedIds (\a -> a.ackedAt)
+        yield {deletedCount: count toDel, pendingAcks: ackedFed}
       fork (when federationEnabled (sendAcksAndClean result.pendingAcks))
       yield (respond {ok: True {}, authorized: True {}, deletedCount: result.deletedCount, error: ""}))
 
@@ -1508,8 +1499,7 @@ handleVerifyToken = \token scope clientIp respond -> do
       else do
         found <- atomic do
           pending <- *pendingVerifications
-          let candidates = filter pending (\p -> p.scope == scope && t - p.createdAt < verificationTokenExpiry)
-          let match = any candidates (\p -> p.token == token)
+          let match = any pending (\p -> p.scope == scope && p.token == token && t - p.createdAt < verificationTokenExpiry)
           when match (set *pendingVerifications = filter pending (\p -> p.scope != scope || p.token != token))
           yield match
         yield (respond {ok: found})
