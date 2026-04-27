@@ -475,7 +475,7 @@ appendCapped = \ref items maxN getKey -> do
 -- Add `server` to the named list ref if absent. Returns the new total.
 addServerToList = \listRef server -> atomic do
   current <- *listRef
-  let updated = if elem current server then current else union current [server]
+  let updated = unique (union current [server])
   set *listRef = updated
   yield (count updated)
 
@@ -487,14 +487,9 @@ removeServerFromList = \listRef server -> atomic do
 
 headOf = \items -> fold (\_ x -> Just {value: x}) Nothing {} (take 1 items)
 
--- Sort then take head: O(n log n) but no fold-with-Maybe boilerplate.
-minBy = \items getKey -> headOf (sortBy getKey items)
-
--- LRU-style eviction: drop the single entry with the smallest key.
-evictOldest = \items getKey -> drop 1 (sortBy getKey items)
-
+-- Cap to maxN by dropping the single entry with the smallest key (LRU-style).
 capList = \items maxN getKey ->
-  if count items > maxN then evictOldest items getKey else items
+  if count items > maxN then drop 1 (sortBy getKey items) else items
 
 -- Integer percentage with zero-denominator guard.
 pct = \cur maxN -> if maxN > 0 then cur * 100 / maxN else 0
@@ -518,7 +513,7 @@ removeForKey = \pred -> do
 capPerKey = \items pred maxN getKey ->
   let mine = filter items pred in
   if count mine >= maxN
-    then union (removeWhere items pred) (evictOldest mine getKey)
+    then union (removeWhere items pred) (drop 1 (sortBy getKey mine))
     else items
 
 -- Shared empty/error shape for /poll. Only a few fields ever vary.
@@ -600,7 +595,7 @@ matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
 extractToken = \authHeader ->
   let token = drop 7 authHeader in
-  if take 7 authHeader == "Bearer " && token != "" && not (tooLong token maxTokenLen)
+  if hasPrefix "Bearer " authHeader && token != "" && not (tooLong token maxTokenLen)
     then Just {value: token}
     else Nothing {}
 
@@ -666,7 +661,7 @@ generateFederationAuth = \scope requestTimestamp ->
 
 -- Verify a federation request: signed (Ed25519 over scope|ts|fromServer|nonce) or callback Bearer token.
 verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
-  if take 7 authorization == "Signed " then do
+  if hasPrefix "Signed " authorization then do
     let payload = drop 7 authorization
     if payload == "" || tooLong payload (maxSignatureLen + 25) then yield False
     else do
@@ -1211,9 +1206,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs msg
   msgs <- *messages
   aids <- *ackedIds
   dids <- *deliveredIds
-  let isDup = (effMsgId != "" && any msgs (\m -> m.messageId == effMsgId && m.toKey == to))
-            || hasMessage effMsgId to aids
-            || hasMessage effMsgId to dids
+  let isDup = hasMessage effMsgId to msgs || hasMessage effMsgId to aids || hasMessage effMsgId to dids
   srLim <- chargeRate sendRates senderKey maxSendRatePerKey sendRateWindowMs t
   prLim <- chargeRate pairRates (senderKey ++ "|" ++ to) maxPairRatePerPair pairRateWindowMs t
   rrLim <- chargeRate recvRates to maxRecvRatePerKey recvRateWindowMs t
@@ -1471,9 +1464,7 @@ storeFederated = \toKey encryptedBlob timestamp originServer messageId expiresAt
     msgs <- *messages
     aids <- *ackedIds
     dids <- *deliveredIds
-    if any msgs (\m -> m.messageId == messageId && m.toKey == toKey)
-       || hasMessage messageId toKey aids
-       || hasMessage messageId toKey dids
+    if hasMessage messageId toKey msgs || hasMessage messageId toKey aids || hasMessage messageId toKey dids
       then yield ""
     else if count msgs >= maxMessages then yield "global_full"
     else if countWhere msgs (\m -> m.toKey == toKey) >= maxMessagesPerRecipient then yield "mailbox_full"
