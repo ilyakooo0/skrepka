@@ -1328,11 +1328,9 @@ handleListMessages = \offset authorization clientIp respond -> do
     {messages: [], authorized: True {}, count: 0, error: "rate_limited"} (\pubkey -> do
       msgs <- *messages
       let myMsgs = sortBy (\m -> m.receivedAt) (filter msgs (\m -> m.toKey == pubkey && m.expiresAt > t))
-      let total = count myMsgs
-      let effectiveOffset = clamp 0 total offset
-      let after = mapWhere (withIndex myMsgs) (\p -> p.i >= effectiveOffset) (\p -> p.v)
+      let after = drop (clamp 0 (count myMsgs) offset) myMsgs
       let result = pluck (takeRelation maxPollEvents after) (\m -> {messageId: m.messageId, timestamp: m.timestamp, receivedAt: m.receivedAt})
-      yield (respond {messages: result, authorized: True {}, count: total, error: ""}))
+      yield (respond {messages: result, authorized: True {}, count: count myMsgs, error: ""}))
 
 handleDeleteMessages = \messageIds authorization clientIp respond -> do
   t <- now
@@ -1562,8 +1560,7 @@ handleFederationBatchCancel = \cancels fromServer requestTimestamp correlationId
         case findFirst msgs (\m -> matches m && m.originServer == fromServer) of
           Nothing {} -> yield False
           Just {} -> do
-            set *messages = removeWhere msgs matches
-            pruneRef forwards (\f -> not (matches f))
+            _ <- applyCancel msgs matches e.toKey e.messageId t
             yield True
       yield {messageId: e.messageId, cancelled: cancelled})
     yield (respond {ok: True {}, error: "", results: results, retryAfterMs: 0}))
