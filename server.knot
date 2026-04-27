@@ -457,6 +457,7 @@ when = \cond action -> if cond then action else yield {}
 min = \a b -> if a < b then a else b
 max = \a b -> if a > b then a else b
 clamp = \lo hi x -> max lo (min hi x)
+mod = \n m -> n - n / m * m
 
 -- Dedup: keeps first occurrence (O(n^2)).
 unique = \items -> fold (\acc x -> if elem acc x then acc else union acc [x]) [] items
@@ -544,9 +545,9 @@ mapEach = \items getKey action -> case headOf items of
     rest <- mapEach (filter items (\y -> getKey y != getKey x)) getKey action
     yield (union [r] rest)
 
--- Hex tokens (modulo lives inside hexDigit, so callers just pass raw bits).
+-- Hex tokens (callers just pass raw bits).
 hexDigit : Int -> Text
-hexDigit = \n -> take 1 (drop (n - n / 16 * 16) "0123456789abcdef")
+hexDigit = \n -> take 1 (drop (mod n 16) "0123456789abcdef")
 
 byteToHex : Int -> Text
 byteToHex = \n -> hexDigit (n / 16) ++ hexDigit n
@@ -562,12 +563,12 @@ genTokenN = \n -> if n <= 0 then yield "" else do
 genToken = genTokenN 8
 
 tooLong : Text -> Int -> Bool
-tooLong = \s maxLen -> drop maxLen s != ""
+tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
 isValidHex = \s ->
-  let n = count (chars s) in
-  n > 0 && n / 2 * 2 == n && all (chars s) (\c -> contains c "0123456789abcdef")
+  let cs = chars s in
+  count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
