@@ -599,9 +599,7 @@ extractToken = \authHeader ->
 verifyMaintenanceAuth : Text -> IO Bool
 verifyMaintenanceAuth = \authorization -> do
   secret <- *runtimeMaintenanceSecret
-  yield (case extractToken authorization of
-    Just {value: token} -> secret != "" && token == secret
-    _ -> False)
+  yield (secret != "" && extractToken authorization == Just {value: secret})
 
 withMaintAuth = \authorization onUnauth onAuth -> do
   authorized <- verifyMaintenanceAuth authorization
@@ -611,11 +609,10 @@ withMaintAuth = \authorization onUnauth onAuth -> do
 -- mkErr is called with one of: "draining", "rate_limited", "unauthorized".
 gateAuth = \checkDrain auth ip t respond mkErr onAuth -> do
   dp <- *drainPhase
+  g <- checkGlobalRate t
   if checkDrain && dp >= 2 then yield (respond (mkErr "draining"))
-  else do
-    g <- checkGlobalRate t
-    if g then yield (respond (mkErr "rate_limited"))
-    else withSessionAuth auth t ip (yield (respond (mkErr "unauthorized"))) onAuth
+  else if g then yield (respond (mkErr "rate_limited"))
+  else withSessionAuth auth t ip (yield (respond (mkErr "unauthorized"))) onAuth
 
 -- gateAuth + per-key rate gate. `rateResp` is the response value when the per-key gate trips.
 gateRated = \checkDrain auth ip rateRef maxRate windowMs t respond mkErr rateResp onAuth ->
@@ -1060,23 +1057,18 @@ handleLogout = \authorization clientIp respond -> do
   case extractToken authorization of
     Nothing {} -> yield (respond {ok: False {}, authorized: False {}})
     Just {value: token} -> do
-      removed <- atomic do
-        ses <- *sessions
-        case authenticateSession ses token t of
-          Unauthorized {} -> yield {ok: False {}, pubkey: "", peers: []}
-          Authorized {pubkey, ip} ->
-            if not (matchIp clientIp ip) then yield {ok: False {}, pubkey: "", peers: []}
+      removed <- atomic (withSessionAuth authorization t clientIp
+        (yield {ok: False {}, pubkey: "", peers: []})
+        (\pubkey -> do
+          ses <- *sessions
+          set *sessions = removeWhere ses (\s -> s.token == token)
+          after <- *sessions
+          peers <- if any after (\s -> s.pubkey == pubkey) then yield []
             else do
-              set *sessions = removeWhere ses (\s -> s.token == token)
-              -- If no remaining sessions for this key, drop local presence
-              after <- *sessions
-              let stillHas = any after (\s -> s.pubkey == pubkey)
-              peers <- if stillHas then yield []
-                else do
-                  pres <- *presence
-                  set *presence = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
-                  yield (knownPeerServersFromPresence pres)
-              yield {ok: True {}, pubkey: pubkey, peers: peers}
+              pres <- *presence
+              set *presence = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
+              yield (knownPeerServersFromPresence pres)
+          yield {ok: True {}, pubkey: pubkey, peers: peers}))
       when (removed.ok && removed.pubkey != "" && count removed.peers > 0 && federationEnabled)
         (fork (sendBatchedGossip removed.peers [mkGossip (GossipOffline {}) removed.pubkey t offlineGossipMinTtl] gossipOriginHops))
       yield (respond {ok: removed.ok, authorized: removed.ok})
@@ -1616,9 +1608,8 @@ handleUndrain = \authorization respond -> withMaintAuth authorization
       set *drainCompletedAt = 0
     yield (respond {ok: True {}}))
 
-handleShutdown = \authorization respond -> withMaintAuth authorization
-  (yield (respond {ok: False {}, drained: 0}))
-  (handleDrain 2 authorization (\r -> respond {ok: r.ok, drained: r.drained}))
+handleShutdown = \authorization respond ->
+  handleDrain 2 authorization (\r -> respond {ok: r.ok, drained: r.drained})
 
 handlePrune = \authorization respond -> do
   t <- now
@@ -1655,12 +1646,10 @@ handleUnblockPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, unblocked: False {}}))
   (do removed <- removeServerFromList blockedPeers server; yield (respond {ok: True {}, unblocked: removed}))
 
-handleListPeers = \listRef authorization respond -> do
+handleListBlocked = \authorization respond -> do
   ok <- verifyMaintenanceAuth authorization
-  list <- *listRef
+  list <- *blockedPeers
   yield (respond {peers: if ok then list else [], ok: ok})
-
-handleListBlocked = \authorization respond -> handleListPeers blockedPeers authorization respond
 
 handleAllowPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, allowed: 0}))
@@ -1670,7 +1659,10 @@ handleUnallowPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, removed: False {}}))
   (do removed <- removeServerFromList allowedPeers server; yield (respond {ok: True {}, removed: removed}))
 
-handleListAllowed = \authorization respond -> handleListPeers allowedPeers authorization respond
+handleListAllowed = \authorization respond -> do
+  ok <- verifyMaintenanceAuth authorization
+  list <- *allowedPeers
+  yield (respond {peers: if ok then list else [], ok: ok})
 
 handlePingPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, latencyMs: 0, error: "unauthorized"}))
@@ -1740,8 +1732,7 @@ handleAdminListAllSessions = \limit authorization respond -> withMaintAuth autho
        ips: unique (mapWhere mine (\s -> s.ip != "") (\s -> s.ip)),
        latestExpiry: fold (\acc s -> max acc s.expiresAt) 0 mine})
     let sorted = sortBy (\g -> 0 - g.count) grouped
-    let effLimit = if limit <= 0 then 100 else clamp 1 500 limit
-    yield (respond {sessions: takeRelation effLimit sorted, ok: True {}, total: count grouped}))
+    yield (respond {sessions: takeRelation (if limit <= 0 then 100 else clamp 1 500 limit) sorted, ok: True {}, total: count grouped}))
 
 handleGetRateLimits = \authorization respond -> do
   ok <- verifyMaintenanceAuth authorization
@@ -1792,11 +1783,11 @@ handleStats = \authorization respond -> withMaintAuth authorization
     let mCount = count msgs
     let pCount = count pres
     let fCount = count fwds
-    let zeroFed = {enabled: federationEnabled, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: count bp, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: count pfc, gossipSuccess: 0, gossipFail: 0, latencyBuckets: {lt100: 0, lt500: 0, lt2000: 0, gte2000: 0}}
-    let zeroRates = {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0, clientCancels: 0, federationCancels: 0}
-    let cap = {sessions: sCount, sessionsMax: maxSessions, sessionsPct: pct sCount maxSessions, messages: mCount, messagesMax: maxMessages, messagesPct: pct mCount maxMessages, totalMessageCount: mCount, presence: pCount, presenceMax: maxPresenceEntries, presencePct: pct pCount maxPresenceEntries, forwards: fCount, forwardsMax: maxForwardsEntries, forwardsPct: pct fCount maxForwardsEntries, challenges: count chs, challengesMax: maxChallenges, ackedIds: count aids, ackedIdsMax: maxAckedIds, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: count dids, deliveredIdsMax: maxDeliveredIds, forwardNonces: 0, forwardNoncesMax: 0, nonceEvictions: 0, activePolls: count aps, activePollsMax: maxActivePolls, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0}
-    let timing = {pruneCount: pc, pruneRunning: 0, heartbeatCount: hc, uptime: t - sa, lastPruneAt: lp, lastHeartbeatAt: lh, draining: dp > 0, drainPhase: dp, totalEntries: sCount + mCount + pCount + fCount, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, pollLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0, sendLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, authAvgMs: 0, authMaxMs: 0, authCount: 0}
-    yield (respond {ok: True {}, version: serverBuildVersion, capacity: cap, federation: zeroFed, rates: zeroRates, timing: timing}))
+    yield (respond {ok: True {}, version: serverBuildVersion,
+      capacity: {sessions: sCount, sessionsMax: maxSessions, sessionsPct: pct sCount maxSessions, messages: mCount, messagesMax: maxMessages, messagesPct: pct mCount maxMessages, totalMessageCount: mCount, presence: pCount, presenceMax: maxPresenceEntries, presencePct: pct pCount maxPresenceEntries, forwards: fCount, forwardsMax: maxForwardsEntries, forwardsPct: pct fCount maxForwardsEntries, challenges: count chs, challengesMax: maxChallenges, ackedIds: count aids, ackedIdsMax: maxAckedIds, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: count dids, deliveredIdsMax: maxDeliveredIds, forwardNonces: 0, forwardNoncesMax: 0, nonceEvictions: 0, activePolls: count aps, activePollsMax: maxActivePolls, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0},
+      federation: {enabled: federationEnabled, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: count bp, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: count pfc, gossipSuccess: 0, gossipFail: 0, latencyBuckets: {lt100: 0, lt500: 0, lt2000: 0, gte2000: 0}},
+      rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0, clientCancels: 0, federationCancels: 0},
+      timing: {pruneCount: pc, pruneRunning: 0, heartbeatCount: hc, uptime: t - sa, lastPruneAt: lp, lastHeartbeatAt: lh, draining: dp > 0, drainPhase: dp, totalEntries: sCount + mCount + pCount + fCount, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, pollLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0, sendLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, authAvgMs: 0, authMaxMs: 0, authCount: 0}}))
 
 zeroStats = {ok: False {}, version: serverBuildVersion, capacity: {sessions: 0, sessionsMax: 0, sessionsPct: 0, messages: 0, messagesMax: 0, messagesPct: 0, totalMessageCount: 0, presence: 0, presenceMax: 0, presencePct: 0, forwards: 0, forwardsMax: 0, forwardsPct: 0, challenges: 0, challengesMax: 0, ackedIds: 0, ackedIdsMax: 0, ackOverflow: 0, ackOverflowMax: 0, deliveredIds: 0, deliveredIdsMax: 0, forwardNonces: 0, forwardNoncesMax: 0, nonceEvictions: 0, activePolls: 0, activePollsMax: 0, recipientCounts: 0, messageBucketMax: 0, messageBucketMin: 0}, federation: {enabled: False {}, inFlight: 0, hungSlots: 0, avgLatencyMs: 0, maxLatencyMs: 0, callCount: 0, slowVerifies: 0, verifyFailures: 0, forwardFailures: 0, oldestForwardAge: 0, oldestAckAge: 0, recentGossip: 0, blockedPeers: 0, drainCompletedAt: 0, forwardServers: 0, maxForwardQueueDepth: 0, topFailingPeers: [], pendingCancels: 0, gossipSuccess: 0, gossipFail: 0, latencyBuckets: {lt100: 0, lt500: 0, lt2000: 0, gte2000: 0}}, rates: {send: 0, challenge: 0, federation: 0, federationPair: 0, global: 0, ip: 0, lookup: 0, recv: 0, pair: 0, gossipEvent: 0, verifyIp: 0, uniqueKeyIp: 0, pendingAckCleanups: 0, senderExpirations: 0, senderDeliveries: 0, rejectedGlobal: 0, rejectedIp: 0, rejectedAuth: 0, rejectedPerKey: 0, rejectedFederation: 0, clientCancels: 0, federationCancels: 0}, timing: {pruneCount: 0, pruneRunning: 0, heartbeatCount: 0, uptime: 0, lastPruneAt: 0, lastHeartbeatAt: 0, draining: False {}, drainPhase: 0, totalEntries: 0, activeRequests: 0, peakActiveRequests: 0, pollAvgMs: 0, pollMaxMs: 0, pollCount: 0, pollLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, sendAvgMs: 0, sendMaxMs: 0, sendCount: 0, sendLatencyBuckets: {lt50: 0, lt200: 0, lt1000: 0, gte1000: 0}, authAvgMs: 0, authMaxMs: 0, authCount: 0}}
 
@@ -1835,8 +1826,7 @@ handleTopRecipients = \limit authorization respond -> withMaintAuth authorizatio
     msgs <- *messages
     let counts = pluck (unique (pluck msgs (\m -> m.toKey))) (\pk -> {pubkey: pk, count: countWhere msgs (\m -> m.toKey == pk)})
     let sorted = sortBy (\c -> 0 - c.count) counts
-    let effLimit = if limit <= 0 then 20 else clamp 1 100 limit
-    yield (respond {recipients: takeRelation effLimit sorted, ok: True {}, total: count counts}))
+    yield (respond {recipients: takeRelation (if limit <= 0 then 20 else clamp 1 100 limit) sorted, ok: True {}, total: count counts}))
 
 handleStatsForwards = \authorization respond -> withMaintAuth authorization
   (yield (respond {servers: [], ok: False {}, total: 0}))
