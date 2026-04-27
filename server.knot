@@ -597,9 +597,8 @@ isBadServerName = \sn ->
 -- Plain ip match (sessions with empty ip skip the check).
 matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
-extractToken = \authHeader ->
-  let rest = drop 7 authHeader in
-  if hasPrefix "Bearer " authHeader && rest != "" then Just {value: rest} else Nothing {}
+extractToken = \h ->
+  if hasPrefix "Bearer " h && drop 7 h != "" then Just {value: drop 7 h} else Nothing {}
 
 verifyMaintenanceAuth : Text -> IO Bool
 verifyMaintenanceAuth = \authorization -> do
