@@ -163,10 +163,12 @@ isValidMessageId : Text -> Bool
 isValidMessageId = isValidBoundedHex maxMessageIdLen
 type MessageIdHex = Text where isValidMessageId
 type OptionalMessageId = Text where \s -> s == "" || isValidMessageId s
+isAnyServerName : Text -> Bool
+isAnyServerName = \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s
 isValidServerName : Text -> Bool
-isValidServerName = \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s && not (isBadServerName s)
+isValidServerName = \s -> isAnyServerName s && not (isBadServerName s)
 type ServerName = Text where isValidServerName
-type AnyServerName = Text where \s -> not (tooLong s maxServerNameLen) && s == normalizeServerName s
+type AnyServerName = Text where isAnyServerName
 
 type Timestamp = Int<Ms>
 
@@ -549,8 +551,7 @@ tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
-isValidHex = \s ->
-  count (chars s) > 0 && mod (count (chars s)) 2 == 0 && all (chars s) (\c -> contains c "0123456789abcdef")
+isValidHex = \s -> let cs = chars s in count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
