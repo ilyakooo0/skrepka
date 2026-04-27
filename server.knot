@@ -884,14 +884,14 @@ cancelOne = \mid to ownerPred t -> atomic do
   when owns (do applyCancel msgs matches to mid t; yield {})
   yield owns
 
-sendBatchedGossip = \peers events hops -> forEach peers (\server -> do
+sendBatchedGossip = \peers events -> forEach peers (\server -> do
   t <- now
   failures <- *forwardFailures
   when (shouldRetryServer server t failures) (do
     auth <- generateFederationAuth "gossip" t
     result <- fetch (federationUrl server) (RecvGossip {
       authorization: auth,
-      events: events, hopsRemaining: hops, fromServer: serverHostN,
+      events: events, hopsRemaining: gossipOriginHops, fromServer: serverHostN,
       requestTimestamp: t, correlationId: "", protocolVersion: federationProtocolVersion})
     case result of
       Err _ -> recordFailure server
@@ -900,7 +900,7 @@ sendBatchedGossip = \peers events hops -> forEach peers (\server -> do
 broadcastOfflineGossip = \t expiredLocal -> do
   presence <- *presence
   when (federationEnabled && count expiredLocal > 0)
-    (sendBatchedGossip (knownPeerServersFromPresence presence) (pluck expiredLocal (\p -> mkGossip (GossipOffline {}) p.pubkey t offlineGossipMinTtl)) gossipOriginHops)
+    (sendBatchedGossip (knownPeerServersFromPresence presence) (pluck expiredLocal (\p -> mkGossip (GossipOffline {}) p.pubkey t offlineGossipMinTtl)))
 
 -- ============================================
 -- Forward retries and acks
@@ -985,7 +985,7 @@ refreshLocalPresence = \t -> do
     set *presence = updated
     yield {refreshed: refreshed, peers: knownPeerServersFromPresence updated}
   when (count refreshState.refreshed > 0)
-    (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> mkGossip (GossipOnline {}) p.pubkey t (clampTtl (sessionExpiry / 1000)))) gossipOriginHops))
+    (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> mkGossip (GossipOnline {}) p.pubkey t (clampTtl (sessionExpiry / 1000))))))
 
 -- ============================================
 -- Handler: challenge / verify / revoke / logout
@@ -1039,7 +1039,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
     if not result.valid then yield (respond {token: "", expiresAt: 0, error: "invalid"})
     else do
       when federationEnabled
-        (fork (sendBatchedGossip result.peers [mkGossip (GossipOnline {}) pubkey t onlineGossipTtl] gossipOriginHops))
+        (fork (sendBatchedGossip result.peers [mkGossip (GossipOnline {}) pubkey t onlineGossipTtl]))
       yield (respond {token: token, expiresAt: expiry, error: ""})
 
 handleRevoke = \targetToken authorization clientIp respond -> do
@@ -1054,12 +1054,12 @@ handleRevoke = \targetToken authorization clientIp respond -> do
 
 handleLogout = \authorization clientIp respond -> do
   t <- now
-  let myToken = extractToken authorization
+  let myToken = case extractToken authorization of Just {value: tk} -> tk; _ -> ""
   removed <- atomic (withSessionAuth authorization t clientIp
     (yield {ok: False {}, pubkey: "", peers: []})
     (\pubkey -> do
       ses <- *sessions
-      set *sessions = removeWhere ses (\s -> Just {value: s.token} == myToken)
+      set *sessions = removeWhere ses (\s -> s.token == myToken)
       after <- *sessions
       peers <- if any after (\s -> s.pubkey == pubkey) then yield []
         else do
@@ -1068,7 +1068,7 @@ handleLogout = \authorization clientIp respond -> do
           yield (knownPeerServersFromPresence pres)
       yield {ok: True {}, pubkey: pubkey, peers: peers}))
   when (removed.ok && federationEnabled)
-    (fork (sendBatchedGossip removed.peers [mkGossip (GossipOffline {}) removed.pubkey t offlineGossipMinTtl] gossipOriginHops))
+    (fork (sendBatchedGossip removed.peers [mkGossip (GossipOffline {}) removed.pubkey t offlineGossipMinTtl]))
   yield (respond {ok: removed.ok, authorized: removed.ok})
 
 -- ============================================
@@ -1519,7 +1519,7 @@ handleDrain = \phase authorization respond -> withMaintAuth authorization
         set *pollWakeup = t
         yield {peers: knownPeerServersFromPresence pres, localKeys: filter pres isLocalLive}
     when (effectivePhase == 2 && count drainResult.localKeys > 0 && federationEnabled)
-      (fork (sendBatchedGossip drainResult.peers (pluck drainResult.localKeys (\p -> mkGossip (GossipOffline {}) p.pubkey t offlineGossipMinTtl)) gossipOriginHops))
+      (fork (sendBatchedGossip drainResult.peers (pluck drainResult.localKeys (\p -> mkGossip (GossipOffline {}) p.pubkey t offlineGossipMinTtl))))
     yield (respond {ok: True {}, drained: count drainResult.localKeys, phase: effectivePhase}))
 
 handleUndrain = \authorization respond -> withMaintAuth authorization
