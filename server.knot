@@ -558,8 +558,9 @@ tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
 isValidHex = \s ->
-  let n = count (chars s) in
-  n > 0 && n / 2 * 2 == n && all (chars s) (\c -> contains c "0123456789abcdef")
+  let cs = chars s in
+  let n = count cs in
+  n > 0 && n / 2 * 2 == n && all cs (\c -> contains c "0123456789abcdef")
 
 stripTrailingDot : Text -> Text
 stripTrailingDot = \s -> if containsSuffix "." s then stripTrailingDot (take (count (chars s) - 1) s) else s
@@ -657,8 +658,8 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
     else do
       -- Split payload on first ':' into {sig, nonce}.
       let cs = chars payload
-      let sepIdx = case headOf (mapWhere (withIndex cs) (\p -> p.v == ":") (\p -> p.i)) of
-            Just {value: i} -> i
+      let sepIdx = case findFirst (withIndex cs) (\p -> p.v == ":") of
+            Just {value: p} -> p.i
             _ -> count cs
       let sig = take sepIdx payload
       let nonce = drop (sepIdx + 1) payload
@@ -764,10 +765,11 @@ recordFailure = \server -> do
   t <- now
   atomic do
     failures <- *forwardFailures
-    let prev = case findFirst failures (\f -> f.server == server) of
+    let same = \f -> f.server == server
+    let prev = case findFirst failures same of
           Just {value: f} -> {count: f.failures + 1, firstFailedAt: f.firstFailedAt}
           _ -> {count: 1, firstFailedAt: t}
-    set *forwardFailures = union (removeWhere failures (\f -> f.server == server))
+    set *forwardFailures = union (removeWhere failures same)
       [{server: server, failedAt: t, failures: prev.count, firstFailedAt: prev.firstFailedAt}]
 
 clearFailure = \server -> atomic (pruneRef forwardFailures (\f -> f.server != server))
@@ -977,14 +979,12 @@ refreshLocalPresence = \t -> do
   refreshState <- atomic do
     sessions <- *sessions
     presence <- *presence
-    let newExpiry = t + sessionExpiry
     let sessionKeys = unique (pluck sessions (\s -> s.pubkey))
-    let updated = pluck presence (\p ->
-      if isLocalServer p.server && elem sessionKeys p.pubkey && p.expiresAt - t < sessionExpiry / 2
-        then {pubkey: p.pubkey, server: p.server, expiresAt: newExpiry, timestamp: t}
-        else p)
+    let needsRefresh = \p -> isLocalServer p.server && elem sessionKeys p.pubkey && p.expiresAt - t < sessionExpiry / 2
+    let refreshed = pluck (filter presence needsRefresh) (\p -> {pubkey: p.pubkey, server: p.server, expiresAt: t + sessionExpiry, timestamp: t})
+    let updated = union (removeWhere presence needsRefresh) refreshed
     set *presence = updated
-    yield {refreshed: filter updated (\p -> isLocalServer p.server && p.expiresAt == newExpiry), peers: knownPeerServersFromPresence updated}
+    yield {refreshed: refreshed, peers: knownPeerServersFromPresence updated}
   when (count refreshState.refreshed > 0)
     (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> mkGossip (GossipOnline {}) p.pubkey t (clampTtl (sessionExpiry / 1000)))) gossipOriginHops))
 
@@ -1243,9 +1243,7 @@ handleBatchLookupPresence = \pubkeys authorization clientIp respond -> do
   gateLookup authorization clientIp t respond mkErr
     {results: [], authorized: True {}, error: "rate_limited"} (\_ -> do
       pres <- *presence
-      let results = do
-        k <- takeRelation 50 pubkeys
-        yield {pubkey: k, server: maskedServer pres k t}
+      let results = pluck (takeRelation 50 pubkeys) (\k -> {pubkey: k, server: maskedServer pres k t})
       yield (respond {results: results, authorized: True {}, error: ""}))
 
 handleMessageStatus = \to messageId authorization clientIp respond -> do
