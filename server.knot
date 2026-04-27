@@ -449,7 +449,7 @@ countWhere = \xs pred -> count (filter xs pred)
 any : [a] -> (a -> Bool) -> Bool
 any = \xs pred -> countWhere xs pred > 0
 none : [a] -> (a -> Bool) -> Bool
-none = \xs pred -> countWhere xs pred == 0
+none = \xs pred -> not (any xs pred)
 all : [a] -> (a -> Bool) -> Bool
 all = \xs pred -> countWhere xs pred == count xs
 elem = \xs x -> any xs (\y -> y == x)
@@ -562,7 +562,7 @@ tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
-isValidHex = \s -> let cs = chars s in count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
+isValidHex = \s -> let cs = chars s in let n = count cs in n > 0 && mod n 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
@@ -621,9 +621,10 @@ withMaintAuth = \authorization onUnauth onAuth -> do
 gateAuth = \checkDrain auth ip t respond mkErr onAuth -> do
   dp <- *drainPhase
   g <- checkGlobalRate t
-  if checkDrain && dp >= 2 then yield (respond (mkErr "draining"))
-  else if g then yield (respond (mkErr "rate_limited"))
-  else withSessionAuth auth t ip (yield (respond (mkErr "unauthorized"))) onAuth
+  let err = \e -> yield (respond (mkErr e))
+  if checkDrain && dp >= 2 then err "draining"
+  else if g then err "rate_limited"
+  else withSessionAuth auth t ip (err "unauthorized") onAuth
 
 -- gateAuth + per-key rate gate. `rateResp` is the response value when the per-key gate trips.
 gateRated = \checkDrain auth ip rateRef maxRate windowMs t respond mkErr rateResp onAuth ->
@@ -673,9 +674,7 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
             else {sig: acc.sig ++ c, nonce: "", split: False {}}) {sig: "", nonce: "", split: False {}} (chars payload)
       result <- fetch (federationUrl fromServer) (FederationPubkey {})
       case result of
-        Ok r ->
-          if not r.ok || r.pubkey == "" then yield False
-          else yield (verify (bytesFromHex r.pubkey) (textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ fromServer ++ (if parts.nonce == "" then "" else "|" ++ parts.nonce))) (bytesFromHex parts.sig))
+        Ok r -> yield (r.ok && r.pubkey != "" && verify (bytesFromHex r.pubkey) (textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ fromServer ++ (if parts.nonce == "" then "" else "|" ++ parts.nonce))) (bytesFromHex parts.sig))
         _ -> yield False
   else case extractToken authorization of
     Just {value: token} -> do
@@ -987,12 +986,14 @@ refreshLocalPresence = \t -> do
   refreshState <- atomic do
     sessions <- *sessions
     presence <- *presence
+    let newExpiry = t + sessionExpiry
+    let sessionKeys = unique (pluck sessions (\s -> s.pubkey))
     let updated = pluck presence (\p ->
-      if isLocalServer p.server && elem (unique (pluck sessions (\s -> s.pubkey))) p.pubkey && p.expiresAt - t < sessionExpiry / 2
-        then {pubkey: p.pubkey, server: p.server, expiresAt: t + sessionExpiry, timestamp: t}
+      if isLocalServer p.server && elem sessionKeys p.pubkey && p.expiresAt - t < sessionExpiry / 2
+        then {pubkey: p.pubkey, server: p.server, expiresAt: newExpiry, timestamp: t}
         else p)
     set *presence = updated
-    yield {refreshed: filter updated (\p -> isLocalServer p.server && p.expiresAt == t + sessionExpiry), peers: knownPeerServersFromPresence updated}
+    yield {refreshed: filter updated (\p -> isLocalServer p.server && p.expiresAt == newExpiry), peers: knownPeerServersFromPresence updated}
   when (count refreshState.refreshed > 0)
     (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> mkGossip (GossipOnline {}) p.pubkey t (clampTtl (sessionExpiry / 1000)))) gossipOriginHops))
 
@@ -1063,11 +1064,12 @@ handleRevoke = \targetToken authorization clientIp respond -> do
 
 handleLogout = \authorization clientIp respond -> do
   t <- now
+  let myToken = extractToken authorization
   removed <- atomic (withSessionAuth authorization t clientIp
     (yield {ok: False {}, pubkey: "", peers: []})
     (\pubkey -> do
       ses <- *sessions
-      set *sessions = removeWhere ses (\s -> Just {value: s.token} == extractToken authorization)
+      set *sessions = removeWhere ses (\s -> Just {value: s.token} == myToken)
       after <- *sessions
       peers <- if any after (\s -> s.pubkey == pubkey) then yield []
         else do
@@ -1089,8 +1091,9 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
   dp <- *drainPhase
   g <- checkGlobalRate t
   let cursorWasReset = generation != serverGen && cursor > 0
-  if dp >= 2 then yield (respond (emptyPollResp 0 (True {}) (False {}) (True {}) serverGen 0 cursorWasReset))
-  else if g then yield (respond (emptyPollResp 0 (False {}) (True {}) (False {}) serverGen globalRateWindowMs cursorWasReset))
+  let er = \auth rate drain retry -> yield (respond (emptyPollResp 0 auth rate drain serverGen retry cursorWasReset))
+  if dp >= 2 then er (True {}) (False {}) (True {}) 0
+  else if g then er (False {}) (True {}) (False {}) globalRateWindowMs
   else pollOnce authorization (if cursorWasReset then 0 else cursor) cursorWasReset (takeRelation maxWatchKeys watchKeys) clientIp serverGen respond t
 
 pollOnce = \authorization cursor cursorWasReset watchKeys clientIp serverGen respond t -> do
