@@ -460,7 +460,7 @@ clamp = \lo hi x -> max lo (min hi x)
 abs = \x -> if x < 0 then 0 - x else x
 
 -- Dedup: keeps first occurrence (O(n^2)).
-unique = \items -> fold (\acc x -> if elem acc x then acc else union acc [x]) [] items
+unique = fold (\acc x -> if elem acc x then acc else union acc [x]) []
 
 -- Pair each element with its 0-based index.
 withIndex = fold (\acc x -> union acc [{i: count acc, v: x}]) []
@@ -499,16 +499,16 @@ pct = \cur maxN -> if maxN > 0 then cur * 100 / maxN else 0
 -- Read entries matching `pred` (transformed by `extract`) and prune them in one step.
 collectAndPrune = \ref pred extract -> do
   items <- *ref
-  pruneRef ref (\x -> not (pred x))
+  set *ref = removeWhere items pred
   yield (mapWhere items pred extract)
 
 -- Common ack/delete tail: pull matching messages, drop them and their forwards.
 removeForKey = \pred -> do
   msgs <- *messages
-  let toRemove = filter msgs pred
+  fwds <- *forwards
   set *messages = removeWhere msgs pred
-  pruneRef forwards (\f -> not (pred f))
-  yield toRemove
+  set *forwards = removeWhere fwds pred
+  yield (filter msgs pred)
 
 -- Cap pred-matching entries to maxN-1 (caller adds one more).
 capPerKey = \items pred maxN getKey ->
