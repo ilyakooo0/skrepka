@@ -615,6 +615,12 @@ gateAuth = \checkDrain auth ip t respond mkErr onAuth -> do
     if g then yield (respond (mkErr "rate_limited"))
     else withSessionAuth auth t ip (yield (respond (mkErr "unauthorized"))) onAuth
 
+-- gateAuth + per-key rate gate. `rateResp` is the response value when the per-key gate trips.
+gateRated = \checkDrain auth ip rateRef maxRate windowMs t respond mkErr rateResp onAuth ->
+  gateAuth checkDrain auth ip t respond mkErr (\pk -> do
+    lim <- checkPubkeyRateGate rateRef pk maxRate windowMs t
+    if lim then yield (respond rateResp) else onAuth pk)
+
 authenticateSession : [Session] -> Text -> Timestamp -> AuthResult
 authenticateSession = \sessions token t ->
   case findFirst sessions (\s -> s.expiresAt > t && s.token == token) of
@@ -864,6 +870,16 @@ recordAcksAndDeliveries = \toAck t -> do
                           (\m -> {senderKey: m.senderKey, messageId: m.messageId, toKey: m.toKey, deliveredAt: t})
   appendCapped senderDeliveries localDel 10000 (\d -> d.deliveredAt)
   yield ackedFed
+
+-- Common cancel block: drop matching messages + forwards, record cancel notification.
+-- Returns the federated forward servers that had the message (for caller follow-up).
+applyCancel = \msgs matches to mid t -> do
+  set *messages = removeWhere msgs matches
+  fwds <- *forwards
+  let fwdServers = collectPeers (filter fwds matches) (\f -> f.toServer)
+  pruneRef forwards (\f -> not (matches f))
+  appendCapped cancelNotifications [{toKey: to, messageId: mid, cancelledAt: t}] 10000 (\c -> c.cancelledAt)
+  yield fwdServers
 
 sendBatchedGossip = \peers events hops -> forEach peers id (\server -> do
   t <- now
@@ -1253,20 +1269,16 @@ forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers ->
 handleLookupPresence = \pubkey authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {server: "", authorized: False {}, error: if e == "rate_limited" then "rate_limited" else ""}
-  gateAuth (False {}) authorization clientIp t respond mkErr (\senderKey -> do
-    lim <- checkPubkeyRateGate lookupRates senderKey maxLookupRatePerKey lookupRateWindowMs t
-    if lim then yield (respond {server: "", authorized: True {}, error: "rate_limited"})
-    else do
+  gateRated (False {}) authorization clientIp lookupRates maxLookupRatePerKey lookupRateWindowMs t respond mkErr
+    {server: "", authorized: True {}, error: "rate_limited"} (\senderKey -> do
       pres <- *presence
       yield (respond {server: maskedServer pres pubkey t, authorized: True {}, error: ""}))
 
 handleBatchLookupPresence = \pubkeys authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {results: [], authorized: False {}, error: if e == "rate_limited" then "rate_limited" else ""}
-  gateAuth (False {}) authorization clientIp t respond mkErr (\senderKey -> do
-    lim <- checkPubkeyRateGate lookupRates senderKey maxLookupRatePerKey lookupRateWindowMs t
-    if lim then yield (respond {results: [], authorized: True {}, error: "rate_limited"})
-    else do
+  gateRated (False {}) authorization clientIp lookupRates maxLookupRatePerKey lookupRateWindowMs t respond mkErr
+    {results: [], authorized: True {}, error: "rate_limited"} (\senderKey -> do
       pres <- *presence
       let results = do
         k <- takeRelation 50 pubkeys
@@ -1295,10 +1307,8 @@ handleMessageStatus = \to messageId authorization clientIp respond -> do
 handleAckMessages = \messageIds authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {ok: False {}, authorized: False {}, ackedCount: 0, error: e}
-  gateAuth (True {}) authorization clientIp t respond mkErr (\pubkey -> do
-    lim <- checkPubkeyRateGate clientWriteRates pubkey maxClientWriteRatePerKey clientWriteRateWindowMs t
-    if lim then yield (respond {ok: False {}, authorized: True {}, ackedCount: 0, error: "rate_limited"})
-    else do
+  gateRated (True {}) authorization clientIp clientWriteRates maxClientWriteRatePerKey clientWriteRateWindowMs t respond mkErr
+    {ok: False {}, authorized: True {}, ackedCount: 0, error: "rate_limited"} (\pubkey -> do
       let dedupedIds = dedupMessageIds messageIds
       let matches = \x -> x.toKey == pubkey && elem dedupedIds x.messageId
       result <- atomic do
@@ -1314,10 +1324,8 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
 handleListMessages = \offset authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {messages: [], authorized: False {}, count: 0, error: if e == "rate_limited" then "rate_limited" else ""}
-  gateAuth (True {}) authorization clientIp t respond mkErr (\pubkey -> do
-    lim <- checkPubkeyRateGate lookupRates pubkey maxLookupRatePerKey lookupRateWindowMs t
-    if lim then yield (respond {messages: [], authorized: True {}, count: 0, error: "rate_limited"})
-    else do
+  gateRated (True {}) authorization clientIp lookupRates maxLookupRatePerKey lookupRateWindowMs t respond mkErr
+    {messages: [], authorized: True {}, count: 0, error: "rate_limited"} (\pubkey -> do
       msgs <- *messages
       let myMsgs = sortBy (\m -> m.receivedAt) (filter msgs (\m -> m.toKey == pubkey && m.expiresAt > t))
       let total = count myMsgs
@@ -1329,10 +1337,8 @@ handleListMessages = \offset authorization clientIp respond -> do
 handleDeleteMessages = \messageIds authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {ok: False {}, authorized: False {}, deletedCount: 0, error: if e == "draining" then "" else e}
-  gateAuth (True {}) authorization clientIp t respond mkErr (\pubkey -> do
-    lim <- checkPubkeyRateGate clientWriteRates pubkey maxClientWriteRatePerKey clientWriteRateWindowMs t
-    if lim then yield (respond {ok: False {}, authorized: True {}, deletedCount: 0, error: "rate_limited"})
-    else do
+  gateRated (True {}) authorization clientIp clientWriteRates maxClientWriteRatePerKey clientWriteRateWindowMs t respond mkErr
+    {ok: False {}, authorized: True {}, deletedCount: 0, error: "rate_limited"} (\pubkey -> do
       let dedupedIds = dedupMessageIds messageIds
       let matches = \x -> x.toKey == pubkey && elem dedupedIds x.messageId
       result <- atomic do
@@ -1349,10 +1355,8 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
 handleCancelMessage = \messageId to authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {ok: False {}, authorized: False {}, cancelled: False {}, error: if e == "draining" then "" else e}
-  gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
-    lim <- checkPubkeyRateGate clientWriteRates senderKey maxClientWriteRatePerKey clientWriteRateWindowMs t
-    if lim then yield (respond {ok: False {}, authorized: True {}, cancelled: False {}, error: "rate_limited"})
-    else do
+  gateRated (True {}) authorization clientIp clientWriteRates maxClientWriteRatePerKey clientWriteRateWindowMs t respond mkErr
+    {ok: False {}, authorized: True {}, cancelled: False {}, error: "rate_limited"} (\senderKey -> do
       let matches = \x -> x.messageId == messageId && x.toKey == to
       result <- atomic do
         msgs <- *messages
@@ -1362,13 +1366,9 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
             if msg.originServer != "" || msg.senderKey != senderKey || msg.senderKey == ""
               then yield {cancelled: False {}, cancelServers: []}
               else do
-                set *messages = removeWhere msgs matches
-                fwds <- *forwards
-                let fwdServers = collectPeers (filter fwds matches) (\f -> f.toServer)
-                pruneRef forwards (\f -> not (matches f))
+                fwdServers <- applyCancel msgs matches to messageId t
                 pres <- *presence
                 let presServers = collectPeers (presenceForKey pres to t) (\p -> p.server)
-                appendCapped cancelNotifications [{toKey: to, messageId: messageId, cancelledAt: t}] 10000 (\c -> c.cancelledAt)
                 yield {cancelled: True {}, cancelServers: unique (union presServers fwdServers)}
       when (result.cancelled && count result.cancelServers > 0 && federationEnabled)
         (fork (sendCancelToEach messageId to result.cancelServers))
@@ -1389,10 +1389,8 @@ sendCancelToEach = \messageId to servers ->
 handleCancelBatch = \cancels authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {results: [], authorized: False {}, error: if e == "draining" then "" else e}
-  gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
-    lim <- checkPubkeyRateGate clientWriteRates senderKey maxClientWriteRatePerKey clientWriteRateWindowMs t
-    if lim then yield (respond {results: [], authorized: True {}, error: "rate_limited"})
-    else do
+  gateRated (True {}) authorization clientIp clientWriteRates maxClientWriteRatePerKey clientWriteRateWindowMs t respond mkErr
+    {results: [], authorized: True {}, error: "rate_limited"} (\senderKey -> do
       results <- mapEach (takeRelation maxBatchSize cancels) (\e -> e.messageId) (\e -> do
         let matches = \x -> x.messageId == e.messageId && x.toKey == e.to
         r <- atomic do
@@ -1403,9 +1401,7 @@ handleCancelBatch = \cancels authorization clientIp respond -> do
               if msg.originServer != "" || msg.senderKey != senderKey || msg.senderKey == ""
                 then yield False
                 else do
-                  set *messages = removeWhere msgs matches
-                  pruneRef forwards (\f -> not (matches f))
-                  appendCapped cancelNotifications [{toKey: e.to, messageId: e.messageId, cancelledAt: t}] 10000 (\c -> c.cancelledAt)
+                  _ <- applyCancel msgs matches e.to e.messageId t
                   yield True
         yield {messageId: e.messageId, cancelled: r})
       yield (respond {results: results, authorized: True {}, error: ""}))
@@ -1551,9 +1547,7 @@ handleFederationCancel = \messageId toKey fromServer requestTimestamp correlatio
       case findFirst msgs (\m -> matches m && m.originServer == fromServer) of
         Nothing {} -> yield False
         Just {} -> do
-          set *messages = removeWhere msgs matches
-          pruneRef forwards (\f -> not (matches f))
-          appendCapped cancelNotifications [{toKey: toKey, messageId: messageId, cancelledAt: t}] 10000 (\c -> c.cancelledAt)
+          _ <- applyCancel msgs matches toKey messageId t
           yield True
     yield (respond {ok: True {}, error: "", cancelled: cancelled, retryAfterMs: 0}))
 
@@ -1593,7 +1587,11 @@ handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp
     if count messageIds != count toKeys
       then yield (respond {ok: False {}, error: "mismatched_lengths", receivedCount: 0, retryAfterMs: 0})
       else do
-        let pairs = zipPairs messageIds toKeys
+        let pairs = do
+          mp <- withIndex messageIds
+          kp <- withIndex toKeys
+          where mp.i == kp.i
+          yield {messageId: mp.v, toKey: kp.v}
         atomic do
           msgs <- *messages
           let receipts = do
@@ -1606,10 +1604,6 @@ handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp
 
 -- Index a list (1-based by virtue of `count` of the partial fold).
 withIndex = \xs -> fold (\acc x -> union acc [{i: count acc, v: x}]) [] xs
-
--- Pair parallel lists by index (O(n*m) cross-filter; trivial code).
-zipPairs = \mids keys ->
-  do mp <- withIndex mids; kp <- withIndex keys; where mp.i == kp.i; yield {messageId: mp.v, toKey: kp.v}
 
 -- ============================================
 -- Maintenance handlers
@@ -1682,10 +1676,12 @@ handleUnblockPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, unblocked: False {}}))
   (do removed <- removeServerFromList blockedPeers server; yield (respond {ok: True {}, unblocked: removed}))
 
-handleListBlocked = \authorization respond -> do
+handleListPeers = \listRef authorization respond -> do
   ok <- verifyMaintenanceAuth authorization
-  blocked <- *blockedPeers
-  yield (respond {peers: if ok then blocked else [], ok: ok})
+  list <- *listRef
+  yield (respond {peers: if ok then list else [], ok: ok})
+
+handleListBlocked = \authorization respond -> handleListPeers blockedPeers authorization respond
 
 handleAllowPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, allowed: 0}))
@@ -1695,10 +1691,7 @@ handleUnallowPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, removed: False {}}))
   (do removed <- removeServerFromList allowedPeers server; yield (respond {ok: True {}, removed: removed}))
 
-handleListAllowed = \authorization respond -> do
-  ok <- verifyMaintenanceAuth authorization
-  allowed <- *allowedPeers
-  yield (respond {peers: if ok then allowed else [], ok: ok})
+handleListAllowed = \authorization respond -> handleListPeers allowedPeers authorization respond
 
 handlePingPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, latencyMs: 0, error: "unauthorized"}))
