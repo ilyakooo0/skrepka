@@ -812,6 +812,11 @@ bestServerForKey = \entries ->
     Just {value: p} -> p.server
     _ -> ""
 
+-- Resolve a key's server for client lookup, masking remote identities behind "remote".
+maskedServer = \pres pubkey t ->
+  let found = bestServerForKey (presenceForKey pres pubkey t) in
+  if found == "" then "" else if isLocalServer found then found else "remote"
+
 hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
 hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey == toKey)
 
@@ -1280,9 +1285,7 @@ handleLookupPresence = \pubkey authorization clientIp respond -> do
     if lim then yield (respond {server: "", authorized: True {}, error: "rate_limited"})
     else do
       pres <- *presence
-      let found = bestServerForKey (presenceForKey pres pubkey t)
-      let masked = if found == "" then "" else if isLocalServer found then found else "remote"
-      yield (respond {server: masked, authorized: True {}, error: ""}))
+      yield (respond {server: maskedServer pres pubkey t, authorized: True {}, error: ""}))
 
 handleBatchLookupPresence = \pubkeys authorization clientIp respond -> do
   t <- now
@@ -1294,9 +1297,7 @@ handleBatchLookupPresence = \pubkeys authorization clientIp respond -> do
       pres <- *presence
       let results = do
         k <- takeRelation 50 pubkeys
-        let found = bestServerForKey (presenceForKey pres k t)
-        let masked = if found == "" then "" else if isLocalServer found then found else "remote"
-        yield {pubkey: k, server: masked}
+        yield {pubkey: k, server: maskedServer pres k t}
       yield (respond {results: results, authorized: True {}, error: ""}))
 
 handleMessageStatus = \to messageId authorization clientIp respond -> do
@@ -1500,43 +1501,49 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
       (fork (forEach valid.newlyOnline (\tgt -> tgt.pubkey ++ "|" ++ tgt.server) (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t)))
     yield (respond {ok: True {}, error: "", retryAfterMs: 0}))
 
+-- Store a federated/forwarded message into the local mailbox. Caller wraps in `atomic`.
+-- Returns "" on success (including duplicates), otherwise an error code:
+-- "no_presence" | "global_full" | "mailbox_full" | "rate_limited" (only when checkRecvRate).
+storeFederated = \toKey encryptedBlob timestamp originServer messageId expiresAt priority checkRecvRate t -> do
+  pres <- *presence
+  if not (any pres (\p -> p.pubkey == toKey && p.expiresAt > t)) then yield "no_presence"
+  else do
+    msgs <- *messages
+    aids <- *ackedIds
+    dids <- *deliveredIds
+    if any msgs (\m -> m.messageId == messageId && m.toKey == toKey)
+       || hasMessage messageId toKey aids
+       || hasMessage messageId toKey dids
+      then yield ""
+    else if count msgs >= maxMessages then yield "global_full"
+    else if countWhere msgs (\m -> m.toKey == toKey) >= maxMessagesPerRecipient then yield "mailbox_full"
+    else do
+      limited <- if checkRecvRate then do
+        rr <- *recvRates
+        let r = checkRate rr toKey maxRecvRatePerKey recvRateWindowMs 5000 t
+        set *recvRates = r.entries
+        yield r.limited
+      else yield False
+      if limited then yield "rate_limited"
+      else do
+        seq <- *seqCounter
+        let seqTs = nextSeqTs t seq
+        set *seqCounter = seqTs
+        let clampedTs = clampTimestamp timestamp t
+        let fwdExpiresAt = if expiresAt > t then min expiresAt (seqTs + unackedMessageMaxAge) else seqTs + unackedMessageMaxAge
+        let clampedPri = clamp 0 maxMessagePriority priority
+        set *messages = union msgs [{messageId: messageId, toKey: toKey, encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: clampedPri}]
+        set *pollWakeup = seqTs
+        yield ""
+
 handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt priority authorization respond -> do
   t <- now
   withFederationAuth authorization t respond fromServer ("forward:" ++ messageId) requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
     if t - timestamp > messageMaxAge
       then yield (respond {ok: False {}, error: "stale_timestamp", retryAfterMs: 0})
       else do
-        let clampedTs = clampTimestamp timestamp t
-        result <- atomic do
-          pres <- *presence
-          let hasPresence = any pres (\p -> p.pubkey == toKey && p.expiresAt > t)
-          if not hasPresence then yield "no_presence"
-          else do
-            msgs <- *messages
-            aids <- *ackedIds
-            dids <- *deliveredIds
-            let isDup = any msgs (\m -> m.messageId == messageId && m.toKey == toKey)
-                      || hasMessage messageId toKey aids
-                      || hasMessage messageId toKey dids
-            if isDup then yield "duplicate"
-            else if count msgs >= maxMessages then yield "global_full"
-            else
-              if countWhere msgs (\m -> m.toKey == toKey) >= maxMessagesPerRecipient then yield "mailbox_full"
-              else do
-                rr <- *recvRates
-                let r = checkRate rr toKey maxRecvRatePerKey recvRateWindowMs 5000 t
-                if r.limited then yield "rate_limited"
-                else do
-                  set *recvRates = r.entries
-                  seq <- *seqCounter
-                  let seqTs = nextSeqTs t seq
-                  set *seqCounter = seqTs
-                  let fwdExpiresAt = if expiresAt > t then min expiresAt (seqTs + unackedMessageMaxAge) else seqTs + unackedMessageMaxAge
-                  let clampedPri = clamp 0 maxMessagePriority priority
-                  set *messages = union msgs [{messageId: messageId, toKey: toKey, encryptedBlob: encryptedBlob, timestamp: clampedTs, originServer: originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: clampedPri}]
-                  set *pollWakeup = seqTs
-                  yield "stored"
-        if result == "stored" || result == "duplicate"
+        result <- atomic (storeFederated toKey encryptedBlob timestamp originServer messageId expiresAt priority (True {}) t)
+        if result == ""
           then yield (respond {ok: True {}, error: "", retryAfterMs: 0})
           else yield (respond {ok: False {}, error: result, retryAfterMs: 0}))
 
@@ -1604,31 +1611,9 @@ handleFederationBatchForward = \forwards fromServer requestTimestamp correlation
   withFederationAuth authorization t batchRespond fromServer "forward-batch" requestTimestamp (not (isLocalServer fromServer) && count forwards <= maxBatchSize) (do
     results <- mapEach (takeRelation maxBatchSize forwards) (\e -> e.messageId) (\e -> do
       ok <- if isLocalServer e.originServer || t - e.timestamp > messageMaxAge then yield False
-        else atomic do
-          pres <- *presence
-          let hasPresence = any pres (\p -> p.pubkey == e.toKey && p.expiresAt > t)
-          if not hasPresence then yield False
-          else do
-            msgs <- *messages
-            aids <- *ackedIds
-            dids <- *deliveredIds
-            let isDup = any msgs (\m -> m.messageId == e.messageId && m.toKey == e.toKey)
-                      || hasMessage e.messageId e.toKey aids
-                      || hasMessage e.messageId e.toKey dids
-            if isDup then yield True
-            else if count msgs >= maxMessages then yield False
-            else
-              if countWhere msgs (\m -> m.toKey == e.toKey) >= maxMessagesPerRecipient then yield False
-              else do
-                seq <- *seqCounter
-                let seqTs = nextSeqTs t seq
-                set *seqCounter = seqTs
-                let clampedTs = clampTimestamp e.timestamp t
-                let fwdExpiresAt = if e.expiresAt > t then min e.expiresAt (seqTs + unackedMessageMaxAge) else seqTs + unackedMessageMaxAge
-                let clampedPri = clamp 0 maxMessagePriority e.priority
-                set *messages = union msgs [{messageId: e.messageId, toKey: e.toKey, encryptedBlob: e.encryptedBlob, timestamp: clampedTs, originServer: e.originServer, receivedAt: seqTs, expiresAt: fwdExpiresAt, senderKey: "", priority: clampedPri}]
-                set *pollWakeup = seqTs
-                yield True
+        else do
+          result <- atomic (storeFederated e.toKey e.encryptedBlob e.timestamp e.originServer e.messageId e.expiresAt e.priority (False {}) t)
+          yield (result == "")
       yield {messageId: e.messageId, ok: ok})
     yield (respond {ok: True {}, error: "", results: results, retryAfterMs: 0}))
 
