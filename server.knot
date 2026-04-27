@@ -549,7 +549,9 @@ tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
-isValidHex = \s -> count (chars s) > 0 && mod (count (chars s)) 2 == 0 && all (chars s) (\c -> contains c "0123456789abcdef")
+isValidHex = \s ->
+  let cs = chars s in
+  count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
@@ -672,17 +674,17 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
 withFederationAuth = \authorization t respond fromServer scope requestTimestamp precondition action -> do
   blocked <- *blockedPeers
   allowed <- *allowedPeers
-  let err = \e -> respond {ok: False {}, error: e, retryAfterMs: 0}
-  if elem blocked fromServer then yield (err "blocked")
-  else if count allowed > 0 && not (elem allowed fromServer) then yield (err "not_allowed")
-  else if not precondition then yield (err "invalid_request")
-  else if requestTimestamp > 0 && abs (requestTimestamp - t) > clockSkewTolerance then yield (err "clock_skew")
+  let err = \e retry -> respond {ok: False {}, error: e, retryAfterMs: retry}
+  if elem blocked fromServer then yield (err "blocked" 0)
+  else if count allowed > 0 && not (elem allowed fromServer) then yield (err "not_allowed" 0)
+  else if not precondition then yield (err "invalid_request" 0)
+  else if requestTimestamp > 0 && abs (requestTimestamp - t) > clockSkewTolerance then yield (err "clock_skew" 0)
   else do
     verified <- verifyFederationAuth authorization fromServer scope requestTimestamp
-    if not verified then yield (err "unauthorized")
+    if not verified then yield (err "unauthorized" 0)
     else do
       limited <- checkServerRateGate fromServer t
-      if limited then yield (respond {ok: False {}, error: "rate_limited", retryAfterMs: federationRateWindowMs})
+      if limited then yield (err "rate_limited" federationRateWindowMs)
       else action
 
 -- ============================================
@@ -789,8 +791,9 @@ presenceForKey = \presence pubkey t ->
 
 -- Resolve a key's server for client lookup, masking remote identities behind "remote".
 maskedServer = \pres pubkey t ->
-  if any (presenceForKey pres pubkey t) (\p -> isLocalServer p.server) then serverHostN
-  else if count (presenceForKey pres pubkey t) > 0 then "remote"
+  let entries = presenceForKey pres pubkey t in
+  if any entries (\p -> isLocalServer p.server) then serverHostN
+  else if count entries > 0 then "remote"
   else ""
 
 hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
@@ -1069,8 +1072,7 @@ handlePoll = \cursor generation watchKeys authorization clientIp respond -> do
   else case extractToken authorization of
     Nothing {} -> yield (respond (emptyPollResp 0 (False {}) (False {}) (False {}) serverGen 0 cursorWasReset))
     Just {value: token} ->
-      let effectiveCursor = if generation != serverGen then 0 else cursor in
-      pollOnce token effectiveCursor cursorWasReset (takeRelation maxWatchKeys watchKeys) clientIp serverGen respond t
+      pollOnce token (if generation != serverGen then 0 else cursor) cursorWasReset (takeRelation maxWatchKeys watchKeys) clientIp serverGen respond t
 
 pollOnce = \token cursor cursorWasReset watchKeys clientIp serverGen respond t -> do
   setup <- atomic do
@@ -1079,9 +1081,9 @@ pollOnce = \token cursor cursorWasReset watchKeys clientIp serverGen respond t -
       Nothing {} -> yield Nothing {}
       Just {value: s} -> do
         let clampedCursor = clamp 0 t cursor
-        ackResult <- if clampedCursor > 0 then ackPolledMessages s.pubkey clampedCursor t else yield {pendingAcks: []}
+        pendingAcks <- if clampedCursor > 0 then ackPolledMessages s.pubkey clampedCursor t else yield []
         startWakeup <- *pollWakeup
-        yield (Just {value: {pubkey: s.pubkey, clampedCursor: clampedCursor, startWakeup: startWakeup, pendingAcks: ackResult.pendingAcks}})
+        yield (Just {value: {pubkey: s.pubkey, clampedCursor: clampedCursor, startWakeup: startWakeup, pendingAcks: pendingAcks}})
   case setup of
     Nothing {} -> yield (respond (emptyPollResp 0 (False {}) (False {}) (False {}) serverGen 0 cursorWasReset))
     Just {value: s} -> do
@@ -1109,8 +1111,7 @@ pollOnce = \token cursor cursorWasReset watchKeys clientIp serverGen respond t -
             myDel <- collectAndPrune senderDeliveries (\x -> x.senderKey == s.pubkey) (\x -> {messageId: x.messageId, toKey: x.toKey, deliveredAt: x.deliveredAt})
             myCancels <- collectAndPrune cancelNotifications (\x -> x.toKey == s.pubkey) (\x -> {messageId: x.messageId, cancelledAt: x.cancelledAt})
             yield {expirations: myExp, deliveries: myDel, cancellations: myCancels}
-          let isHeartbeat = pollResult.authorized && count pollResult.events == 0
-          yield (respond {events: pollResult.events, cursor: pollResult.cursor, authorized: pollResult.authorized, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: isHeartbeat, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: pollResult.hasMore, cursorStale: False {}, messageExpirations: drains.expirations, messageDeliveries: drains.deliveries, droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: drains.cancellations})
+          yield (respond {events: pollResult.events, cursor: pollResult.cursor, authorized: pollResult.authorized, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: pollResult.authorized && count pollResult.events == 0, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: pollResult.hasMore, cursorStale: False {}, messageExpirations: drains.expirations, messageDeliveries: drains.deliveries, droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: drains.cancellations})
 
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic do
@@ -1140,8 +1141,7 @@ ackPolledMessages = \pubkey cursor t -> do
   let mids = pluck toAck (\m -> m.messageId)
   set *messages = removeWhere msgs matches
   pruneRef forwards (\f -> not (f.toKey == pubkey && elem mids f.messageId))
-  ackedFederated <- recordAcksAndDeliveries toAck t
-  yield {pendingAcks: ackedFederated}
+  recordAcksAndDeliveries toAck t
 
 -- ============================================
 -- Handler: send
