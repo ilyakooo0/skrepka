@@ -725,8 +725,8 @@ chargeRate = \rateRef key maxRate windowMs t -> do
 checkPubkeyRateGate = \rateRef pubkey maxRate windowMs t -> atomic
   (chargeRate rateRef pubkey maxRate windowMs t)
 
-checkServerRateGate = \server t ->
-  checkPubkeyRateGate federationRates server maxFederationRatePerServer federationRateWindowMs t
+checkServerRateGate = \server ->
+  checkPubkeyRateGate federationRates server maxFederationRatePerServer federationRateWindowMs
 
 -- Pre-auth gate: drain + global + ip + auth-global. Returns "" when ok, else an error code.
 authPreCheck = \clientIp t -> do
@@ -755,8 +755,9 @@ recordFailure = \server -> do
   t <- now
   atomic do
     failures <- *forwardFailures
-    set *forwardFailures = union (removeWhere failures (\f -> f.server == server))
-      [case findFirst failures (\f -> f.server == server) of
+    let same = \f -> f.server == server
+    set *forwardFailures = union (removeWhere failures same)
+      [case findFirst failures same of
         Just {value: f} -> {server: server, failedAt: t, failures: min (f.failures + 1) 10, firstFailedAt: f.firstFailedAt}
         Nothing {} -> {server: server, failedAt: t, failures: 1, firstFailedAt: t}]
 
@@ -1126,9 +1127,10 @@ handleSendMessage = \to encryptedBlob timestamp messageId expiresInMs priority a
   dp <- *drainPhase
   g <- checkGlobalRate t
   effMsgId <- if messageId != "" then yield messageId else genToken
-  if dp >= 2 then yield (respond (sendErrResp (MsDraining {}) "draining"))
-  else if g then yield (respond (sendErrResp (MsRateLimited {}) "rate_limited"))
-  else if t - timestamp > messageMaxAge then yield (respond (sendErrResp (MsRejected {}) "stale_timestamp"))
+  let err = \s e -> yield (respond (sendErrResp s e))
+  if dp >= 2 then err (MsDraining {}) "draining"
+  else if g then err (MsRateLimited {}) "rate_limited"
+  else if t - timestamp > messageMaxAge then err (MsRejected {}) "stale_timestamp"
   else do
     let clampedTs = clampTimestamp timestamp t
     result <- atomic do
@@ -1149,11 +1151,12 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs msg
   srLim <- chargeRate sendRates senderKey maxSendRatePerKey sendRateWindowMs t
   prLim <- chargeRate pairRates (senderKey ++ "|" ++ to) maxPairRatePerPair pairRateWindowMs t
   rrLim <- chargeRate recvRates to maxRecvRatePerKey recvRateWindowMs t
-  if senderKey == to then yield {status: MsRejected {}, remoteServers: []}
-  else if hasMessage effMsgId to msgs || hasMessage effMsgId to aids || hasMessage effMsgId to dids then yield {status: MsDuplicate {}, remoteServers: []}
-  else if srLim || prLim || rrLim then yield {status: MsRateLimited {}, remoteServers: []}
-  else if count msgs >= maxMessages then yield {status: MsRejected {}, remoteServers: []}
-  else if countWhere msgs (\m -> m.toKey == to) >= maxMessagesPerRecipient then yield {status: MsQueued {}, remoteServers: []}
+  let reject = \s -> yield {status: s, remoteServers: []}
+  if senderKey == to then reject (MsRejected {})
+  else if hasMessage effMsgId to msgs || hasMessage effMsgId to aids || hasMessage effMsgId to dids then reject (MsDuplicate {})
+  else if srLim || prLim || rrLim then reject (MsRateLimited {})
+  else if count msgs >= maxMessages then reject (MsRejected {})
+  else if countWhere msgs (\m -> m.toKey == to) >= maxMessagesPerRecipient then reject (MsQueued {})
   else do
     pres <- *presence
     seq <- *seqCounter
@@ -1175,7 +1178,8 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs msg
 forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers ->
   forEach servers id (\server -> do
     fwds <- *forwards
-    case findFirst fwds (\f -> f.messageId == effMsgId && f.toServer == server) of
+    let same = \x -> x.messageId == effMsgId && x.toServer == server
+    case findFirst fwds same of
       Nothing {} -> yield {}
       Just {value: f} -> do
         t <- now
@@ -1190,7 +1194,7 @@ forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers ->
           Err _ -> recordFailure server
           Ok r -> when r.ok (do
             clearFailure server
-            atomic (pruneRef forwards (\x -> not (x.messageId == effMsgId && x.toServer == server)))))
+            atomic (pruneRef forwards (\x -> not (same x)))))
 
 -- ============================================
 -- Handler: lookup
@@ -1255,9 +1259,7 @@ handleListMessages = \offset authorization clientIp respond -> do
     {messages: [], authorized: True {}, count: 0, error: "rate_limited"} (\pubkey -> do
       msgs <- *messages
       let myMsgs = sortBy (\m -> m.receivedAt) (filter msgs (\m -> m.toKey == pubkey && m.expiresAt > t))
-      let after = drop (clamp 0 (count myMsgs) offset) myMsgs
-      let result = pluck (takeRelation maxPollEvents after) (\m -> {messageId: m.messageId, timestamp: m.timestamp, receivedAt: m.receivedAt})
-      yield (respond {messages: result, authorized: True {}, count: count myMsgs, error: ""}))
+      yield (respond {messages: pluck (takeRelation maxPollEvents (drop (clamp 0 (count myMsgs) offset) myMsgs)) (\m -> {messageId: m.messageId, timestamp: m.timestamp, receivedAt: m.receivedAt}), authorized: True {}, count: count myMsgs, error: ""}))
 
 handleDeleteMessages = \messageIds authorization clientIp respond -> do
   t <- now
@@ -1345,8 +1347,9 @@ handleVerifyToken = \token scope clientIp respond -> do
   else do
     found <- atomic do
       pending <- *pendingVerifications
-      let match = any pending (\p -> p.scope == scope && p.token == token && t - p.createdAt < verificationTokenExpiry)
-      when match (set *pendingVerifications = removeWhere pending (\p -> p.scope == scope && p.token == token))
+      let same = \p -> p.scope == scope && p.token == token
+      let match = any pending (\p -> same p && t - p.createdAt < verificationTokenExpiry)
+      when match (set *pendingVerifications = removeWhere pending same)
       yield match
     yield (respond {ok: found})
 
@@ -1424,7 +1427,7 @@ handleFederationAck = \messageIds originServer fromServer requestTimestamp corre
         && t - m.receivedAt >= ackGracePeriod
         && none pres (\p -> p.pubkey == m.toKey && isLocalServer p.server && p.expiresAt > t)
         && none remainingFwds (\f -> f.messageId == m.messageId && f.toKey == m.toKey))
-      set *messages = removeWhere msgs (\m -> any toReap (\r -> r.messageId == m.messageId && r.toKey == m.toKey))
+      set *messages = removeWhere msgs (\m -> hasMessage m.messageId m.toKey toReap)
       yield {ackedCount: count removed, results: pluck dedupedIds (\mid -> {messageId: mid, found: any removed (\f -> f.messageId == mid)})}
     yield (respond {ok: True {}, error: "", ackedCount: result.ackedCount, results: result.results, retryAfterMs: 0}))
 
@@ -1560,10 +1563,12 @@ handleUnblockPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, unblocked: False {}}))
   (do removed <- removeServerFromList blockedPeers server; yield (respond {ok: True {}, unblocked: removed}))
 
-handleListBlocked = \authorization respond -> do
+handleListPeersResp = \listRef authorization respond -> do
   ok <- verifyMaintenanceAuth authorization
-  list <- *blockedPeers
+  list <- *listRef
   yield (respond {peers: if ok then list else [], ok: ok})
+
+handleListBlocked = handleListPeersResp blockedPeers
 
 handleAllowPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, allowed: 0}))
@@ -1573,10 +1578,7 @@ handleUnallowPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, removed: False {}}))
   (do removed <- removeServerFromList allowedPeers server; yield (respond {ok: True {}, removed: removed}))
 
-handleListAllowed = \authorization respond -> do
-  ok <- verifyMaintenanceAuth authorization
-  list <- *allowedPeers
-  yield (respond {peers: if ok then list else [], ok: ok})
+handleListAllowed = handleListPeersResp allowedPeers
 
 handlePingPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, latencyMs: 0, error: "unauthorized"}))
@@ -1603,7 +1605,7 @@ handleAdminRevokeSessions = \pubkey authorization respond -> withMaintAuth autho
   (do
     revoked <- atomic do
       ses <- *sessions
-      pruneRef sessions (\s -> s.pubkey != pubkey)
+      set *sessions = removeWhere ses (\s -> s.pubkey == pubkey)
       pruneRef presence (\p -> p.pubkey != pubkey || not (isLocalServer p.server))
       yield (countWhere ses (\s -> s.pubkey == pubkey))
     yield (respond {ok: True {}, revokedCount: revoked}))
@@ -1615,7 +1617,7 @@ handleAdminPurgeMessages = \pubkey authorization respond -> withMaintAuth author
     purged <- atomic do
       msgs <- *messages
       let mine = filter msgs (\m -> m.toKey == pubkey)
-      pruneRef messages (\m -> m.toKey != pubkey)
+      set *messages = removeWhere msgs (\m -> m.toKey == pubkey)
       pruneRef forwards (\f -> f.toKey != pubkey)
       appendCapped ackedIds (mapWhere mine (\m -> m.originServer != "") (\m -> mkAckedEntry m t)) maxAckedIds (\a -> a.ackedAt)
       yield (count mine)
@@ -1626,7 +1628,7 @@ handleAdminRevokeIp = \ip authorization respond -> withMaintAuth authorization
   (do
     keys <- if ip == "" then yield [] else atomic do
       ses <- *sessions
-      pruneRef sessions (\s -> s.ip != ip)
+      set *sessions = removeWhere ses (\s -> s.ip == ip)
       yield (mapWhere ses (\s -> s.ip == ip) (\s -> s.pubkey))
     yield (respond {ok: ip != "", revokedCount: count keys, affectedKeys: count (unique keys)}))
 
