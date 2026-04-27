@@ -512,10 +512,9 @@ removeForKey = \pred -> do
 
 -- If `pred` matches at least maxN items, drop the oldest matching one.
 capPerKey = \items pred maxN getKey ->
-  let mine = filter items pred in
-  if count mine >= maxN
-    then union (removeWhere items pred) (drop 1 (sortBy getKey mine))
-    else items
+  let mine = sortBy getKey (filter items pred) in
+  let dropN = if count mine >= maxN then 1 else 0 in
+  union (removeWhere items pred) (drop dropN mine)
 
 -- Shared empty/error shape for /poll. Only a few fields ever vary.
 emptyPollResp = \cursor authorized rateLimited draining gen retryAfterMs cursorWasReset ->
@@ -562,7 +561,9 @@ tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
-isValidHex = \s -> count (chars s) > 0 && mod (count (chars s)) 2 == 0 && all (chars s) (\c -> contains c "0123456789abcdef")
+isValidHex = \s ->
+  let cs = chars s in
+  count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
@@ -583,7 +584,9 @@ hasPrefix = \pre s -> take (count (chars pre)) s == pre
 
 containsSuffix : Text -> Text -> Bool
 containsSuffix = \suffix s ->
-  drop (max 0 (count (chars s) - count (chars suffix))) s == suffix
+  let sn = count (chars s) in
+  let pn = count (chars suffix) in
+  drop (max 0 (sn - pn)) s == suffix
 
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
 -- tricks (octal, hex, percent-encoding) but covers the high-value cases.
@@ -602,8 +605,9 @@ isBadServerName = \sn ->
 matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
 extractToken = \authHeader ->
-  if hasPrefix "Bearer " authHeader && drop 7 authHeader != "" && not (tooLong (drop 7 authHeader) maxTokenLen)
-    then Just {value: drop 7 authHeader}
+  let rest = drop 7 authHeader in
+  if hasPrefix "Bearer " authHeader && rest != "" && not (tooLong rest maxTokenLen)
+    then Just {value: rest}
     else Nothing {}
 
 verifyMaintenanceAuth : Text -> IO Bool
@@ -802,8 +806,9 @@ presenceForKey = \presence pubkey t ->
 
 -- Resolve a key's server for client lookup, masking remote identities behind "remote".
 maskedServer = \pres pubkey t ->
-  if any (presenceForKey pres pubkey t) (\p -> isLocalServer p.server) then serverHostN
-  else if count (presenceForKey pres pubkey t) > 0 then "remote"
+  let here = presenceForKey pres pubkey t in
+  if any here (\p -> isLocalServer p.server) then serverHostN
+  else if count here > 0 then "remote"
   else ""
 
 hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
@@ -822,8 +827,9 @@ knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.serve
 -- Last-write-wins merge by (pubkey, server), keeping the entry with the larger expiresAt.
 mergePresence = \existing incoming ->
   fold (\acc e ->
-    if any acc (\x -> x.pubkey == e.pubkey && x.server == e.server && x.expiresAt >= e.expiresAt) then acc
-    else union (removeWhere acc (\x -> x.pubkey == e.pubkey && x.server == e.server)) [e]) existing incoming
+    let same = \x -> x.pubkey == e.pubkey && x.server == e.server in
+    if any acc (\x -> same x && x.expiresAt >= e.expiresAt) then acc
+    else union (removeWhere acc same) [e]) existing incoming
 
 -- ============================================
 -- Pruning
@@ -864,9 +870,10 @@ mkAckedEntry = \m t -> {messageId: m.messageId, toKey: m.toKey, ackedAt: t, orig
 -- Returns the federated-ack entries (the caller flushes them remotely later).
 recordAcksAndDeliveries = \toAck t -> do
   let ackedFed = mapWhere toAck (\m -> m.originServer != "") (\m -> mkAckedEntry m t)
+  let myDel = mapWhere toAck (\m -> m.senderKey != "" && m.originServer == "")
+                (\m -> {senderKey: m.senderKey, messageId: m.messageId, toKey: m.toKey, deliveredAt: t})
   appendCapped ackedIds ackedFed maxAckedIds (\a -> a.ackedAt)
-  appendCapped senderDeliveries (mapWhere toAck (\m -> m.senderKey != "" && m.originServer == "")
-    (\m -> {senderKey: m.senderKey, messageId: m.messageId, toKey: m.toKey, deliveredAt: t})) 10000 (\d -> d.deliveredAt)
+  appendCapped senderDeliveries myDel 10000 (\d -> d.deliveredAt)
   yield ackedFed
 
 -- Common cancel block: drop matching messages + forwards, record cancel notification.
@@ -1026,10 +1033,10 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
       ch <- *challenges
       dp <- *drainPhase
       let same = \c -> c.pubkey == pubkey && c.challenge == challenge
-      if dp >= 1
-         || none ch (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip)
-         || not (verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature))
-      then yield {valid: False {}, peers: []}
+      let valid = dp < 1
+            && any ch (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip)
+            && verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature)
+      if not valid then yield {valid: False {}, peers: []}
       else do
         set *challenges = removeWhere ch same
         ses <- *sessions
@@ -1115,16 +1122,15 @@ pollOnce = \authorization cursor cursorWasReset watchKeys clientIp serverGen res
           pollResult <- doPoll s t
           atomic (pruneRef activePolls (\p -> p.pubkey != s.pubkey))
           when federationEnabled (fork (sendAcksAndClean s.pendingAcks))
-          presenceUpdates <- atomic do
+          extras <- atomic do
             t2 <- now
             pres <- *presence
-            yield (pluck watchKeys (\k -> {pubkey: k, online: count (presenceForKey pres k t2) > 0}))
-          drains <- atomic do
-            myExp <- collectAndPrune senderExpirations (\x -> x.senderKey == s.pubkey) (\x -> {messageId: x.messageId, toKey: x.toKey, expiredAt: x.expiredAt})
-            myDel <- collectAndPrune senderDeliveries (\x -> x.senderKey == s.pubkey) (\x -> {messageId: x.messageId, toKey: x.toKey, deliveredAt: x.deliveredAt})
+            let mine = \x -> x.senderKey == s.pubkey
+            myExp <- collectAndPrune senderExpirations mine (\x -> {messageId: x.messageId, toKey: x.toKey, expiredAt: x.expiredAt})
+            myDel <- collectAndPrune senderDeliveries mine (\x -> {messageId: x.messageId, toKey: x.toKey, deliveredAt: x.deliveredAt})
             myCancels <- collectAndPrune cancelNotifications (\x -> x.toKey == s.pubkey) (\x -> {messageId: x.messageId, cancelledAt: x.cancelledAt})
-            yield {expirations: myExp, deliveries: myDel, cancellations: myCancels}
-          yield (respond {events: pollResult.events, cursor: pollResult.cursor, authorized: True {}, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: presenceUpdates, heartbeat: count pollResult.events == 0, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: pollResult.hasMore, cursorStale: False {}, messageExpirations: drains.expirations, messageDeliveries: drains.deliveries, droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: drains.cancellations})
+            yield {presenceUpdates: pluck watchKeys (\k -> {pubkey: k, online: count (presenceForKey pres k t2) > 0}), expirations: myExp, deliveries: myDel, cancellations: myCancels}
+          yield (respond {events: pollResult.events, cursor: pollResult.cursor, authorized: True {}, rateLimited: False {}, draining: False {}, generation: serverGen, presenceUpdates: extras.presenceUpdates, heartbeat: count pollResult.events == 0, retryAfterMs: 0, cursorReset: cursorWasReset, hasMore: pollResult.hasMore, cursorStale: False {}, messageExpirations: extras.expirations, messageDeliveries: extras.deliveries, droppedDeliveryReceipts: 0, droppedExpirationNotifs: 0, loadPct: 0, messageCancellations: extras.cancellations})
 
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic do
