@@ -457,7 +457,6 @@ when = \cond action -> if cond then action else yield {}
 min = \a b -> if a < b then a else b
 max = \a b -> if a > b then a else b
 clamp = \lo hi x -> max lo (min hi x)
-mod = \n m -> n - n / m * m
 abs = \x -> if x < 0 then 0 - x else x
 
 -- Dedup: keeps first occurrence (O(n^2)).
@@ -511,11 +510,9 @@ removeForKey = \pred -> do
   pruneRef forwards (\f -> not (pred f))
   yield toRemove
 
--- If `pred` matches at least maxN items, drop the oldest matching one.
+-- Cap pred-matching entries to maxN-1 (caller adds one more).
 capPerKey = \items pred maxN getKey ->
-  let mine = sortBy getKey (filter items pred) in
-  let dropN = if count mine >= maxN then 1 else 0 in
-  union (removeWhere items pred) (drop dropN mine)
+  union (removeWhere items pred) (capList (filter items pred) (maxN - 1) getKey)
 
 -- Shared empty/error shape for /poll. Only a few fields ever vary.
 emptyPollResp = \cursor authorized rateLimited draining gen retryAfterMs cursorWasReset ->
@@ -561,8 +558,8 @@ tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
 isValidHex = \s ->
-  let cs = chars s in
-  count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
+  let n = count (chars s) in
+  n > 0 && n / 2 * 2 == n && all (chars s) (\c -> contains c "0123456789abcdef")
 
 stripTrailingDot : Text -> Text
 stripTrailingDot = \s -> if containsSuffix "." s then stripTrailingDot (take (count (chars s) - 1) s) else s
@@ -579,10 +576,7 @@ hasPrefix : Text -> Text -> Bool
 hasPrefix = \pre s -> take (count (chars pre)) s == pre
 
 containsSuffix : Text -> Text -> Bool
-containsSuffix = \suffix s ->
-  let sn = count (chars s) in
-  let pn = count (chars suffix) in
-  drop (max 0 (sn - pn)) s == suffix
+containsSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix))) s == suffix
 
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
 -- tricks (octal, hex, percent-encoding) but covers the high-value cases.
@@ -661,14 +655,16 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
     let payload = drop 7 authorization
     if payload == "" || tooLong payload (maxSignatureLen + 25) then yield False
     else do
-      -- Split payload on first ':' into {sig, nonce} via a fold over chars.
-      let parts = fold (\acc c ->
-            if acc.split then {sig: acc.sig, nonce: acc.nonce ++ c, split: True {}}
-            else if c == ":" then {sig: acc.sig, nonce: "", split: True {}}
-            else {sig: acc.sig ++ c, nonce: "", split: False {}}) {sig: "", nonce: "", split: False {}} (chars payload)
+      -- Split payload on first ':' into {sig, nonce}.
+      let cs = chars payload
+      let sepIdx = case headOf (mapWhere (withIndex cs) (\p -> p.v == ":") (\p -> p.i)) of
+            Just {value: i} -> i
+            _ -> count cs
+      let sig = take sepIdx payload
+      let nonce = drop (sepIdx + 1) payload
       result <- fetch (federationUrl fromServer) (FederationPubkey {})
       case result of
-        Ok r -> yield (r.ok && r.pubkey != "" && verify (bytesFromHex r.pubkey) (textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ fromServer ++ (if parts.nonce == "" then "" else "|" ++ parts.nonce))) (bytesFromHex parts.sig))
+        Ok r -> yield (r.ok && r.pubkey != "" && verify (bytesFromHex r.pubkey) (textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ fromServer ++ (if nonce == "" then "" else "|" ++ nonce))) (bytesFromHex sig))
         _ -> yield False
   else case extractToken authorization of
     Just {value: token} -> do
@@ -1235,7 +1231,7 @@ forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers ->
 
 handleLookupPresence = \pubkey authorization clientIp respond -> do
   t <- now
-  let mkErr = \e -> {server: "", authorized: False {}, error: if e == "rate_limited" then "rate_limited" else ""}
+  let mkErr = \e -> {server: "", authorized: False {}, error: if e == "rate_limited" then e else ""}
   gateLookup authorization clientIp t respond mkErr
     {server: "", authorized: True {}, error: "rate_limited"} (\_ -> do
       pres <- *presence
@@ -1243,7 +1239,7 @@ handleLookupPresence = \pubkey authorization clientIp respond -> do
 
 handleBatchLookupPresence = \pubkeys authorization clientIp respond -> do
   t <- now
-  let mkErr = \e -> {results: [], authorized: False {}, error: if e == "rate_limited" then "rate_limited" else ""}
+  let mkErr = \e -> {results: [], authorized: False {}, error: if e == "rate_limited" then e else ""}
   gateLookup authorization clientIp t respond mkErr
     {results: [], authorized: True {}, error: "rate_limited"} (\_ -> do
       pres <- *presence
@@ -1285,7 +1281,7 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
 
 handleListMessages = \offset authorization clientIp respond -> do
   t <- now
-  let mkErr = \e -> {messages: [], authorized: False {}, count: 0, error: if e == "rate_limited" then "rate_limited" else ""}
+  let mkErr = \e -> {messages: [], authorized: False {}, count: 0, error: if e == "rate_limited" then e else ""}
   gateRated lookupRates maxLookupRatePerKey lookupRateWindowMs (True {}) authorization clientIp t respond mkErr
     {messages: [], authorized: True {}, count: 0, error: "rate_limited"} (\pubkey -> do
       msgs <- *messages
@@ -1521,10 +1517,10 @@ handleDrain = \phase authorization respond -> withMaintAuth authorization
       if effectivePhase == 1 then yield {peers: [], localKeys: []}
       else do
         pres <- *presence
-        let localEntries = filter pres (\p -> isLocalServer p.server && p.expiresAt > t)
-        set *presence = filter pres (\p -> not (isLocalServer p.server) || p.expiresAt <= t)
+        let isLocalLive = \p -> isLocalServer p.server && p.expiresAt > t
+        set *presence = removeWhere pres isLocalLive
         set *pollWakeup = t
-        yield {peers: knownPeerServersFromPresence pres, localKeys: localEntries}
+        yield {peers: knownPeerServersFromPresence pres, localKeys: filter pres isLocalLive}
     when (effectivePhase == 2 && count drainResult.localKeys > 0 && federationEnabled)
       (fork (sendBatchedGossip drainResult.peers (pluck drainResult.localKeys (\p -> mkGossip (GossipOffline {}) p.pubkey t offlineGossipMinTtl)) gossipOriginHops))
     yield (respond {ok: True {}, drained: count drainResult.localKeys, phase: effectivePhase}))
