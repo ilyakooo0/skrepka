@@ -464,7 +464,7 @@ unique = \items -> fold (\acc x -> if elem acc x then acc else union acc [x]) []
 -- Replace a ref's contents with the entries that satisfy `keep`. Caller controls atomicity.
 pruneRef = \ref keep -> do
   cur <- *ref
-  set *ref = do x <- cur; where keep x; yield x
+  set *ref = filter cur keep
 
 -- Append `items` to a ref, then cap by `getKey` (drops oldest on overflow).
 appendCapped = \ref items maxN getKey -> do
@@ -559,9 +559,7 @@ normalizeHex = \s -> bytesToHex (bytesFromHex s)
 stripTrailingDot : Text -> Text
 stripTrailingDot = \s ->
   let n = count (chars s) in
-  if n == 0 then ""
-  else if drop (n - 1) s == "." then stripTrailingDot (take (n - 1) s)
-  else s
+  if n > 0 && drop (n - 1) s == "." then stripTrailingDot (take (n - 1) s) else s
 
 normalizeServerName : Text -> Text
 normalizeServerName = \s -> toLower (stripTrailingDot s)
@@ -573,20 +571,17 @@ isLocalServer = \s -> s == serverHostN
 
 containsSuffix : Text -> Text -> Bool
 containsSuffix = \suffix s ->
-  let suffixLen = count (chars suffix) in
-  let sLen = count (chars s) in
-  sLen >= suffixLen && drop (sLen - suffixLen) s == suffix
+  let d = count (chars s) - count (chars suffix) in
+  d >= 0 && drop d s == suffix
 
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
 -- tricks (octal, hex, percent-encoding) but covers the high-value cases.
 isBadServerName : Text -> Bool
 isBadServerName = \sn ->
-  let fc = take 1 sn in
-  fc == "" || fc == "." || fc == ":" || fc == "["
+  sn == "" || sn == "localhost"
   || not (all (chars sn) (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:"))
-  || sn == "localhost"
+  || any [".", ":", "[", "127.", "10.", "192.168.", "169.254.", "0.", "::"] (\pre -> take (count (chars pre)) sn == pre)
   || any [".localhost", ".local", ".internal", ".arpa", ".onion"] (\suf -> containsSuffix suf sn)
-  || any ["127.", "10.", "192.168.", "169.254.", "0.", "::"] (\pre -> take (count (chars pre)) sn == pre)
 
 -- ============================================
 -- Auth helpers
@@ -805,17 +800,12 @@ dedupMessageIds = \ids -> takeRelation maxMessageIds (unique ids)
 presenceForKey = \presence pubkey t ->
   filter presence (\p -> p.pubkey == pubkey && p.expiresAt > t)
 
--- Pick local if present, else the remote with the latest expiresAt; "" when none.
-bestServerForKey = \entries ->
-  if any entries (\p -> isLocalServer p.server) then serverHostN
-  else case maxBy entries (\p -> p.expiresAt) of
-    Just {value: p} -> p.server
-    _ -> ""
-
 -- Resolve a key's server for client lookup, masking remote identities behind "remote".
 maskedServer = \pres pubkey t ->
-  let found = bestServerForKey (presenceForKey pres pubkey t) in
-  if found == "" then "" else if isLocalServer found then found else "remote"
+  let entries = presenceForKey pres pubkey t in
+  if any entries (\p -> isLocalServer p.server) then serverHostN
+  else if count entries > 0 then "remote"
+  else ""
 
 hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
 hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey == toKey)
@@ -830,8 +820,9 @@ knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.serve
 -- Last-write-wins merge by (pubkey, server), keeping the entry with the larger expiresAt.
 mergePresence = \existing incoming ->
   fold (\acc e ->
-    if any acc (\a -> a.pubkey == e.pubkey && a.server == e.server && a.expiresAt >= e.expiresAt) then acc
-    else union (removeWhere acc (\x -> x.pubkey == e.pubkey && x.server == e.server)) [e]) existing incoming
+    let same = \x -> x.pubkey == e.pubkey && x.server == e.server in
+    if any acc (\x -> same x && x.expiresAt >= e.expiresAt) then acc
+    else union (removeWhere acc same) [e]) existing incoming
 
 -- ============================================
 -- Pruning
@@ -923,15 +914,13 @@ retryPendingForwards = do
       case result of Err _ -> recordFailure server; Ok _ -> when success (clearFailure server)
       let isMatch = \x -> x.messageId == f.messageId && x.toServer == server
       atomic do
-        if success then pruneRef forwards (\x -> not (isMatch x))
-        else do
-          cur <- *forwards
-          set *forwards = do
-            x <- cur
-            where not (isMatch x) || x.retries + 1 < maxForwardRetries
-            yield (if isMatch x
-              then {messageId: x.messageId, toServer: x.toServer, createdAt: x.createdAt, toKey: x.toKey, encryptedBlob: x.encryptedBlob, timestamp: x.timestamp, originServer: x.originServer, retries: x.retries + 1, expiresAt: x.expiresAt, priority: x.priority, senderKey: x.senderKey}
-              else x)))
+        cur <- *forwards
+        set *forwards = do
+          x <- cur
+          where not (isMatch x && (success || x.retries + 1 >= maxForwardRetries))
+          yield (if isMatch x
+            then {messageId: x.messageId, toServer: x.toServer, createdAt: x.createdAt, toKey: x.toKey, encryptedBlob: x.encryptedBlob, timestamp: x.timestamp, originServer: x.originServer, retries: x.retries + 1, expiresAt: x.expiresAt, priority: x.priority, senderKey: x.senderKey}
+            else x)))
 
 sendAcksAndClean = \pendingAcks ->
   forEach (collectPeers pendingAcks (\a -> a.originServer)) id (\server -> do
@@ -1005,8 +994,9 @@ handleChallenge = \pubkey clientIp respond -> do
     result <- atomic do
       ch <- *challenges
       let active = filter ch (\c -> c.expiresAt > t)
-      let cappedActive = if countWhere active (\c -> c.pubkey == pubkey) >= maxChallengesPerKey
-            then evictOldest active (\c -> if c.pubkey == pubkey then c.expiresAt else 999999999999)
+      let mine = filter active (\c -> c.pubkey == pubkey)
+      let cappedActive = if count mine >= maxChallengesPerKey
+            then union (removeWhere active (\c -> c.pubkey == pubkey)) (evictOldest mine (\c -> c.expiresAt))
             else active
       rates <- *challengeRates
       let r = checkRate rates pubkey maxChallengeRatePerKey challengeRateWindowMs 5000 t
@@ -1053,17 +1043,13 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
 
 handleRevoke = \targetToken authorization clientIp respond -> do
   t <- now
-  g <- checkGlobalRate t
-  if g then yield (respond {ok: False {}, authorized: False {}})
-  else withSessionAuth authorization t clientIp
-    (yield (respond {ok: False {}, authorized: False {}}))
-    (\caller -> do
-      result <- atomic do
-        ses <- *sessions
-        let pred = \s -> s.pubkey == caller && s.token == targetToken
-        set *sessions = removeWhere ses pred
-        yield (any ses pred)
-      yield (respond {ok: result, authorized: True {}}))
+  gateAuth (False {}) authorization clientIp t respond (\_ -> {ok: False {}, authorized: False {}}) (\caller -> do
+    result <- atomic do
+      ses <- *sessions
+      let pred = \s -> s.pubkey == caller && s.token == targetToken
+      set *sessions = removeWhere ses pred
+      yield (any ses pred)
+    yield (respond {ok: result, authorized: True {}}))
 
 handleLogout = \authorization clientIp respond -> do
   t <- now
@@ -1181,13 +1167,11 @@ ackPolledMessages = \pubkey cursor t -> do
   msgs <- *messages
   let matches = \m -> m.toKey == pubkey && m.receivedAt <= cursor
   let toAck = filter msgs matches
-  if count toAck == 0 then yield {pendingAcks: []}
-  else do
-    set *messages = removeWhere msgs matches
-    let mids = pluck toAck (\m -> m.messageId)
-    pruneRef forwards (\f -> not (f.toKey == pubkey && elem mids f.messageId))
-    ackedFederated <- recordAcksAndDeliveries toAck t
-    yield {pendingAcks: ackedFederated}
+  let mids = pluck toAck (\m -> m.messageId)
+  set *messages = removeWhere msgs matches
+  pruneRef forwards (\f -> not (f.toKey == pubkey && elem mids f.messageId))
+  ackedFederated <- recordAcksAndDeliveries toAck t
+  yield {pendingAcks: ackedFederated}
 
 -- ============================================
 -- Handler: send
@@ -1458,21 +1442,17 @@ handleSendBatch = \messages authorization clientIp respond -> do
 -- ============================================
 
 handleVerifyToken = \token scope clientIp respond -> do
-  if scope == "" then yield (respond {ok: False {}})
+  t <- now
+  g <- checkGlobalRate t
+  ipLim <- checkIpRateGate clientIp t
+  if scope == "" || g || ipLim then yield (respond {ok: False {}})
   else do
-    t <- now
-    g <- checkGlobalRate t
-    if g then yield (respond {ok: False {}})
-    else do
-      ipLim <- checkIpRateGate clientIp t
-      if ipLim then yield (respond {ok: False {}})
-      else do
-        found <- atomic do
-          pending <- *pendingVerifications
-          let match = any pending (\p -> p.scope == scope && p.token == token && t - p.createdAt < verificationTokenExpiry)
-          when match (set *pendingVerifications = filter pending (\p -> p.scope != scope || p.token != token))
-          yield match
-        yield (respond {ok: found})
+    found <- atomic do
+      pending <- *pendingVerifications
+      let match = any pending (\p -> p.scope == scope && p.token == token && t - p.createdAt < verificationTokenExpiry)
+      when match (set *pendingVerifications = filter pending (\p -> p.scope != scope || p.token != token))
+      yield match
+    yield (respond {ok: found})
 
 handleFederationPubkey = \respond -> do
   yield (respond {pubkey: serverFederationPublicKeyHex, ok: serverFederationPublicKeyHex != ""})
@@ -1684,9 +1664,9 @@ handlePrune = \authorization respond -> do
   when authorized (fork (pruneAndRetry t))
   yield (respond {ok: authorized})
 
-handleReconcile = \authorization respond -> withMaintAuth authorization
-  (yield (respond {ok: False {}, messageDrift: 0, presenceDrift: 0, sessionDrift: 0}))
-  (yield (respond {ok: True {}, messageDrift: 0, presenceDrift: 0, sessionDrift: 0}))
+handleReconcile = \authorization respond -> do
+  authorized <- verifyMaintenanceAuth authorization
+  yield (respond {ok: authorized, messageDrift: 0, presenceDrift: 0, sessionDrift: 0})
 
 handleHealth = \authorization respond -> do
   t <- now
@@ -1713,9 +1693,10 @@ handleUnblockPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, unblocked: False {}}))
   (do removed <- removeServerFromList blockedPeers server; yield (respond {ok: True {}, unblocked: removed}))
 
-handleListBlocked = \authorization respond -> withMaintAuth authorization
-  (yield (respond {peers: [], ok: False {}}))
-  (do blocked <- *blockedPeers; yield (respond {peers: blocked, ok: True {}}))
+handleListBlocked = \authorization respond -> do
+  ok <- verifyMaintenanceAuth authorization
+  blocked <- *blockedPeers
+  yield (respond {peers: if ok then blocked else [], ok: ok})
 
 handleAllowPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, allowed: 0}))
@@ -1725,9 +1706,10 @@ handleUnallowPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, removed: False {}}))
   (do removed <- removeServerFromList allowedPeers server; yield (respond {ok: True {}, removed: removed}))
 
-handleListAllowed = \authorization respond -> withMaintAuth authorization
-  (yield (respond {peers: [], ok: False {}}))
-  (do allowed <- *allowedPeers; yield (respond {peers: allowed, ok: True {}}))
+handleListAllowed = \authorization respond -> do
+  ok <- verifyMaintenanceAuth authorization
+  allowed <- *allowedPeers
+  yield (respond {peers: if ok then allowed else [], ok: ok})
 
 handlePingPeer = \server authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, latencyMs: 0, error: "unauthorized"}))
@@ -1743,12 +1725,11 @@ handlePingPeer = \server authorization respond -> withMaintAuth authorization
       Err e -> yield (respond {ok: False {}, latencyMs: endTime - startTime, error: show e})
       Ok r -> yield (respond {ok: r.ok, latencyMs: endTime - startTime, error: r.error}))
 
-handleAdminListSessions = \pubkey authorization respond -> withMaintAuth authorization
-  (yield (respond {sessions: [], count: 0, ok: False {}}))
-  (do
-    ses <- *sessions
-    let mine = mapWhere ses (\s -> s.pubkey == pubkey) (\s -> {token: "***", expiresAt: s.expiresAt, ip: s.ip, createdAt: s.createdAt})
-    yield (respond {sessions: mine, count: count mine, ok: True {}}))
+handleAdminListSessions = \pubkey authorization respond -> do
+  ok <- verifyMaintenanceAuth authorization
+  ses <- *sessions
+  let mine = if ok then mapWhere ses (\s -> s.pubkey == pubkey) (\s -> {token: "***", expiresAt: s.expiresAt, ip: s.ip, createdAt: s.createdAt}) else []
+  yield (respond {sessions: mine, count: count mine, ok: ok})
 
 handleAdminRevokeSessions = \pubkey authorization respond -> withMaintAuth authorization
   (yield (respond {ok: False {}, revokedCount: 0}))
@@ -1801,9 +1782,10 @@ handleAdminListAllSessions = \limit authorization respond -> withMaintAuth autho
     let effLimit = if limit <= 0 then 100 else clamp 1 500 limit
     yield (respond {sessions: takeRelation effLimit sorted, ok: True {}, total: count grouped}))
 
-handleGetRateLimits = \authorization respond -> withMaintAuth authorization
-  (yield (respond {ok: False {}, globalRequest: 0, ipRate: 0, sendRate: 0, federationRate: 0, authGlobal: 0, recvRate: 0, challengeRate: 0, pairRate: 0, lookupRate: 0, clientWriteRate: 0}))
-  (yield (respond {ok: True {}, globalRequest: maxGlobalRequestRate, ipRate: maxIpRatePerIp, sendRate: maxSendRatePerKey, federationRate: maxFederationRatePerServer, authGlobal: maxAuthGlobalRate, recvRate: maxRecvRatePerKey, challengeRate: maxChallengeRatePerKey, pairRate: maxPairRatePerPair, lookupRate: maxLookupRatePerKey, clientWriteRate: maxClientWriteRatePerKey}))
+handleGetRateLimits = \authorization respond -> do
+  ok <- verifyMaintenanceAuth authorization
+  let v = \x -> if ok then x else 0
+  yield (respond {ok: ok, globalRequest: v maxGlobalRequestRate, ipRate: v maxIpRatePerIp, sendRate: v maxSendRatePerKey, federationRate: v maxFederationRatePerServer, authGlobal: v maxAuthGlobalRate, recvRate: v maxRecvRatePerKey, challengeRate: v maxChallengeRatePerKey, pairRate: v maxPairRatePerPair, lookupRate: v maxLookupRatePerKey, clientWriteRate: v maxClientWriteRatePerKey})
 
 handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization respond -> do
   authorized <- verifyMaintenanceAuth authorization
@@ -1819,9 +1801,10 @@ handleRotateSecret = \newSecret authorization respond -> withMaintAuth authoriza
     atomic do set *runtimeMaintenanceSecret = newSecret
     yield (respond {ok: True {}, error: ""}))
 
-handleGetConfig = \authorization respond -> withMaintAuth authorization
-  (yield (respond {ok: False {}, maxMessagesPerRecipient: 0, maxGossipHops: 0, pollTimeoutMs: 0, ackGracePeriod: 0}))
-  (yield (respond {ok: True {}, maxMessagesPerRecipient: maxMessagesPerRecipient, maxGossipHops: maxGossipHops, pollTimeoutMs: pollTimeoutMs, ackGracePeriod: ackGracePeriod}))
+handleGetConfig = \authorization respond -> do
+  ok <- verifyMaintenanceAuth authorization
+  let v = \x -> if ok then x else 0
+  yield (respond {ok: ok, maxMessagesPerRecipient: v maxMessagesPerRecipient, maxGossipHops: v maxGossipHops, pollTimeoutMs: v pollTimeoutMs, ackGracePeriod: v ackGracePeriod})
 
 -- /stats: zero-fill all metric fields we no longer compute.
 handleStats = \authorization respond -> withMaintAuth authorization
@@ -1906,9 +1889,10 @@ handleStatsForwards = \authorization respond -> withMaintAuth authorization
       {server: s, count: count svFwds, oldestAge: oldest, totalRetries: fold (\acc f -> acc + f.retries) 0 svFwds})
     yield (respond {servers: result, ok: True {}, total: count fwds}))
 
-handleStatsRates = \authorization respond -> withMaintAuth authorization
-  (yield (respond {ok: False {}, scalePct: 0, globalRequest: 0, ipRate: 0, sendRate: 0, federationRate: 0, authGlobal: 0, recvRate: 0, challengeRate: 0, pairRate: 0, lookupRate: 0, clientWriteRate: 0}))
-  (yield (respond {ok: True {}, scalePct: 100, globalRequest: maxGlobalRequestRate, ipRate: maxIpRatePerIp, sendRate: maxSendRatePerKey, federationRate: maxFederationRatePerServer, authGlobal: maxAuthGlobalRate, recvRate: maxRecvRatePerKey, challengeRate: maxChallengeRatePerKey, pairRate: maxPairRatePerPair, lookupRate: maxLookupRatePerKey, clientWriteRate: maxClientWriteRatePerKey}))
+handleStatsRates = \authorization respond -> do
+  ok <- verifyMaintenanceAuth authorization
+  let v = \x -> if ok then x else 0
+  yield (respond {ok: ok, scalePct: v 100, globalRequest: v maxGlobalRequestRate, ipRate: v maxIpRatePerIp, sendRate: v maxSendRatePerKey, federationRate: v maxFederationRatePerServer, authGlobal: v maxAuthGlobalRate, recvRate: v maxRecvRatePerKey, challengeRate: v maxChallengeRatePerKey, pairRate: v maxPairRatePerPair, lookupRate: v maxLookupRatePerKey, clientWriteRate: v maxClientWriteRatePerKey})
 
 handleMetrics = \authorization respond -> do
   t <- now
