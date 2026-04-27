@@ -787,9 +787,7 @@ clampTimestamp : Timestamp -> Timestamp -> Timestamp
 clampTimestamp = \timestamp t -> clamp (t - messageMaxAge) t timestamp
 
 effectiveMessageTtl : Int<Ms> -> Int<Ms>
-effectiveMessageTtl = \expiresInMs ->
-  if expiresInMs <= 0 then unackedMessageMaxAge
-  else clamp minMessageTtl unackedMessageMaxAge expiresInMs
+effectiveMessageTtl = \e -> if e <= 0 then unackedMessageMaxAge else clamp minMessageTtl unackedMessageMaxAge e
 
 nextSeqTs : Timestamp -> Timestamp -> Timestamp
 nextSeqTs = \t seqCounter -> max t (seqCounter + 1)
@@ -802,9 +800,8 @@ presenceForKey = \presence pubkey t ->
 
 -- Resolve a key's server for client lookup, masking remote identities behind "remote".
 maskedServer = \pres pubkey t ->
-  let entries = presenceForKey pres pubkey t in
-  if any entries (\p -> isLocalServer p.server) then serverHostN
-  else if count entries > 0 then "remote"
+  if any (presenceForKey pres pubkey t) (\p -> isLocalServer p.server) then serverHostN
+  else if count (presenceForKey pres pubkey t) > 0 then "remote"
   else ""
 
 hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
@@ -843,10 +840,9 @@ pruneExpired = \t -> atomic do
   pruneRef pendingFederationCancels (\x -> t - x.createdAt < messageMaxAge)
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
-  let keptPres = filter pres (\p -> p.expiresAt > t)
-  let stillLocal = filter keptPres (\k -> isLocalServer k.server)
-  set *presence = keptPres
-  yield (filter pres (\p -> p.expiresAt <= t && isLocalServer p.server && none stillLocal (\k -> k.pubkey == p.pubkey)))
+  pruneRef presence (\p -> p.expiresAt > t)
+  newPres <- *presence
+  yield (filter pres (\p -> p.expiresAt <= t && isLocalServer p.server && none newPres (\k -> isLocalServer k.server && k.pubkey == p.pubkey)))
 
 -- ============================================
 -- Federation gossip
@@ -1409,7 +1405,7 @@ handleVerifyToken = \token scope clientIp respond -> do
     found <- atomic do
       pending <- *pendingVerifications
       let match = any pending (\p -> p.scope == scope && p.token == token && t - p.createdAt < verificationTokenExpiry)
-      when match (set *pendingVerifications = filter pending (\p -> p.scope != scope || p.token != token))
+      when match (set *pendingVerifications = removeWhere pending (\p -> p.scope == scope && p.token == token))
       yield match
     yield (respond {ok: found})
 
