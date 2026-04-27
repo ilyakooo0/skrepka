@@ -155,7 +155,7 @@ impl ToJSON MessageStatus where
     MsDraining {} -> "draining")
 
 isValidBoundedHex : Int -> Text -> Bool
-isValidBoundedHex = \maxLen s -> not (tooLong s maxLen) && isValidHex s && s == normalizeHex s
+isValidBoundedHex = \maxLen s -> not (tooLong s maxLen) && isValidHex s
 type PubkeyHex = Text where isValidBoundedHex maxPubkeyLen
 type BlobHex = Text where isValidBoundedHex maxBlobLen
 type SignatureHex = Text where isValidBoundedHex maxSignatureLen
@@ -565,9 +565,6 @@ isValidHex = \s ->
   let cs = chars s in
   count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
 
-normalizeHex : Text -> Text
-normalizeHex = \s -> bytesToHex (bytesFromHex s)
-
 stripTrailingDot : Text -> Text
 stripTrailingDot = \s -> if containsSuffix "." s then stripTrailingDot (take (count (chars s) - 1) s) else s
 
@@ -606,9 +603,7 @@ matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
 extractToken = \authHeader ->
   let rest = drop 7 authHeader in
-  if hasPrefix "Bearer " authHeader && rest != "" && not (tooLong rest maxTokenLen)
-    then Just {value: rest}
-    else Nothing {}
+  if hasPrefix "Bearer " authHeader && rest != "" then Just {value: rest} else Nothing {}
 
 verifyMaintenanceAuth : Text -> IO Bool
 verifyMaintenanceAuth = \authorization -> do
@@ -688,17 +683,17 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
 withFederationAuth = \authorization t respond fromServer scope requestTimestamp precondition action -> do
   blocked <- *blockedPeers
   allowed <- *allowedPeers
-  let err = \e retry -> respond {ok: False {}, error: e, retryAfterMs: retry}
-  if elem blocked fromServer then yield (err "blocked" 0)
-  else if count allowed > 0 && not (elem allowed fromServer) then yield (err "not_allowed" 0)
-  else if not precondition then yield (err "invalid_request" 0)
-  else if requestTimestamp > 0 && abs (requestTimestamp - t) > clockSkewTolerance then yield (err "clock_skew" 0)
+  let err = \e -> yield (respond {ok: False {}, error: e, retryAfterMs: 0})
+  if elem blocked fromServer then err "blocked"
+  else if count allowed > 0 && not (elem allowed fromServer) then err "not_allowed"
+  else if not precondition then err "invalid_request"
+  else if requestTimestamp > 0 && abs (requestTimestamp - t) > clockSkewTolerance then err "clock_skew"
   else do
     verified <- verifyFederationAuth authorization fromServer scope requestTimestamp
-    if not verified then yield (err "unauthorized" 0)
+    if not verified then err "unauthorized"
     else do
       limited <- checkServerRateGate fromServer t
-      if limited then yield (err "rate_limited" federationRateWindowMs)
+      if limited then yield (respond {ok: False {}, error: "rate_limited", retryAfterMs: federationRateWindowMs})
       else action
 
 -- ============================================
@@ -775,10 +770,10 @@ recordFailure = \server -> do
   atomic do
     failures <- *forwardFailures
     let prev = case findFirst failures (\f -> f.server == server) of
-          Just {value: f} -> {count: f.failures, firstFailedAt: f.firstFailedAt}
-          _ -> {count: 0, firstFailedAt: t}
+          Just {value: f} -> {count: f.failures + 1, firstFailedAt: f.firstFailedAt}
+          _ -> {count: 1, firstFailedAt: t}
     set *forwardFailures = union (removeWhere failures (\f -> f.server == server))
-      [{server: server, failedAt: t, failures: min (prev.count + 1) 10, firstFailedAt: prev.firstFailedAt}]
+      [{server: server, failedAt: t, failures: prev.count, firstFailedAt: prev.firstFailedAt}]
 
 clearFailure = \server -> atomic (pruneRef forwardFailures (\f -> f.server != server))
 
@@ -887,12 +882,11 @@ applyCancel = \msgs matches to mid t -> do
 
 -- Cancel one message if `ownerPred` holds for it; returns whether a cancel happened.
 cancelOne = \mid to ownerPred t -> atomic do
-  let matches = \x -> x.messageId == mid && x.toKey == to
   msgs <- *messages
-  if any msgs (\m -> matches m && ownerPred m) then do
-    _ <- applyCancel msgs matches to mid t
-    yield True
-  else yield False
+  let matches = \x -> x.messageId == mid && x.toKey == to
+  let owns = any msgs (\m -> matches m && ownerPred m)
+  when owns (do _ <- applyCancel msgs matches to mid t; yield {})
+  yield owns
 
 sendBatchedGossip = \peers events hops -> forEach peers id (\server -> do
   t <- now
