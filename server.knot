@@ -440,7 +440,6 @@ route Api = AuthApi | ClientApi | FederationApi | FederationVerifyApi | Federati
 -- Generic helpers
 -- ============================================
 
-id = \x -> x
 filter = \xs pred -> do x <- xs; where pred x; yield x
 removeWhere = \xs pred -> filter xs (\x -> not (pred x))
 pluck = \xs f -> do x <- xs; yield (f x)
@@ -533,19 +532,17 @@ isSendSuccess = \s -> case s of
   MsDuplicate {} -> True {}
   _ -> False {}
 
--- Sequence an IO action over each unique item (dedup by getKey).
-forEach = \items getKey action -> case headOf items of
+-- Sequence an IO action over each item, in order.
+forEach = \items action -> case headOf items of
   Nothing {} -> yield {}
-  Just {value: x} -> do
-    action x
-    forEach (filter items (\y -> getKey y != getKey x)) getKey action
+  Just {value: x} -> do action x; forEach (drop 1 items) action
 
 -- Like forEach, but collects each action's result into a list.
-mapEach = \items getKey action -> case headOf items of
+mapEach = \items action -> case headOf items of
   Nothing {} -> yield []
   Just {value: x} -> do
     r <- action x
-    rest <- mapEach (filter items (\y -> getKey y != getKey x)) getKey action
+    rest <- mapEach (drop 1 items) action
     yield (union [r] rest)
 
 -- Hex tokens: one random hex char per recursive call.
@@ -890,7 +887,7 @@ cancelOne = \mid to ownerPred t -> atomic do
   when owns (do _ <- applyCancel msgs matches to mid t; yield {})
   yield owns
 
-sendBatchedGossip = \peers events hops -> forEach peers id (\server -> do
+sendBatchedGossip = \peers events hops -> forEach peers (\server -> do
   t <- now
   failures <- *forwardFailures
   when (shouldRetryServer server t failures) (do
@@ -917,8 +914,8 @@ retryPendingForwards = do
   fwds <- *forwards
   failures <- *forwardFailures
   blocked <- *blockedPeers
-  forEach (filter (collectPeers fwds (\f -> f.toServer)) (\s -> shouldRetryServer s t failures && not (elem blocked s))) id (\server ->
-    forEach (takeRelation maxBatchSize (filter fwds (\f -> f.toServer == server))) (\f -> f.messageId) (\f -> do
+  forEach (filter (collectPeers fwds (\f -> f.toServer)) (\s -> shouldRetryServer s t failures && not (elem blocked s))) (\server ->
+    forEach (takeRelation maxBatchSize (filter fwds (\f -> f.toServer == server))) (\f -> do
       t2 <- now
       auth <- generateFederationAuth ("forward:" ++ f.messageId) t2
       result <- fetch (federationUrl server) (ForwardMessage {
@@ -940,7 +937,7 @@ retryPendingForwards = do
             else x)))
 
 sendAcksAndClean = \pendingAcks ->
-  forEach (collectPeers pendingAcks (\a -> a.originServer)) id (\server -> do
+  forEach (collectPeers pendingAcks (\a -> a.originServer)) (\server -> do
     let mids = mapWhere pendingAcks (\a -> a.originServer == server) (\a -> a.messageId)
     t <- now
     auth <- generateFederationAuth "ack" t
@@ -979,7 +976,6 @@ pruneAndRetry = \t -> do
     when (t - lastRefresh >= presenceRefreshInterval) (do
       atomic do set *lastPresenceRefresh = t
       refreshLocalPresence t))
-  yield {}
 
 refreshLocalPresence = \t -> do
   refreshState <- atomic do
@@ -1213,7 +1209,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs msg
     yield {status: if any toPresence (\p -> isLocalServer p.server) then MsDelivered {} else if forwardsEnqueued then MsFederated {} else MsQueued {}, remoteServers: remoteServers}
 
 forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers ->
-  forEach servers id (\server -> do
+  forEach servers (\server -> do
     fwds <- *forwards
     let same = \x -> x.messageId == effMsgId && x.toServer == server
     case findFirst fwds same of
@@ -1329,7 +1325,7 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
       yield (respond {ok: True {}, authorized: True {}, cancelled: result.cancelled, error: ""}))
 
 sendCancelToEach = \messageId to servers ->
-  forEach servers id (\server -> do
+  forEach servers (\server -> do
     t <- now
     auth <- generateFederationAuth ("cancel:" ++ messageId) t
     result <- fetch (federationUrl server) (FederationCancel {
@@ -1344,7 +1340,7 @@ handleCancelBatch = \cancels authorization clientIp respond -> do
   let mkErr = \e -> {results: [], authorized: False {}, error: if e == "draining" then "" else e}
   gateClientWrite authorization clientIp t respond mkErr
     {results: [], authorized: True {}, error: "rate_limited"} (\senderKey -> do
-      results <- mapEach (takeRelation maxBatchSize cancels) (\e -> e.messageId) (\e -> do
+      results <- mapEach (takeRelation maxBatchSize cancels) (\e -> do
         r <- cancelOne e.messageId e.to (\m -> m.originServer == "" && m.senderKey == senderKey) t
         yield {messageId: e.messageId, cancelled: r})
       yield (respond {results: results, authorized: True {}, error: ""}))
@@ -1353,7 +1349,7 @@ handleSendBatch = \messages authorization clientIp respond -> do
   t <- now
   let mkErr = \_ -> {results: [], authorized: False {}, retryAfterMs: 0}
   gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
-    results <- mapEach (takeRelation maxBatchSize messages) id (\m -> do
+    results <- mapEach (takeRelation maxBatchSize messages) (\m -> do
       effMsgId <- resolveMessageId m.messageId
       let clampedTs = clampTimestamp m.timestamp t
       r <- if t - m.timestamp > messageMaxAge
@@ -1385,7 +1381,7 @@ handleVerifyToken = \token scope clientIp respond -> do
 handleFederationPubkey = \respond -> do
   yield (respond {pubkey: serverFederationPublicKeyHex, ok: serverFederationPublicKeyHex != ""})
 
-handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlationId authorization respond -> do
+handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorization respond -> do
   t <- now
   withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (clamp 0 maxGossipHops hopsRemaining >= 1 && not (isLocalServer fromServer) && count events <= maxGossipEvents) (do
     newlyOnline <- atomic do
@@ -1402,7 +1398,7 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
       let offline = mapWhere validEvents isOffline (\v -> {pubkey: v.pubkey, server: v.server, timestamp: v.timestamp})
       set *presence = capList (mergePresence (filter pres (\p -> none offline (\o -> o.pubkey == p.pubkey && o.server == p.server && o.timestamp > p.timestamp))) online) maxPresenceEntries (\p -> p.expiresAt)
       yield (mapWhere online (\e -> none pres (\p -> p.pubkey == e.pubkey && p.server == e.server && p.expiresAt >= e.expiresAt)) (\e -> {pubkey: e.pubkey, server: e.server}))
-    fork (forEach newlyOnline (\tgt -> tgt.pubkey ++ "|" ++ tgt.server) (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t))
+    fork (forEach newlyOnline (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t))
     yield (respond {ok: True {}, error: "", retryAfterMs: 0}))
 
 -- Store a federated/forwarded message into the local mailbox. Caller wraps in `atomic`.
@@ -1429,7 +1425,7 @@ storeFederated = \toKey encryptedBlob timestamp originServer messageId expiresAt
       set *pollWakeup = seqTs
       yield ""
 
-handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt priority authorization respond -> do
+handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp expiresAt priority authorization respond -> do
   t <- now
   withFederationAuth authorization t respond fromServer ("forward:" ++ messageId) requestTimestamp (not (isLocalServer originServer) && not (isLocalServer fromServer)) (do
     if t - timestamp > messageMaxAge
@@ -1438,7 +1434,7 @@ handleForwardMessage = \toKey encryptedBlob timestamp originServer messageId fro
         result <- atomic (storeFederated toKey encryptedBlob timestamp originServer messageId expiresAt priority (True {}) t)
         yield (respond {ok: result == "", error: result, retryAfterMs: 0}))
 
-handleFederationAck = \messageIds originServer fromServer requestTimestamp correlationId authorization respond -> do
+handleFederationAck = \messageIds originServer fromServer requestTimestamp authorization respond -> do
   t <- now
   let ackRespond = \r -> respond {ok: r.ok, error: r.error, ackedCount: 0, results: [], retryAfterMs: r.retryAfterMs}
   withFederationAuth authorization t ackRespond fromServer "ack" requestTimestamp (isLocalServer originServer && not (isLocalServer fromServer)) (do
@@ -1461,27 +1457,27 @@ handleFederationAck = \messageIds originServer fromServer requestTimestamp corre
       yield {ackedCount: count removed, results: pluck dedupedIds (\mid -> {messageId: mid, found: any removed (\f -> f.messageId == mid)})}
     yield (respond {ok: True {}, error: "", ackedCount: result.ackedCount, results: result.results, retryAfterMs: 0}))
 
-handleFederationCancel = \messageId toKey fromServer requestTimestamp correlationId authorization respond -> do
+handleFederationCancel = \messageId toKey fromServer requestTimestamp authorization respond -> do
   t <- now
   let cancelRespond = \r -> respond {ok: r.ok, error: r.error, cancelled: False {}, retryAfterMs: r.retryAfterMs}
   withFederationAuth authorization t cancelRespond fromServer ("cancel:" ++ messageId) requestTimestamp (not (isLocalServer fromServer)) (do
     cancelled <- cancelOne messageId toKey (\m -> m.originServer == fromServer) t
     yield (respond {ok: True {}, error: "", cancelled: cancelled, retryAfterMs: 0}))
 
-handleFederationBatchCancel = \cancels fromServer requestTimestamp correlationId authorization respond -> do
+handleFederationBatchCancel = \cancels fromServer requestTimestamp authorization respond -> do
   t <- now
   let batchRespond = \r -> respond {ok: r.ok, error: r.error, results: [], retryAfterMs: r.retryAfterMs}
   withFederationAuth authorization t batchRespond fromServer "cancel-batch" requestTimestamp (not (isLocalServer fromServer) && count cancels <= maxBatchSize) (do
-    results <- mapEach (takeRelation maxBatchSize cancels) (\e -> e.messageId) (\e -> do
+    results <- mapEach (takeRelation maxBatchSize cancels) (\e -> do
       cancelled <- cancelOne e.messageId e.toKey (\m -> m.originServer == fromServer) t
       yield {messageId: e.messageId, cancelled: cancelled})
     yield (respond {ok: True {}, error: "", results: results, retryAfterMs: 0}))
 
-handleFederationBatchForward = \forwards fromServer requestTimestamp correlationId authorization respond -> do
+handleFederationBatchForward = \forwards fromServer requestTimestamp authorization respond -> do
   t <- now
   let batchRespond = \r -> respond {ok: r.ok, error: r.error, results: [], retryAfterMs: r.retryAfterMs}
   withFederationAuth authorization t batchRespond fromServer "forward-batch" requestTimestamp (not (isLocalServer fromServer) && count forwards <= maxBatchSize) (do
-    results <- mapEach (takeRelation maxBatchSize forwards) (\e -> e.messageId) (\e -> do
+    results <- mapEach (takeRelation maxBatchSize forwards) (\e -> do
       ok <- if isLocalServer e.originServer || t - e.timestamp > messageMaxAge then yield False
         else do
           result <- atomic (storeFederated e.toKey e.encryptedBlob e.timestamp e.originServer e.messageId e.expiresAt e.priority (False {}) t)
@@ -1489,7 +1485,7 @@ handleFederationBatchForward = \forwards fromServer requestTimestamp correlation
       yield {messageId: e.messageId, ok: ok})
     yield (respond {ok: True {}, error: "", results: results, retryAfterMs: 0}))
 
-handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp correlationId authorization respond -> do
+handleFederationDeliveryReceipt = \messageIds toKeys fromServer requestTimestamp authorization respond -> do
   t <- now
   let receiptRespond = \r -> respond {ok: r.ok, error: r.error, receivedCount: 0, retryAfterMs: r.retryAfterMs}
   withFederationAuth authorization t receiptRespond fromServer "delivery-receipt" requestTimestamp (not (isLocalServer fromServer) && count messageIds <= maxMessageIds) (do
@@ -1648,8 +1644,7 @@ handleAdminRevokeIp = \ip authorization respond -> withMaintAuth authorization
       let same = \s -> s.ip == ip
       set *sessions = removeWhere ses same
       yield (mapWhere ses same (\s -> s.pubkey))
-    let uniqueKeys = unique keys
-    yield (respond {ok: ip != "", revokedCount: count keys, affectedKeys: count uniqueKeys}))
+    yield (respond {ok: ip != "", revokedCount: count keys, affectedKeys: count (unique keys)}))
 
 handleAdminListAllSessions = \limit authorization respond -> withMaintAuth authorization
   (yield (respond {sessions: [], ok: False {}, total: 0}))
@@ -1816,13 +1811,13 @@ serve = \req -> case req of
   CancelBatch {cancels, authorization, clientIp, respond} -> handleCancelBatch cancels authorization clientIp respond
   LookupPresence {pubkey, authorization, clientIp, respond} -> handleLookupPresence pubkey authorization clientIp respond
   BatchLookupPresence {pubkeys, authorization, clientIp, respond} -> handleBatchLookupPresence pubkeys authorization clientIp respond
-  RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp correlationId authorization respond
-  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, correlationId, expiresAt, priority, protocolVersion, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp correlationId expiresAt priority authorization respond
-  FederationAck {messageIds, originServer, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> handleFederationAck messageIds originServer fromServer requestTimestamp correlationId authorization respond
-  FederationCancel {messageId, toKey, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> handleFederationCancel messageId toKey fromServer requestTimestamp correlationId authorization respond
-  FederationBatchCancel {cancels, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> handleFederationBatchCancel cancels fromServer requestTimestamp correlationId authorization respond
-  FederationBatchForward {forwards, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> handleFederationBatchForward forwards fromServer requestTimestamp correlationId authorization respond
-  FederationDeliveryReceipt {messageIds, toKeys, fromServer, requestTimestamp, correlationId, protocolVersion, authorization, respond} -> handleFederationDeliveryReceipt messageIds toKeys fromServer requestTimestamp correlationId authorization respond
+  RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp authorization respond
+  ForwardMessage {toKey, encryptedBlob, timestamp, originServer, messageId, fromServer, requestTimestamp, expiresAt, priority, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp originServer messageId fromServer requestTimestamp expiresAt priority authorization respond
+  FederationAck {messageIds, originServer, fromServer, requestTimestamp, authorization, respond} -> handleFederationAck messageIds originServer fromServer requestTimestamp authorization respond
+  FederationCancel {messageId, toKey, fromServer, requestTimestamp, authorization, respond} -> handleFederationCancel messageId toKey fromServer requestTimestamp authorization respond
+  FederationBatchCancel {cancels, fromServer, requestTimestamp, authorization, respond} -> handleFederationBatchCancel cancels fromServer requestTimestamp authorization respond
+  FederationBatchForward {forwards, fromServer, requestTimestamp, authorization, respond} -> handleFederationBatchForward forwards fromServer requestTimestamp authorization respond
+  FederationDeliveryReceipt {messageIds, toKeys, fromServer, requestTimestamp, authorization, respond} -> handleFederationDeliveryReceipt messageIds toKeys fromServer requestTimestamp authorization respond
   VerifyToken {token, scope, clientIp, respond} -> handleVerifyToken token scope clientIp respond
   FederationPubkey {respond} -> handleFederationPubkey respond
   Prune {authorization, respond} -> handlePrune authorization respond
