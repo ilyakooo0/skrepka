@@ -482,12 +482,10 @@ addServerToList = \listRef server -> atomic do
 -- Remove `server` from the named list ref. Returns whether it was present.
 removeServerFromList = \listRef server -> atomic do
   current <- *listRef
-  pruneRef listRef (\x -> x != server)
+  set *listRef = removeWhere current (\x -> x == server)
   yield (elem current server)
 
-headOf = \items -> fold (\acc x -> case acc of
-  Nothing {} -> Just {value: x}
-  _ -> acc) Nothing {} items
+headOf = \items -> fold (\_ x -> Just {value: x}) Nothing {} (take 1 items)
 
 -- Sort then take head: O(n log n) but no fold-with-Maybe boilerplate.
 minBy = \items getKey -> headOf (sortBy getKey items)
@@ -560,18 +558,13 @@ tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
 
 isValidHex : Text -> Bool
-isValidHex = \s ->
-  let cs = chars s in
-  let n = count cs in
-  n > 0 && mod n 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
+isValidHex = \s -> let cs = chars s in count cs > 0 && mod (count cs) 2 == 0 && all cs (\c -> contains c "0123456789abcdef")
 
 normalizeHex : Text -> Text
 normalizeHex = \s -> bytesToHex (bytesFromHex s)
 
 stripTrailingDot : Text -> Text
-stripTrailingDot = \s ->
-  let n = count (chars s) in
-  if n > 0 && drop (n - 1) s == "." then stripTrailingDot (take (n - 1) s) else s
+stripTrailingDot = \s -> if containsSuffix "." s then stripTrailingDot (take (count (chars s) - 1) s) else s
 
 normalizeServerName : Text -> Text
 normalizeServerName = \s -> toLower (stripTrailingDot s)
@@ -580,6 +573,9 @@ serverHostN : Text
 serverHostN = normalizeServerName serverHost
 isLocalServer : Text -> Bool
 isLocalServer = \s -> s == serverHostN
+
+hasPrefix : Text -> Text -> Bool
+hasPrefix = \pre s -> take (count (chars pre)) s == pre
 
 containsSuffix : Text -> Text -> Bool
 containsSuffix = \suffix s ->
@@ -592,8 +588,8 @@ isBadServerName : Text -> Bool
 isBadServerName = \sn ->
   sn == "" || sn == "localhost"
   || not (all (chars sn) (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:"))
-  || any [".", ":", "[", "127.", "10.", "192.168.", "169.254.", "0.", "::"] (\pre -> take (count (chars pre)) sn == pre)
-  || any [".localhost", ".local", ".internal", ".arpa", ".onion"] (\suf -> containsSuffix suf sn)
+  || any [".", ":", "[", "127.", "10.", "192.168.", "169.254.", "0.", "::"] (\p -> hasPrefix p sn)
+  || any [".localhost", ".local", ".internal", ".arpa", ".onion"] (\s -> containsSuffix s sn)
 
 -- ============================================
 -- Auth helpers
@@ -890,10 +886,9 @@ recordAcksAndDeliveries = \toAck t -> do
 applyCancel = \msgs matches to mid t -> do
   set *messages = removeWhere msgs matches
   fwds <- *forwards
-  let fwdServers = collectPeers (filter fwds matches) (\f -> f.toServer)
-  pruneRef forwards (\f -> not (matches f))
+  set *forwards = removeWhere fwds matches
   appendCapped cancelNotifications [{toKey: to, messageId: mid, cancelledAt: t}] 10000 (\c -> c.cancelledAt)
-  yield fwdServers
+  yield (collectPeers (filter fwds matches) (\f -> f.toServer))
 
 sendBatchedGossip = \peers events hops -> forEach peers id (\server -> do
   t <- now
