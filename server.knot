@@ -458,6 +458,7 @@ min = \a b -> if a < b then a else b
 max = \a b -> if a > b then a else b
 clamp = \lo hi x -> max lo (min hi x)
 mod = \n m -> n - n / m * m
+abs = \x -> if x < 0 then 0 - x else x
 
 -- Dedup: keeps first occurrence (O(n^2)).
 unique = \items -> fold (\acc x -> if elem acc x then acc else union acc [x]) [] items
@@ -690,7 +691,7 @@ withFederationAuth = \authorization t respond fromServer scope requestTimestamp 
     if elem blocked fromServer then "blocked"
     else if count allowed > 0 && not (elem allowed fromServer) then "not_allowed"
     else if not precondition then "invalid_request"
-    else if requestTimestamp > 0 && (requestTimestamp > t + clockSkewTolerance || requestTimestamp < t - clockSkewTolerance) then "clock_skew"
+    else if requestTimestamp > 0 && abs (requestTimestamp - t) > clockSkewTolerance then "clock_skew"
     else ""
   if preErr != "" then yield (respond {ok: False {}, error: preErr, retryAfterMs: 0})
   else do
@@ -969,8 +970,7 @@ pruneAndRetry = \t -> do
   when federationEnabled (do
     fork retryPendingForwards
     aids <- *ackedIds
-    let pendingAcks = filter aids (\a -> not (isLocalServer a.originServer))
-    fork (sendAcksAndClean pendingAcks))
+    fork (sendAcksAndClean (filter aids (\a -> not (isLocalServer a.originServer)))))
   -- Refresh local presence for active sessions every ~5 minutes
   lastRefresh <- *lastPresenceRefresh
   when (federationEnabled && t - lastRefresh >= presenceRefreshInterval) (do
@@ -1038,8 +1038,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
         let afterPerKey = capPerKey kept (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt)
         set *sessions = capList (union afterPerKey [{token: token, pubkey: pubkey, expiresAt: expiry, ip: clientIp, createdAt: t}]) maxSessions (\s -> s.expiresAt)
         pres <- *presence
-        let withoutLocal = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
-        let newPres = capList (union withoutLocal [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]) maxPresenceEntries (\p -> p.expiresAt)
+        let newPres = capList (union (removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)) [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]) maxPresenceEntries (\p -> p.expiresAt)
         set *presence = newPres
         yield {valid: True {}, peers: knownPeerServersFromPresence newPres}
     if not result.valid then yield (respond {token: "", expiresAt: 0, error: "invalid"})
