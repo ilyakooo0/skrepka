@@ -449,9 +449,9 @@ countWhere = \xs pred -> count (filter xs pred)
 any : [a] -> (a -> Bool) -> Bool
 any = \xs pred -> countWhere xs pred > 0
 none : [a] -> (a -> Bool) -> Bool
-none = \xs pred -> not (any xs pred)
+none = \xs pred -> countWhere xs pred == 0
 all : [a] -> (a -> Bool) -> Bool
-all = \xs pred -> none xs (\x -> not (pred x))
+all = \xs pred -> countWhere xs pred == count xs
 elem = \xs x -> any xs (\y -> y == x)
 findFirst = \xs pred -> headOf (filter xs pred)
 when = \cond action -> if cond then action else yield {}
@@ -524,6 +524,14 @@ emptyPollResp = \cursor authorized rateLimited draining gen retryAfterMs cursorW
 -- Shared error shape for /messages send.
 sendErrResp = \status err -> {status: status, messageId: "", retryAfterMs: 0, error: err, loadPct: 0}
 
+-- True when a send produced (or matched) a deliverable message.
+isSendSuccess = \s -> case s of
+  MsDelivered {} -> True {}
+  MsFederated {} -> True {}
+  MsQueued {} -> True {}
+  MsDuplicate {} -> True {}
+  _ -> False {}
+
 -- Sequence an IO action over each unique item (dedup by getKey).
 forEach = \items getKey action -> case headOf items of
   Nothing {} -> yield {}
@@ -546,6 +554,9 @@ genTokenN = \n -> if n <= 0 then yield "" else do
   yield (take 1 (drop d "0123456789abcdef") ++ rest)
 
 genToken = genTokenN 48
+
+-- Use the supplied message id when non-empty, otherwise generate a fresh one.
+resolveMessageId = \mid -> if mid != "" then yield mid else genToken
 
 tooLong : Text -> Int -> Bool
 tooLong = \s maxLen -> count (chars s) > maxLen
@@ -756,10 +767,10 @@ recordFailure = \server -> do
   atomic do
     failures <- *forwardFailures
     let same = \f -> f.server == server
-    set *forwardFailures = union (removeWhere failures same)
-      [case findFirst failures same of
-        Just {value: f} -> {server: server, failedAt: t, failures: min (f.failures + 1) 10, firstFailedAt: f.firstFailedAt}
-        Nothing {} -> {server: server, failedAt: t, failures: 1, firstFailedAt: t}]
+    let entry = case findFirst failures same of
+          Just {value: f} -> {server: server, failedAt: t, failures: min (f.failures + 1) 10, firstFailedAt: f.firstFailedAt}
+          Nothing {} -> {server: server, failedAt: t, failures: 1, firstFailedAt: t}
+    set *forwardFailures = union (removeWhere failures same) [entry]
 
 clearFailure = \server -> atomic (pruneRef forwardFailures (\f -> f.server != server))
 
@@ -805,8 +816,9 @@ knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.serve
 -- Last-write-wins merge by (pubkey, server), keeping the entry with the larger expiresAt.
 mergePresence = \existing incoming ->
   fold (\acc e ->
-    if any acc (\x -> x.pubkey == e.pubkey && x.server == e.server && x.expiresAt >= e.expiresAt) then acc
-    else union (removeWhere acc (\x -> x.pubkey == e.pubkey && x.server == e.server)) [e]) existing incoming
+    let same = \x -> x.pubkey == e.pubkey && x.server == e.server in
+    if any acc (\x -> same x && x.expiresAt >= e.expiresAt) then acc
+    else union (removeWhere acc same) [e]) existing incoming
 
 -- ============================================
 -- Pruning
@@ -829,7 +841,8 @@ pruneExpired = \t -> atomic do
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   pruneRef presence (\p -> p.expiresAt > t)
-  yield (filter pres (\p -> p.expiresAt <= t && isLocalServer p.server && none pres (\k -> isLocalServer k.server && k.pubkey == p.pubkey && k.expiresAt > t)))
+  let stillLive = \pk -> any pres (\k -> isLocalServer k.server && k.pubkey == pk && k.expiresAt > t)
+  yield (filter pres (\p -> p.expiresAt <= t && isLocalServer p.server && not (stillLive p.pubkey)))
 
 -- ============================================
 -- Federation gossip
@@ -901,12 +914,11 @@ retryPendingForwards = do
         Err _ -> do recordFailure server; yield False
         Ok r -> do when r.ok (clearFailure server); yield r.ok
       let isMatch = \x -> x.messageId == f.messageId && x.toServer == server
+      let isDone = \x -> isMatch x && (success || x.retries + 1 >= maxForwardRetries)
       atomic do
         cur <- *forwards
-        set *forwards = do
-          x <- cur
-          where not (isMatch x && (success || x.retries + 1 >= maxForwardRetries))
-          yield (if isMatch x
+        set *forwards = pluck (removeWhere cur isDone) (\x ->
+          if isMatch x
             then {messageId: x.messageId, toServer: x.toServer, createdAt: x.createdAt, toKey: x.toKey, encryptedBlob: x.encryptedBlob, timestamp: x.timestamp, originServer: x.originServer, retries: x.retries + 1, expiresAt: x.expiresAt, priority: x.priority, senderKey: x.senderKey}
             else x)))
 
@@ -929,8 +941,10 @@ sendAcksAndClean = \pendingAcks ->
 forwardQueuedToServer = \pubkey server t -> atomic do
   msgs <- *messages
   fwds <- *forwards
-  set *forwards = capList (union fwds (takeRelation maxForwardsPerServer (mapWhere msgs (\m -> m.toKey == pubkey && none fwds (\f -> f.messageId == m.messageId && f.toServer == server)) (\m ->
-    {messageId: m.messageId, toServer: server, createdAt: t, toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp, originServer: (if m.originServer == "" then serverHostN else m.originServer), retries: 0, expiresAt: m.expiresAt, priority: m.priority, senderKey: m.senderKey})))) maxForwardsEntries (\f -> f.createdAt)
+  let candidates = filter msgs (\m -> m.toKey == pubkey && none fwds (\f -> f.messageId == m.messageId && f.toServer == server))
+  let newFwds = pluck (takeRelation maxForwardsPerServer candidates) (\m ->
+    {messageId: m.messageId, toServer: server, createdAt: t, toKey: m.toKey, encryptedBlob: m.encryptedBlob, timestamp: m.timestamp, originServer: (if m.originServer == "" then serverHostN else m.originServer), retries: 0, expiresAt: m.expiresAt, priority: m.priority, senderKey: m.senderKey})
+  set *forwards = capList (union fwds newFwds) maxForwardsEntries (\f -> f.createdAt)
 
 -- ============================================
 -- Background loops
@@ -995,12 +1009,13 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
     result <- atomic do
       ch <- *challenges
       dp <- *drainPhase
+      let same = \c -> c.pubkey == pubkey && c.challenge == challenge
       if dp >= 1
-         || none ch (\c -> c.pubkey == pubkey && c.challenge == challenge && c.expiresAt > t && matchIp clientIp c.ip)
+         || none ch (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip)
          || not (verify (bytesFromHex pubkey) (textToBytes challenge) (bytesFromHex signature))
       then yield {valid: False {}, peers: []}
       else do
-        set *challenges = removeWhere ch (\c -> c.pubkey == pubkey && c.challenge == challenge)
+        set *challenges = removeWhere ch same
         ses <- *sessions
         set *sessions = capList (union (if revokeOthers then removeWhere ses (\s -> s.pubkey == pubkey) else capPerKey ses (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt)) [{token: token, pubkey: pubkey, expiresAt: expiry, ip: clientIp, createdAt: t}]) maxSessions (\s -> s.expiresAt)
         pres <- *presence
@@ -1126,7 +1141,7 @@ handleSendMessage = \to encryptedBlob timestamp messageId expiresInMs priority a
   t <- now
   dp <- *drainPhase
   g <- checkGlobalRate t
-  effMsgId <- if messageId != "" then yield messageId else genToken
+  effMsgId <- resolveMessageId messageId
   let err = \s e -> yield (respond (sendErrResp s e))
   if dp >= 2 then err (MsDraining {}) "draining"
   else if g then err (MsRateLimited {}) "rate_limited"
@@ -1139,9 +1154,7 @@ handleSendMessage = \to encryptedBlob timestamp messageId expiresInMs priority a
         (\senderKey -> sendMessageCore senderKey to encryptedBlob clampedTs effMsgId expiresInMs (clamp 0 maxMessagePriority priority) t)
     when federationEnabled
       (fork (forkForwardsTo effMsgId to encryptedBlob clampedTs result.remoteServers))
-    let ok = case result.status of
-          MsDelivered {} -> True {}; MsFederated {} -> True {}
-          MsQueued {} -> True {}; MsDuplicate {} -> True {}; _ -> False {}
+    let ok = isSendSuccess result.status
     yield (respond {status: result.status, messageId: if ok then effMsgId else "", retryAfterMs: 0, error: if ok then "" else "rejected", loadPct: 0})
 
 sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs msgPriority t -> do
@@ -1325,7 +1338,7 @@ handleSendBatch = \messages authorization clientIp respond -> do
   let mkErr = \_ -> {results: [], authorized: False {}, retryAfterMs: 0}
   gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
     results <- mapEach (takeRelation maxBatchSize messages) id (\m -> do
-      effMsgId <- if m.messageId != "" then yield m.messageId else genToken
+      effMsgId <- resolveMessageId m.messageId
       let clampedTs = clampTimestamp m.timestamp t
       r <- if t - m.timestamp > messageMaxAge
         then yield {status: MsRejected {}, remoteServers: []}
@@ -1367,8 +1380,10 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp correlation
         let expiresAt = min e.timestamp t + clampTtl e.ttl * 1000
         where expiresAt > t
         yield {pubkey: e.pubkey, server: e.server, expiresAt: expiresAt, timestamp: e.timestamp, eventType: e.eventType}
-      let online = mapWhere validEvents (\v -> case v.eventType of GossipOnline {} -> True {}; _ -> False {}) (\v -> {pubkey: v.pubkey, server: v.server, expiresAt: v.expiresAt, timestamp: v.timestamp})
-      let offline = mapWhere validEvents (\v -> case v.eventType of GossipOffline {} -> True {}; _ -> False {}) (\v -> {pubkey: v.pubkey, server: v.server, timestamp: v.timestamp})
+      let isOnline = \v -> case v.eventType of GossipOnline {} -> True {}; _ -> False {}
+      let isOffline = \v -> case v.eventType of GossipOffline {} -> True {}; _ -> False {}
+      let online = mapWhere validEvents isOnline (\v -> {pubkey: v.pubkey, server: v.server, expiresAt: v.expiresAt, timestamp: v.timestamp})
+      let offline = mapWhere validEvents isOffline (\v -> {pubkey: v.pubkey, server: v.server, timestamp: v.timestamp})
       set *presence = capList (mergePresence (filter pres (\p -> none offline (\o -> o.pubkey == p.pubkey && o.server == p.server && o.timestamp > p.timestamp))) online) maxPresenceEntries (\p -> p.expiresAt)
       yield (mapWhere online (\e -> none pres (\p -> p.pubkey == e.pubkey && p.server == e.server && p.expiresAt >= e.expiresAt)) (\e -> {pubkey: e.pubkey, server: e.server}))
     fork (forEach newlyOnline (\tgt -> tgt.pubkey ++ "|" ++ tgt.server) (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t))
@@ -1605,9 +1620,10 @@ handleAdminRevokeSessions = \pubkey authorization respond -> withMaintAuth autho
   (do
     revoked <- atomic do
       ses <- *sessions
-      set *sessions = removeWhere ses (\s -> s.pubkey == pubkey)
+      let same = \s -> s.pubkey == pubkey
+      set *sessions = removeWhere ses same
       pruneRef presence (\p -> p.pubkey != pubkey || not (isLocalServer p.server))
-      yield (countWhere ses (\s -> s.pubkey == pubkey))
+      yield (countWhere ses same)
     yield (respond {ok: True {}, revokedCount: revoked}))
 
 handleAdminPurgeMessages = \pubkey authorization respond -> withMaintAuth authorization
@@ -1616,11 +1632,12 @@ handleAdminPurgeMessages = \pubkey authorization respond -> withMaintAuth author
     t <- now
     purged <- atomic do
       msgs <- *messages
-      let mine = filter msgs (\m -> m.toKey == pubkey)
-      set *messages = removeWhere msgs (\m -> m.toKey == pubkey)
+      let mine = \m -> m.toKey == pubkey
+      let purgedMsgs = filter msgs mine
+      set *messages = removeWhere msgs mine
       pruneRef forwards (\f -> f.toKey != pubkey)
-      appendCapped ackedIds (mapWhere mine (\m -> m.originServer != "") (\m -> mkAckedEntry m t)) maxAckedIds (\a -> a.ackedAt)
-      yield (count mine)
+      appendCapped ackedIds (mapWhere purgedMsgs (\m -> m.originServer != "") (\m -> mkAckedEntry m t)) maxAckedIds (\a -> a.ackedAt)
+      yield (count purgedMsgs)
     yield (respond {ok: True {}, purgedCount: purged}))
 
 handleAdminRevokeIp = \ip authorization respond -> withMaintAuth authorization
@@ -1628,8 +1645,9 @@ handleAdminRevokeIp = \ip authorization respond -> withMaintAuth authorization
   (do
     keys <- if ip == "" then yield [] else atomic do
       ses <- *sessions
-      set *sessions = removeWhere ses (\s -> s.ip == ip)
-      yield (mapWhere ses (\s -> s.ip == ip) (\s -> s.pubkey))
+      let same = \s -> s.ip == ip
+      set *sessions = removeWhere ses same
+      yield (mapWhere ses same (\s -> s.pubkey))
     yield (respond {ok: ip != "", revokedCount: count keys, affectedKeys: count (unique keys)}))
 
 handleAdminListAllSessions = \limit authorization respond -> withMaintAuth authorization
