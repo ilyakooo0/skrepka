@@ -540,13 +540,10 @@ mapEach = \items getKey action -> case headOf items of
     yield (union [r] rest)
 
 -- Hex tokens: one random hex char per recursive call.
-hexDigit : Int -> Text
-hexDigit = \n -> take 1 (drop n "0123456789abcdef")
-
 genTokenN = \n -> if n <= 0 then yield "" else do
   d <- randomInt 16
   rest <- genTokenN (n - 1)
-  yield (hexDigit d ++ rest)
+  yield (take 1 (drop d "0123456789abcdef") ++ rest)
 
 genToken = genTokenN 48
 
@@ -1034,9 +1031,10 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
       else do
         set *challenges = removeWhere ch (\c -> c.pubkey == pubkey && c.challenge == challenge)
         ses <- *sessions
-        let kept = if revokeOthers then removeWhere ses (\s -> s.pubkey == pubkey) else ses
-        let afterPerKey = capPerKey kept (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt)
-        set *sessions = capList (union afterPerKey [{token: token, pubkey: pubkey, expiresAt: expiry, ip: clientIp, createdAt: t}]) maxSessions (\s -> s.expiresAt)
+        let cleaned = if revokeOthers
+              then removeWhere ses (\s -> s.pubkey == pubkey)
+              else capPerKey ses (\s -> s.pubkey == pubkey) maxSessionsPerKey (\s -> s.expiresAt)
+        set *sessions = capList (union cleaned [{token: token, pubkey: pubkey, expiresAt: expiry, ip: clientIp, createdAt: t}]) maxSessions (\s -> s.expiresAt)
         pres <- *presence
         let newPres = capList (union (removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)) [{pubkey: pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}]) maxPresenceEntries (\p -> p.expiresAt)
         set *presence = newPres
@@ -1348,7 +1346,7 @@ handleCancelMessage = \messageId to authorization clientIp respond -> do
         case findFirst msgs matches of
           Nothing {} -> yield {cancelled: False {}, cancelServers: []}
           Just {value: msg} ->
-            if msg.originServer != "" || msg.senderKey != senderKey || msg.senderKey == ""
+            if msg.originServer != "" || msg.senderKey != senderKey
               then yield {cancelled: False {}, cancelServers: []}
               else do
                 fwdServers <- applyCancel msgs matches to messageId t
@@ -1367,8 +1365,7 @@ sendCancelToEach = \messageId to servers ->
       messageId: messageId, toKey: to, fromServer: serverHostN,
       requestTimestamp: t, correlationId: "", authorization: auth,
       protocolVersion: federationProtocolVersion})
-    let failed = case result of Err _ -> True {}; Ok r -> not r.ok
-    when failed (atomic
+    when (case result of Err _ -> True {}; Ok r -> not r.ok) (atomic
       (appendCapped pendingFederationCancels [{messageId: messageId, toKey: to, toServer: server, createdAt: t, retries: 0}] 10000 (\c -> c.createdAt))))
 
 handleCancelBatch = \cancels authorization clientIp respond -> do
@@ -1383,7 +1380,7 @@ handleCancelBatch = \cancels authorization clientIp respond -> do
           case findFirst msgs matches of
             Nothing {} -> yield False
             Just {value: msg} ->
-              if msg.originServer != "" || msg.senderKey != senderKey || msg.senderKey == ""
+              if msg.originServer != "" || msg.senderKey != senderKey
                 then yield False
                 else do
                   _ <- applyCancel msgs matches e.to e.messageId t
