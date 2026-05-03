@@ -2812,7 +2812,7 @@ main = do
   atomic (do *startedAt = t; *serverGeneration = t * 1000 + genJitter)
   priv <- *federationPrivateKeyHex
   when (priv == "") (do
-    let kp = generateKeyPair
+    kp <- generateKeyPair
     atomic (do
       *federationPrivateKeyHex = bytesToHex kp.privateKey
       *federationPublicKeyHex = bytesToHex kp.publicKey)
