@@ -607,12 +607,7 @@ module App =
 
                             let results =
                                 response.Events
-                                |> Array.choose (fun evt ->
-                                    match evt.EventType with
-                                    | Message -> Some(decryptEvent session.Identity.PrivKey evt.Payload)
-                                    | UnknownEvent s ->
-                                        log $"unknown event type: {s}"
-                                        None)
+                                |> Array.map (fun evt -> decryptEvent session.Identity.PrivKey evt.Payload)
 
                             let events = results |> Array.choose Result.toOption |> Array.toList
 

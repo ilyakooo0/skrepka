@@ -222,11 +222,10 @@ sToMs = \s -> stripUnit s * 1000
 -- and stripped of trailing dots, with a deny-list filter (`isBadServerName`)
 -- applied where SSRF is a concern.
 
--- One event in a /poll response. `eventType` is currently always "message"; the
--- payload is the cipher blob plus delivery metadata for the recipient.
+-- One event in a /poll response. The payload is the opaque cipher blob plus
+-- delivery metadata for the recipient; the server cannot read the blob.
 type PollEvent = {
   id: MessageIdHex,
-  eventType: Text,
   payload: {encryptedBlob: BlobHex, timestamp: Timestamp, toKey: PubkeyHex, expiresAt: Timestamp}
 }
 
@@ -1566,7 +1565,7 @@ pollOnce = \authorization cursor cursorWasReset clientIp serverGen respond t -> 
 
 -- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
 -- (bumped by send/heartbeat) and re-collect once at the new wall time.
-doPoll : {clampedCursor: Int, pendingAcks: [AckedEntry], pubkey: PubkeyHex, startWakeup: Timestamp} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{eventType: Text, id: MessageIdHex, payload: {encryptedBlob: BlobHex, expiresAt: Timestamp, timestamp: Timestamp, toKey: PubkeyHex}}], hasMore: Bool}
+doPoll : {clampedCursor: Int, pendingAcks: [AckedEntry], pubkey: PubkeyHex, startWakeup: Timestamp} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{id: MessageIdHex, payload: {encryptedBlob: BlobHex, expiresAt: Timestamp, timestamp: Timestamp, toKey: PubkeyHex}}], hasMore: Bool}
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic (do
     msgs <- *messages
@@ -1582,7 +1581,7 @@ doPoll = \s t -> do
 -- Pull this pubkey's unexpired messages newer than `cursor`, sort by
 -- receivedAt, take up to `maxPollEvents`, and report `hasMore` if truncated.
 collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp, hasMore: Bool}
-collectPollEvents = \messages pubkey cursor t -> (\myMsgs -> (\limited -> {events: pluck limited (\m -> {id: m.messageId, eventType: "message", payload: {m.toKey, m.encryptedBlob, m.timestamp, m.expiresAt}}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited, hasMore: count myMsgs > count limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) myMsgs))) (filter messages (\m -> m.toKey == pubkey && m.expiresAt > t && m.receivedAt > cursor))
+collectPollEvents = \messages pubkey cursor t -> (\myMsgs -> (\limited -> {events: pluck limited (\m -> {id: m.messageId, payload: {m.toKey, m.encryptedBlob, m.timestamp, m.expiresAt}}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited, hasMore: count myMsgs > count limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) myMsgs))) (filter messages (\m -> m.toKey == pubkey && m.expiresAt > t && m.receivedAt > cursor))
 
 -- Treat the supplied cursor as an ack: drop all messages with
 -- receivedAt <= cursor, plus their pending forwards, and record federated

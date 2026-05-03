@@ -16,22 +16,8 @@ module ApiClient =
     [<CLIMutable>]
     type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
 
-    [<JsonConverter(typeof<EventTypeConverter>)>]
-    type EventType = Message | UnknownEvent of string
-    and private EventTypeConverter() =
-        inherit JsonConverter<EventType>()
-        override _.Read(reader, _, _) =
-            match reader.GetString() with
-            | "message" -> Message
-            | s -> UnknownEvent s
-        override _.Write(writer, value, _) =
-            writer.WriteStringValue(
-                match value with
-                | Message -> "message"
-                | UnknownEvent s -> s)
-
     [<CLIMutable>]
-    type PollEvent = { Id: string; EventType: EventType; Payload: EventPayload }
+    type PollEvent = { Id: string; Payload: EventPayload }
 
     [<CLIMutable>]
     type PollResponse = { Cursor: int64; Events: PollEvent array; Authorized: bool; Heartbeat: bool }
