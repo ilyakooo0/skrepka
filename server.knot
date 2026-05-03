@@ -1873,11 +1873,11 @@ sendCancelToEach = \messageId to servers -> forEach servers (\server -> do
     authorization: auth,
     protocolVersion: federationProtocolVersion
   })
-  when (case result of; Err _ -> True {}; Ok {value: r} -> not r.ok) (atomic (do
+  when (case result of Err _ -> True {}; Ok {value: r} -> not r.ok) (atomic do
     cur <- *pendingFederationCancels
     *pendingFederationCancels = capList (union cur [
       {messageId, toKey: to, toServer: server, createdAt: t, retries: 0}
-    ]) 10000 (\c -> c.createdAt))))
+    ]) 10000 (\c -> c.createdAt)))
 
 -- POST /messages/cancel-batch: multi-id sender-side cancel. Same ownership
 -- check as `handleCancelMessage`, applied independently per entry.
@@ -1939,7 +1939,7 @@ handleVerifyToken = \token scope clientIp respond -> do
       pending <- *pendingVerifications
       let same = \p -> p.scope == scope && p.token == token
       let match = any pending (\p -> same p && t - p.createdAt < verificationTokenExpiry)
-      when match *pendingVerifications = removeWhere pending same
+      when match (*pendingVerifications = removeWhere pending same)
       yield match)
     yield (respond {ok: found})
 
