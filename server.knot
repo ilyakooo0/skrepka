@@ -179,9 +179,6 @@ pollTimeoutMs = 25000
 -- Concurrent active long-polls permitted per pubkey.
 maxPollsPerKey : Int
 maxPollsPerKey = 3
--- Global ceiling on active long-polls.
-maxActivePolls : Int
-maxActivePolls = 5000
 -- Cadence at which this server refreshes its own presence to peers (5 min).
 presenceRefreshInterval : Int<Ms>
 presenceRefreshInterval = 300000
@@ -196,9 +193,6 @@ minMessageTtl = 60000
 ackGracePeriod : Int<Ms>
 ackGracePeriod = 120000
 
--- Wire protocol version used for federation calls; bumped on incompatible changes.
-federationProtocolVersion : Int
-federationProtocolVersion = 15
 -- Human-readable build identifier returned by the /health endpoint.
 serverBuildVersion : Text
 serverBuildVersion = "2026-04-27-simple"
@@ -450,11 +444,11 @@ route ClientApi where
   POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: AnyServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
 route FederationApi where
-  POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /federation/gossip headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = RecvGossip
-  POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, expiresAt: Timestamp, protocolVersion: Int} /federation/forward headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = ForwardMessage
-  POST {messageIds: [MessageIdHex], originServer: ServerName, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /federation/ack headers {authorization: Text} -> {ok: Bool, error: Text, ackedCount: Int, results: [{messageId: MessageIdHex, found: Bool}], retryAfterMs: Int} = FederationAck
-  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, expiresAt: Timestamp}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /federation/forward-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} = FederationBatchForward
-  POST {messageIds: [MessageIdHex], toKeys: [PubkeyHex], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /federation/delivery-receipt headers {authorization: Text} -> {ok: Bool, error: Text, receivedCount: Int, retryAfterMs: Int} = FederationDeliveryReceipt
+  POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/gossip headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = RecvGossip
+  POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, expiresAt: Timestamp} /federation/forward headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = ForwardMessage
+  POST {messageIds: [MessageIdHex], originServer: ServerName, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/ack headers {authorization: Text} -> {ok: Bool, error: Text, ackedCount: Int, results: [{messageId: MessageIdHex, found: Bool}], retryAfterMs: Int} = FederationAck
+  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, expiresAt: Timestamp}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} = FederationBatchForward
+  POST {messageIds: [MessageIdHex], toKeys: [PubkeyHex], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/delivery-receipt headers {authorization: Text} -> {ok: Bool, error: Text, receivedCount: Int, retryAfterMs: Int} = FederationDeliveryReceipt
 
 route FederationPubkeyApi where
   GET /federation/pubkey -> {pubkey: Text, ok: Bool} = FederationPubkey
@@ -503,7 +497,7 @@ type KeyPresenceEntry = {server: Text, expiresAt: Timestamp}
 type RecipientCount = {pubkey: PubkeyHex, count: Int}
 
 route StatsApi where
-  GET /stats headers {authorization: Text} -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, totalMessageCount: Int, presence: Int, forwards: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, nonceEvictions: Int, activePolls: Int, activePollsMax: Int, recipientCounts: Int, messageBucketMax: Int, messageBucketMin: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}], gossipSuccess: Int, gossipFail: Int, latencyBuckets: {lt100: Int, lt500: Int, lt2000: Int, gte2000: Int}}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int, senderDeliveries: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, pollLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int, sendLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, authAvgMs: Int, authMaxMs: Int, authCount: Int}} = Stats
+  GET /stats headers {authorization: Text} -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, totalMessageCount: Int, presence: Int, forwards: Int, challenges: Int, challengesMax: Int, ackedIds: Int, ackedIdsMax: Int, ackOverflow: Int, ackOverflowMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, nonceEvictions: Int, activePolls: Int, recipientCounts: Int, messageBucketMax: Int, messageBucketMin: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}], gossipSuccess: Int, gossipFail: Int, latencyBuckets: {lt100: Int, lt500: Int, lt2000: Int, gte2000: Int}}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, senderExpirations: Int, senderDeliveries: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, pollLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int, sendLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, authAvgMs: Int, authMaxMs: Int, authCount: Int}} = Stats
   GET /stats/peers headers {authorization: Text} -> {peers: [PeerStatus], ok: Bool} = StatsPeers
   GET /stats/key/{pubkey: PubkeyHex} headers {authorization: Text} -> {messages: Int, presence: [KeyPresenceEntry], sessions: Int, forwards: Int, forwardDetails: [{server: Text, retries: Int, createdAt: Timestamp}], activePolls: Int, ok: Bool} = StatsKey
   POST {limit: Int} /stats/top-recipients headers {authorization: Text} -> {recipients: [RecipientCount], ok: Bool, total: Int} = TopRecipients
@@ -1072,8 +1066,7 @@ sendBatchedGossip = \peers events -> forEach peers (\server -> do
       hopsRemaining: gossipOriginHops,
       fromServer: serverHostN,
       requestTimestamp: t,
-      correlationId: "",
-      protocolVersion: federationProtocolVersion
+      correlationId: ""
     })
     case result of
       Err _ -> recordFailure server
@@ -1114,8 +1107,7 @@ retryPendingForwards = do
       requestTimestamp: t2,
       authorization: auth,
       correlationId: "",
-      f.expiresAt,
-      protocolVersion: federationProtocolVersion
+      f.expiresAt
     })
     success <- case result of
       Err _ -> do
@@ -1154,8 +1146,7 @@ sendAcksAndClean = \pendingAcks -> forEach (collectPeers pendingAcks (\a -> a.or
     originServer: server,
     fromServer: serverHostN,
     requestTimestamp: t,
-    correlationId: "",
-    protocolVersion: federationProtocolVersion
+    correlationId: ""
   })
   case result of
     Err _ -> recordFailure server
@@ -1411,7 +1402,7 @@ pollOnce = \authorization cursor cursorWasReset clientIp serverGen respond t -> 
         if countWhere aps (\p -> p.pubkey == s.pubkey) >= maxPollsPerKey
         then yield (False {})
         else do
-          *activePolls = capList (union aps [{s.pubkey, startedAt: t}]) maxActivePolls (\p -> p.startedAt)
+          *activePolls = union aps [{s.pubkey, startedAt: t}]
           yield (True {}))
       if not acquired
       then yield (respond (emptyPollResp cursor (True {}) (True {}) (False {}) serverGen pollTimeoutMs cursorWasReset))
@@ -1621,8 +1612,7 @@ forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers -> forEach servers
         requestTimestamp: t,
         authorization: auth,
         correlationId: "",
-        f.expiresAt,
-        protocolVersion: federationProtocolVersion
+        f.expiresAt
       })
       case result of
         Err _ -> recordFailure server
@@ -2170,8 +2160,7 @@ handlePingPeer = \server authorization respond -> withMaintAuth authorization (y
     hopsRemaining: 1,
     fromServer: serverHostN,
     requestTimestamp: startTime,
-    correlationId: "",
-    protocolVersion: federationProtocolVersion
+    correlationId: ""
   })
   endTime <- now
   case result of
@@ -2320,7 +2309,7 @@ handleGetConfig = \authorization respond -> do
 -- GET /stats: capacity gauges + minimal federation/timing snapshot. Most of
 -- the historical metric fields are zero-filled (see `zeroStats`) — only the
 -- counts that come straight from the state refs are populated.
-handleStats : Text -> ({capacity: {ackOverflow: Int, ackOverflowMax: Int, ackedIds: Int, ackedIdsMax: Int, activePolls: Int, activePollsMax: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, drainCompletedAt: Timestamp, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestAckAge: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, pendingAckCleanups: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, senderDeliveries: Int, senderExpirations: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, drainPhase: Int, draining: Bool, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text} -> a) -> IO {r *ackedIds, r *activePolls, r *blockedPeers, r *challenges, r *deliveredIds, r *drainPhase, r *forwards, r *heartbeatCount, r *lastHeartbeatAt, r *lastPrunedAt, r *messages, r *presence, r *pruneCount, r *runtimeMaintenanceSecret, r *sessions, r *startedAt, clock} a
+handleStats : Text -> ({capacity: {ackOverflow: Int, ackOverflowMax: Int, ackedIds: Int, ackedIdsMax: Int, activePolls: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, drainCompletedAt: Timestamp, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestAckAge: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, pendingAckCleanups: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, senderDeliveries: Int, senderExpirations: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, drainPhase: Int, draining: Bool, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text} -> a) -> IO {r *ackedIds, r *activePolls, r *blockedPeers, r *challenges, r *deliveredIds, r *drainPhase, r *forwards, r *heartbeatCount, r *lastHeartbeatAt, r *lastPrunedAt, r *messages, r *presence, r *pruneCount, r *runtimeMaintenanceSecret, r *sessions, r *startedAt, clock} a
 handleStats = \authorization respond -> withMaintAuth authorization (yield (respond zeroStats)) (do
   t <- now
   sa <- *startedAt
@@ -2365,7 +2354,6 @@ handleStats = \authorization respond -> withMaintAuth authorization (yield (resp
       forwardNoncesMax: 0,
       nonceEvictions: 0,
       activePolls: count aps,
-      activePollsMax: maxActivePolls,
       recipientCounts: 0,
       messageBucketMax: 0,
       messageBucketMin: 0
@@ -2440,7 +2428,7 @@ handleStats = \authorization respond -> withMaintAuth authorization (yield (resp
     }
   }))
 
-zeroStats : {capacity: {ackOverflow: Int, ackOverflowMax: Int, ackedIds: Int, ackedIdsMax: Int, activePolls: Int, activePollsMax: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, drainCompletedAt: Timestamp, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestAckAge: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, pendingAckCleanups: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, senderDeliveries: Int, senderExpirations: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, drainPhase: Int, draining: Bool, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text}
+zeroStats : {capacity: {ackOverflow: Int, ackOverflowMax: Int, ackedIds: Int, ackedIdsMax: Int, activePolls: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, drainCompletedAt: Timestamp, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestAckAge: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, pendingAckCleanups: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, senderDeliveries: Int, senderExpirations: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, drainPhase: Int, draining: Bool, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text}
 zeroStats = {
   ok: False {},
   version: serverBuildVersion,
@@ -2464,7 +2452,6 @@ zeroStats = {
     forwardNoncesMax: 0,
     nonceEvictions: 0,
     activePolls: 0,
-    activePollsMax: 0,
     recipientCounts: 0,
     messageBucketMax: 0,
     messageBucketMin: 0
