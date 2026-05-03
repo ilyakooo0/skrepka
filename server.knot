@@ -592,6 +592,7 @@ pct : Int -> Int -> Int
 pct = \cur maxN -> if maxN > 0 then cur * 100 / maxN else 0
 
 -- Common ack/delete tail: pull matching messages, drop them and their forwards.
+removeForKey : (forall r. {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, expiresAt: Timestamp, senderKey: Text | r} -> Bool) -> IO {rw *forwards, rw *messages} [Message]
 removeForKey = \pred -> do
   msgs <- *messages
   fwds <- *forwards
