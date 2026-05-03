@@ -11,162 +11,225 @@
 -- per-key/window rate limits, expiry/backoff/TTL durations, and protocol version.
 -- All values are plain literals; nothing is read from disk or env at runtime.
 
+-- Hostname this server binds to. Use 0.0.0.0 to accept connections on every interface.
 serverHost : Text
 serverHost = "localhost"
+-- TCP port for incoming HTTP connections.
 listenPort : Int
 listenPort = 8080
+-- URL scheme used when contacting peer federation servers.
 federationScheme : Text
 federationScheme = "https://"
-serverFederationPrivateKeyHex : Text
-serverFederationPrivateKeyHex = ""
-serverFederationPublicKeyHex : Text
-serverFederationPublicKeyHex = ""
+-- The Ed25519 federation keypair lives in `*federationPrivateKeyHex` /
+-- `*federationPublicKeyHex` refs and is generated on first startup; see `main`.
 
+-- Drop stored messages older than this (30 days).
 messageMaxAge : Int<Ms>
 messageMaxAge = 2592000000
+-- Upper bound on TTL a client may request for a presence entry (1 hour).
 maxPresenceTtl : Int<Ms>
 maxPresenceTtl = 3600000
+-- Max length (chars) of a hex-encoded pubkey accepted on the wire.
 maxPubkeyLen : Int
 maxPubkeyLen = 256
+-- Max length of a hex-encoded message body / opaque blob (64 KiB hex ≈ 32 KiB bytes).
 maxBlobLen : Int
 maxBlobLen = 65536
+-- Max length of a hex-encoded signature.
 maxSignatureLen : Int
 maxSignatureLen = 256
+-- Cap on the number of message IDs accepted in a single ack/lookup request.
 maxMessageIds : Int
 maxMessageIds = 100
+-- Cap on items in a batched send or batched cancel request.
 maxBatchSize : Int
 maxBatchSize = 100
+-- Highest priority value a message is allowed to declare.
 maxMessagePriority : Int
 maxMessagePriority = 10
+-- Cap on gossip events accepted or emitted in a single federation exchange.
 maxGossipEvents : Int
 maxGossipEvents = 100
+-- Cap on events returned by one long-poll response.
 maxPollEvents : Int
 maxPollEvents = 50
+-- Hard ceiling on presence entries kept in memory.
 maxPresenceEntries : Int
 maxPresenceEntries = 10000
+-- Per-recipient ceiling on stored undelivered messages before older ones are pruned.
 maxMessagesPerRecipient : Int
 maxMessagesPerRecipient = 500
+-- Total ceiling on stored messages across all recipients.
 maxMessages : Int
 maxMessages = 100000
+-- Allowance for clock drift when validating client timestamps (5 s).
 clockSkewTolerance : Int<Ms>
 clockSkewTolerance = 5000
+-- Ceiling on outstanding federation forward attempts retained for retry.
 maxForwardsEntries : Int
 maxForwardsEntries = 10000
+-- Per-peer ceiling on outstanding forward attempts.
 maxForwardsPerServer : Int
 maxForwardsPerServer = 2000
+-- Max accepted length of a server hostname.
 maxServerNameLen : Int
 maxServerNameLen = 128
+-- Max accepted length of a hex-encoded message ID.
 maxMessageIdLen : Int
 maxMessageIdLen = 128
+-- Max accepted length of an auth/session token.
 maxTokenLen : Int
 maxTokenLen = 256
+-- Ceiling on outstanding auth challenges held in memory.
 maxChallenges : Int
 maxChallenges = 10000
+-- Ceiling on concurrent active sessions.
 maxSessions : Int
 maxSessions = 10000
+-- Ceiling on remembered acked message IDs (used for replay protection).
 maxAckedIds : Int
 maxAckedIds = 10000
+-- Ceiling on remembered delivered message IDs.
 maxDeliveredIds : Int
 maxDeliveredIds = 10000
+-- Per-pubkey ceiling on outstanding challenges (prevents one key from exhausting the pool).
 maxChallengesPerKey : Int
 maxChallengesPerKey = 5
+-- Per-pubkey ceiling on concurrent sessions.
 maxSessionsPerKey : Int
 maxSessionsPerKey = 10
+-- Validity window for an auth challenge before it must be re-issued (1 min).
 challengeExpiry : Int<Ms>
 challengeExpiry = 60000
+-- Challenge requests permitted per key inside its rate window.
 maxChallengeRatePerKey : Int
 maxChallengeRatePerKey = 5
+-- Window over which the per-key challenge rate is measured (1 s).
 challengeRateWindowMs : Int<Ms>
 challengeRateWindowMs = 1000
+-- Send-message requests permitted per key per window.
 maxSendRatePerKey : Int
 maxSendRatePerKey = 20
+-- Window for the per-key send rate limit (1 s).
 sendRateWindowMs : Int<Ms>
 sendRateWindowMs = 1000
+-- Receive/poll requests permitted per key per window.
 maxRecvRatePerKey : Int
 maxRecvRatePerKey = 10
+-- Window for the per-key receive rate limit (1 s).
 recvRateWindowMs : Int<Ms>
 recvRateWindowMs = 1000
+-- Messages permitted per (sender, recipient) pair within the pair window.
 maxPairRatePerPair : Int
 maxPairRatePerPair = 30
+-- Window for the per-pair rate limit (1 min).
 pairRateWindowMs : Int<Ms>
 pairRateWindowMs = 60000
+-- Federation requests permitted from a single peer server per window.
 maxFederationRatePerServer : Int
 maxFederationRatePerServer = 50
+-- Window for the per-peer federation rate limit (1 s).
 federationRateWindowMs : Int<Ms>
 federationRateWindowMs = 1000
+-- Presence/key lookups permitted per key per window.
 maxLookupRatePerKey : Int
 maxLookupRatePerKey = 5
+-- Window for the per-key lookup rate limit (1 s).
 lookupRateWindowMs : Int<Ms>
 lookupRateWindowMs = 1000
+-- Other client write requests permitted per key per window.
 maxClientWriteRatePerKey : Int
 maxClientWriteRatePerKey = 10
+-- Window for the per-key client-write rate limit (1 s).
 clientWriteRateWindowMs : Int<Ms>
 clientWriteRateWindowMs = 1000
+-- Requests permitted per source IP per window (covers unauthenticated traffic).
 maxIpRatePerIp : Int
 maxIpRatePerIp = 10
+-- Window for the per-IP rate limit (1 s).
 ipRateWindowMs : Int<Ms>
 ipRateWindowMs = 1000
+-- Global ceiling on total request rate across all clients.
 maxGlobalRequestRate : Int
 maxGlobalRequestRate = 1000
+-- Window for the global request rate limit (1 s).
 globalRateWindowMs : Int<Ms>
 globalRateWindowMs = 1000
+-- Global ceiling on auth-endpoint requests (challenge + verify combined).
 maxAuthGlobalRate : Int
 maxAuthGlobalRate = 200
+-- Window for the global auth rate limit (1 s).
 authGlobalRateWindowMs : Int<Ms>
 authGlobalRateWindowMs = 1000
 
+-- How long a session token remains valid after issue (1 hour).
 sessionExpiry : Int<Ms>
 sessionExpiry = 3600000
+-- How long an "online" presence gossip is considered fresh (90 min).
 onlineGossipTtl : Int<Ms>
 onlineGossipTtl = 5400000
+-- Floor on TTL accepted for "offline" presence gossip (1 min).
 offlineGossipMinTtl : Int<Ms>
 offlineGossipMinTtl = 60000
+-- Times to retry a federation forward before giving up.
 maxForwardRetries : Int
 maxForwardRetries = 10
+-- Hop-count ceiling for gossip propagation between peers.
 maxGossipHops : Int
 maxGossipHops = 5
+-- Initial hop budget assigned to gossip events that originate on this server.
 gossipOriginHops : Int
 gossipOriginHops = 2
 
+-- Base delay for federation retry backoff (linear, not exponential — 30 s).
 retryBackoffBase : Int<Ms>
 retryBackoffBase = 30000
+-- Cap on federation retry backoff (8 min).
 retryBackoffMax : Int<Ms>
 retryBackoffMax = 480000
 
-verificationTokenExpiry : Int<Ms>
-verificationTokenExpiry = 30000
-maxPendingVerifications : Int
-maxPendingVerifications = 10000
-
+-- Cadence of the background prune/cleanup task (30 s).
 backgroundPruneInterval : Int<Ms>
 backgroundPruneInterval = 30000
+-- Long-poll hold timeout before returning empty to the client (25 s).
 pollTimeoutMs : Int<Ms>
 pollTimeoutMs = 25000
+-- Concurrent active long-polls permitted per pubkey.
 maxPollsPerKey : Int
 maxPollsPerKey = 3
+-- Global ceiling on active long-polls.
 maxActivePolls : Int
 maxActivePolls = 5000
+-- Max number of pubkeys a single poll may subscribe to.
 maxWatchKeys : Int
 maxWatchKeys = 50
+-- Cadence at which this server refreshes its own presence to peers (5 min).
 presenceRefreshInterval : Int<Ms>
 presenceRefreshInterval = 300000
 
+-- Drop unacked messages older than this (7 days).
 unackedMessageMaxAge : Int<Ms>
 unackedMessageMaxAge = 604800000
+-- Floor on the TTL a client may request when sending a message (1 min).
 minMessageTtl : Int<Ms>
 minMessageTtl = 60000
+-- Window during which a delivered-but-unacked message is retained for re-delivery (2 min).
 ackGracePeriod : Int<Ms>
 ackGracePeriod = 120000
 
+-- Wire protocol version used for federation calls; bumped on incompatible changes.
 federationProtocolVersion : Int
 federationProtocolVersion = 15
+-- Human-readable build identifier returned by the /health endpoint.
 serverBuildVersion : Text
 serverBuildVersion = "2026-04-27-simple"
 
+-- Master switch for federation; when False the server runs in single-node mode.
 federationEnabled : Bool
 federationEnabled = True {}
 federationUrl : Text -> Text
 federationUrl = \server -> federationScheme ++ server
+-- When True, reject requests that arrive without a client-IP header (for IP-based rate limits).
 requireClientIp : Bool
 requireClientIp = True {}
 
@@ -376,14 +439,15 @@ type BatchCancelResult = {messageId: MessageIdHex, cancelled: Bool}
 *drainPhase : Int
 *drainCompletedAt : Timestamp
 
-*pendingVerifications : [{token: Text, createdAt: Timestamp, scope: Text}]
-
 *senderExpirations : [SenderExpiration]
 *senderDeliveries : [SenderDelivery]
 *cancelNotifications : [CancelNotification]
 *pendingFederationCancels : [PendingFederationCancel]
 
 *runtimeMaintenanceSecret : Text
+
+*federationPrivateKeyHex : Text
+*federationPublicKeyHex : Text
 
 *blockedPeers : [Text]
 *allowedPeers : [Text]
@@ -398,7 +462,6 @@ type BatchCancelResult = {messageId: MessageIdHex, cancelled: Bool}
 --   AuthApi          -- challenge/verify/revoke/logout (client identity)
 --   ClientApi        -- /poll, send/batch/list/ack/delete/cancel, presence lookup
 --   FederationApi    -- inter-server gossip, forward, ack, cancel, delivery receipts
---   FederationVerify -- callback used by peers to verify Bearer tokens this server issued
 --   FederationPubkey -- exposes this server's federation Ed25519 public key
 --   MaintenanceApi   -- operator endpoints (drain, prune, peer allow/block, admin)
 --   HealthApi/StatsApi/MetricsApi/ReadyApi -- observability
@@ -432,9 +495,6 @@ route FederationApi where
   POST {cancels: [{messageId: MessageIdHex, toKey: PubkeyHex}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /federation/cancel-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [BatchCancelResult], retryAfterMs: Int} = FederationBatchCancel
   POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: ServerName, messageId: MessageIdHex, expiresAt: Timestamp, priority: Int}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /federation/forward-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} = FederationBatchForward
   POST {messageIds: [MessageIdHex], toKeys: [PubkeyHex], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text, protocolVersion: Int} /federation/delivery-receipt headers {authorization: Text} -> {ok: Bool, error: Text, receivedCount: Int, retryAfterMs: Int} = FederationDeliveryReceipt
-
-route FederationVerifyApi where
-  POST {token: Text, scope: Text} /federation/verify headers {clientIp: Text} -> {ok: Bool} = VerifyToken
 
 route FederationPubkeyApi where
   GET /federation/pubkey -> {pubkey: Text, ok: Bool} = FederationPubkey
@@ -496,7 +556,7 @@ route MetricsApi where
 route ReadyApi where
   GET /ready -> {ready: Bool} = Ready
 
-route Api = AuthApi | ClientApi | FederationApi | FederationVerifyApi | FederationPubkeyApi | MaintenanceApi | HealthApi | StatsApi | MetricsApi | ReadyApi
+route Api = AuthApi | ClientApi | FederationApi | FederationPubkeyApi | MaintenanceApi | HealthApi | StatsApi | MetricsApi | ReadyApi
 
 -- ============================================
 -- Generic helpers
@@ -691,8 +751,8 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c
 -- Bearer token extraction, session lookup, maintenance secret check, and the
 -- `gateAuth`/`gateClientWrite`/`gateLookup` combinators that every client
 -- handler funnels through (drain → global rate → per-key rate → session).
--- Federation requests use a separate path (`withFederationAuth`) supporting
--- both Ed25519-signed and callback-Bearer auth.
+-- Federation requests use a separate path (`withFederationAuth`) using
+-- Ed25519-signed auth verified via the peer's published public key.
 
 -- Plain ip match (sessions with empty ip skip the check).
 matchIp : Text -> Text -> Bool
@@ -756,24 +816,17 @@ withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
       Just {value: s} -> onAuth s.pubkey
       _ -> onUnauth
 
-generateFederationAuth : Text -> a -> IO {reads *pendingVerifications, writes *pendingVerifications, clock, random} Text
+generateFederationAuth : Text -> a -> IO {reads *federationPrivateKeyHex, random} Text
 generateFederationAuth = \scope requestTimestamp -> do
-  let privKey = if serverFederationPrivateKeyHex == ""
-  then Nothing {}
-  else bytesFromHex serverFederationPrivateKeyHex
+  hex <- *federationPrivateKeyHex
+  let privKey = if hex == "" then Nothing {} else bytesFromHex hex
   case privKey of
     Just {value: pk} -> do
       nonce <- genTokenN 48
       yield ("Signed " ++ bytesToHex (sign pk (textToBytes (scope ++ "|" ++ show requestTimestamp ++ "|" ++ serverHostN ++ "|" ++ nonce))) ++ ":" ++ nonce)
-    _ -> do
-      token <- genToken
-      t <- now
-      atomic (do
-        cur <- *pendingVerifications
-        *pendingVerifications = capList (union cur [{token, createdAt: t, scope}]) maxPendingVerifications (\p -> p.createdAt))
-      yield ("Bearer " ++ token)
+    _ -> yield ""
 
--- Verify a federation request: signed (Ed25519 over scope|ts|fromServer|nonce) or callback Bearer token.
+-- Verify a federation request: Ed25519 signature over scope|ts|fromServer|nonce, key fetched from peer.
 verifyFederationAuth : Text -> Text -> Text -> a -> IO {network} {} Bool
 verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
   if hasPrefix "Signed " authorization then do
@@ -795,11 +848,7 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
             _ -> yield False {}
           _ -> yield False {}
         _ -> yield False {}
-  else case extractToken authorization of
-    Just {value: token} -> do
-      result <- fetch (federationUrl fromServer) (VerifyToken {token: token, scope: scope, clientIp: ""})
-      case result of Ok {value: r} -> yield r.ok; _ -> yield False {}
-    _ -> yield False {}
+  else yield False {}
 
 withFederationAuth = \authorization t respond fromServer scope requestTimestamp precondition action -> do
   blocked <- *blockedPeers
@@ -985,7 +1034,7 @@ mergePresence = \existing incoming -> fold (\acc e -> (\same -> if any acc (\x -
 -- block. Returns the locally-expired presence rows whose pubkey has no other
 -- live local session, so the caller can broadcast offline gossip for them.
 
-pruneExpired : Int<Ms> -> IO {reads *ackedIds, reads *activePolls, reads *cancelNotifications, reads *challenges, reads *deliveredIds, reads *forwardFailures, reads *forwards, reads *messages, reads *pendingFederationCancels, reads *pendingVerifications, reads *presence, reads *senderDeliveries, reads *senderExpirations, reads *sessions, writes *ackedIds, writes *activePolls, writes *cancelNotifications, writes *challenges, writes *deliveredIds, writes *forwardFailures, writes *forwards, writes *messages, writes *pendingFederationCancels, writes *pendingVerifications, writes *presence, writes *senderDeliveries, writes *senderExpirations, writes *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: AnyServerName, timestamp: Timestamp}]
+pruneExpired : Int<Ms> -> IO {reads *ackedIds, reads *activePolls, reads *cancelNotifications, reads *challenges, reads *deliveredIds, reads *forwardFailures, reads *forwards, reads *messages, reads *pendingFederationCancels, reads *presence, reads *senderDeliveries, reads *senderExpirations, reads *sessions, writes *ackedIds, writes *activePolls, writes *cancelNotifications, writes *challenges, writes *deliveredIds, writes *forwardFailures, writes *forwards, writes *messages, writes *pendingFederationCancels, writes *presence, writes *senderDeliveries, writes *senderExpirations, writes *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: AnyServerName, timestamp: Timestamp}]
 pruneExpired = \t -> atomic do
   ch <- *challenges
   *challenges = filter ch (\x -> x.expiresAt > t)
@@ -1003,8 +1052,6 @@ pruneExpired = \t -> atomic do
   *forwardFailures = filter ff (\f -> t - f.failedAt < 86400000)
   aps <- *activePolls
   *activePolls = filter aps (\p -> t - p.startedAt < pollTimeoutMs * 3)
-  pv <- *pendingVerifications
-  *pendingVerifications = filter pv (\p -> t - p.createdAt < verificationTokenExpiry)
   se <- *senderExpirations
   *senderExpirations = filter se (\x -> t - x.expiredAt < unackedMessageMaxAge)
   sd <- *senderDeliveries
@@ -1217,7 +1264,7 @@ forwardQueuedToServer = \pubkey server t -> atomic (do
 -- expire stale rows, then opportunistically retry pending forwards and refresh
 -- local presence so peers don't see us go offline mid-session.
 
-pruneAndRetry : Int<Ms> -> IO {reads *ackedIds, reads *activePolls, reads *cancelNotifications, reads *challenges, reads *deliveredIds, reads *forwardFailures, reads *forwards, reads *lastPrunedAt, reads *messages, reads *pendingFederationCancels, reads *pendingVerifications, reads *presence, reads *senderDeliveries, reads *senderExpirations, reads *sessions, writes *ackedIds, writes *activePolls, writes *cancelNotifications, writes *challenges, writes *deliveredIds, writes *forwardFailures, writes *forwards, writes *lastPrunedAt, writes *messages, writes *pendingFederationCancels, writes *pendingVerifications, writes *presence, writes *senderDeliveries, writes *senderExpirations, writes *sessions, reads *blockedPeers, reads *lastPresenceRefresh, writes *lastPresenceRefresh, clock} {}
+pruneAndRetry : Int<Ms> -> IO {reads *ackedIds, reads *activePolls, reads *cancelNotifications, reads *challenges, reads *deliveredIds, reads *federationPrivateKeyHex, reads *forwardFailures, reads *forwards, reads *lastPrunedAt, reads *messages, reads *pendingFederationCancels, reads *presence, reads *senderDeliveries, reads *senderExpirations, reads *sessions, writes *ackedIds, writes *activePolls, writes *cancelNotifications, writes *challenges, writes *deliveredIds, writes *forwardFailures, writes *forwards, writes *lastPrunedAt, writes *messages, writes *pendingFederationCancels, writes *presence, writes *senderDeliveries, writes *senderExpirations, writes *sessions, reads *blockedPeers, reads *lastPresenceRefresh, writes *lastPresenceRefresh, clock} {}
 pruneAndRetry = \t -> do
   *lastPrunedAt = t
   expiredLocal <- pruneExpired t
@@ -1920,35 +1967,17 @@ handleSendBatch = \messages authorization clientIp respond -> do
 -- Inbound endpoints called peer-to-peer. Every handler funnels through
 -- `withFederationAuth` which checks: peer block/allow lists, request
 -- precondition (e.g. expected origin/server constraints), clock skew vs the
--- request timestamp, signature/Bearer auth, and per-peer rate limit.
+-- request timestamp, Ed25519 signature auth, and per-peer rate limit.
 -- Receive paths never trust `originServer` for routing; they only use it for
 -- ack bookkeeping and SSRF-style filtering.
 
--- POST /federation/verify: callback endpoint a peer invokes to validate a
--- Bearer token we issued in `generateFederationAuth`. Single-use: a
--- successful match removes the token from `pendingVerifications`.
-handleVerifyToken : Text -> Text -> Text -> ({ok: Bool} -> a) -> IO {reads *globalRateCount, reads *globalRateWindowStart, reads *ipRates, reads *pendingVerifications, writes *globalRateCount, writes *globalRateWindowStart, writes *ipRates, clock, writes *pendingVerifications} a
-handleVerifyToken = \token scope clientIp respond -> do
-  t <- now
-  g <- checkGlobalRate t
-  ipLim <- checkIpRateGate clientIp t
-  if scope == "" || g || ipLim
-  then yield (respond {ok: False {}})
-  else do
-    found <- atomic (do
-      pending <- *pendingVerifications
-      let same = \p -> p.scope == scope && p.token == token
-      let match = any pending (\p -> same p && t - p.createdAt < verificationTokenExpiry)
-      when match (*pendingVerifications = removeWhere pending same)
-      yield match)
-    yield (respond {ok: found})
-
 -- GET /federation/pubkey: publish the Ed25519 public key peers should use to
 -- verify our `Signed ...` federation auth headers. Returns ok=False when the
--- server has no configured federation key (peers fall back to Bearer mode).
-handleFederationPubkey : ({pubkey: Text, ok: Bool} -> ret) -> IO {} ret
+-- keypair has not yet been generated (should not happen post-startup).
+handleFederationPubkey : ({pubkey: Text, ok: Bool} -> ret) -> IO {reads *federationPublicKeyHex} ret
 handleFederationPubkey = \respond -> do
-  yield (respond {pubkey: serverFederationPublicKeyHex, ok: serverFederationPublicKeyHex != ""})
+  hex <- *federationPublicKeyHex
+  yield (respond {pubkey: hex, ok: hex != ""})
 
 -- POST /federation/gossip: ingest peer presence events. Filters out events
 -- whose origin is local (loops) or whose timestamp is in the future beyond
@@ -2205,7 +2234,7 @@ handleShutdown = \authorization respond -> handleDrain 2 authorization (\r -> re
 -- POST /maintenance/prune: trigger an out-of-band `pruneAndRetry` tick.
 -- Useful when the operator wants to force expiry/forward retries without
 -- waiting for the next `backgroundPrune` interval.
-handlePrune : Text -> ({ok: Bool} -> a) -> IO {reads *runtimeMaintenanceSecret, clock, reads *ackedIds, reads *activePolls, reads *blockedPeers, reads *cancelNotifications, reads *challenges, reads *deliveredIds, reads *forwardFailures, reads *forwards, reads *lastPresenceRefresh, reads *lastPrunedAt, reads *messages, reads *pendingFederationCancels, reads *pendingVerifications, reads *presence, reads *senderDeliveries, reads *senderExpirations, reads *sessions, writes *ackedIds, writes *activePolls, writes *cancelNotifications, writes *challenges, writes *deliveredIds, writes *forwardFailures, writes *forwards, writes *lastPresenceRefresh, writes *lastPrunedAt, writes *messages, writes *pendingFederationCancels, writes *pendingVerifications, writes *presence, writes *senderDeliveries, writes *senderExpirations, writes *sessions} a
+handlePrune : Text -> ({ok: Bool} -> a) -> IO {reads *runtimeMaintenanceSecret, clock, reads *ackedIds, reads *activePolls, reads *blockedPeers, reads *cancelNotifications, reads *challenges, reads *deliveredIds, reads *federationPrivateKeyHex, reads *forwardFailures, reads *forwards, reads *lastPresenceRefresh, reads *lastPrunedAt, reads *messages, reads *pendingFederationCancels, reads *presence, reads *senderDeliveries, reads *senderExpirations, reads *sessions, writes *ackedIds, writes *activePolls, writes *cancelNotifications, writes *challenges, writes *deliveredIds, writes *forwardFailures, writes *forwards, writes *lastPresenceRefresh, writes *lastPrunedAt, writes *messages, writes *pendingFederationCancels, writes *presence, writes *senderDeliveries, writes *senderExpirations, writes *sessions} a
 handlePrune = \authorization respond -> do
   t <- now
   authorized <- verifyMaintenanceAuth authorization
@@ -2325,7 +2354,7 @@ handleListAllowed = \authorization respond -> do
 -- POST /maintenance/ping: send a zero-event gossip to a peer and return the
 -- round-trip latency. Useful for diagnosing federation reachability without
 -- waiting for organic traffic.
-handlePingPeer : Text -> Text -> ({error: Text, latencyMs: Int, ok: Bool} -> a) -> IO {reads *pendingVerifications, reads *runtimeMaintenanceSecret, writes *pendingVerifications, network, clock, random} a
+handlePingPeer : Text -> Text -> ({error: Text, latencyMs: Int, ok: Bool} -> a) -> IO {reads *federationPrivateKeyHex, reads *runtimeMaintenanceSecret, network, clock, random} a
 handlePingPeer = \server authorization respond -> withMaintAuth authorization (yield (respond {
   ok: False {},
   latencyMs: 0,
@@ -2874,7 +2903,7 @@ handleMetrics = \authorization respond -> do
 -- to the corresponding `handleXxx` function. Adding a new route means adding
 -- a `route ... = NewReq` line, a `handleNewReq` definition, and a clause here.
 
-serve : <AckMessages {authorization: Text, clientIp: Text, messageIds: [MessageIdHex], respond: {ackedCount: Int, authorized: Bool, error: Text, ok: Bool} -> Response} | AdminListAllSessions {authorization: Text, limit: Int, respond: {ok: Bool, sessions: [{count: Int, ips: [Text], latestExpiry: Timestamp, pubkey: PubkeyHex}], total: Int} -> Response} | AdminListSessions {authorization: Text, pubkey: PubkeyHex, respond: {count: Int, ok: Bool, sessions: [{createdAt: Timestamp, expiresAt: Timestamp, ip: Text, token: Text}]} -> Response} | AdminPurgeMessages {authorization: Text, pubkey: PubkeyHex, respond: {ok: Bool, purgedCount: Int} -> Response} | AdminRevokeIp {authorization: Text, ip: Text, respond: {affectedKeys: Int, ok: Bool, revokedCount: Int} -> Response} | AdminRevokeSessions {authorization: Text, pubkey: PubkeyHex, respond: {ok: Bool, revokedCount: Int} -> Response} | AllowPeer {authorization: Text, respond: {allowed: Int, ok: Bool} -> Response, server: ServerName} | BatchLookupPresence {authorization: Text, clientIp: Text, pubkeys: [PubkeyHex], respond: {authorized: Bool, error: Text, results: [{pubkey: PubkeyHex, server: AnyServerName}]} -> Response} | BlockPeer {authorization: Text, respond: {blocked: Int, ok: Bool} -> Response, server: ServerName} | CancelBatch {authorization: Text, cancels: [BatchCancelEntry], clientIp: Text, respond: {authorized: Bool, error: Text, results: [BatchCancelResult]} -> Response} | CancelMessage {authorization: Text, clientIp: Text, messageId: MessageIdHex, respond: {authorized: Bool, cancelled: Bool, error: Text, ok: Bool} -> Response, to: PubkeyHex} | DeleteMessages {authorization: Text, clientIp: Text, messageIds: [MessageIdHex], respond: {authorized: Bool, deletedCount: Int, error: Text, ok: Bool} -> Response} | Drain {authorization: Text, phase: Int, respond: {drained: Int, ok: Bool, phase: Int} -> Response} | FederationAck {authorization: Text, correlationId: Text, fromServer: ServerName, messageIds: [MessageIdHex], originServer: ServerName, protocolVersion: Int, requestTimestamp: Timestamp, respond: {ackedCount: Int, error: Text, ok: Bool, results: [{found: Bool, messageId: MessageIdHex}], retryAfterMs: Int} -> Response} | FederationBatchCancel {authorization: Text, cancels: [{messageId: MessageIdHex, toKey: PubkeyHex}], correlationId: Text, fromServer: ServerName, protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, results: [BatchCancelResult], retryAfterMs: Int} -> Response} | FederationBatchForward {authorization: Text, correlationId: Text, forwards: [{encryptedBlob: BlobHex, expiresAt: Timestamp, messageId: MessageIdHex, originServer: ServerName, priority: Int, timestamp: Timestamp, toKey: PubkeyHex}], fromServer: ServerName, protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} -> Response} | FederationCancel {authorization: Text, correlationId: Text, fromServer: ServerName, messageId: MessageIdHex, protocolVersion: Int, requestTimestamp: Timestamp, respond: {cancelled: Bool, error: Text, ok: Bool, retryAfterMs: Int} -> Response, toKey: PubkeyHex} | FederationDeliveryReceipt {authorization: Text, correlationId: Text, fromServer: ServerName, messageIds: [MessageIdHex], protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, receivedCount: Int, retryAfterMs: Int} -> Response, toKeys: [PubkeyHex]} | FederationPubkey {respond: {ok: Bool, pubkey: Text} -> Response} | FlushNonces {authorization: Text, respond: {flushedCount: Int, ok: Bool} -> Response} | ForwardMessage {authorization: Text, correlationId: Text, encryptedBlob: BlobHex, expiresAt: Timestamp, fromServer: ServerName, messageId: MessageIdHex, originServer: ServerName, priority: Int, protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, retryAfterMs: Int} -> Response, timestamp: Timestamp, toKey: PubkeyHex} | GetConfig {authorization: Text, respond: {ackGracePeriod: Int, maxGossipHops: Int, maxMessagesPerRecipient: Int, ok: Bool, pollTimeoutMs: Int} -> Response} | GetRateLimits {authorization: Text, respond: {authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, sendRate: Int} -> Response} | Health {authorization: Text, respond: {capacityHealthy: Bool, capacityWarning: Bool, degradedPeers: Int, draining: Bool, federationHealthy: Bool, forwardQueueHealthy: Bool, heartbeatHealthy: Bool, nonceHealthy: Bool, ok: Bool, pruneHealthy: Bool, requestPressureHealthy: Bool, version: Text, watchdogHealthy: Bool} -> Response} | ListAllowed {authorization: Text, respond: {ok: Bool, peers: [Text]} -> Response} | ListBlocked {authorization: Text, respond: {ok: Bool, peers: [Text]} -> Response} | ListMessages {authorization: Text, clientIp: Text, offset: Int, respond: {authorized: Bool, count: Int, error: Text, messages: [{messageId: MessageIdHex, receivedAt: Timestamp, timestamp: Timestamp}]} -> Response} | Logout {authorization: Text, clientIp: Text, respond: {authorized: Bool, ok: Bool} -> Response} | LookupPresence {authorization: Text, clientIp: Text, pubkey: PubkeyHex, respond: {authorized: Bool, error: Text, server: AnyServerName} -> Response} | MessageStatus {authorization: Text, clientIp: Text, messageId: MessageIdHex, respond: {authorized: Bool, status: Text} -> Response, to: PubkeyHex} | Metrics {authorization: Text, respond: {metrics: Text, ok: Bool} -> Response} | PingPeer {authorization: Text, respond: {error: Text, latencyMs: Int, ok: Bool} -> Response, server: ServerName} | Poll {authorization: Text, clientIp: Text, cursor: Timestamp, generation: Int, respond: {authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, draining: Bool, droppedDeliveryReceipts: Int, droppedExpirationNotifs: Int, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, messageCancellations: [{cancelledAt: Timestamp, messageId: MessageIdHex}], messageDeliveries: [{deliveredAt: Timestamp, messageId: MessageIdHex, toKey: PubkeyHex}], messageExpirations: [{expiredAt: Timestamp, messageId: MessageIdHex, toKey: PubkeyHex}], presenceUpdates: [{online: Bool, pubkey: PubkeyHex}], rateLimited: Bool, retryAfterMs: Int} -> Response, watchKeys: [PubkeyHex]} | Prune {authorization: Text, respond: {ok: Bool} -> Response} | Ready {respond: {ready: Bool} -> Response} | Reconcile {authorization: Text, respond: {messageDrift: Int, ok: Bool, presenceDrift: Int, sessionDrift: Int} -> Response} | RecvGossip {authorization: Text, correlationId: Text, events: [GossipEvent], fromServer: ServerName, hopsRemaining: Int, protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, retryAfterMs: Int} -> Response} | ReqChallenge {clientIp: Text, pubkey: PubkeyHex, respond: {challenge: Text, error: Text, expiresAt: Timestamp, ok: Bool, retryAfterMs: Int} -> Response} | RevokeSession {authorization: Text, clientIp: Text, respond: {authorized: Bool, ok: Bool} -> Response, targetToken: Text} | RotateSecret {authorization: Text, newSecret: Text, respond: {error: Text, ok: Bool} -> Response} | SendBatch {authorization: Text, clientIp: Text, messages: [BatchMessage], respond: {authorized: Bool, results: [BatchResult], retryAfterMs: Int} -> Response} | SendMessage {authorization: Text, clientIp: Text, encryptedBlob: BlobHex, expiresInMs: Int, messageId: OptionalMessageId, priority: Int, respond: {error: Text, loadPct: Int, messageId: OptionalMessageId, retryAfterMs: Int, status: MessageStatus} -> Response, timestamp: Timestamp, to: PubkeyHex} | SetRateLimits {authGlobal: Int, authorization: Text, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, pairRate: Int, recvRate: Int, respond: {ok: Bool} -> Response, sendRate: Int} | Shutdown {authorization: Text, respond: {drained: Int, ok: Bool} -> Response} | Stats {authorization: Text, respond: {capacity: {ackOverflow: Int, ackOverflowMax: Int, ackedIds: Int, ackedIdsMax: Int, activePolls: Int, activePollsMax: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, messagesMax: Int, messagesPct: Int, nonceEvictions: Int, presence: Int, presenceMax: Int, presencePct: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, drainCompletedAt: Timestamp, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestAckAge: Int, oldestForwardAge: Int, pendingCancels: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, clientCancels: Int, federation: Int, federationCancels: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, pendingAckCleanups: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, senderDeliveries: Int, senderExpirations: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, drainPhase: Int, draining: Bool, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text} -> Response} | StatsForwards {authorization: Text, respond: {ok: Bool, servers: [{count: Int, oldestAge: Int, server: Text, totalRetries: Int}], total: Int} -> Response} | StatsKey {authorization: Text, pubkey: PubkeyHex, respond: {activePolls: Int, forwardDetails: [{createdAt: Timestamp, retries: Int, server: Text}], forwards: Int, messages: Int, ok: Bool, presence: [KeyPresenceEntry], sessions: Int} -> Response} | StatsPeers {authorization: Text, respond: {ok: Bool, peers: [PeerStatus]} -> Response} | StatsRates {authorization: Text, respond: {authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, scalePct: Int, sendRate: Int} -> Response} | TopRecipients {authorization: Text, limit: Int, respond: {ok: Bool, recipients: [RecipientCount], total: Int} -> Response} | UnallowPeer {authorization: Text, respond: {ok: Bool, removed: Bool} -> Response, server: ServerName} | UnblockPeer {authorization: Text, respond: {ok: Bool, unblocked: Bool} -> Response, server: ServerName} | Undrain {authorization: Text, respond: {ok: Bool} -> Response} | VerifyAuth {challenge: Text, clientIp: Text, pubkey: PubkeyHex, respond: {error: Text, expiresAt: Timestamp, token: Text} -> Response, revokeOthers: Bool, signature: SignatureHex} | VerifyToken {clientIp: Text, respond: {ok: Bool} -> Response, scope: Text, token: Text}> -> IO {reads *ackedIds, reads *activePolls, reads *allowedPeers, reads *authGlobalRateCount, reads *authGlobalRateWindowStart, reads *blockedPeers, reads *cancelNotifications, reads *challengeRates, reads *challenges, reads *deliveredIds, reads *drainCompletedAt, reads *drainPhase, reads *federationRates, reads *forwardFailures, reads *forwards, reads *globalRateCount, reads *globalRateWindowStart, reads *heartbeatCount, reads *ipRates, reads *lastHeartbeatAt, reads *lastPresenceRefresh, reads *lastPrunedAt, reads *messages, reads *pendingFederationCancels, reads *pendingVerifications, reads *pollWakeup, reads *presence, reads *pruneCount, reads *recvRates, reads *runtimeMaintenanceSecret, reads *senderDeliveries, reads *senderExpirations, reads *seqCounter, reads *serverGeneration, reads *sessions, reads *startedAt, writes *ackedIds, writes *activePolls, writes *allowedPeers, writes *authGlobalRateCount, writes *authGlobalRateWindowStart, writes *blockedPeers, writes *cancelNotifications, writes *challengeRates, writes *challenges, writes *deliveredIds, writes *drainCompletedAt, writes *drainPhase, writes *federationRates, writes *forwardFailures, writes *forwards, writes *globalRateCount, writes *globalRateWindowStart, writes *ipRates, writes *lastPresenceRefresh, writes *lastPrunedAt, writes *messages, writes *pendingFederationCancels, writes *pendingVerifications, writes *pollWakeup, writes *presence, writes *recvRates, writes *runtimeMaintenanceSecret, writes *senderDeliveries, writes *senderExpirations, writes *seqCounter, writes *sessions, network, clock, random} Response
+serve : <AckMessages {authorization: Text, clientIp: Text, messageIds: [MessageIdHex], respond: {ackedCount: Int, authorized: Bool, error: Text, ok: Bool} -> Response} | AdminListAllSessions {authorization: Text, limit: Int, respond: {ok: Bool, sessions: [{count: Int, ips: [Text], latestExpiry: Timestamp, pubkey: PubkeyHex}], total: Int} -> Response} | AdminListSessions {authorization: Text, pubkey: PubkeyHex, respond: {count: Int, ok: Bool, sessions: [{createdAt: Timestamp, expiresAt: Timestamp, ip: Text, token: Text}]} -> Response} | AdminPurgeMessages {authorization: Text, pubkey: PubkeyHex, respond: {ok: Bool, purgedCount: Int} -> Response} | AdminRevokeIp {authorization: Text, ip: Text, respond: {affectedKeys: Int, ok: Bool, revokedCount: Int} -> Response} | AdminRevokeSessions {authorization: Text, pubkey: PubkeyHex, respond: {ok: Bool, revokedCount: Int} -> Response} | AllowPeer {authorization: Text, respond: {allowed: Int, ok: Bool} -> Response, server: ServerName} | BatchLookupPresence {authorization: Text, clientIp: Text, pubkeys: [PubkeyHex], respond: {authorized: Bool, error: Text, results: [{pubkey: PubkeyHex, server: AnyServerName}]} -> Response} | BlockPeer {authorization: Text, respond: {blocked: Int, ok: Bool} -> Response, server: ServerName} | CancelBatch {authorization: Text, cancels: [BatchCancelEntry], clientIp: Text, respond: {authorized: Bool, error: Text, results: [BatchCancelResult]} -> Response} | CancelMessage {authorization: Text, clientIp: Text, messageId: MessageIdHex, respond: {authorized: Bool, cancelled: Bool, error: Text, ok: Bool} -> Response, to: PubkeyHex} | DeleteMessages {authorization: Text, clientIp: Text, messageIds: [MessageIdHex], respond: {authorized: Bool, deletedCount: Int, error: Text, ok: Bool} -> Response} | Drain {authorization: Text, phase: Int, respond: {drained: Int, ok: Bool, phase: Int} -> Response} | FederationAck {authorization: Text, correlationId: Text, fromServer: ServerName, messageIds: [MessageIdHex], originServer: ServerName, protocolVersion: Int, requestTimestamp: Timestamp, respond: {ackedCount: Int, error: Text, ok: Bool, results: [{found: Bool, messageId: MessageIdHex}], retryAfterMs: Int} -> Response} | FederationBatchCancel {authorization: Text, cancels: [{messageId: MessageIdHex, toKey: PubkeyHex}], correlationId: Text, fromServer: ServerName, protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, results: [BatchCancelResult], retryAfterMs: Int} -> Response} | FederationBatchForward {authorization: Text, correlationId: Text, forwards: [{encryptedBlob: BlobHex, expiresAt: Timestamp, messageId: MessageIdHex, originServer: ServerName, priority: Int, timestamp: Timestamp, toKey: PubkeyHex}], fromServer: ServerName, protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} -> Response} | FederationCancel {authorization: Text, correlationId: Text, fromServer: ServerName, messageId: MessageIdHex, protocolVersion: Int, requestTimestamp: Timestamp, respond: {cancelled: Bool, error: Text, ok: Bool, retryAfterMs: Int} -> Response, toKey: PubkeyHex} | FederationDeliveryReceipt {authorization: Text, correlationId: Text, fromServer: ServerName, messageIds: [MessageIdHex], protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, receivedCount: Int, retryAfterMs: Int} -> Response, toKeys: [PubkeyHex]} | FederationPubkey {respond: {ok: Bool, pubkey: Text} -> Response} | FlushNonces {authorization: Text, respond: {flushedCount: Int, ok: Bool} -> Response} | ForwardMessage {authorization: Text, correlationId: Text, encryptedBlob: BlobHex, expiresAt: Timestamp, fromServer: ServerName, messageId: MessageIdHex, originServer: ServerName, priority: Int, protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, retryAfterMs: Int} -> Response, timestamp: Timestamp, toKey: PubkeyHex} | GetConfig {authorization: Text, respond: {ackGracePeriod: Int, maxGossipHops: Int, maxMessagesPerRecipient: Int, ok: Bool, pollTimeoutMs: Int} -> Response} | GetRateLimits {authorization: Text, respond: {authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, sendRate: Int} -> Response} | Health {authorization: Text, respond: {capacityHealthy: Bool, capacityWarning: Bool, degradedPeers: Int, draining: Bool, federationHealthy: Bool, forwardQueueHealthy: Bool, heartbeatHealthy: Bool, nonceHealthy: Bool, ok: Bool, pruneHealthy: Bool, requestPressureHealthy: Bool, version: Text, watchdogHealthy: Bool} -> Response} | ListAllowed {authorization: Text, respond: {ok: Bool, peers: [Text]} -> Response} | ListBlocked {authorization: Text, respond: {ok: Bool, peers: [Text]} -> Response} | ListMessages {authorization: Text, clientIp: Text, offset: Int, respond: {authorized: Bool, count: Int, error: Text, messages: [{messageId: MessageIdHex, receivedAt: Timestamp, timestamp: Timestamp}]} -> Response} | Logout {authorization: Text, clientIp: Text, respond: {authorized: Bool, ok: Bool} -> Response} | LookupPresence {authorization: Text, clientIp: Text, pubkey: PubkeyHex, respond: {authorized: Bool, error: Text, server: AnyServerName} -> Response} | MessageStatus {authorization: Text, clientIp: Text, messageId: MessageIdHex, respond: {authorized: Bool, status: Text} -> Response, to: PubkeyHex} | Metrics {authorization: Text, respond: {metrics: Text, ok: Bool} -> Response} | PingPeer {authorization: Text, respond: {error: Text, latencyMs: Int, ok: Bool} -> Response, server: ServerName} | Poll {authorization: Text, clientIp: Text, cursor: Timestamp, generation: Int, respond: {authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, draining: Bool, droppedDeliveryReceipts: Int, droppedExpirationNotifs: Int, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, messageCancellations: [{cancelledAt: Timestamp, messageId: MessageIdHex}], messageDeliveries: [{deliveredAt: Timestamp, messageId: MessageIdHex, toKey: PubkeyHex}], messageExpirations: [{expiredAt: Timestamp, messageId: MessageIdHex, toKey: PubkeyHex}], presenceUpdates: [{online: Bool, pubkey: PubkeyHex}], rateLimited: Bool, retryAfterMs: Int} -> Response, watchKeys: [PubkeyHex]} | Prune {authorization: Text, respond: {ok: Bool} -> Response} | Ready {respond: {ready: Bool} -> Response} | Reconcile {authorization: Text, respond: {messageDrift: Int, ok: Bool, presenceDrift: Int, sessionDrift: Int} -> Response} | RecvGossip {authorization: Text, correlationId: Text, events: [GossipEvent], fromServer: ServerName, hopsRemaining: Int, protocolVersion: Int, requestTimestamp: Timestamp, respond: {error: Text, ok: Bool, retryAfterMs: Int} -> Response} | ReqChallenge {clientIp: Text, pubkey: PubkeyHex, respond: {challenge: Text, error: Text, expiresAt: Timestamp, ok: Bool, retryAfterMs: Int} -> Response} | RevokeSession {authorization: Text, clientIp: Text, respond: {authorized: Bool, ok: Bool} -> Response, targetToken: Text} | RotateSecret {authorization: Text, newSecret: Text, respond: {error: Text, ok: Bool} -> Response} | SendBatch {authorization: Text, clientIp: Text, messages: [BatchMessage], respond: {authorized: Bool, results: [BatchResult], retryAfterMs: Int} -> Response} | SendMessage {authorization: Text, clientIp: Text, encryptedBlob: BlobHex, expiresInMs: Int, messageId: OptionalMessageId, priority: Int, respond: {error: Text, loadPct: Int, messageId: OptionalMessageId, retryAfterMs: Int, status: MessageStatus} -> Response, timestamp: Timestamp, to: PubkeyHex} | SetRateLimits {authGlobal: Int, authorization: Text, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, pairRate: Int, recvRate: Int, respond: {ok: Bool} -> Response, sendRate: Int} | Shutdown {authorization: Text, respond: {drained: Int, ok: Bool} -> Response} | Stats {authorization: Text, respond: {capacity: {ackOverflow: Int, ackOverflowMax: Int, ackedIds: Int, ackedIdsMax: Int, activePolls: Int, activePollsMax: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, forwardsMax: Int, forwardsPct: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, messagesMax: Int, messagesPct: Int, nonceEvictions: Int, presence: Int, presenceMax: Int, presencePct: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, drainCompletedAt: Timestamp, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestAckAge: Int, oldestForwardAge: Int, pendingCancels: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, clientCancels: Int, federation: Int, federationCancels: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, pendingAckCleanups: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, senderDeliveries: Int, senderExpirations: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, drainPhase: Int, draining: Bool, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text} -> Response} | StatsForwards {authorization: Text, respond: {ok: Bool, servers: [{count: Int, oldestAge: Int, server: Text, totalRetries: Int}], total: Int} -> Response} | StatsKey {authorization: Text, pubkey: PubkeyHex, respond: {activePolls: Int, forwardDetails: [{createdAt: Timestamp, retries: Int, server: Text}], forwards: Int, messages: Int, ok: Bool, presence: [KeyPresenceEntry], sessions: Int} -> Response} | StatsPeers {authorization: Text, respond: {ok: Bool, peers: [PeerStatus]} -> Response} | StatsRates {authorization: Text, respond: {authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, scalePct: Int, sendRate: Int} -> Response} | TopRecipients {authorization: Text, limit: Int, respond: {ok: Bool, recipients: [RecipientCount], total: Int} -> Response} | UnallowPeer {authorization: Text, respond: {ok: Bool, removed: Bool} -> Response, server: ServerName} | UnblockPeer {authorization: Text, respond: {ok: Bool, unblocked: Bool} -> Response, server: ServerName} | Undrain {authorization: Text, respond: {ok: Bool} -> Response} | VerifyAuth {challenge: Text, clientIp: Text, pubkey: PubkeyHex, respond: {error: Text, expiresAt: Timestamp, token: Text} -> Response, revokeOthers: Bool, signature: SignatureHex}> -> IO {reads *ackedIds, reads *activePolls, reads *allowedPeers, reads *authGlobalRateCount, reads *authGlobalRateWindowStart, reads *blockedPeers, reads *cancelNotifications, reads *challengeRates, reads *challenges, reads *deliveredIds, reads *drainCompletedAt, reads *drainPhase, reads *federationPrivateKeyHex, reads *federationPublicKeyHex, reads *federationRates, reads *forwardFailures, reads *forwards, reads *globalRateCount, reads *globalRateWindowStart, reads *heartbeatCount, reads *ipRates, reads *lastHeartbeatAt, reads *lastPresenceRefresh, reads *lastPrunedAt, reads *messages, reads *pendingFederationCancels, reads *pollWakeup, reads *presence, reads *pruneCount, reads *recvRates, reads *runtimeMaintenanceSecret, reads *senderDeliveries, reads *senderExpirations, reads *seqCounter, reads *serverGeneration, reads *sessions, reads *startedAt, writes *ackedIds, writes *activePolls, writes *allowedPeers, writes *authGlobalRateCount, writes *authGlobalRateWindowStart, writes *blockedPeers, writes *cancelNotifications, writes *challengeRates, writes *challenges, writes *deliveredIds, writes *drainCompletedAt, writes *drainPhase, writes *federationRates, writes *forwardFailures, writes *forwards, writes *globalRateCount, writes *globalRateWindowStart, writes *ipRates, writes *lastPresenceRefresh, writes *lastPrunedAt, writes *messages, writes *pendingFederationCancels, writes *pollWakeup, writes *presence, writes *recvRates, writes *runtimeMaintenanceSecret, writes *senderDeliveries, writes *senderExpirations, writes *seqCounter, writes *sessions, network, clock, random} Response
 serve = \req -> case req of
   ReqChallenge {pubkey, clientIp, respond} -> handleChallenge pubkey clientIp respond
   VerifyAuth {pubkey, challenge, signature, revokeOthers, clientIp, respond} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp respond
@@ -2898,7 +2927,6 @@ serve = \req -> case req of
   FederationBatchCancel {cancels, fromServer, requestTimestamp, authorization, respond} -> handleFederationBatchCancel cancels fromServer requestTimestamp authorization respond
   FederationBatchForward {forwards, fromServer, requestTimestamp, authorization, respond} -> handleFederationBatchForward forwards fromServer requestTimestamp authorization respond
   FederationDeliveryReceipt {messageIds, toKeys, fromServer, requestTimestamp, authorization, respond} -> handleFederationDeliveryReceipt messageIds toKeys fromServer requestTimestamp authorization respond
-  VerifyToken {token, scope, clientIp, respond} -> handleVerifyToken token scope clientIp respond
   FederationPubkey {respond} -> handleFederationPubkey respond
   Prune {authorization, respond} -> handlePrune authorization respond
   Drain {phase, authorization, respond} -> handleDrain phase authorization respond
@@ -2940,7 +2968,7 @@ serve = \req -> case req of
 -- `pollTimeoutMs` so long-poll holders unblock and return an empty heartbeat
 -- response, keeping connections fresh.
 
-backgroundPrune : IO {reads *drainPhase, clock, reads *ackedIds, reads *activePolls, reads *blockedPeers, reads *cancelNotifications, reads *challenges, reads *deliveredIds, reads *forwardFailures, reads *forwards, reads *lastPresenceRefresh, reads *lastPrunedAt, reads *messages, reads *pendingFederationCancels, reads *pendingVerifications, reads *presence, reads *pruneCount, reads *senderDeliveries, reads *senderExpirations, reads *sessions, writes *ackedIds, writes *activePolls, writes *cancelNotifications, writes *challenges, writes *deliveredIds, writes *forwardFailures, writes *forwards, writes *lastPresenceRefresh, writes *lastPrunedAt, writes *messages, writes *pendingFederationCancels, writes *pendingVerifications, writes *presence, writes *pruneCount, writes *senderDeliveries, writes *senderExpirations, writes *sessions} a
+backgroundPrune : IO {reads *drainPhase, clock, reads *ackedIds, reads *activePolls, reads *blockedPeers, reads *cancelNotifications, reads *challenges, reads *deliveredIds, reads *federationPrivateKeyHex, reads *forwardFailures, reads *forwards, reads *lastPresenceRefresh, reads *lastPrunedAt, reads *messages, reads *pendingFederationCancels, reads *presence, reads *pruneCount, reads *senderDeliveries, reads *senderExpirations, reads *sessions, writes *ackedIds, writes *activePolls, writes *cancelNotifications, writes *challenges, writes *deliveredIds, writes *forwardFailures, writes *forwards, writes *lastPresenceRefresh, writes *lastPrunedAt, writes *messages, writes *pendingFederationCancels, writes *presence, writes *pruneCount, writes *senderDeliveries, writes *senderExpirations, writes *sessions} a
 backgroundPrune = do
   sleep backgroundPruneInterval
   dp <- *drainPhase
@@ -2969,6 +2997,13 @@ main = do
   t <- now
   genJitter <- randomInt 1000000
   atomic (do *startedAt = t; *serverGeneration = t * 1000 + genJitter)
+  priv <- *federationPrivateKeyHex
+  when (priv == "") (do
+    let kp = generateKeyPair
+    atomic (do
+      *federationPrivateKeyHex = bytesToHex kp.privateKey
+      *federationPublicKeyHex = bytesToHex kp.publicKey)
+    logInfo "Generated federation keypair on first startup")
   logInfo ("Skrepka relay server starting on port " ++ show listenPort ++ "...")
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
   fork backgroundPrune
