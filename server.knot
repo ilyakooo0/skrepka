@@ -294,7 +294,8 @@ isValidMessageId : Text -> Bool
 isValidMessageId = isValidBoundedHex maxMessageIdLen
 -- Hex-encoded message id, length ≤ `maxMessageIdLen`.
 type MessageIdHex = Text where isValidMessageId
--- A `MessageIdHex` or the empty string. Empty means "let the server generate one".
+-- A `MessageIdHex` or the empty string. Used in send responses, where empty
+-- means the send was rejected so no id was assigned.
 type OptionalMessageId = Text where \s -> s == "" || isValidMessageId s
 -- Normalized hostname (lowercased, no trailing dot, length-bounded).
 isAnyServerName : Text -> Bool
@@ -397,7 +398,6 @@ type BatchMessage = {
   to: PubkeyHex,
   encryptedBlob: BlobHex,
   timestamp: Timestamp,
-  messageId: OptionalMessageId,
   expiresInMs: Int
 }
 -- Per-entry result returned by /messages/batch.
@@ -481,7 +481,7 @@ route AuthApi where
 
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, messageExpirations: [{messageId: MessageIdHex, toKey: PubkeyHex, expiredAt: Timestamp}], messageDeliveries: [DeliveredEntry], droppedDeliveryReceipts: Int, droppedExpirationNotifs: Int, loadPct: Int} = Poll
-  POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: OptionalMessageId, expiresInMs: Int} /messages headers {authorization: Text, clientIp: Text} -> {status: MessageStatus, messageId: OptionalMessageId, retryAfterMs: Int, error: Text, loadPct: Int} = SendMessage
+  POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, expiresInMs: Int} /messages headers {authorization: Text, clientIp: Text} -> {status: MessageStatus, messageId: OptionalMessageId, retryAfterMs: Int, error: Text, loadPct: Int} = SendMessage
   POST {to: PubkeyHex, messageId: MessageIdHex} /messages/status headers {authorization: Text, clientIp: Text} -> {status: Text, authorized: Bool} = MessageStatus
   POST {messageIds: [MessageIdHex]} /messages/ack headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, ackedCount: Int, error: Text} = AckMessages
   POST {messages: [BatchMessage]} /messages/batch headers {authorization: Text, clientIp: Text} -> {results: [BatchResult], authorized: Bool, retryAfterMs: Int} = SendBatch
@@ -703,10 +703,6 @@ else do
 -- Standard 48-char hex token used for session bearers and federation nonces.
 genToken : IO {random} Text
 genToken = genTokenN 48
-
--- Use the supplied message id when non-empty, otherwise generate a fresh one.
-resolveMessageId : OptionalMessageId -> IO {random} OptionalMessageId
-resolveMessageId = \mid -> if mid != "" then yield mid else genToken
 
 -- True when `s` exceeds `maxLen` characters.
 tooLong : Text -> Int -> Bool
@@ -1617,12 +1613,12 @@ ackPolledMessages = \pubkey cursor t -> do
 -- POST /messages: send one ciphertext to `to`. Rejects on draining/rate
 -- limit/stale timestamp; otherwise calls `sendMessageCore` inside an atomic
 -- block and forks the federation forward (if any) once the local commit lands.
-handleSendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> OptionalMessageId -> Int -> Text -> Text -> ({error: Text, loadPct: Int, messageId: OptionalMessageId, retryAfterMs: Int, status: MessageStatus} -> a) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock, random} a
-handleSendMessage = \to encryptedBlob timestamp messageId expiresInMs authorization clientIp respond -> do
+handleSendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> Int -> Text -> Text -> ({error: Text, loadPct: Int, messageId: OptionalMessageId, retryAfterMs: Int, status: MessageStatus} -> a) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock, random} a
+handleSendMessage = \to encryptedBlob timestamp expiresInMs authorization clientIp respond -> do
   t <- now
   dp <- *drainPhase
   g <- checkGlobalRate t
-  effMsgId <- resolveMessageId messageId
+  effMsgId <- genToken
   let err = \s e -> yield (respond (sendErrResp s e))
   if dp >= 2
   then err (MsDraining {}) "draining"
@@ -1895,13 +1891,13 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
 -- POST /messages/batch: multi-recipient send in one call. Each entry runs
 -- through `sendMessageCore` separately so per-entry rate limits/errors don't
 -- abort the rest; federated forwards are forked per entry.
-handleSendBatch : [{encryptedBlob: BlobHex, expiresInMs: Int, messageId: OptionalMessageId, timestamp: Int<Ms>, to: PubkeyHex | a}] -> Text -> Text -> ({authorized: Bool, results: [BatchResult], retryAfterMs: Int} -> b) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} b
+handleSendBatch : [{encryptedBlob: BlobHex, expiresInMs: Int, timestamp: Int<Ms>, to: PubkeyHex | a}] -> Text -> Text -> ({authorized: Bool, results: [BatchResult], retryAfterMs: Int} -> b) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} b
 handleSendBatch = \messages authorization clientIp respond -> do
   t <- now
   let mkErr = \_ -> {results: [], authorized: False {}, retryAfterMs: 0}
   gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
     results <- mapEach (takeRelation maxBatchSize messages) (\m -> do
-      effMsgId <- resolveMessageId m.messageId
+      effMsgId <- genToken
       let clampedTs = clampTimestamp m.timestamp t
       r <- if t - m.timestamp > messageMaxAge
       then yield {status: MsRejected {}, remoteServers: []}
@@ -2815,7 +2811,7 @@ serve = \req -> case req of
   RevokeSession {targetToken, authorization, clientIp, respond} -> handleRevoke targetToken authorization clientIp respond
   Logout {authorization, clientIp, respond} -> handleLogout authorization clientIp respond
   Poll {cursor, generation, authorization, clientIp, respond} -> handlePoll cursor generation authorization clientIp respond
-  SendMessage {to, encryptedBlob, timestamp, messageId, expiresInMs, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob timestamp messageId expiresInMs authorization clientIp respond
+  SendMessage {to, encryptedBlob, timestamp, expiresInMs, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob timestamp expiresInMs authorization clientIp respond
   MessageStatus {to, messageId, authorization, clientIp, respond} -> handleMessageStatus to messageId authorization clientIp respond
   AckMessages {messageIds, authorization, clientIp, respond} -> handleAckMessages messageIds authorization clientIp respond
   SendBatch {messages, authorization, clientIp, respond} -> handleSendBatch messages authorization clientIp respond
