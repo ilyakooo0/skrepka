@@ -293,9 +293,6 @@ isValidMessageId : Text -> Bool
 isValidMessageId = isValidBoundedHex maxMessageIdLen
 -- Hex-encoded message id, length ≤ `maxMessageIdLen`.
 type MessageIdHex = Text where isValidMessageId
--- A `MessageIdHex` or the empty string. Used in send responses, where empty
--- means the send was rejected so no id was assigned.
-type OptionalMessageId = Text where \s -> s == "" || isValidMessageId s
 -- Normalized hostname (lowercased, no trailing dot, length-bounded).
 isAnyServerName : Text -> Bool
 isAnyServerName = \s -> not tooLong s maxServerNameLen && s == normalizeServerName s
@@ -400,7 +397,7 @@ type BatchMessage = {
   expiresInMs: Int
 }
 -- Per-entry result returned by /messages/batch.
-type BatchResult = {messageId: OptionalMessageId, status: MessageStatus}
+type BatchResult = {messageId: MessageIdHex, status: MessageStatus}
 
 -- ============================================
 -- Persisted State (all flat lists, no sharding)
@@ -480,7 +477,7 @@ route AuthApi where
 
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, messageExpirations: [{messageId: MessageIdHex, toKey: PubkeyHex, expiredAt: Timestamp}], messageDeliveries: [DeliveredEntry], droppedDeliveryReceipts: Int, droppedExpirationNotifs: Int, loadPct: Int} = Poll
-  POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, expiresInMs: Int} /messages headers {authorization: Text, clientIp: Text} -> {status: MessageStatus, messageId: OptionalMessageId, retryAfterMs: Int, error: Text, loadPct: Int} = SendMessage
+  POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, expiresInMs: Int} /messages headers {authorization: Text, clientIp: Text} -> {status: MessageStatus, messageId: MessageIdHex, retryAfterMs: Int, error: Text, loadPct: Int} = SendMessage
   POST {to: PubkeyHex, messageId: MessageIdHex} /messages/status headers {authorization: Text, clientIp: Text} -> {status: Text, authorized: Bool} = MessageStatus
   POST {messageIds: [MessageIdHex]} /messages/ack headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, ackedCount: Int, error: Text} = AckMessages
   POST {messages: [BatchMessage]} /messages/batch headers {authorization: Text, clientIp: Text} -> {results: [BatchResult], authorized: Bool, retryAfterMs: Int} = SendBatch
@@ -661,8 +658,8 @@ emptyPollResp = \cursor authorized rateLimited draining gen retryAfterMs cursorW
 }
 
 -- Shared error shape for /messages send.
-sendErrResp : MessageStatus -> Text -> {status: MessageStatus, messageId: OptionalMessageId, retryAfterMs: Int, error: Text, loadPct: Int}
-sendErrResp = \status err -> {status, messageId: "", retryAfterMs: 0, error: err, loadPct: 0}
+sendErrResp : MessageStatus -> Text -> MessageIdHex -> {status: MessageStatus, messageId: MessageIdHex, retryAfterMs: Int, error: Text, loadPct: Int}
+sendErrResp = \status err messageId -> {status, messageId, retryAfterMs: 0, error: err, loadPct: 0}
 
 -- True when a send produced (or matched) a deliverable message.
 isSendSuccess : MessageStatus -> Bool
@@ -1612,13 +1609,13 @@ ackPolledMessages = \pubkey cursor t -> do
 -- POST /messages: send one ciphertext to `to`. Rejects on draining/rate
 -- limit/stale timestamp; otherwise calls `sendMessageCore` inside an atomic
 -- block and forks the federation forward (if any) once the local commit lands.
-handleSendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> Int -> Text -> Text -> ({error: Text, loadPct: Int, messageId: OptionalMessageId, retryAfterMs: Int, status: MessageStatus} -> a) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock, random} a
+handleSendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> Int -> Text -> Text -> ({error: Text, loadPct: Int, messageId: MessageIdHex, retryAfterMs: Int, status: MessageStatus} -> a) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock, random} a
 handleSendMessage = \to encryptedBlob timestamp expiresInMs authorization clientIp respond -> do
   t <- now
   dp <- *drainPhase
   g <- checkGlobalRate t
   effMsgId <- genToken
-  let err = \s e -> yield (respond (sendErrResp s e))
+  let err = \s e -> yield (respond (sendErrResp s e effMsgId))
   if dp >= 2
   then err (MsDraining {}) "draining"
   else if g
@@ -1633,7 +1630,7 @@ handleSendMessage = \to encryptedBlob timestamp expiresInMs authorization client
     let ok = isSendSuccess result.status
     yield (respond {
       result.status,
-      messageId: if ok then effMsgId else "",
+      messageId: effMsgId,
       retryAfterMs: 0,
       error: if ok then "" else "rejected",
       loadPct: 0
@@ -1645,7 +1642,7 @@ handleSendMessage = \to encryptedBlob timestamp expiresInMs authorization client
 -- `seqCounter`, appends the message, and pre-stages forwards for any remote
 -- presence rows that already exist for `to`. Returns the chosen status and
 -- the list of remote servers the caller should kick forwards to.
-sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> OptionalMessageId -> Int -> Int<Ms> -> IO {r *ackedIds, r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], status: MessageStatus}
+sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> MessageIdHex -> Int -> Int<Ms> -> IO {r *ackedIds, r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], status: MessageStatus}
 sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs t -> do
   msgs <- *messages
   aids <- *ackedIds
@@ -1718,7 +1715,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs t -
 -- Fire one /federation/forward call per pre-staged server. On success the
 -- corresponding row in `forwards` is pruned (no retry needed); on failure
 -- it stays so `retryPendingForwards` can re-attempt with backoff.
-forkForwardsTo : OptionalMessageId -> PubkeyHex -> BlobHex -> Int<Ms> -> [Text] -> IO {} {}
+forkForwardsTo : MessageIdHex -> PubkeyHex -> BlobHex -> Int<Ms> -> [Text] -> IO {} {}
 forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers -> forEach servers (\server -> do
   fwds <- *forwards
   let same = \x -> x.messageId == effMsgId && x.toServer == server
