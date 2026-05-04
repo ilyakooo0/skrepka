@@ -607,7 +607,7 @@ module App =
 
                             let results =
                                 response.Events
-                                |> Array.map (fun evt -> decryptEvent session.Identity.PrivKey evt.Payload)
+                                |> Array.map (fun evt -> decryptEvent session.Identity.PrivKey evt)
 
                             let events = results |> Array.choose Result.toOption |> Array.toList
 

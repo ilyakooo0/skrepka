@@ -82,9 +82,9 @@ module Protocol =
 
         envelope |> Option.map (fun e -> ts, e)
 
-    let decryptEvent (privKey: byte[]) (payload: EventPayload) =
+    let decryptEvent (privKey: byte[]) (event: PollEvent) =
         try
-            let blob = Crypto.fromHex payload.EncryptedBlob
+            let blob = Crypto.fromHex event.EncryptedBlob
 
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->

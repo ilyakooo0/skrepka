@@ -14,10 +14,7 @@ module ApiClient =
     exception Unauthorized
 
     [<CLIMutable>]
-    type EventPayload = { EncryptedBlob: string }
-
-    [<CLIMutable>]
-    type PollEvent = { Id: string; Payload: EventPayload }
+    type PollEvent = { EncryptedBlob: string }
 
     [<CLIMutable>]
     type PollResponse = { Cursor: int64; Events: PollEvent array; Authorized: bool; Heartbeat: bool }
