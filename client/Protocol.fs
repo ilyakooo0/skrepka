@@ -12,25 +12,28 @@ module Protocol =
 
     let private log msg = eprintfn $"[skrepka] {msg}"
 
-    let serializeEnvelope =
+    let serializeEnvelope (ts: int64) =
         function
         | Envelope.TextMessage(id, body) ->
             JsonSerializer.Serialize(
                 {| ``type`` = "text"
                    id = id
-                   body = body |}
+                   body = body
+                   ts = ts |}
             )
         | Envelope.DeliveryAck ackIds ->
             JsonSerializer.Serialize(
                 {| ``type`` = "delivery.ack"
-                   ack_ids = ackIds |}
+                   ack_ids = ackIds
+                   ts = ts |}
             )
         | Envelope.ProfileMessage profile ->
             JsonSerializer.Serialize(
                 {| ``type`` = "profile"
                    display_name = profile.DisplayName
                    bio = profile.Bio
-                   photo = profile.Photo |}
+                   photo = profile.Photo
+                   ts = ts |}
             )
 
     let private tryGetJsonString (el: JsonElement) (name: string) =
@@ -47,29 +50,37 @@ module Protocol =
         use doc = JsonDocument.Parse(json)
         let root = doc.RootElement
 
-        match tryGetJsonString root "type" with
-        | Some "text" ->
-            match tryGetJsonString root "id", tryGetJsonString root "body" with
-            | Some id, Some body -> Some(Envelope.TextMessage(id, body))
-            | _ -> None
-        | Some "delivery.ack" ->
-            match root.TryGetProperty("ack_ids") with
-            | true, v ->
-                let ackIds = v.EnumerateArray() |> Seq.map _.GetString() |> Seq.toList
-                Some(Envelope.DeliveryAck ackIds)
-            | _ -> None
-        | Some "profile" ->
-            let displayName = tryGetJsonString root "display_name" |> Option.defaultValue ""
-            let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
-            let photo = tryGetJsonBytes root "photo"
+        let ts =
+            match root.TryGetProperty("ts") with
+            | true, v when v.ValueKind = JsonValueKind.Number -> v.GetInt64()
+            | _ -> DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
 
-            Some(
-                Envelope.ProfileMessage
-                    { DisplayName = displayName
-                      Bio = bio
-                      Photo = photo }
-            )
-        | _ -> None
+        let envelope =
+            match tryGetJsonString root "type" with
+            | Some "text" ->
+                match tryGetJsonString root "id", tryGetJsonString root "body" with
+                | Some id, Some body -> Some(Envelope.TextMessage(id, body))
+                | _ -> None
+            | Some "delivery.ack" ->
+                match root.TryGetProperty("ack_ids") with
+                | true, v ->
+                    let ackIds = v.EnumerateArray() |> Seq.map _.GetString() |> Seq.toList
+                    Some(Envelope.DeliveryAck ackIds)
+                | _ -> None
+            | Some "profile" ->
+                let displayName = tryGetJsonString root "display_name" |> Option.defaultValue ""
+                let bio = tryGetJsonString root "bio" |> Option.defaultValue ""
+                let photo = tryGetJsonBytes root "photo"
+
+                Some(
+                    Envelope.ProfileMessage
+                        { DisplayName = displayName
+                          Bio = bio
+                          Photo = photo }
+                )
+            | _ -> None
+
+        envelope |> Option.map (fun e -> ts, e)
 
     let decryptEvent (privKey: byte[]) (payload: EventPayload) =
         try
@@ -78,10 +89,10 @@ module Protocol =
             match Crypto.decrypt privKey blob with
             | Some(plaintext, senderHex) ->
                 match parseEnvelope plaintext with
-                | Some envelope ->
+                | Some(ts, envelope) ->
                     Ok
                         { Sender = senderHex
-                          Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(payload.Timestamp)
+                          Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(ts)
                           Envelope = envelope }
                 | None -> Error "unknown envelope type"
             | None -> Error "decrypt failed"
@@ -90,11 +101,10 @@ module Protocol =
 
     let sendEnvelope (session: Session) (recipientHex: string) (envelope: Envelope) =
         async {
-            let payload = serializeEnvelope envelope
+            let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            let payload = serializeEnvelope ts envelope
 
             match Crypto.encrypt session.Identity.PrivKey (Crypto.fromHex recipientHex) payload with
-            | Some blob ->
-                let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-                do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob) ts
+            | Some blob -> do! sendMessage session.Url session.Token recipientHex (Crypto.toHex blob)
             | None -> log $"encrypt failed for {recipientHex}"
         }

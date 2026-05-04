@@ -544,7 +544,8 @@ module App =
         | CmdEnqueue(recipientHex, envelope) ->
             Cmd.ofEffect (fun dispatch ->
                 async {
-                    let json = serializeEnvelope envelope
+                    let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    let json = serializeEnvelope ts envelope
                     do! Store.enqueueOutbox recipientHex json
                     dispatch StartFlush
                 }
@@ -565,9 +566,8 @@ module App =
 
                             match blobOpt with
                             | Some blob ->
-                                let ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                                 log $"flush: encrypted, posting to {session.Url}/messages"
-                                do! sendMessage session.Url session.Token item.RecipientHex (Crypto.toHex blob) ts
+                                do! sendMessage session.Url session.Token item.RecipientHex (Crypto.toHex blob)
                                 log "flush: sent OK"
                                 do! Store.dequeueOutbox item.Id
                                 dispatch (FlushResult true)

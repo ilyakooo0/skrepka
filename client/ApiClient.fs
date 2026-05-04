@@ -14,7 +14,7 @@ module ApiClient =
     exception Unauthorized
 
     [<CLIMutable>]
-    type EventPayload = { EncryptedBlob: string; Timestamp: int64 }
+    type EventPayload = { EncryptedBlob: string }
 
     [<CLIMutable>]
     type PollEvent = { Id: string; Payload: EventPayload }
@@ -79,8 +79,8 @@ module ApiClient =
             return token
         }
 
-    let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
-        let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
+    let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) =
+        let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex |})
         async {
             use! doc = sendRequest client $"{serverUrl}/messages" body (Some token)
             match doc.RootElement.GetProperty("status").GetString() with

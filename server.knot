@@ -46,9 +46,8 @@ federationScheme = "https://"
 -- The Ed25519 federation keypair lives in `*federationPrivateKeyHex` /
 -- `*federationPublicKeyHex` refs and is generated on first startup; see `main`.
 
--- Storage retention for messages (and clamp on client-supplied wall-clock
--- timestamps + dedup-id retention). Stored messages live this long; sends
--- whose `timestamp` is older than this are rejected (30 days).
+-- Storage retention for messages and dedup-id records. Mailbox rows live this
+-- long after `receivedAt`; expired rows are pruned by `pruneExpired` (30 days).
 messageMaxAge : Int<Ms>
 messageMaxAge = 2592000000
 -- Upper bound on TTL a client may request for a presence entry (1 hour).
@@ -240,10 +239,7 @@ sToMs = \s -> stripUnit s * 1000
 
 -- One event in a /poll response. The payload is the opaque cipher blob plus
 -- delivery metadata for the recipient; the server cannot read the blob.
-type PollEvent = {
-  id: MessageIdHex,
-  payload: {encryptedBlob: BlobHex, timestamp: Timestamp, toKey: PubkeyHex}
-}
+type PollEvent = {id: MessageIdHex, payload: {encryptedBlob: BlobHex, toKey: PubkeyHex}}
 
 -- Kind of presence event flowing through federation gossip. `GossipUnknown` is
 -- the parser's fallback for forward-compatibility with future event types.
@@ -337,13 +333,10 @@ type Session = {
 -- Mailbox row: a stored message awaiting recipient pickup or federation forward.
 -- Identity is `messageIdOf encryptedBlob` (BLAKE3 of the ciphertext); we don't
 -- persist it because it's deterministically derivable. Storage TTL is fixed
--- at `messageMaxAge`, so expiry is derived from `receivedAt`.
-type Message = {
-  toKey: PubkeyHex,
-  encryptedBlob: BlobHex,
-  timestamp: Timestamp,
-  receivedAt: Timestamp
-}
+-- at `messageMaxAge`, so expiry is derived from `receivedAt`. Any send time
+-- the sender wants to convey lives inside `encryptedBlob` (the server cannot
+-- read it).
+type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp}
 -- Last-known location of a pubkey, either local (`server == serverHostN`) or
 -- learned from a peer via gossip. Multiple entries per pubkey are allowed.
 type PresenceEntry = {
@@ -360,7 +353,6 @@ type ForwardEntry = {
   createdAt: Timestamp,
   toKey: PubkeyHex,
   encryptedBlob: BlobHex,
-  timestamp: Timestamp,
   retries: Int
 }
 -- Replay-protection record: a message id we already delivered locally.
@@ -374,7 +366,7 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 
 -- One entry of a /messages/batch request body.
-type BatchMessage = {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp}
+type BatchMessage = {to: PubkeyHex, encryptedBlob: BlobHex}
 -- Per-entry result returned by /messages/batch.
 type BatchResult = {messageId: MessageIdHex, status: MessageStatus}
 
@@ -452,19 +444,19 @@ route AuthApi where
 
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, loadPct: Int} = Poll
-  POST {to: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp} /messages headers {authorization: Text, clientIp: Text} -> {status: MessageStatus, messageId: MessageIdHex, retryAfterMs: Int, error: Text, loadPct: Int} = SendMessage
+  POST {to: PubkeyHex, encryptedBlob: BlobHex} /messages headers {authorization: Text, clientIp: Text} -> {status: MessageStatus, messageId: MessageIdHex, retryAfterMs: Int, error: Text, loadPct: Int} = SendMessage
   POST {to: PubkeyHex, messageId: MessageIdHex} /messages/status headers {authorization: Text, clientIp: Text} -> {status: Text, authorized: Bool} = MessageStatus
   POST {messageIds: [MessageIdHex]} /messages/ack headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, ackedCount: Int, error: Text} = AckMessages
   POST {messages: [BatchMessage]} /messages/batch headers {authorization: Text, clientIp: Text} -> {results: [BatchResult], authorized: Bool, retryAfterMs: Int} = SendBatch
-  POST {offset: Int} /messages/list headers {authorization: Text, clientIp: Text} -> {messages: [{messageId: MessageIdHex, timestamp: Timestamp, receivedAt: Timestamp}], authorized: Bool, count: Int, error: Text} = ListMessages
+  POST {offset: Int} /messages/list headers {authorization: Text, clientIp: Text} -> {messages: [{messageId: MessageIdHex, receivedAt: Timestamp}], authorized: Bool, count: Int, error: Text} = ListMessages
   POST {messageIds: [MessageIdHex]} /messages/delete headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, deletedCount: Int, error: Text} = DeleteMessages
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text} -> {server: AnyServerName, authorized: Bool, error: Text} = LookupPresence
   POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: AnyServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
 route FederationApi where
   POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/gossip headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = RecvGossip
-  POST {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = ForwardMessage
-  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, messageId: MessageIdHex}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} = FederationBatchForward
+  POST {toKey: PubkeyHex, encryptedBlob: BlobHex, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = ForwardMessage
+  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, messageId: MessageIdHex}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} = FederationBatchForward
 
 route FederationPubkeyApi where
   GET /federation/pubkey -> {pubkey: Text, ok: Bool} = FederationPubkey
@@ -597,7 +589,7 @@ pct : Int -> Int -> Int
 pct = \cur maxN -> if maxN > 0 then cur * 100 / maxN else 0
 
 -- Common ack/delete tail: pull matching messages, drop them and their forwards.
-removeForKey : (forall r. {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp | r} -> Bool) -> IO {rw *forwards, rw *messages} [Message]
+removeForKey : (forall r. {toKey: PubkeyHex, encryptedBlob: BlobHex | r} -> Bool) -> IO {rw *forwards, rw *messages} [Message]
 removeForKey = \pred -> do
   msgs <- *messages
   fwds <- *forwards
@@ -998,18 +990,13 @@ clearFailure = \server -> atomic (do
 -- ============================================
 -- Common utility queries
 -- ============================================
--- Pure helpers shared by send/poll/federation paths: TTL/timestamp clamping,
--- monotonic sequence generation, presence lookup, duplicate detection across
+-- Pure helpers shared by send/poll/federation paths: TTL clamping, monotonic
+-- sequence generation, presence lookup, duplicate detection across
 -- (messages, deliveredIds), and last-write-wins presence merge.
 
 -- Clamp a client-supplied TTL to (0, maxPresenceTtl].
 clampTtl : Int<Ms> -> Int<Ms>
 clampTtl = clamp 1 maxPresenceTtl
-
--- Clamp a client-supplied message timestamp into [now - messageMaxAge, now].
--- Stops senders from claiming arbitrary future or far-past timestamps.
-clampTimestamp : Timestamp -> Timestamp -> Timestamp
-clampTimestamp = \timestamp t -> clamp (t - messageMaxAge) t timestamp
 
 -- Strictly-monotonic next sequence timestamp: max of wall clock and prior+1.
 -- Guarantees /poll cursors order events even when many arrive in the same ms.
@@ -1155,7 +1142,6 @@ retryPendingForwards = do
     result <- fetch (federationUrl server) (ForwardMessage {
       f.toKey,
       f.encryptedBlob,
-      f.timestamp,
       messageId,
       fromServer: serverHostN,
       requestTimestamp: t2,
@@ -1174,7 +1160,7 @@ retryPendingForwards = do
     atomic (do
       cur <- *forwards
       *forwards = pluck (removeWhere cur isDone) (\x -> if isMatch x
-      then {x.toServer, x.createdAt, x.toKey, x.encryptedBlob, x.timestamp, retries: x.retries + 1}
+      then {x.toServer, x.createdAt, x.toKey, x.encryptedBlob, retries: x.retries + 1}
       else x))))
 
 -- Forward queued messages to a server when a remote key comes online.
@@ -1188,7 +1174,6 @@ forwardQueuedToServer = \pubkey server t -> atomic (do
     createdAt: t,
     m.toKey,
     m.encryptedBlob,
-    m.timestamp,
     retries: 0
   })
   *forwards = union fwds newFwds)
@@ -1350,7 +1335,7 @@ handleRevoke = \targetToken authorization clientIp respond -> do
 
 -- POST /auth/logout: drop the caller's own session. If this was the last
 -- session for the pubkey, also clear local presence and gossip offline.
-handleLogout : Text -> Text -> ({authorized: Bool, ok: Bool} -> a) -> IO {r *sessions, clock} a
+handleLogout : Text -> Text -> ({authorized: Bool, ok: Bool} -> a) -> IO {rw *presence, rw *sessions, clock} a
 handleLogout = \authorization clientIp respond -> do
   t <- now
   let myToken = case extractToken authorization of
@@ -1390,7 +1375,7 @@ handleLogout = \authorization clientIp respond -> do
 -- POST /poll: top-level dispatch. Validates drain/global gates, detects a
 -- generation mismatch (server restart) to force a cursor reset, then hands
 -- off to `pollOnce` for the actual long-poll body.
-handlePoll : Int -> Int -> Text -> Text -> ({authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, draining: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int} -> Response) -> IO {rw *activePolls, r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *pollWakeup, r *serverGeneration, r *sessions, clock} Response
+handlePoll : Int -> Int -> Text -> Text -> ({authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, draining: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int} -> Response) -> IO {r *drainPhase, r *pollWakeup, r *serverGeneration, r *sessions, rw *activePolls, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} Response
 handlePoll = \cursor generation authorization clientIp respond -> do
   t <- now
   serverGen <- *serverGeneration
@@ -1407,7 +1392,7 @@ handlePoll = \cursor generation authorization clientIp respond -> do
 -- Body of a single poll. Treats the cursor advance as an implicit ack
 -- (`ackPolledMessages`), acquires a per-pubkey poll slot, runs `doPoll` to
 -- collect events (or block until wakeup), then assembles the response.
-pollOnce : Text -> Int -> Bool -> Text -> Int -> ({authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, draining: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int} -> Response) -> Int<Ms> -> IO {rw *activePolls, r *pollWakeup, r *sessions, clock} Response
+pollOnce : Text -> Int -> Bool -> Text -> Int -> ({authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, draining: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int} -> Response) -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *activePolls, rw *forwards, rw *messages, clock} Response
 pollOnce = \authorization cursor cursorWasReset clientIp serverGen respond t -> do
   setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
     let clampedCursor = clamp 0 t cursor
@@ -1446,7 +1431,7 @@ pollOnce = \authorization cursor cursorWasReset clientIp serverGen respond t -> 
 
 -- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
 -- (bumped by send/heartbeat) and re-collect once at the new wall time.
-doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{id: MessageIdHex, payload: {encryptedBlob: BlobHex, timestamp: Timestamp, toKey: PubkeyHex}}], hasMore: Bool}
+doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{id: MessageIdHex, payload: {encryptedBlob: BlobHex, toKey: PubkeyHex}}], hasMore: Bool}
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic (do
     msgs <- *messages
@@ -1462,7 +1447,7 @@ doPoll = \s t -> do
 -- Pull this pubkey's unexpired messages newer than `cursor`, sort by
 -- receivedAt, take up to `maxPollEvents`, and report `hasMore` if truncated.
 collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp, hasMore: Bool}
-collectPollEvents = \messages pubkey cursor t -> (\myMsgs -> (\limited -> {events: pluck limited (\m -> {id: messageIdOf m.encryptedBlob, payload: {m.toKey, m.encryptedBlob, m.timestamp}}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited, hasMore: count myMsgs > count limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) myMsgs))) (filter messages (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor))
+collectPollEvents = \messages pubkey cursor t -> (\myMsgs -> (\limited -> {events: pluck limited (\m -> {id: messageIdOf m.encryptedBlob, payload: {m.toKey, m.encryptedBlob}}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited, hasMore: count myMsgs > count limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) myMsgs))) (filter messages (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor))
 
 -- Treat the supplied cursor as an ack: drop all messages with
 -- receivedAt <= cursor, plus their pending forwards.
@@ -1489,10 +1474,10 @@ ackPolledMessages = \pubkey cursor -> do
 -- Federated forwards are kicked off in a background fork after the atomic.
 
 -- POST /messages: send one ciphertext to `to`. Rejects on draining/rate
--- limit/stale timestamp; otherwise calls `sendMessageCore` inside an atomic
--- block and forks the federation forward (if any) once the local commit lands.
-handleSendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> Text -> Text -> ({error: Text, loadPct: Int, messageId: MessageIdHex, retryAfterMs: Int, status: MessageStatus} -> a) -> IO {r *deliveredIds, r *drainPhase, r *presence, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, rw *pairRates, rw *pollWakeup, rw *recvRates, rw *sendRates, rw *seqCounter, clock} a
-handleSendMessage = \to encryptedBlob timestamp authorization clientIp respond -> do
+-- limit; otherwise calls `sendMessageCore` inside an atomic block and forks
+-- the federation forward (if any) once the local commit lands.
+handleSendMessage : PubkeyHex -> BlobHex -> Text -> Text -> ({error: Text, loadPct: Int, messageId: MessageIdHex, retryAfterMs: Int, status: MessageStatus} -> a) -> IO {r *deliveredIds, r *drainPhase, r *presence, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, rw *pairRates, rw *pollWakeup, rw *recvRates, rw *sendRates, rw *seqCounter, clock} a
+handleSendMessage = \to encryptedBlob authorization clientIp respond -> do
   t <- now
   dp <- *drainPhase
   g <- checkGlobalRate t
@@ -1502,13 +1487,10 @@ handleSendMessage = \to encryptedBlob timestamp authorization clientIp respond -
   then err (MsDraining {}) "draining"
   else if g
   then err (MsRateLimited {}) "rate_limited"
-  else if t - timestamp > messageMaxAge
-  then err (MsRejected {}) "stale_timestamp"
   else do
-    let clampedTs = clampTimestamp timestamp t
     result <- atomic (do
-      withSessionAuth authorization t clientIp (yield {status: MsUnauthorized {}, remoteServers: []}) (\senderKey -> sendMessageCore senderKey to encryptedBlob clampedTs t))
-    when federationEnabled (fork (forkForwardsTo to encryptedBlob clampedTs result.remoteServers))
+      withSessionAuth authorization t clientIp (yield {status: MsUnauthorized {}, remoteServers: []}) (\senderKey -> sendMessageCore senderKey to encryptedBlob t))
+    when federationEnabled (fork (forkForwardsTo to encryptedBlob result.remoteServers))
     let ok = isSendSuccess result.status
     yield (respond {
       result.status,
@@ -1524,8 +1506,8 @@ handleSendMessage = \to encryptedBlob timestamp authorization clientIp respond -
 -- `seqCounter`, appends the message, and pre-stages forwards for any remote
 -- presence rows that already exist for `to`. Returns the chosen status and
 -- the list of remote servers the caller should kick forwards to.
-sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> Int<Ms> -> IO {r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], status: MessageStatus}
-sendMessageCore = \senderKey to encryptedBlob clampedTs t -> do
+sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> IO {r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], status: MessageStatus}
+sendMessageCore = \senderKey to encryptedBlob t -> do
   msgs <- *messages
   dids <- *deliveredIds
   sRates <- *sendRates
@@ -1552,7 +1534,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs t -> do
     seq <- *seqCounter
     let seqTs = nextSeqTs t seq
     *seqCounter = seqTs
-    *messages = union msgs [{toKey: to, encryptedBlob, timestamp: clampedTs, receivedAt: seqTs}]
+    *messages = union msgs [{toKey: to, encryptedBlob, receivedAt: seqTs}]
     *pollWakeup = seqTs
     let toPresence = presenceForKey pres to t
     let remoteServers = collectPeers toPresence (\p -> p.server)
@@ -1564,7 +1546,6 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs t -> do
         createdAt: t,
         toKey: to,
         encryptedBlob,
-        timestamp: clampedTs,
         retries: 0
       })
       *forwards = union fwds newFwds
@@ -1583,8 +1564,8 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs t -> do
 -- `*messages` row is dropped too: the origin's job is done and the message
 -- now lives on the receiving peer's mailbox. On failure the forwards row
 -- stays so `retryPendingForwards` can re-attempt with backoff.
-forkForwardsTo : PubkeyHex -> BlobHex -> Int<Ms> -> [Text] -> IO {} {}
-forkForwardsTo = \to encryptedBlob clampedTs servers -> forEach servers (\server -> do
+forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {} {}
+forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
   let effMsgId = messageIdOf encryptedBlob
   fwds <- *forwards
   let same = \x -> x.encryptedBlob == encryptedBlob && x.toServer == server
@@ -1596,7 +1577,6 @@ forkForwardsTo = \to encryptedBlob clampedTs servers -> forEach servers (\server
       result <- fetch (federationUrl server) (ForwardMessage {
         toKey: to,
         encryptedBlob,
-        timestamp: clampedTs,
         messageId: effMsgId,
         fromServer: serverHostN,
         requestTimestamp: t,
@@ -1703,7 +1683,7 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
 
 -- POST /messages/list: paginated peek at the caller's mailbox without acking.
 -- Returns metadata only (no ciphertext) plus the total count.
-handleListMessages : Int -> Text -> Text -> ({authorized: Bool, count: Int, error: Text, messages: [{messageId: MessageIdHex, receivedAt: Int<Ms>, timestamp: Int<Ms>}]} -> a) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
+handleListMessages : Int -> Text -> Text -> ({authorized: Bool, count: Int, error: Text, messages: [{messageId: MessageIdHex, receivedAt: Int<Ms>}]} -> a) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
 handleListMessages = \offset authorization clientIp respond -> do
   t <- now
   let mkErr = \e -> {
@@ -1726,7 +1706,6 @@ handleListMessages = \offset authorization clientIp respond -> do
       let total = count myMsgs
       let page = pluck (takeRelation maxPollEvents (dropRelation (clamp 0 total offset) myMsgs)) (\m -> {
         messageId: messageIdOf m.encryptedBlob,
-        m.timestamp,
         m.receivedAt
       })
       yield (respond {messages: page, authorized: True {}, count: total, error: ""}))
@@ -1756,18 +1735,15 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
 -- POST /messages/batch: multi-recipient send in one call. Each entry runs
 -- through `sendMessageCore` separately so per-entry rate limits/errors don't
 -- abort the rest; federated forwards are forked per entry.
-handleSendBatch : [{encryptedBlob: BlobHex, timestamp: Int<Ms>, to: PubkeyHex | a}] -> Text -> Text -> ({authorized: Bool, results: [BatchResult], retryAfterMs: Int} -> b) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} b
+handleSendBatch : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> ({authorized: Bool, results: [BatchResult], retryAfterMs: Int} -> b) -> IO {r *drainPhase, rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} b
 handleSendBatch = \messages authorization clientIp respond -> do
   t <- now
   let mkErr = \_ -> {results: [], authorized: False {}, retryAfterMs: 0}
   gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
     results <- mapEach (takeRelation maxBatchSize messages) (\m -> do
       let effMsgId = messageIdOf m.encryptedBlob
-      let clampedTs = clampTimestamp m.timestamp t
-      r <- if t - m.timestamp > messageMaxAge
-      then yield {status: MsRejected {}, remoteServers: []}
-      else atomic (do sendMessageCore senderKey m.to m.encryptedBlob clampedTs t)
-      when federationEnabled (fork (forkForwardsTo m.to m.encryptedBlob clampedTs r.remoteServers))
+      r <- atomic (do sendMessageCore senderKey m.to m.encryptedBlob t)
+      when federationEnabled (fork (forkForwardsTo m.to m.encryptedBlob r.remoteServers))
       yield {messageId: effMsgId, r.status})
     yield (respond {results, authorized: True {}, retryAfterMs: 0}))
 
@@ -1834,8 +1810,8 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorizati
 -- on stale gossip about R could land on B with no actively-polling client and
 -- get stuck. If B refuses, A retries via `retryPendingForwards` against the
 -- next presence target.
-storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> Bool -> Int<Ms> -> IO {r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter} Text
-storeFederated = \toKey encryptedBlob timestamp checkRecvRate t -> do
+storeFederated : PubkeyHex -> BlobHex -> Bool -> Int<Ms> -> IO {r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter} Text
+storeFederated = \toKey encryptedBlob checkRecvRate t -> do
   pres <- *presence
   msgs <- *messages
   dids <- *deliveredIds
@@ -1857,9 +1833,7 @@ storeFederated = \toKey encryptedBlob timestamp checkRecvRate t -> do
       seq <- *seqCounter
       let seqTs = nextSeqTs t seq
       *seqCounter = seqTs
-      *messages = union msgs [
-        {toKey, encryptedBlob, timestamp: clampTimestamp timestamp t, receivedAt: seqTs}
-      ]
+      *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
       *pollWakeup = seqTs
       yield ""
 
@@ -1870,21 +1844,18 @@ storeFederated = \toKey encryptedBlob timestamp checkRecvRate t -> do
 -- the blob ourselves so a hostile peer cannot bypass dedup by varying the
 -- id. Honest senders derive the same value, so the "forward:" ++ messageId
 -- auth scope still verifies.
-handleForwardMessage : PubkeyHex -> BlobHex -> Int<Ms> -> Text -> Text -> Int -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> a) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock, network} a
-handleForwardMessage = \toKey encryptedBlob timestamp _ fromServer requestTimestamp authorization respond -> do
+handleForwardMessage : PubkeyHex -> BlobHex -> Text -> Text -> Int -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> a) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock, network} a
+handleForwardMessage = \toKey encryptedBlob _ fromServer requestTimestamp authorization respond -> do
   let messageId = messageIdOf encryptedBlob
   t <- now
   withFederationAuth authorization t respond fromServer ("forward:" ++ messageId) requestTimestamp (isRemote fromServer) (do
-    if t - timestamp > messageMaxAge
-    then yield (respond {ok: False {}, error: "stale_timestamp", retryAfterMs: 0})
-    else do
-      result <- atomic storeFederated toKey encryptedBlob timestamp (True {}) t
-      yield (respond {ok: result == "", error: result, retryAfterMs: 0}))
+    result <- atomic storeFederated toKey encryptedBlob (True {}) t
+    yield (respond {ok: result == "", error: result, retryAfterMs: 0}))
 
 -- POST /federation/forward-batch: bulk variant of `handleForwardMessage`.
 -- Skips per-entry recv-rate charging (the per-server federation rate limit
 -- already gates the call as a whole).
-handleFederationBatchForward : [{encryptedBlob: BlobHex, messageId: MessageIdHex, timestamp: Int<Ms>, toKey: PubkeyHex | a}] -> Text -> Int -> Text -> ({error: Text, ok: Bool, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} -> b) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, clock, network} b
+handleFederationBatchForward : [{encryptedBlob: BlobHex, messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Text -> Int -> Text -> ({error: Text, ok: Bool, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} -> b) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, clock, network} b
 handleFederationBatchForward = \forwards fromServer requestTimestamp authorization respond -> do
   t <- now
   let batchRespond = \r -> respond {r.ok, r.error, results: [], r.retryAfterMs}
@@ -1892,12 +1863,8 @@ handleFederationBatchForward = \forwards fromServer requestTimestamp authorizati
     results <- mapEach (takeRelation maxBatchSize forwards) (\e -> do
       -- Recompute id from blob; ignore e.messageId (untrusted, peer-chosen).
       let messageId = messageIdOf e.encryptedBlob
-      ok <- if t - e.timestamp > messageMaxAge
-      then yield (False {})
-      else do
-        result <- atomic storeFederated e.toKey e.encryptedBlob e.timestamp (False {}) t
-        yield (result == "")
-      yield {messageId, ok})
+      result <- atomic storeFederated e.toKey e.encryptedBlob (False {}) t
+      yield {messageId, ok: result == ""})
     yield (respond {ok: True {}, error: "", results, retryAfterMs: 0}))
 
 -- ============================================
@@ -2595,7 +2562,7 @@ serve = \req -> case req of
   RevokeSession {targetToken, authorization, clientIp, respond} -> handleRevoke targetToken authorization clientIp respond
   Logout {authorization, clientIp, respond} -> handleLogout authorization clientIp respond
   Poll {cursor, generation, authorization, clientIp, respond} -> handlePoll cursor generation authorization clientIp respond
-  SendMessage {to, encryptedBlob, timestamp, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob timestamp authorization clientIp respond
+  SendMessage {to, encryptedBlob, authorization, clientIp, respond} -> handleSendMessage to encryptedBlob authorization clientIp respond
   MessageStatus {to, messageId, authorization, clientIp, respond} -> handleMessageStatus to messageId authorization clientIp respond
   AckMessages {messageIds, authorization, clientIp, respond} -> handleAckMessages messageIds authorization clientIp respond
   SendBatch {messages, authorization, clientIp, respond} -> handleSendBatch messages authorization clientIp respond
@@ -2604,7 +2571,7 @@ serve = \req -> case req of
   LookupPresence {pubkey, authorization, clientIp, respond} -> handleLookupPresence pubkey authorization clientIp respond
   BatchLookupPresence {pubkeys, authorization, clientIp, respond} -> handleBatchLookupPresence pubkeys authorization clientIp respond
   RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp authorization respond
-  ForwardMessage {toKey, encryptedBlob, timestamp, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob timestamp messageId fromServer requestTimestamp authorization respond
+  ForwardMessage {toKey, encryptedBlob, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob messageId fromServer requestTimestamp authorization respond
   FederationBatchForward {forwards, fromServer, requestTimestamp, authorization, respond} -> handleFederationBatchForward forwards fromServer requestTimestamp authorization respond
   FederationPubkey {respond} -> handleFederationPubkey respond
   Prune {authorization, respond} -> handlePrune authorization respond
