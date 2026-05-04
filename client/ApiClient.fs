@@ -80,11 +80,11 @@ module ApiClient =
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) (timestamp: int64) =
-        let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp; messageId = "" |})
+        let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex; timestamp = timestamp |})
         async {
             use! doc = sendRequest client $"{serverUrl}/messages" body (Some token)
             match doc.RootElement.GetProperty("status").GetString() with
-            | "delivered" | "federated" | "queued" -> ()
+            | "delivered" | "federated" | "queued" | "duplicate" -> ()
             | "rejected" -> raise (ServerRejected "Message rejected by server")
             | "unauthorized" -> raise Unauthorized
             | s -> raise (ApiError $"Unexpected status: {s}")

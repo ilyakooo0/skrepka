@@ -339,8 +339,9 @@ type Session = {
   createdAt: Timestamp
 }
 -- Mailbox row: a stored message awaiting recipient pickup or federation forward.
+-- Identity is `messageIdOf encryptedBlob` (BLAKE3 of the ciphertext); we don't
+-- persist it because it's deterministically derivable.
 type Message = {
-  messageId: MessageIdHex,
   toKey: PubkeyHex,
   encryptedBlob: BlobHex,
   timestamp: Timestamp,
@@ -357,8 +358,8 @@ type PresenceEntry = {
 }
 -- A message queued for cross-server delivery to `toServer`. `retries` is
 -- incremented by `retryPendingForwards` until `maxForwardRetries` is hit.
+-- Identity is derived from `encryptedBlob` (see `Message`).
 type ForwardEntry = {
-  messageId: MessageIdHex,
   toServer: ServerName,
   createdAt: Timestamp,
   toKey: PubkeyHex,
@@ -396,32 +397,6 @@ type BatchResult = {messageId: MessageIdHex, status: MessageStatus}
 *presence : [PresenceEntry]
 *forwards : [ForwardEntry]
 *deliveredIds : [DeliveredEntry]
-
--- Drop the obsolete `originServer` field. Federation now uses presence-based
--- routing exclusively; ack-back is gone, so there's no consumer for the value.
-migrate *messages
-  from {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, receivedAt: Timestamp, expiresAt: Timestamp, senderKey: Text}
-  to   {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, receivedAt: Timestamp, expiresAt: Timestamp, senderKey: Text}
-  using (\old -> {old.messageId, old.toKey, old.encryptedBlob, old.timestamp, old.receivedAt, old.expiresAt, old.senderKey})
-
-migrate *forwards
-  from {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, originServer: Text, retries: Int, expiresAt: Timestamp, senderKey: Text}
-  to   {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, retries: Int, expiresAt: Timestamp, senderKey: Text}
-  using (\old -> {old.messageId, old.toServer, old.createdAt, old.toKey, old.encryptedBlob, old.timestamp, old.retries, old.expiresAt, old.senderKey})
-
--- Drop `senderKey`. Server-side delivery/expiration receipts are gone (clients
--- exchange them as encrypted app-level envelopes), so the only thing the field
--- still gated -- self-send rejection -- now reads the value from the session.
-migrate *messages
-  from {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, receivedAt: Timestamp, expiresAt: Timestamp, senderKey: Text}
-  to   {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, receivedAt: Timestamp, expiresAt: Timestamp}
-  using (\old -> {old.messageId, old.toKey, old.encryptedBlob, old.timestamp, old.receivedAt, old.expiresAt})
-
-migrate *forwards
-  from {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, retries: Int, expiresAt: Timestamp, senderKey: Text}
-  to   {messageId: MessageIdHex, toServer: ServerName, createdAt: Timestamp, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, retries: Int, expiresAt: Timestamp}
-  using (\old -> {old.messageId, old.toServer, old.createdAt, old.toKey, old.encryptedBlob, old.timestamp, old.retries, old.expiresAt})
-
 *forwardFailures : [ForwardFailure]
 *activePolls : [ActivePoll]
 
@@ -627,7 +602,7 @@ pct : Int -> Int -> Int
 pct = \cur maxN -> if maxN > 0 then cur * 100 / maxN else 0
 
 -- Common ack/delete tail: pull matching messages, drop them and their forwards.
-removeForKey : (forall r. {messageId: MessageIdHex, toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, expiresAt: Timestamp | r} -> Bool) -> IO {rw *forwards, rw *messages} [Message]
+removeForKey : (forall r. {toKey: PubkeyHex, encryptedBlob: BlobHex, timestamp: Timestamp, expiresAt: Timestamp | r} -> Bool) -> IO {rw *forwards, rw *messages} [Message]
 removeForKey = \pred -> do
   msgs <- *messages
   fwds <- *forwards
@@ -698,6 +673,13 @@ else do
 -- Standard 48-char hex token used for session bearers and federation nonces.
 genToken : IO {random} Text
 genToken = genTokenN 48
+
+-- Canonical message identity: BLAKE3 of the encrypted blob, hex-encoded.
+-- Binding the id to the payload means a hostile peer cannot multiply-store
+-- the same ciphertext under different ids on /federation/forward — same
+-- blob always collides with the existing dedup key.
+messageIdOf : BlobHex -> MessageIdHex
+messageIdOf = \blob -> bytesToHex (hash blob)
 
 -- True when `s` exceeds `maxLen` characters.
 tooLong : Text -> Int -> Bool
@@ -1059,14 +1041,16 @@ presenceForKey = \presence pubkey t -> filter presence (\p -> p.pubkey == pubkey
 maskedServer : [PresenceEntry] -> PubkeyHex -> Timestamp -> Text
 maskedServer = \pres pubkey t -> (\here -> if any here (\p -> isLocalServer p.server) then serverHostN else if count here > 0 then "remote" else "") (presenceForKey pres pubkey t)
 
--- True when any row in `items` has a matching (messageId, toKey) pair.
-hasMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Bool
-hasMessage = \mid toKey items -> any items (\x -> x.messageId == mid && x.toKey == toKey)
-
--- Replay-protection check: True if the (messageId, toKey) is already present in
--- the live mailbox, the federated-acked log, or the delivered log.
-isDuplicateMessage : MessageIdHex -> PubkeyHex -> [{messageId: MessageIdHex, toKey: PubkeyHex | a}] -> [{messageId: MessageIdHex, toKey: PubkeyHex | b}] -> Bool
-isDuplicateMessage = \mid toKey msgs dids -> hasMessage mid toKey msgs || hasMessage mid toKey dids
+-- Replay-protection check. A message is a duplicate if either:
+--   * a live mailbox row exists with the same (encryptedBlob, toKey) -- since
+--     id := messageIdOf encryptedBlob, same blob ⇒ same id; or
+--   * a delivered-id tombstone matches (messageId, toKey).
+-- The blob comparison avoids hashing every live row on each check; the
+-- tombstone log only stores the id, so we compare it directly.
+isDuplicateMessage : BlobHex -> PubkeyHex -> [Message] -> [DeliveredEntry] -> Bool
+isDuplicateMessage = \blob toKey msgs dids ->
+  any msgs (\m -> m.toKey == toKey && m.encryptedBlob == blob) ||
+  (\mid -> any dids (\d -> d.toKey == toKey && d.messageId == mid)) (messageIdOf blob)
 
 -- Project items through `getServer`, drop our own hostname, and dedupe.
 -- Used to derive peer recipient lists from forwards/presence/etc.
@@ -1180,12 +1164,13 @@ retryPendingForwards = do
   blocked <- *blockedPeers
   forEach (filter (collectPeers fwds (\f -> f.toServer)) (\s -> shouldRetryServer s t failures && not elem blocked s)) (\server -> forEach (takeRelation maxBatchSize (filter fwds (\f -> f.toServer == server))) (\f -> do
     t2 <- now
-    auth <- generateFederationAuth ("forward:" ++ f.messageId) t2
+    let messageId = messageIdOf f.encryptedBlob
+    auth <- generateFederationAuth ("forward:" ++ messageId) t2
     result <- fetch (federationUrl server) (ForwardMessage {
       f.toKey,
       f.encryptedBlob,
       f.timestamp,
-      f.messageId,
+      messageId,
       fromServer: serverHostN,
       requestTimestamp: t2,
       authorization: auth,
@@ -1199,13 +1184,12 @@ retryPendingForwards = do
       Ok {value: r} -> do
         when r.ok (clearFailure server)
         yield r.ok
-    let isMatch = \x -> x.messageId == f.messageId && x.toServer == server
+    let isMatch = \x -> x.encryptedBlob == f.encryptedBlob && x.toServer == server
     let isDone = \x -> isMatch x && (success || x.retries + 1 >= maxForwardRetries)
     atomic (do
       cur <- *forwards
       *forwards = pluck (removeWhere cur isDone) (\x -> if isMatch x
       then {
-        x.messageId,
         x.toServer,
         x.createdAt,
         x.toKey,
@@ -1221,9 +1205,8 @@ forwardQueuedToServer : PubkeyHex -> ServerName -> Int<Ms> -> IO {rw *forwards, 
 forwardQueuedToServer = \pubkey server t -> atomic (do
   msgs <- *messages
   fwds <- *forwards
-  let candidates = filter msgs (\m -> m.toKey == pubkey && none fwds (\f -> f.messageId == m.messageId && f.toServer == server))
+  let candidates = filter msgs (\m -> m.toKey == pubkey && none fwds (\f -> f.encryptedBlob == m.encryptedBlob && f.toServer == server))
   let newFwds = pluck (takeRelation maxForwardsPerServer candidates) (\m -> {
-    m.messageId,
     toServer: server,
     createdAt: t,
     m.toKey,
@@ -1503,7 +1486,7 @@ doPoll = \s t -> do
 -- Pull this pubkey's unexpired messages newer than `cursor`, sort by
 -- receivedAt, take up to `maxPollEvents`, and report `hasMore` if truncated.
 collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp, hasMore: Bool}
-collectPollEvents = \messages pubkey cursor t -> (\myMsgs -> (\limited -> {events: pluck limited (\m -> {id: m.messageId, payload: {m.toKey, m.encryptedBlob, m.timestamp, m.expiresAt}}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited, hasMore: count myMsgs > count limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) myMsgs))) (filter messages (\m -> m.toKey == pubkey && m.expiresAt > t && m.receivedAt > cursor))
+collectPollEvents = \messages pubkey cursor t -> (\myMsgs -> (\limited -> {events: pluck limited (\m -> {id: messageIdOf m.encryptedBlob, payload: {m.toKey, m.encryptedBlob, m.timestamp, m.expiresAt}}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited, hasMore: count myMsgs > count limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) myMsgs))) (filter messages (\m -> m.toKey == pubkey && m.expiresAt > t && m.receivedAt > cursor))
 
 -- Treat the supplied cursor as an ack: drop all messages with
 -- receivedAt <= cursor, plus their pending forwards.
@@ -1512,10 +1495,10 @@ ackPolledMessages = \pubkey cursor -> do
   msgs <- *messages
   let matches = \m -> m.toKey == pubkey && m.receivedAt <= cursor
   let toAck = filter msgs matches
-  let mids = pluck toAck (\m -> m.messageId)
+  let blobs = pluck toAck (\m -> m.encryptedBlob)
   *messages = removeWhere msgs matches
   fwds <- *forwards
-  *forwards = filter fwds (\f -> not (f.toKey == pubkey && elem mids f.messageId))
+  *forwards = filter fwds (\f -> not (f.toKey == pubkey && elem blobs f.encryptedBlob))
 
 -- ============================================
 -- Handler: send
@@ -1537,7 +1520,7 @@ handleSendMessage = \to encryptedBlob timestamp expiresInMs authorization client
   t <- now
   dp <- *drainPhase
   g <- checkGlobalRate t
-  effMsgId <- genToken
+  let effMsgId = messageIdOf encryptedBlob
   let err = \s e -> yield (respond (sendErrResp s e effMsgId))
   if dp >= 2
   then err (MsDraining {}) "draining"
@@ -1548,8 +1531,8 @@ handleSendMessage = \to encryptedBlob timestamp expiresInMs authorization client
   else do
     let clampedTs = clampTimestamp timestamp t
     result <- atomic (do
-      withSessionAuth authorization t clientIp (yield {status: MsUnauthorized {}, remoteServers: []}) (\senderKey -> sendMessageCore senderKey to encryptedBlob clampedTs effMsgId expiresInMs t))
-    when federationEnabled (fork (forkForwardsTo effMsgId to encryptedBlob clampedTs result.remoteServers))
+      withSessionAuth authorization t clientIp (yield {status: MsUnauthorized {}, remoteServers: []}) (\senderKey -> sendMessageCore senderKey to encryptedBlob clampedTs expiresInMs t))
+    when federationEnabled (fork (forkForwardsTo to encryptedBlob clampedTs result.remoteServers))
     let ok = isSendSuccess result.status
     yield (respond {
       result.status,
@@ -1565,8 +1548,8 @@ handleSendMessage = \to encryptedBlob timestamp expiresInMs authorization client
 -- `seqCounter`, appends the message, and pre-stages forwards for any remote
 -- presence rows that already exist for `to`. Returns the chosen status and
 -- the list of remote servers the caller should kick forwards to.
-sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> MessageIdHex -> Int -> Int<Ms> -> IO {r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], status: MessageStatus}
-sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs t -> do
+sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> Int -> Int<Ms> -> IO {r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], status: MessageStatus}
+sendMessageCore = \senderKey to encryptedBlob clampedTs expiresInMs t -> do
   msgs <- *messages
   dids <- *deliveredIds
   sRates <- *sendRates
@@ -1584,7 +1567,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs t -
   let reject = \s -> yield {status: s, remoteServers: []}
   if senderKey == to
   then reject (MsRejected {})
-  else if isDuplicateMessage effMsgId to msgs dids
+  else if isDuplicateMessage encryptedBlob to msgs dids
   then reject (MsDuplicate {})
   else if srLim || prLim || rrLim
   then reject (MsRateLimited {})
@@ -1596,7 +1579,6 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs t -
     let expiresAt = seqTs + effectiveMessageTtl expiresInMs
     *messages = union msgs [
       {
-        messageId: effMsgId,
         toKey: to,
         encryptedBlob,
         timestamp: clampedTs,
@@ -1610,8 +1592,7 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs t -
     forwardsEnqueued <- if federationEnabled
     then do
       fwds <- *forwards
-      let newFwds = mapWhere remoteServers (\s -> none fwds (\f -> f.messageId == effMsgId && f.toServer == s)) (\s -> {
-        messageId: effMsgId,
+      let newFwds = mapWhere remoteServers (\s -> none fwds (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s)) (\s -> {
         toServer: s,
         createdAt: t,
         toKey: to,
@@ -1632,14 +1613,15 @@ sendMessageCore = \senderKey to encryptedBlob clampedTs effMsgId expiresInMs t -
 
 -- Fire one /federation/forward call per pre-staged server. On success the
 -- corresponding row in `forwards` is pruned, and if no other forwards remain
--- for this messageId AND the recipient has no local presence, the backing
+-- for this blob AND the recipient has no local presence, the backing
 -- `*messages` row is dropped too: the origin's job is done and the message
 -- now lives on the receiving peer's mailbox. On failure the forwards row
 -- stays so `retryPendingForwards` can re-attempt with backoff.
-forkForwardsTo : MessageIdHex -> PubkeyHex -> BlobHex -> Int<Ms> -> [Text] -> IO {} {}
-forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers -> forEach servers (\server -> do
+forkForwardsTo : PubkeyHex -> BlobHex -> Int<Ms> -> [Text] -> IO {} {}
+forkForwardsTo = \to encryptedBlob clampedTs servers -> forEach servers (\server -> do
+  let effMsgId = messageIdOf encryptedBlob
   fwds <- *forwards
-  let same = \x -> x.messageId == effMsgId && x.toServer == server
+  let same = \x -> x.encryptedBlob == encryptedBlob && x.toServer == server
   case findFirst fwds same of
     Nothing {} -> yield {}
     Just {value: f} -> do
@@ -1666,10 +1648,10 @@ forkForwardsTo = \effMsgId to encryptedBlob clampedTs servers -> forEach servers
             replace *forwards = remaining
             pres <- *presence
             let stillLocal = any pres (\p -> p.pubkey == to && isLocalServer p.server && p.expiresAt > t)
-            let othersPending = any remaining (\x -> x.messageId == effMsgId)
+            let othersPending = any remaining (\x -> x.encryptedBlob == encryptedBlob)
             when (not stillLocal && not othersPending) (do
               msgs <- *messages
-              *messages = filter msgs (\m -> m.messageId != effMsgId)))))
+              *messages = filter msgs (\m -> m.encryptedBlob != encryptedBlob)))))
 
 -- ============================================
 -- Handler: lookup
@@ -1723,12 +1705,13 @@ handleMessageStatus = \to messageId authorization clientIp respond -> do
     msgs <- *messages
     fwds <- *forwards
     dids <- *deliveredIds
-    let matches = \x -> x.messageId == messageId && x.toKey == to
-    let s = if any msgs matches
+    let blobMatches = \x -> messageIdOf x.encryptedBlob == messageId && x.toKey == to
+    let didMatches = \d -> d.messageId == messageId && d.toKey == to
+    let s = if any msgs blobMatches
     then "pending"
-    else if any fwds matches
+    else if any fwds blobMatches
     then "forwarding"
-    else if any dids matches then "delivered" else "unknown"
+    else if any dids didMatches then "delivered" else "unknown"
     yield (respond {status: s, authorized: True {}}))
 
 -- ============================================
@@ -1749,7 +1732,7 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
     error: "rate_limited"
   } (\pubkey -> do
     ackedCount <- atomic (do
-      toAck <- removeForKey (\x -> x.toKey == pubkey && elem (dedupMessageIds messageIds) x.messageId)
+      toAck <- removeForKey (\x -> x.toKey == pubkey && elem (dedupMessageIds messageIds) (messageIdOf x.encryptedBlob))
       yield (count toAck))
     yield (respond {ok: True {}, authorized: True {}, ackedCount, error: ""}))
 
@@ -1777,7 +1760,7 @@ handleListMessages = \offset authorization clientIp respond -> do
       let myMsgs = sortBy (\m -> m.receivedAt) (filter msgs (\m -> m.toKey == pubkey && m.expiresAt > t))
       let total = count myMsgs
       let page = pluck (takeRelation maxPollEvents (dropRelation (clamp 0 total offset) myMsgs)) (\m -> {
-        m.messageId,
+        messageId: messageIdOf m.encryptedBlob,
         m.timestamp,
         m.receivedAt
       })
@@ -1801,7 +1784,7 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
     error: "rate_limited"
   } (\pubkey -> do
     deletedCount <- atomic (do
-      toDel <- removeForKey (\x -> x.toKey == pubkey && elem (dedupMessageIds messageIds) x.messageId)
+      toDel <- removeForKey (\x -> x.toKey == pubkey && elem (dedupMessageIds messageIds) (messageIdOf x.encryptedBlob))
       yield (count toDel))
     yield (respond {ok: True {}, authorized: True {}, deletedCount, error: ""}))
 
@@ -1814,13 +1797,13 @@ handleSendBatch = \messages authorization clientIp respond -> do
   let mkErr = \_ -> {results: [], authorized: False {}, retryAfterMs: 0}
   gateAuth (True {}) authorization clientIp t respond mkErr (\senderKey -> do
     results <- mapEach (takeRelation maxBatchSize messages) (\m -> do
-      effMsgId <- genToken
+      let effMsgId = messageIdOf m.encryptedBlob
       let clampedTs = clampTimestamp m.timestamp t
       r <- if t - m.timestamp > messageMaxAge
       then yield {status: MsRejected {}, remoteServers: []}
       else atomic (do
-        sendMessageCore senderKey m.to m.encryptedBlob clampedTs effMsgId m.expiresInMs t)
-      when federationEnabled (fork (forkForwardsTo effMsgId m.to m.encryptedBlob clampedTs r.remoteServers))
+        sendMessageCore senderKey m.to m.encryptedBlob clampedTs m.expiresInMs t)
+      when federationEnabled (fork (forkForwardsTo m.to m.encryptedBlob clampedTs r.remoteServers))
       yield {messageId: effMsgId, r.status})
     yield (respond {results, authorized: True {}, retryAfterMs: 0}))
 
@@ -1887,14 +1870,14 @@ handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorizati
 -- on stale gossip about R could land on B with no actively-polling client and
 -- get stuck. If B refuses, A retries via `retryPendingForwards` against the
 -- next presence target.
-storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> MessageIdHex -> Int<Ms> -> Bool -> Int<Ms> -> IO {r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter} Text
-storeFederated = \toKey encryptedBlob timestamp messageId expiresAt checkRecvRate t -> do
+storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> Int<Ms> -> Bool -> Int<Ms> -> IO {r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter} Text
+storeFederated = \toKey encryptedBlob timestamp expiresAt checkRecvRate t -> do
   pres <- *presence
   msgs <- *messages
   dids <- *deliveredIds
   if not any pres (\p -> p.pubkey == toKey && isLocalServer p.server && p.expiresAt > t)
   then yield "no_presence"
-  else if isDuplicateMessage messageId toKey msgs dids
+  else if isDuplicateMessage encryptedBlob toKey msgs dids
   then yield ""
   else do
     limited <- if checkRecvRate
@@ -1915,7 +1898,6 @@ storeFederated = \toKey encryptedBlob timestamp messageId expiresAt checkRecvRat
       *seqCounter = seqTs
       *messages = union msgs [
         {
-          messageId,
           toKey,
           encryptedBlob,
           timestamp: clampTimestamp timestamp t,
@@ -1928,15 +1910,20 @@ storeFederated = \toKey encryptedBlob timestamp messageId expiresAt checkRecvRat
 
 -- POST /federation/forward: receive a single federated message destined for
 -- a local key. Delegates the actual store decision to `storeFederated`,
--- which returns "" on success (including the duplicate case).
+-- which returns "" on success (including the duplicate case). The peer-
+-- supplied messageId in the request body is ignored: we derive the id from
+-- the blob ourselves so a hostile peer cannot bypass dedup by varying the
+-- id. Honest senders derive the same value, so the "forward:" ++ messageId
+-- auth scope still verifies.
 handleForwardMessage : PubkeyHex -> BlobHex -> Int<Ms> -> Text -> Text -> Int -> Int<Ms> -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> a) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock, network} a
-handleForwardMessage = \toKey encryptedBlob timestamp messageId fromServer requestTimestamp expiresAt authorization respond -> do
+handleForwardMessage = \toKey encryptedBlob timestamp _ fromServer requestTimestamp expiresAt authorization respond -> do
+  let messageId = messageIdOf encryptedBlob
   t <- now
   withFederationAuth authorization t respond fromServer ("forward:" ++ messageId) requestTimestamp (isRemote fromServer) (do
     if t - timestamp > messageMaxAge
     then yield (respond {ok: False {}, error: "stale_timestamp", retryAfterMs: 0})
     else do
-      result <- atomic storeFederated toKey encryptedBlob timestamp messageId expiresAt (True {}) t
+      result <- atomic storeFederated toKey encryptedBlob timestamp expiresAt (True {}) t
       yield (respond {ok: result == "", error: result, retryAfterMs: 0}))
 
 -- POST /federation/forward-batch: bulk variant of `handleForwardMessage`.
@@ -1948,12 +1935,14 @@ handleFederationBatchForward = \forwards fromServer requestTimestamp authorizati
   let batchRespond = \r -> respond {r.ok, r.error, results: [], r.retryAfterMs}
   withFederationAuth authorization t batchRespond fromServer "forward-batch" requestTimestamp (isRemote fromServer && count forwards <= maxBatchSize) (do
     results <- mapEach (takeRelation maxBatchSize forwards) (\e -> do
+      -- Recompute id from blob; ignore e.messageId (untrusted, peer-chosen).
+      let messageId = messageIdOf e.encryptedBlob
       ok <- if t - e.timestamp > messageMaxAge
       then yield (False {})
       else do
-        result <- atomic storeFederated e.toKey e.encryptedBlob e.timestamp e.messageId e.expiresAt (False {}) t
+        result <- atomic storeFederated e.toKey e.encryptedBlob e.timestamp e.expiresAt (False {}) t
         yield (result == "")
-      yield {e.messageId, ok})
+      yield {messageId, ok})
     yield (respond {ok: True {}, error: "", results, retryAfterMs: 0}))
 
 -- ============================================
