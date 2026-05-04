@@ -173,12 +173,6 @@ onlineGossipTtl = 5400000
 -- Times to retry a federation forward before giving up.
 maxForwardRetries : Int
 maxForwardRetries = 10
--- Hop-count ceiling for gossip propagation between peers.
-maxGossipHops : Int
-maxGossipHops = 5
--- Initial hop budget assigned to gossip events that originate on this server.
-gossipOriginHops : Int
-gossipOriginHops = 2
 
 -- Base delay for federation retry backoff (linear, not exponential — 30 s).
 retryBackoffBase : Int<Ms>
@@ -251,13 +245,10 @@ impl ToJSON GossipEventType where
 impl FromJSON GossipEventType where
   parseJson t = (\s -> if s == "online" then GossipOnline {} else if s == "offline" then GossipOffline {} else GossipUnknown {}) (parseJson t : Text)
 
--- One presence change exchanged between federated servers. `seenBy` lists the
--- hostnames already aware of the event, used by receivers to break gossip loops.
+-- One presence change exchanged between federated servers.
 type GossipEvent = {
   eventType: GossipEventType,
-  pubkey: PubkeyHex,
-  server: ServerName,
-  seenBy: [Text]
+  pubkey: PubkeyHex
 }
 
 -- Outcome classification returned to the sender of /messages and per-entry in
@@ -448,7 +439,7 @@ route ClientApi where
   POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: AnyServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
 route FederationApi where
-  POST {events: [GossipEvent], hopsRemaining: Int, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/gossip headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = RecvGossip
+  POST {events: [GossipEvent], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/gossip headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = RecvGossip
   POST {toKey: PubkeyHex, encryptedBlob: BlobHex, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = ForwardMessage
   POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, messageId: MessageIdHex}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} = FederationBatchForward
 
@@ -477,7 +468,7 @@ route MaintenanceApi where
   GET /maintenance/allowed headers {authorization: Text} -> {peers: [Text], ok: Bool} = ListAllowed
   POST /maintenance/reconcile headers {authorization: Text} -> {ok: Bool, messageDrift: Int, presenceDrift: Int, sessionDrift: Int} = Reconcile
   POST {newSecret: Text} /maintenance/rotate-secret headers {authorization: Text} -> {ok: Bool, error: Text} = RotateSecret
-  GET /maintenance/config headers {authorization: Text} -> {ok: Bool, maxGossipHops: Int, pollTimeoutMs: Int, ackGracePeriod: Int} = GetConfig
+  GET /maintenance/config headers {authorization: Text} -> {ok: Bool, pollTimeoutMs: Int, ackGracePeriod: Int} = GetConfig
 
 route HealthApi where
   GET /health headers {authorization: Text} -> {ok: Bool, version: Text, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, capacityWarning: Bool, federationHealthy: Bool, watchdogHealthy: Bool, nonceHealthy: Bool, forwardQueueHealthy: Bool, requestPressureHealthy: Bool, draining: Bool, degradedPeers: Int} = Health
@@ -1060,18 +1051,15 @@ pruneExpired = \t -> atomic do
 -- ============================================
 -- Federation gossip
 -- ============================================
--- Construction and outbound dispatch of presence gossip events. Each event
--- carries a `seenBy` list to short-circuit loops on the receiver. Failures
--- from a peer record into `forwardFailures` (shared with forward retries) so
--- both subsystems back off together.
+-- Construction and outbound dispatch of presence gossip events. Failures from
+-- a peer record into `forwardFailures` (shared with forward retries) so both
+-- subsystems back off together.
 
--- Build a gossip event with this server's identity.
+-- Build a gossip event with the originating pubkey's status.
 mkGossip : GossipEventType -> PubkeyHex -> GossipEvent
 mkGossip = \etype pk -> {
   eventType: etype,
-  pubkey: pk,
-  server: serverHostN,
-  seenBy: [serverHostN]
+  pubkey: pk
 }
 
 -- Fan out one bundle of gossip events to each peer, skipping peers in backoff.
@@ -1085,7 +1073,6 @@ sendBatchedGossip = \peers events -> forEach peers (\server -> do
     result <- fetch (federationUrl server) (RecvGossip {
       authorization: auth,
       events,
-      hopsRemaining: gossipOriginHops,
       fromServer: serverHostN,
       requestTimestamp: t,
       correlationId: ""
@@ -1746,30 +1733,29 @@ handleFederationPubkey = \respond -> do
   hex <- *federationPublicKeyHex
   yield (respond {pubkey: hex, ok: hex != ""})
 
--- POST /federation/gossip: ingest peer presence events. Drops loop-back
--- events (origin == this server), then applies each event in arrival order:
--- `GossipOnline` upserts the (pubkey, server) row with a fresh receiver-side
--- TTL, `GossipOffline` deletes it. For keys that transition offline → online,
--- flushes any locally-buffered messages via `forwardQueuedToServer`.
-handleRecvGossip : [{eventType: <GossipOffline {} | GossipOnline {} | a>, pubkey: PubkeyHex, server: Text | b}] -> Int -> Text -> Int -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> c) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, rw *presence, clock, network} c
-handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorization respond -> do
+-- POST /federation/gossip: ingest peer presence events. The transport-level
+-- `fromServer` is the home server for every event. Applies each event in
+-- arrival order: `GossipOnline` upserts the (pubkey, fromServer) row with a
+-- fresh receiver-side TTL, `GossipOffline` deletes it. For keys that
+-- transition offline → online, flushes any locally-buffered messages via
+-- `forwardQueuedToServer`.
+handleRecvGossip : [{eventType: <GossipOffline {} | GossipOnline {} | a>, pubkey: PubkeyHex | b}] -> Text -> Int -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> c) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, rw *presence, clock, network} c
+handleRecvGossip = \events fromServer requestTimestamp authorization respond -> do
   t <- now
-  withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (clamp 0 maxGossipHops hopsRemaining >= 1 && isRemote fromServer && count events <= maxGossipEvents) (do
+  withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (isRemote fromServer && count events <= maxGossipEvents) (do
     newlyOnline <- atomic (do
       pres <- *presence
       let final = fold (\state e ->
-        if not isRemote e.server
-        then state
-        else (\matches -> case e.eventType of
+        (\matches -> case e.eventType of
           GossipOnline {} -> {
-            pres: union (removeWhere state.pres matches) [{e.pubkey, e.server, expiresAt: t + onlineGossipTtl}],
-            newlyOnline: if any state.pres (\p -> matches p && p.expiresAt > t) then state.newlyOnline else union state.newlyOnline [{e.pubkey, e.server}]
+            pres: union (removeWhere state.pres matches) [{e.pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}],
+            newlyOnline: if any state.pres (\p -> matches p && p.expiresAt > t) then state.newlyOnline else union state.newlyOnline [{e.pubkey, server: fromServer}]
           }
           GossipOffline {} -> {
             pres: removeWhere state.pres matches,
             state.newlyOnline
           }
-          _ -> state) (\p -> p.pubkey == e.pubkey && p.server == e.server)
+          _ -> state) (\p -> p.pubkey == e.pubkey && p.server == fromServer)
       ) {pres, newlyOnline: []} events
       *presence = final.pres
       yield final.newlyOnline)
@@ -2027,7 +2013,6 @@ handlePingPeer = \server authorization respond -> withMaintAuth authorization (y
   result <- fetch (federationUrl server) (RecvGossip {
     authorization: auth,
     events: [],
-    hopsRemaining: 1,
     fromServer: serverHostN,
     requestTimestamp: startTime,
     correlationId: ""
@@ -2161,14 +2146,13 @@ handleRotateSecret = \newSecret authorization respond -> withMaintAuth authoriza
   yield (respond {ok: True {}, error: ""}))
 
 -- GET /maintenance/config: expose a small set of operationally-relevant
--- compile-time constants (gossip hops, poll timeout, ack grace).
-handleGetConfig : Text -> ({ackGracePeriod: Int, maxGossipHops: Int, ok: Bool, pollTimeoutMs: Int} -> a) -> IO {r *runtimeMaintenanceSecret} a
+-- compile-time constants (poll timeout, ack grace).
+handleGetConfig : Text -> ({ackGracePeriod: Int, ok: Bool, pollTimeoutMs: Int} -> a) -> IO {r *runtimeMaintenanceSecret} a
 handleGetConfig = \authorization respond -> do
   ok <- verifyMaintenanceAuth authorization
   let v = \x -> if ok then x else 0
   yield (respond {
     ok,
-    maxGossipHops: v maxGossipHops,
     pollTimeoutMs: v pollTimeoutMs,
     ackGracePeriod: v ackGracePeriod
   })
@@ -2545,7 +2529,7 @@ serve = \req -> case req of
   DeleteMessages {messageIds, authorization, clientIp, respond} -> handleDeleteMessages messageIds authorization clientIp respond
   LookupPresence {pubkey, authorization, clientIp, respond} -> handleLookupPresence pubkey authorization clientIp respond
   BatchLookupPresence {pubkeys, authorization, clientIp, respond} -> handleBatchLookupPresence pubkeys authorization clientIp respond
-  RecvGossip {events, hopsRemaining, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events hopsRemaining fromServer requestTimestamp authorization respond
+  RecvGossip {events, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events fromServer requestTimestamp authorization respond
   ForwardMessage {toKey, encryptedBlob, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob messageId fromServer requestTimestamp authorization respond
   FederationBatchForward {forwards, fromServer, requestTimestamp, authorization, respond} -> handleFederationBatchForward forwards fromServer requestTimestamp authorization respond
   FederationPubkey {respond} -> handleFederationPubkey respond
