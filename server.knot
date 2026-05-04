@@ -257,7 +257,6 @@ type GossipEvent = {
   eventType: GossipEventType,
   pubkey: PubkeyHex,
   server: ServerName,
-  timestamp: Timestamp,
   seenBy: [Text]
 }
 
@@ -338,8 +337,7 @@ type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp}
 type PresenceEntry = {
   pubkey: PubkeyHex,
   server: AnyServerName,
-  expiresAt: Timestamp,
-  timestamp: Timestamp
+  expiresAt: Timestamp
 }
 -- A message queued for cross-server delivery to `toServer`. `retries` is
 -- incremented by `retryPendingForwards` until `maxForwardRetries` is hit.
@@ -986,9 +984,9 @@ clearFailure = \server -> atomic (do
 -- ============================================
 -- Common utility queries
 -- ============================================
--- Pure helpers shared by send/poll/federation paths: TTL clamping, monotonic
--- sequence generation, presence lookup, duplicate detection across
--- (messages, deliveredIds), and last-write-wins presence merge.
+-- Pure helpers shared by send/poll/federation paths: monotonic sequence
+-- generation, presence lookup, and duplicate detection across
+-- (messages, deliveredIds).
 
 -- Strictly-monotonic next sequence timestamp: max of wall clock and prior+1.
 -- Guarantees /poll cursors order events even when many arrive in the same ms.
@@ -1027,10 +1025,6 @@ collectPeers = \items getServer -> unique (filter (pluck items getServer) isRemo
 knownPeerServersFromPresence : [PresenceEntry] -> [Text]
 knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.server)
 
--- Last-write-wins merge by (pubkey, server), keeping the entry with the larger expiresAt.
-mergePresence : [PresenceEntry] -> [PresenceEntry] -> [PresenceEntry]
-mergePresence = \existing incoming -> fold (\acc e -> (\same -> if any acc (\x -> same x && x.expiresAt >= e.expiresAt) then acc else union (removeWhere acc same) [e]) (\x -> x.pubkey == e.pubkey && x.server == e.server)) existing incoming
-
 -- ============================================
 -- Pruning
 -- ============================================
@@ -1041,7 +1035,7 @@ mergePresence = \existing incoming -> fold (\acc e -> (\same -> if any acc (\x -
 -- One sweep over every state ref: drops expired rows in a single atomic block.
 -- Returns the locally-expired presence rows whose pubkey has no other live
 -- local session, so the caller can broadcast offline gossip for them.
-pruneExpired : Int<Ms> -> IO {rw *activePolls, rw *challenges, rw *deliveredIds, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: AnyServerName, timestamp: Timestamp}]
+pruneExpired : Int<Ms> -> IO {rw *activePolls, rw *challenges, rw *deliveredIds, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: AnyServerName}]
 pruneExpired = \t -> atomic do
   ch <- *challenges
   *challenges = filter ch (\x -> x.expiresAt > t)
@@ -1072,12 +1066,11 @@ pruneExpired = \t -> atomic do
 -- both subsystems back off together.
 
 -- Build a gossip event with this server's identity.
-mkGossip : GossipEventType -> PubkeyHex -> Timestamp -> GossipEvent
-mkGossip = \etype pk t -> {
+mkGossip : GossipEventType -> PubkeyHex -> GossipEvent
+mkGossip = \etype pk -> {
   eventType: etype,
   pubkey: pk,
   server: serverHostN,
-  timestamp: t,
   seenBy: [serverHostN]
 }
 
@@ -1103,10 +1096,10 @@ sendBatchedGossip = \peers events -> forEach peers (\server -> do
 
 -- Tell known peers that the listed local pubkeys just went offline. No-op when
 -- federation is disabled or the list is empty.
-broadcastOfflineGossip : Int<Ms> -> [{pubkey: PubkeyHex | a}] -> IO {r *presence} {}
-broadcastOfflineGossip = \t expiredLocal -> do
+broadcastOfflineGossip : [{pubkey: PubkeyHex | a}] -> IO {r *presence} {}
+broadcastOfflineGossip = \expiredLocal -> do
   presence <- *presence
-  when (federationEnabled && count expiredLocal > 0) (sendBatchedGossip (knownPeerServersFromPresence presence) (pluck expiredLocal (\p -> mkGossip (GossipOffline {}) p.pubkey t)))
+  when (federationEnabled && count expiredLocal > 0) (sendBatchedGossip (knownPeerServersFromPresence presence) (pluck expiredLocal (\p -> mkGossip (GossipOffline {}) p.pubkey)))
 
 -- ============================================
 -- Forward retries
@@ -1182,7 +1175,7 @@ forwardQueuedToServer = \pubkey server t -> atomic (do
 pruneAndRetry = \t -> do
   *lastPrunedAt = t
   expiredLocal <- pruneExpired t
-  fork (broadcastOfflineGossip t expiredLocal)
+  fork (broadcastOfflineGossip expiredLocal)
   when federationEnabled (do
     fork retryPendingForwards
     lastRefresh <- *lastPresenceRefresh
@@ -1203,13 +1196,12 @@ refreshLocalPresence = \t -> do
     let refreshed = mapWhere presence needsRefresh (\p -> {
       p.pubkey,
       p.server,
-      expiresAt: t + sessionExpiry,
-      timestamp: t
+      expiresAt: t + sessionExpiry
     })
     let updated = union (removeWhere presence needsRefresh) refreshed
     replace *presence = updated
     yield {refreshed, peers: knownPeerServersFromPresence updated})
-  when (count refreshState.refreshed > 0) (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> mkGossip (GossipOnline {}) p.pubkey t))))
+  when (count refreshState.refreshed > 0) (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> mkGossip (GossipOnline {}) p.pubkey))))
 
 -- ============================================
 -- Handler: challenge / verify / revoke / logout
@@ -1299,7 +1291,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
         pres <- *presence
         let prunedPres = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
         let newPres = union prunedPres [
-          {pubkey, server: serverHostN, expiresAt: expiry, timestamp: t}
+          {pubkey, server: serverHostN, expiresAt: expiry}
         ]
         replace *presence = newPres
         yield {valid: True {}, peers: knownPeerServersFromPresence newPres})
@@ -1307,7 +1299,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
     then yield (respond {token: "", expiresAt: 0, error: "invalid"})
     else do
       when federationEnabled (fork (sendBatchedGossip result.peers [
-        mkGossip (GossipOnline {}) pubkey t
+        mkGossip (GossipOnline {}) pubkey
       ]))
       yield (respond {token, expiresAt: expiry, error: ""})
 
@@ -1348,7 +1340,7 @@ handleLogout = \authorization clientIp respond -> do
       yield (knownPeerServersFromPresence pres)
     yield {ok: True {}, pubkey, peers})
   when (removed.ok && federationEnabled) (fork (sendBatchedGossip removed.peers [
-    mkGossip (GossipOffline {}) removed.pubkey t
+    mkGossip (GossipOffline {}) removed.pubkey
   ]))
   yield (respond {removed.ok, authorized: removed.ok})
 
@@ -1754,45 +1746,33 @@ handleFederationPubkey = \respond -> do
   hex <- *federationPublicKeyHex
   yield (respond {pubkey: hex, ok: hex != ""})
 
--- POST /federation/gossip: ingest peer presence events. Filters out events
--- whose origin is local (loops) or whose timestamp is in the future beyond
--- skew tolerance, applies last-write-wins merge per (pubkey, server), and
--- — for keys that became newly online — flushes any locally-buffered messages
--- for them via `forwardQueuedToServer` (the catch-up path).
-handleRecvGossip : [{eventType: <GossipOffline {} | GossipOnline {} | a>, pubkey: PubkeyHex, server: Text, timestamp: Int<Ms> | b}] -> Int -> Text -> Int -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> c) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, rw *presence, clock, network} c
+-- POST /federation/gossip: ingest peer presence events. Drops loop-back
+-- events (origin == this server), then applies each event in arrival order:
+-- `GossipOnline` upserts the (pubkey, server) row with a fresh receiver-side
+-- TTL, `GossipOffline` deletes it. For keys that transition offline → online,
+-- flushes any locally-buffered messages via `forwardQueuedToServer`.
+handleRecvGossip : [{eventType: <GossipOffline {} | GossipOnline {} | a>, pubkey: PubkeyHex, server: Text | b}] -> Int -> Text -> Int -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> c) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, rw *presence, clock, network} c
 handleRecvGossip = \events hopsRemaining fromServer requestTimestamp authorization respond -> do
   t <- now
   withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (clamp 0 maxGossipHops hopsRemaining >= 1 && isRemote fromServer && count events <= maxGossipEvents) (do
     newlyOnline <- atomic (do
       pres <- *presence
-      -- Clamp e.timestamp to receive time so a peer can't push it into the
-      -- future to game the offline-vs-online LWW comparison below. The skew
-      -- check is a redundant sanity filter against broken senders.
-      let validEvents = do
-        e <- events
-        where isRemote e.server && e.timestamp <= t + clockSkewTolerance
-        let effTs = min e.timestamp t
-        yield {e.pubkey, e.server, effTs, e.eventType}
-      let isOnline = \v -> case v.eventType of
-        GossipOnline {} -> True {}
-        _ -> False {}
-      let isOffline = \v -> case v.eventType of
-        GossipOffline {} -> True {}
-        _ -> False {}
-      -- Receiver anchors expiresAt to its own clock + onlineGossipTtl; senders
-      -- don't carry a TTL on the wire.
-      let online = mapWhere validEvents isOnline (\v -> {
-        v.pubkey,
-        v.server,
-        expiresAt: t + onlineGossipTtl,
-        timestamp: v.effTs
-      })
-      let offline = mapWhere validEvents isOffline (\v -> {v.pubkey, v.server, timestamp: v.effTs})
-      *presence = mergePresence (filter pres (\p -> none offline (\o -> o.pubkey == p.pubkey && o.server == p.server && o.timestamp > p.timestamp))) online
-      yield (mapWhere online (\e -> none pres (\p -> p.pubkey == e.pubkey && p.server == e.server && p.expiresAt >= e.expiresAt)) (\e -> {
-        e.pubkey,
-        e.server
-      })))
+      let final = fold (\state e ->
+        if not isRemote e.server
+        then state
+        else (\matches -> case e.eventType of
+          GossipOnline {} -> {
+            pres: union (removeWhere state.pres matches) [{e.pubkey, e.server, expiresAt: t + onlineGossipTtl}],
+            newlyOnline: if any state.pres (\p -> matches p && p.expiresAt > t) then state.newlyOnline else union state.newlyOnline [{e.pubkey, e.server}]
+          }
+          GossipOffline {} -> {
+            pres: removeWhere state.pres matches,
+            state.newlyOnline
+          }
+          _ -> state) (\p -> p.pubkey == e.pubkey && p.server == e.server)
+      ) {pres, newlyOnline: []} events
+      *presence = final.pres
+      yield final.newlyOnline)
     fork (forEach newlyOnline (\tgt -> forwardQueuedToServer tgt.pubkey tgt.server t))
     yield (respond {ok: True {}, error: "", retryAfterMs: 0}))
 
@@ -1893,7 +1873,7 @@ handleDrain = \phase authorization respond -> withMaintAuth authorization (yield
       *presence = removeWhere pres isLocalLive
       *pollWakeup = t
       yield {peers: knownPeerServersFromPresence pres, localKeys: filter pres isLocalLive})
-  when (effectivePhase == 2 && count drainResult.localKeys > 0 && federationEnabled) (fork (sendBatchedGossip drainResult.peers (pluck drainResult.localKeys (\p -> mkGossip (GossipOffline {}) p.pubkey t))))
+  when (effectivePhase == 2 && count drainResult.localKeys > 0 && federationEnabled) (fork (sendBatchedGossip drainResult.peers (pluck drainResult.localKeys (\p -> mkGossip (GossipOffline {}) p.pubkey))))
   yield (respond {ok: True {}, drained: count drainResult.localKeys, phase: effectivePhase}))
 
 -- POST /maintenance/undrain: clear drain state and resume normal operation.
