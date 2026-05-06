@@ -224,8 +224,8 @@ sToMs = \s -> stripUnit s * 1000
 -- ============================================
 -- Wire/state shapes plus refinement aliases for hex/server-name validation.
 -- Hex types are bounded length + lowercase-hex; server names are lowercased
--- and stripped of trailing dots, with a deny-list filter (`isBadServerName`)
--- applied where SSRF is a concern.
+-- and stripped of trailing dots. The SSRF deny-list (`isBadServerName`) is
+-- applied at federation egress, not in the type predicate.
 
 -- One event in a /poll response: the opaque cipher blob addressed to the
 -- polling pubkey. The server cannot read the blob; clients derive any
@@ -272,17 +272,14 @@ isValidMessageId : Text -> Bool
 isValidMessageId = isValidBoundedHex maxMessageIdLen
 -- Hex-encoded message id, length ≤ `maxMessageIdLen`.
 type MessageIdHex = Text where isValidMessageId
--- Normalized hostname (lowercased, no trailing dot, length-bounded).
-isAnyServerName : Text -> Bool
-isAnyServerName = \s -> not tooLong s maxServerNameLen && s == normalizeServerName s
--- A normalized hostname that also passes the SSRF deny-list (`isBadServerName`).
+-- Normalized hostname (lowercased, no trailing dot, length-bounded). The SSRF
+-- deny-list (`isBadServerName`) is enforced separately at federation egress
+-- (`withFederationAuth`, `handlePingPeer`); keeping it out of the type predicate
+-- lets the default `serverHost = "localhost"` flow through presence rows in a
+-- non-federated single-node deployment.
 isValidServerName : Text -> Bool
-isValidServerName = \s -> isAnyServerName s && not isBadServerName s
--- Peer hostname suitable for outbound federation calls.
+isValidServerName = \s -> not tooLong s maxServerNameLen && s == normalizeServerName s
 type ServerName = Text where isValidServerName
--- Normalized hostname with no SSRF filter; used when the value comes from
--- presence rows that the client only ever sees masked to "remote".
-type AnyServerName = Text where isAnyServerName
 
 -- Wall-clock time in milliseconds since epoch.
 type Timestamp = Int<Ms>
@@ -306,7 +303,7 @@ type Session = {
 type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp}
 -- Last-known location of a pubkey, either local (`server == serverHostN`) or
 -- learned from a peer via gossip. Multiple entries per pubkey are allowed.
-type PresenceEntry = {pubkey: PubkeyHex, server: AnyServerName, expiresAt: Timestamp}
+type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp}
 -- A message queued for cross-server delivery to `toServer`. `retries` is
 -- incremented by `retryPendingForwards` until `maxForwardRetries` is hit.
 -- Identity is derived from `encryptedBlob` (see `Message`).
@@ -406,8 +403,8 @@ route ClientApi where
   POST {messageIds: [MessageIdHex]} /messages/ack headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, ackedCount: Int, error: Text} = AckMessages
   POST {offset: Int} /messages/list headers {authorization: Text, clientIp: Text} -> {messages: [{messageId: MessageIdHex, receivedAt: Timestamp}], authorized: Bool, count: Int, error: Text} = ListMessages
   POST {messageIds: [MessageIdHex]} /messages/delete headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, deletedCount: Int, error: Text} = DeleteMessages
-  GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text} -> {server: AnyServerName, authorized: Bool, error: Text} = LookupPresence
-  POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: AnyServerName}], authorized: Bool, error: Text} = BatchLookupPresence
+  GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text} -> {server: ServerName, authorized: Bool, error: Text} = LookupPresence
+  POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: ServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
 route FederationApi where
   POST {events: [GossipEvent], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/gossip headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = RecvGossip
@@ -776,14 +773,18 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
 
 -- Combined gate for inbound federation calls. Order of checks (each short-
 -- circuits with an error code in the response):
---   1. peer not block-listed; 2. peer in allow-list (if any); 3. caller-supplied
---   `precondition` holds; 4. clock skew within `clockSkewTolerance`;
---   5. Ed25519 signature verifies; 6. per-peer federation rate limit.
+--   1. `fromServer` passes the SSRF deny-list (so `verifyFederationAuth`'s
+--   pubkey fetch can't be steered at loopback/private hosts);
+--   2. peer not block-listed; 3. peer in allow-list (if any); 4. caller-supplied
+--   `precondition` holds; 5. clock skew within `clockSkewTolerance`;
+--   6. Ed25519 signature verifies; 7. per-peer federation rate limit.
 withFederationAuth = \authorization t respond fromServer scope requestTimestamp precondition action -> do
   blocked <- *blockedPeers
   allowed <- *allowedPeers
   let err = \e r -> yield (respond {ok: False {}, error: e, retryAfterMs: r})
-  let preErr = if elem fromServer blocked
+  let preErr = if isBadServerName fromServer
+  then "invalid_request"
+  else if elem fromServer blocked
   then "blocked"
   else if count allowed > 0 && not elem fromServer allowed
   then "not_allowed"
@@ -977,7 +978,7 @@ knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.serve
 -- One sweep over every state ref: drops expired rows in a single atomic block.
 -- Returns the locally-expired presence rows whose pubkey has no other live
 -- local session, so the caller can broadcast offline gossip for them.
-pruneExpired : Int<Ms> -> IO {rw *activePolls, rw *challenges, rw *deliveredIds, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: AnyServerName}]
+pruneExpired : Int<Ms> -> IO {rw *activePolls, rw *challenges, rw *deliveredIds, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: ServerName}]
 pruneExpired = \t -> atomic do
   ch <- *challenges
   *challenges = filter ch (\x -> x.expiresAt > t)
@@ -1912,7 +1913,9 @@ handlePingPeer = \server authorization respond -> withMaintAuth authorization (y
   ok: False {},
   latencyMs: 0,
   error: "unauthorized"
-})) (do
+})) (if isBadServerName server
+then yield (respond {ok: False {}, latencyMs: 0, error: "invalid_server"})
+else do
   startTime <- now
   auth <- generateFederationAuth "gossip" startTime
   result <- fetch (federationUrl server) (RecvGossip {
@@ -2297,7 +2300,7 @@ handleStatsPeers = \authorization respond -> withMaintAuth authorization (yield 
 
 -- GET /stats/key/{pubkey}: per-key footprint — message count, presence rows,
 -- session count, queued forwards (with details), and active long-poll count.
-handleStatsKey : PubkeyHex -> Text -> ({activePolls: Int, forwardDetails: [{createdAt: Int<Ms>, retries: Int, server: ServerName}], forwards: Int, messages: Int, ok: Bool, presence: [{expiresAt: Int<Ms>, server: AnyServerName}], sessions: Int} -> a) -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *runtimeMaintenanceSecret, r *sessions, clock} a
+handleStatsKey : PubkeyHex -> Text -> ({activePolls: Int, forwardDetails: [{createdAt: Int<Ms>, retries: Int, server: ServerName}], forwards: Int, messages: Int, ok: Bool, presence: [{expiresAt: Int<Ms>, server: ServerName}], sessions: Int} -> a) -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *runtimeMaintenanceSecret, r *sessions, clock} a
 handleStatsKey = \pubkey authorization respond -> withMaintAuth authorization (yield (respond {
   messages: 0,
   presence: [],
