@@ -51,9 +51,11 @@ module ApiClient =
             let! text = response.Content.ReadAsStringAsync() |> awaitTask
             let doc = JsonDocument.Parse(text)
             match doc.RootElement.TryGetProperty("error") with
-            | true, err ->
+            | true, err when not (String.IsNullOrEmpty(err.GetString())) ->
+                let code = err.GetString()
                 doc.Dispose()
-                return raise (ApiError $"{url}: {err.GetString()}")
+                if code = "unauthorized" then return raise Unauthorized
+                else return raise (ApiError $"{url}: {code}")
             | _ -> return doc
         }
 
@@ -79,12 +81,12 @@ module ApiClient =
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) =
         let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex |})
         async {
-            use! doc = sendRequest client $"{serverUrl}/messages" body (Some token)
-            match doc.RootElement.GetProperty("status").GetString() with
-            | "delivered" | "federated" | "queued" | "duplicate" -> ()
-            | "rejected" -> raise (ServerRejected "Message rejected by server")
-            | "unauthorized" -> raise Unauthorized
-            | s -> raise (ApiError $"Unexpected status: {s}")
+            try
+                use! _ = sendRequest client $"{serverUrl}/messages" body (Some token)
+                return ()
+            with
+            | ApiError msg when msg.EndsWith(": self_send") ->
+                return raise (ServerRejected "Message rejected by server")
         }
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =

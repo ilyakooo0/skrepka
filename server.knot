@@ -248,29 +248,11 @@ impl FromJSON GossipEventType where
 -- One presence change exchanged between federated servers.
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex}
 
--- Outcome classification returned to the sender of /messages and per-entry in
--- /messages/batch. The first four are success-ish (see `isSendSuccess`); the
--- rest are refusals.
-data MessageStatus
-  = MsDelivered {}
-  | MsFederated {}
-  | MsQueued {}
-  | MsUnauthorized {}
-  | MsRejected {}
-  | MsRateLimited {}
-  | MsDuplicate {}
-  | MsDraining {}
-
-impl ToJSON MessageStatus where
-  toJson ms = toJson (case ms of
-    MsDelivered {} -> "delivered"
-    MsFederated {} -> "federated"
-    MsQueued {} -> "queued"
-    MsUnauthorized {} -> "unauthorized"
-    MsRejected {} -> "rejected"
-    MsRateLimited {} -> "rate_limited"
-    MsDuplicate {} -> "duplicate"
-    MsDraining {} -> "draining")
+-- /messages and /messages/batch responses signal failure via the `error`
+-- field: empty = success (delivered, federated, queued, or silent duplicate),
+-- non-empty = "draining" | "rate_limited" | "unauthorized" | "self_send".
+-- The sender's UI treats every success the same and learns "they got it"
+-- only via the recipient's E2E ack.
 
 -- True when `s` is non-empty lowercase hex of even length, with `maxLen` ceiling.
 isValidBoundedHex : Int -> Text -> Bool
@@ -346,7 +328,7 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 -- One entry of a /messages/batch request body.
 type BatchMessage = {to: PubkeyHex, encryptedBlob: BlobHex}
 -- Per-entry result returned by /messages/batch.
-type BatchResult = {messageId: MessageIdHex, status: MessageStatus}
+type BatchResult = {messageId: MessageIdHex, error: Text}
 
 -- ============================================
 -- Persisted State (all flat lists, no sharding)
@@ -422,7 +404,7 @@ route AuthApi where
 
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, draining: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, loadPct: Int} = Poll
-  POST {to: PubkeyHex, encryptedBlob: BlobHex} /messages headers {authorization: Text, clientIp: Text} -> {status: MessageStatus, messageId: MessageIdHex, retryAfterMs: Int, error: Text, loadPct: Int} = SendMessage
+  POST {to: PubkeyHex, encryptedBlob: BlobHex} /messages headers {authorization: Text, clientIp: Text} -> {messageId: MessageIdHex, retryAfterMs: Int, error: Text, loadPct: Int} = SendMessage
   POST {to: PubkeyHex, messageId: MessageIdHex} /messages/status headers {authorization: Text, clientIp: Text} -> {status: Text, authorized: Bool} = MessageStatus
   POST {messageIds: [MessageIdHex]} /messages/ack headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, ackedCount: Int, error: Text} = AckMessages
   POST {messages: [BatchMessage]} /messages/batch headers {authorization: Text, clientIp: Text} -> {results: [BatchResult], authorized: Bool, retryAfterMs: Int} = SendBatch
@@ -590,17 +572,8 @@ emptyPollResp = \cursor authorized rateLimited draining gen retryAfterMs cursorW
 }
 
 -- Shared error shape for /messages send.
-sendErrResp : MessageStatus -> Text -> MessageIdHex -> {status: MessageStatus, messageId: MessageIdHex, retryAfterMs: Int, error: Text, loadPct: Int}
-sendErrResp = \status err messageId -> {status, messageId, retryAfterMs: 0, error: err, loadPct: 0}
-
--- True when a send produced (or matched) a deliverable message.
-isSendSuccess : MessageStatus -> Bool
-isSendSuccess = \s -> case s of
-  MsDelivered {} -> True {}
-  MsFederated {} -> True {}
-  MsQueued {} -> True {}
-  MsDuplicate {} -> True {}
-  _ -> False {}
+sendErrResp : Text -> MessageIdHex -> {messageId: MessageIdHex, retryAfterMs: Int, error: Text, loadPct: Int}
+sendErrResp = \err messageId -> {messageId, retryAfterMs: 0, error: err, loadPct: 0}
 
 -- Sequence an IO action over each item, in order.
 forEach : [a] -> (a -> IO {} {}) -> IO {} {}
@@ -1412,11 +1385,11 @@ ackPolledMessages = \pubkey cursor -> do
 -- ============================================
 -- Handler: send
 -- ============================================
--- Accept a message for a recipient pubkey and decide its placement:
---   * `MsDelivered`  -- recipient has a live local session
---   * `MsFederated`  -- recipient lives on a remote peer; queued as a forward
---   * `MsQueued`     -- no presence yet; held until presence appears
---   * `MsRejected` / `MsRateLimited` / `MsDuplicate` / `MsDraining` -- refused
+-- Accept a message for a recipient pubkey. Placement (live local session,
+-- federated forward, or held-for-presence) is internal; the response only
+-- says whether the message was accepted (`error: ""`) or refused (`error:
+-- "draining" | "rate_limited" | "unauthorized" | "self_send"`). Duplicates
+-- are silently treated as success so retries are idempotent.
 -- Send is gated by drain phase, global rate, and the per-sender / per-pair /
 -- per-recipient rate limits charged together inside `sendMessageCore`.
 -- Federated forwards are kicked off in a background fork after the atomic.
@@ -1424,27 +1397,25 @@ ackPolledMessages = \pubkey cursor -> do
 -- POST /messages: send one ciphertext to `to`. Rejects on draining/rate
 -- limit; otherwise calls `sendMessageCore` inside an atomic block and forks
 -- the federation forward (if any) once the local commit lands.
-handleSendMessage : PubkeyHex -> BlobHex -> Text -> Text -> ({error: Text, loadPct: Int, messageId: MessageIdHex, retryAfterMs: Int, status: MessageStatus} -> a) -> IO {r *deliveredIds, r *drainPhase, r *presence, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, rw *pairRates, rw *pollWakeup, rw *recvRates, rw *sendRates, rw *seqCounter, clock} a
+handleSendMessage : PubkeyHex -> BlobHex -> Text -> Text -> ({error: Text, loadPct: Int, messageId: MessageIdHex, retryAfterMs: Int} -> a) -> IO {r *deliveredIds, r *drainPhase, r *presence, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, rw *pairRates, rw *pollWakeup, rw *recvRates, rw *sendRates, rw *seqCounter, clock} a
 handleSendMessage = \to encryptedBlob authorization clientIp respond -> do
   t <- now
   dp <- *drainPhase
   g <- checkGlobalRate t
   let effMsgId = messageIdOf encryptedBlob
-  let err = \s e -> yield (respond (sendErrResp s e effMsgId))
+  let err = \e -> yield (respond (sendErrResp e effMsgId))
   if dp >= 2
-  then err (MsDraining {}) "draining"
+  then err "draining"
   else if g
-  then err (MsRateLimited {}) "rate_limited"
+  then err "rate_limited"
   else do
     result <- atomic (do
-      withSessionAuth authorization t clientIp (yield {status: MsUnauthorized {}, remoteServers: []}) (\senderKey -> sendMessageCore senderKey to encryptedBlob t))
+      withSessionAuth authorization t clientIp (yield {error: "unauthorized", remoteServers: []}) (\senderKey -> sendMessageCore senderKey to encryptedBlob t))
     when federationEnabled (fork (forkForwardsTo to encryptedBlob result.remoteServers))
-    let ok = isSendSuccess result.status
     yield (respond {
-      result.status,
       messageId: effMsgId,
       retryAfterMs: 0,
-      error: if ok then "" else "rejected",
+      error: result.error,
       loadPct: 0
     })
 
@@ -1452,9 +1423,10 @@ handleSendMessage = \to encryptedBlob authorization clientIp respond -> do
 -- counters together (so any limit denies the message), enforces caps and
 -- self-send/duplicate rejections, allocates a monotonic receivedAt via
 -- `seqCounter`, appends the message, and pre-stages forwards for any remote
--- presence rows that already exist for `to`. Returns the chosen status and
--- the list of remote servers the caller should kick forwards to.
-sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> IO {r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], status: MessageStatus}
+-- presence rows that already exist for `to`. Returns the error code (empty
+-- on success or silent duplicate) and the list of remote servers the caller
+-- should kick forwards to.
+sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> IO {r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], error: Text}
 sendMessageCore = \senderKey to encryptedBlob t -> do
   msgs <- *messages
   dids <- *deliveredIds
@@ -1470,13 +1442,13 @@ sendMessageCore = \senderKey to encryptedBlob t -> do
   let rR = checkRate rRates to maxRecvRatePerKey recvRateWindowMs t
   *recvRates = rR.entries
   let rrLim = rR.limited
-  let reject = \s -> yield {status: s, remoteServers: []}
+  let reject = \e -> yield {error: e, remoteServers: []}
   if senderKey == to
-  then reject (MsRejected {})
+  then reject "self_send"
   else if isDuplicateMessage encryptedBlob to msgs dids
-  then reject (MsDuplicate {})
+  then reject ""
   else if srLim || prLim || rrLim
-  then reject (MsRateLimited {})
+  then reject "rate_limited"
   else do
     pres <- *presence
     seq <- *seqCounter
@@ -1486,8 +1458,7 @@ sendMessageCore = \senderKey to encryptedBlob t -> do
     *pollWakeup = seqTs
     let toPresence = presenceForKey pres to t
     let remoteServers = collectPeers toPresence (\p -> p.server)
-    forwardsEnqueued <- if federationEnabled
-    then do
+    when federationEnabled (do
       fwds <- *forwards
       let newFwds = mapWhere remoteServers (\s -> none fwds (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s)) (\s -> {
         toServer: s,
@@ -1496,15 +1467,8 @@ sendMessageCore = \senderKey to encryptedBlob t -> do
         encryptedBlob,
         retries: 0
       })
-      *forwards = union fwds newFwds
-      yield (count newFwds > 0)
-    else yield (False {})
-    yield {
-      status: if any toPresence (\p -> isLocalServer p.server)
-      then MsDelivered {}
-      else if forwardsEnqueued then MsFederated {} else MsQueued {},
-      remoteServers
-    }
+      *forwards = union fwds newFwds)
+    yield {error: "", remoteServers}
 
 -- Fire one /federation/forward call per pre-staged server. On success the
 -- corresponding row in `forwards` is pruned, and if no other forwards remain
@@ -1692,7 +1656,7 @@ handleSendBatch = \messages authorization clientIp respond -> do
       let effMsgId = messageIdOf m.encryptedBlob
       r <- atomic (do sendMessageCore senderKey m.to m.encryptedBlob t)
       when federationEnabled (fork (forkForwardsTo m.to m.encryptedBlob r.remoteServers))
-      yield {messageId: effMsgId, r.status})
+      yield {messageId: effMsgId, r.error})
     yield (respond {results, authorized: True {}, retryAfterMs: 0}))
 
 -- ============================================
