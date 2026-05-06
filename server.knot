@@ -301,12 +301,7 @@ type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestam
 -- A message queued for cross-server delivery to `toServer`. `retries` is
 -- incremented by `retryPendingForwards` until `maxForwardRetries` is hit.
 -- Identity is derived from `encryptedBlob` (see `Message`).
-type ForwardEntry = {
-  toServer: ServerName,
-  toKey: PubkeyHex,
-  encryptedBlob: BlobHex,
-  retries: Int
-}
+type ForwardEntry = {toServer: ServerName, toKey: PubkeyHex, encryptedBlob: BlobHex, retries: Int}
 -- Replay-protection record: a message id we already delivered locally.
 type DeliveredEntry = {messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: Timestamp}
 -- Running failure counter for a peer; keyed by `server`. Drives `retryBackoff`.
@@ -1582,12 +1577,7 @@ handleListMessages = \offset authorization clientIp respond -> do
 handleDeleteMessages : [MessageIdHex] -> Text -> Text -> ({authorized: Bool, deletedCount: Int, error: Text, ok: Bool} -> a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
 handleDeleteMessages = \messageIds authorization clientIp respond -> do
   t <- now
-  let mkErr = \e -> {
-    ok: False {},
-    authorized: False {},
-    deletedCount: 0,
-    error: e
-  }
+  let mkErr = \e -> {ok: False {}, authorized: False {}, deletedCount: 0, error: e}
   gateClientWrite authorization clientIp t respond mkErr {
     ok: False {},
     authorized: True {},
