@@ -79,14 +79,18 @@ module ApiClient =
         }
 
     let sendMessage (serverUrl: string) (token: string) (toHex: string) (blobHex: string) =
-        let body = JsonSerializer.Serialize({| ``to`` = toHex; encryptedBlob = blobHex |})
+        let body =
+            JsonSerializer.Serialize(
+                {| messages = [| {| ``to`` = toHex; encryptedBlob = blobHex |} |] |})
         async {
-            try
-                use! _ = sendRequest client $"{serverUrl}/messages" body (Some token)
-                return ()
-            with
-            | ApiError msg when msg.EndsWith(": self_send") ->
-                return raise (ServerRejected "Message rejected by server")
+            use! doc = sendRequest client $"{serverUrl}/messages" body (Some token)
+            let results = doc.RootElement.GetProperty("results")
+            if results.GetArrayLength() > 0 then
+                let entryErr = results.[0].GetProperty("error").GetString()
+                if entryErr = "self_send" then
+                    return raise (ServerRejected "Message rejected by server")
+                elif not (String.IsNullOrEmpty(entryErr)) then
+                    return raise (ApiError $"{serverUrl}/messages: {entryErr}")
         }
 
     let poll (serverUrl: string) (token: string) (cursor: int64) =
