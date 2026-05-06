@@ -303,7 +303,6 @@ type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestam
 -- Identity is derived from `encryptedBlob` (see `Message`).
 type ForwardEntry = {
   toServer: ServerName,
-  createdAt: Timestamp,
   toKey: PubkeyHex,
   encryptedBlob: BlobHex,
   retries: Int
@@ -458,9 +457,9 @@ type RecipientCount = {pubkey: PubkeyHex, count: Int}
 route StatsApi where
   GET /stats headers {authorization: Text} -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, totalMessageCount: Int, presence: Int, forwards: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, nonceEvictions: Int, activePolls: Int, recipientCounts: Int, messageBucketMax: Int, messageBucketMin: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, oldestAckAge: Int, recentGossip: Int, blockedPeers: Int, drainCompletedAt: Timestamp, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}], gossipSuccess: Int, gossipFail: Int, latencyBuckets: {lt100: Int, lt500: Int, lt2000: Int, gte2000: Int}}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, pendingAckCleanups: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, draining: Bool, drainPhase: Int, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, pollLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int, sendLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, authAvgMs: Int, authMaxMs: Int, authCount: Int}} = Stats
   GET /stats/peers headers {authorization: Text} -> {peers: [PeerStatus], ok: Bool} = StatsPeers
-  GET /stats/key/{pubkey: PubkeyHex} headers {authorization: Text} -> {messages: Int, presence: [KeyPresenceEntry], sessions: Int, forwards: Int, forwardDetails: [{server: Text, retries: Int, createdAt: Timestamp}], activePolls: Int, ok: Bool} = StatsKey
+  GET /stats/key/{pubkey: PubkeyHex} headers {authorization: Text} -> {messages: Int, presence: [KeyPresenceEntry], sessions: Int, forwards: Int, forwardDetails: [{server: Text, retries: Int}], activePolls: Int, ok: Bool} = StatsKey
   POST {limit: Int} /stats/top-recipients headers {authorization: Text} -> {recipients: [RecipientCount], ok: Bool, total: Int} = TopRecipients
-  GET /stats/forwards headers {authorization: Text} -> {servers: [{server: Text, count: Int, oldestAge: Int, totalRetries: Int}], ok: Bool, total: Int} = StatsForwards
+  GET /stats/forwards headers {authorization: Text} -> {servers: [{server: Text, count: Int, totalRetries: Int}], ok: Bool, total: Int} = StatsForwards
   GET /stats/rates headers {authorization: Text} -> {ok: Bool, scalePct: Int, globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int, clientWriteRate: Int} = StatsRates
 
 route MetricsApi where
@@ -972,7 +971,7 @@ knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.serve
 -- One sweep over every state ref: drops expired rows in a single atomic block.
 -- Returns the locally-expired presence rows whose pubkey has no other live
 -- local session, so the caller can broadcast offline gossip for them.
-pruneExpired : Int<Ms> -> IO {rw *activePolls, rw *challenges, rw *deliveredIds, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: ServerName}]
+pruneExpired : Int<Ms> -> IO {rw *activePolls, rw *challenges, rw *deliveredIds, rw *forwardFailures, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: ServerName}]
 pruneExpired = \t -> atomic do
   ch <- *challenges
   *challenges = filter ch (\x -> x.expiresAt > t)
@@ -980,8 +979,6 @@ pruneExpired = \t -> atomic do
   *sessions = filter ses (\x -> x.expiresAt > t)
   msgs <- *messages
   *messages = filter msgs (\m -> t - m.receivedAt < messageMaxAge)
-  fwds <- *forwards
-  *forwards = filter fwds (\f -> t - f.createdAt < messageMaxAge)
   dids <- *deliveredIds
   *deliveredIds = filter dids (\d -> t - d.deliveredAt < messageMaxAge)
   ff <- *forwardFailures
@@ -1074,18 +1071,17 @@ retryPendingForwards = do
     atomic (do
       cur <- *forwards
       *forwards = pluck (removeWhere cur isDone) (\x -> if isMatch x
-      then {x.toServer, x.createdAt, x.toKey, x.encryptedBlob, retries: x.retries + 1}
+      then {x.toServer, x.toKey, x.encryptedBlob, retries: x.retries + 1}
       else x))))
 
 -- Forward queued messages to a server when a remote key comes online.
-forwardQueuedToServer : PubkeyHex -> ServerName -> Int<Ms> -> IO {rw *forwards, r *messages} {}
-forwardQueuedToServer = \pubkey server t -> atomic (do
+forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages} {}
+forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
   fwds <- *forwards
   let candidates = filter msgs (\m -> m.toKey == pubkey && none fwds (\f -> f.encryptedBlob == m.encryptedBlob && f.toServer == server))
   let newFwds = pluck (takeRelation maxForwardsPerServer candidates) (\m -> {
     toServer: server,
-    createdAt: t,
     m.toKey,
     m.encryptedBlob,
     retries: 0
@@ -1441,7 +1437,6 @@ sendMessageCore = \senderKey to encryptedBlob t -> do
       fwds <- *forwards
       let newFwds = mapWhere remoteServers (\s -> none fwds (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s)) (\s -> {
         toServer: s,
-        createdAt: t,
         toKey: to,
         encryptedBlob,
         retries: 0
@@ -1659,7 +1654,7 @@ handleRecvGossip = \events fromServer requestTimestamp authorization respond -> 
       let added = map (\pk -> {pubkey: pk, server: fromServer, expiresAt: t + onlineGossipTtl}) onlinePubkeys
       *presence = union kept added
       yield (filter onlinePubkeys (\pk -> none pres (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t))))
-    fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer t))
+    fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (respond {ok: True {}, error: "", retryAfterMs: 0}))
 
 -- Store a federated/forwarded message into the local mailbox. Caller wraps in `atomic`.
@@ -1780,7 +1775,7 @@ handleShutdown = \authorization respond -> handleDrain 2 authorization (\r -> re
 -- POST /maintenance/prune: trigger an out-of-band `pruneAndRetry` tick.
 -- Useful when the operator wants to force expiry/forward retries without
 -- waiting for the next `backgroundPrune` interval.
-handlePrune : Text -> ({ok: Bool} -> a) -> IO {r *runtimeMaintenanceSecret, rw *activePolls, r *blockedPeers, rw *challenges, rw *deliveredIds, rw *forwardFailures, rw *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *sessions, clock} a
+handlePrune : Text -> ({ok: Bool} -> a) -> IO {r *runtimeMaintenanceSecret, rw *activePolls, r *blockedPeers, rw *challenges, rw *deliveredIds, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *sessions, clock} a
 handlePrune = \authorization respond -> do
   t <- now
   authorized <- verifyMaintenanceAuth authorization
@@ -2294,7 +2289,7 @@ handleStatsPeers = \authorization respond -> withMaintAuth authorization (yield 
 
 -- GET /stats/key/{pubkey}: per-key footprint — message count, presence rows,
 -- session count, queued forwards (with details), and active long-poll count.
-handleStatsKey : PubkeyHex -> Text -> ({activePolls: Int, forwardDetails: [{createdAt: Int<Ms>, retries: Int, server: ServerName}], forwards: Int, messages: Int, ok: Bool, presence: [{expiresAt: Int<Ms>, server: ServerName}], sessions: Int} -> a) -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *runtimeMaintenanceSecret, r *sessions, clock} a
+handleStatsKey : PubkeyHex -> Text -> ({activePolls: Int, forwardDetails: [{retries: Int, server: ServerName}], forwards: Int, messages: Int, ok: Bool, presence: [{expiresAt: Int<Ms>, server: ServerName}], sessions: Int} -> a) -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *runtimeMaintenanceSecret, r *sessions, clock} a
 handleStatsKey = \pubkey authorization respond -> withMaintAuth authorization (yield (respond {
   messages: 0,
   presence: [],
@@ -2319,7 +2314,7 @@ handleStatsKey = \pubkey authorization respond -> withMaintAuth authorization (y
     }),
     sessions: countWhere ses (\x -> x.pubkey == pubkey),
     forwards: count myFwds,
-    forwardDetails: pluck myFwds (\x -> {server: x.toServer, x.retries, x.createdAt}),
+    forwardDetails: pluck myFwds (\x -> {server: x.toServer, x.retries}),
     activePolls: countWhere aps (\x -> x.pubkey == pubkey),
     ok: True {}
   }))
@@ -2341,18 +2336,17 @@ handleTopRecipients = \limit authorization respond -> withMaintAuth authorizatio
   let top = takeRelation cap (sortBy (\c -> 0 - c.count) counts)
   yield (respond {recipients: top, ok: True {}, total: count counts}))
 
--- GET /stats/forwards: per-destination forward queue summary — count, age of
--- oldest pending entry, and total accumulated retries.
-handleStatsForwards : Text -> ({ok: Bool, servers: [{count: Int<u>, oldestAge: Int<Ms>, server: ServerName, totalRetries: Int}], total: Int} -> a) -> IO {r *forwards, r *runtimeMaintenanceSecret, clock} a
+-- GET /stats/forwards: per-destination forward queue summary — count and
+-- total accumulated retries.
+handleStatsForwards : Text -> ({ok: Bool, servers: [{count: Int<u>, server: ServerName, totalRetries: Int}], total: Int} -> a) -> IO {r *forwards, r *runtimeMaintenanceSecret} a
 handleStatsForwards = \authorization respond -> withMaintAuth authorization (yield (respond {
   servers: [],
   ok: False {},
   total: 0
 })) (do
-  t <- now
   fwds <- *forwards
   yield (respond {
-    servers: pluck (collectPeers fwds (\f -> f.toServer)) (\s -> (\svFwds -> {server: s, count: count svFwds, oldestAge: t - fold (\acc f -> min acc f.createdAt) t svFwds, totalRetries: fold (\acc f -> acc + f.retries) 0 svFwds}) (filter fwds (\f -> f.toServer == s))),
+    servers: pluck (collectPeers fwds (\f -> f.toServer)) (\s -> (\svFwds -> {server: s, count: count svFwds, totalRetries: fold (\acc f -> acc + f.retries) 0 svFwds}) (filter fwds (\f -> f.toServer == s))),
     ok: True {},
     total: count fwds
   }))
@@ -2472,7 +2466,7 @@ serve = \req -> case req of
 
 -- Endless tick: every `backgroundPruneInterval` run `pruneAndRetry` (skipped
 -- when drain phase >= 2) and bump `pruneCount` for /stats and /health.
-backgroundPrune : IO {r *drainPhase, rw *activePolls, r *blockedPeers, rw *challenges, rw *deliveredIds, rw *forwardFailures, rw *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *pruneCount, rw *sessions, clock} a
+backgroundPrune : IO {r *drainPhase, rw *activePolls, r *blockedPeers, rw *challenges, rw *deliveredIds, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *pruneCount, rw *sessions, clock} a
 backgroundPrune = do
   sleep backgroundPruneInterval
   dp <- *drainPhase
