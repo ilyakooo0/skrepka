@@ -287,13 +287,7 @@ type Timestamp = Int<Ms>
 -- Outstanding nonce issued by /auth/challenge; consumed by /auth/verify.
 type Challenge = {pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp, ip: Text}
 -- An issued bearer token bound to (pubkey, ip, expiry).
-type Session = {
-  token: Text,
-  pubkey: PubkeyHex,
-  expiresAt: Timestamp,
-  ip: Text,
-  createdAt: Timestamp
-}
+type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp, ip: Text}
 -- Mailbox row: a stored message awaiting recipient pickup or federation forward.
 -- Identity is `messageIdOf encryptedBlob` (BLAKE3 of the ciphertext); we don't
 -- persist it because it's deterministically derivable. Storage TTL is fixed
@@ -423,7 +417,7 @@ route MaintenanceApi where
   POST {server: ServerName} /maintenance/unblock headers {authorization: Text} -> {ok: Bool, unblocked: Bool} = UnblockPeer
   GET /maintenance/blocked headers {authorization: Text} -> {peers: [Text], ok: Bool} = ListBlocked
   POST {server: ServerName} /maintenance/ping headers {authorization: Text} -> {ok: Bool, latencyMs: Int, error: Text} = PingPeer
-  GET /maintenance/sessions/{pubkey: PubkeyHex} headers {authorization: Text} -> {sessions: [{token: Text, expiresAt: Timestamp, ip: Text, createdAt: Timestamp}], count: Int, ok: Bool} = AdminListSessions
+  GET /maintenance/sessions/{pubkey: PubkeyHex} headers {authorization: Text} -> {sessions: [{token: Text, expiresAt: Timestamp, ip: Text}], count: Int, ok: Bool} = AdminListSessions
   POST {pubkey: PubkeyHex} /maintenance/sessions/revoke-all headers {authorization: Text} -> {ok: Bool, revokedCount: Int} = AdminRevokeSessions
   POST {pubkey: PubkeyHex} /maintenance/messages/purge headers {authorization: Text} -> {ok: Bool, purgedCount: Int} = AdminPurgeMessages
   POST {ip: Text} /maintenance/sessions/revoke-ip headers {authorization: Text} -> {ok: Bool, revokedCount: Int, affectedKeys: Int} = AdminRevokeIp
@@ -1219,7 +1213,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
         let pruned = if revokeOthers
         then removeWhere ses mine
         else capPerKey ses mine maxSessionsPerKey (\s -> s.expiresAt)
-        let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp, createdAt: t}
+        let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
         *sessions = capList (union pruned [newSession]) maxSessions (\s -> s.expiresAt)
         pres <- *presence
         let prunedPres = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
@@ -1931,13 +1925,13 @@ else do
     Ok {value: r} -> yield (respond {r.ok, latencyMs: endTime - startTime, r.error}))
 
 -- GET /maintenance/sessions/{pubkey}: list a single user's active sessions.
--- Token values are masked ("***") — operators see expiry, ip, createdAt only.
-handleAdminListSessions : PubkeyHex -> Text -> ({count: Int, ok: Bool, sessions: [{createdAt: Int<Ms>, expiresAt: Int<Ms>, ip: Text, token: Text}]} -> a) -> IO {r *runtimeMaintenanceSecret, r *sessions} a
+-- Token values are masked ("***") — operators see expiry and ip only.
+handleAdminListSessions : PubkeyHex -> Text -> ({count: Int, ok: Bool, sessions: [{expiresAt: Int<Ms>, ip: Text, token: Text}]} -> a) -> IO {r *runtimeMaintenanceSecret, r *sessions} a
 handleAdminListSessions = \pubkey authorization respond -> do
   ok <- verifyMaintenanceAuth authorization
   ses <- *sessions
   let mine = if ok
-  then mapWhere ses (\s -> s.pubkey == pubkey) (\s -> {token: "***", s.expiresAt, s.ip, s.createdAt})
+  then mapWhere ses (\s -> s.pubkey == pubkey) (\s -> {token: "***", s.expiresAt, s.ip})
   else []
   yield (respond {sessions: mine, count: count mine, ok})
 
