@@ -669,35 +669,35 @@ withMaintAuth = \authorization onUnauth onAuth -> do
 
 -- Common gate for handlers: global rate, session auth.
 -- mkErr is called with one of: "rate_limited", "unauthorized".
-gateAuth : Text -> Text -> Timestamp -> (resp -> ret) -> (Text -> resp) -> (PubkeyHex -> IO {} ret) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} ret
-gateAuth = \auth ip t respond mkErr onAuth -> do
+gateAuth : Text -> Text -> Timestamp -> (Text -> resp) -> (PubkeyHex -> IO {} resp) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} resp
+gateAuth = \auth ip t mkErr onAuth -> do
   g <- checkGlobalRate t
-  let err = \e -> yield (respond (mkErr e))
+  let err = \e -> yield (mkErr e)
   if g then err "rate_limited" else withSessionAuth auth t ip (err "unauthorized") onAuth
 
 -- gateAuth + per-key rate gate. `rateResp` is the response value when the per-key gate trips.
-gateClientWrite : Text -> Text -> Int<Ms> -> (a -> b) -> (Text -> a) -> a -> (Text -> IO {} b) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} b
-gateClientWrite = \auth ip t respond mkErr rateResp onAuth ->
-  gateAuth auth ip t respond mkErr (\pk -> do
+gateClientWrite : Text -> Text -> Int<Ms> -> (Text -> a) -> a -> (Text -> IO {} a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} a
+gateClientWrite = \auth ip t mkErr rateResp onAuth ->
+  gateAuth auth ip t mkErr (\pk -> do
     lim <- atomic do
       rates <- *clientWriteRates
       let r = checkRate rates pk maxClientWriteRatePerKey clientWriteRateWindowMs t
       -- TODO: make this no be a `replace`
       *clientWriteRates = r.entries
       yield r.limited
-    if lim then yield (respond rateResp) else onAuth pk)
+    if lim then yield rateResp else onAuth pk)
 
 -- Variant of `gateClientWrite` that uses the per-key lookup-rate window instead.
-gateLookup : Text -> Text -> Int<Ms> -> (a -> b) -> (Text -> a) -> a -> (Text -> IO {} b) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} b
-gateLookup = \auth ip t respond mkErr rateResp onAuth ->
-  gateAuth auth ip t respond mkErr (\pk -> do
+gateLookup : Text -> Text -> Int<Ms> -> (Text -> a) -> a -> (Text -> IO {} a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} a
+gateLookup = \auth ip t mkErr rateResp onAuth ->
+  gateAuth auth ip t mkErr (\pk -> do
     lim <- atomic do
       rates <- *lookupRates
       let r = checkRate rates pk maxLookupRatePerKey lookupRateWindowMs t
       -- TODO: make this no be a `replace`
       *lookupRates = r.entries
       yield r.limited
-    if lim then yield (respond rateResp) else onAuth pk)
+    if lim then yield rateResp else onAuth pk)
 
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
 -- the client IP matches. Runs `onAuth pubkey` on success, `onUnauth` otherwise.
@@ -755,10 +755,10 @@ verifyFederationAuth = \authorization fromServer scope requestTimestamp -> do
 --   2. peer not block-listed; 3. peer in allow-list (if any); 4. caller-supplied
 --   `precondition` holds; 5. clock skew within `clockSkewTolerance`;
 --   6. Ed25519 signature verifies; 7. per-peer federation rate limit.
-withFederationAuth = \authorization t respond fromServer scope requestTimestamp precondition action -> do
+withFederationAuth = \authorization t mkErr fromServer scope requestTimestamp precondition action -> do
   blocked <- *blockedPeers
   allowed <- *allowedPeers
-  let err = \e r -> yield (respond {ok: False {}, error: e, retryAfterMs: r})
+  let err = \e r -> yield (mkErr e r)
   let preErr = if isBadServerName fromServer
   then "invalid_request"
   else if elem fromServer blocked
@@ -1124,14 +1124,14 @@ refreshLocalPresence = \t -> do
 -- POST /auth/challenge: issue a fresh signed-nonce challenge for `pubkey`.
 -- Capped per-key (maxChallengesPerKey) and rate-limited; the IP is recorded
 -- so /auth/verify can require the same client.
-handleChallenge : PubkeyHex -> Text -> ({challenge: Text, error: Text, expiresAt: Int, ok: Bool, retryAfterMs: Int} -> a) -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challengeRates, rw *challenges, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, clock, random} a
-handleChallenge = \pubkey clientIp respond -> do
+handleChallenge : PubkeyHex -> Text -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challengeRates, rw *challenges, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, clock, random} {challenge: Text, error: Text, expiresAt: Int, ok: Bool, retryAfterMs: Int}
+handleChallenge = \pubkey clientIp -> do
   t <- now
   preErr <- if requireClientIp && clientIp == ""
   then yield "client_ip_required"
   else authPreCheck clientIp t
   if preErr != ""
-  then yield (respond {challenge: "", ok: False {}, expiresAt: 0, retryAfterMs: 0, error: preErr})
+  then yield {challenge: "", ok: False {}, expiresAt: 0, retryAfterMs: 0, error: preErr}
   else do
     challenge <- genToken
     result <- atomic (do
@@ -1150,24 +1150,24 @@ handleChallenge = \pubkey clientIp respond -> do
             {pubkey, challenge, expiresAt: t + challengeExpiry, ip: clientIp}
           ]
           yield {ok: True {}, error: ""})
-    yield (respond {
+    yield {
       challenge: if result.ok then challenge else "",
       result.ok,
       expiresAt: if result.ok then t + challengeExpiry else 0,
       retryAfterMs: 0,
       result.error
-    })
+    }
 
 -- POST /auth/verify: validate `signature` over `challenge` for `pubkey`.
 -- On success, mints a session token, records local presence (`pubkey` is now
 -- live on this server), and gossips an `online` event to known peers. If
 -- `revokeOthers` is set, all other sessions for the same pubkey are dropped.
-handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> ({error: Text, expiresAt: Int, token: Text} -> a) -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challenges, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, rw *presence, rw *sessions, clock, random} a
-handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> do
+handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challenges, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, rw *presence, rw *sessions, clock, random} {error: Text, expiresAt: Int, token: Text}
+handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
   preErr <- authPreCheck clientIp t
   if preErr != ""
-  then yield (respond {token: "", expiresAt: 0, error: preErr})
+  then yield {token: "", expiresAt: 0, error: preErr}
   else do
     let expiry = t + sessionExpiry
     token <- genToken
@@ -1197,30 +1197,30 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp respond -> 
         *presence = newPres
         yield {valid: True {}, peers: knownPeerServersFromPresence newPres})
     if not result.valid
-    then yield (respond {token: "", expiresAt: 0, error: "invalid"})
+    then yield {token: "", expiresAt: 0, error: "invalid"}
     else do
       when federationEnabled (fork (sendBatchedGossip result.peers [
         mkGossip (GossipOnline {}) pubkey
       ]))
-      yield (respond {token, expiresAt: expiry, error: ""})
+      yield {token, expiresAt: expiry, error: ""}
 
 -- POST /auth/revoke: caller (any session for the pubkey) revokes a sibling
 -- session by token. Returns ok=False if no such sibling existed.
-handleRevoke : Text -> Text -> Text -> ({authorized: Bool, ok: Bool} -> a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
-handleRevoke = \targetToken authorization clientIp respond -> do
+handleRevoke : Text -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, ok: Bool}
+handleRevoke = \targetToken authorization clientIp -> do
   t <- now
-  gateAuth authorization clientIp t respond (\_ -> {ok: False {}, authorized: False {}}) (\caller -> do
+  gateAuth authorization clientIp t (\_ -> {ok: False {}, authorized: False {}}) (\caller -> do
     result <- atomic (do
       ses <- *sessions
       let pred = \s -> s.pubkey == caller && s.token == targetToken
       *sessions = removeWhere ses pred
       yield (any ses pred))
-    yield (respond {ok: result, authorized: True {}}))
+    yield {ok: result, authorized: True {}})
 
 -- POST /auth/logout: drop the caller's own session. If this was the last
 -- session for the pubkey, also clear local presence and gossip offline.
-handleLogout : Text -> Text -> ({authorized: Bool, ok: Bool} -> a) -> IO {rw *presence, rw *sessions, clock} a
-handleLogout = \authorization clientIp respond -> do
+handleLogout : Text -> Text -> IO {rw *presence, rw *sessions, clock} {authorized: Bool, ok: Bool}
+handleLogout = \authorization clientIp -> do
   t <- now
   let myToken = case extractToken authorization of
     Just {value: tk} -> tk
@@ -1243,7 +1243,7 @@ handleLogout = \authorization clientIp respond -> do
   when (removed.ok && federationEnabled) (fork (sendBatchedGossip removed.peers [
     mkGossip (GossipOffline {}) removed.pubkey
   ]))
-  yield (respond {removed.ok, authorized: removed.ok})
+  yield {removed.ok, authorized: removed.ok}
 
 -- ============================================
 -- Handler: poll
@@ -1259,29 +1259,29 @@ handleLogout = \authorization clientIp respond -> do
 -- POST /poll: top-level dispatch. Validates the global rate gate, detects a
 -- generation mismatch (server restart) to force a cursor reset, then hands
 -- off to `pollOnce` for the actual long-poll body.
-handlePoll : Int -> Int -> Text -> Text -> ({authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int} -> Response) -> IO {r *pollWakeup, r *serverGeneration, r *sessions, rw *activePolls, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} Response
-handlePoll = \cursor generation authorization clientIp respond -> do
+handlePoll : Int -> Int -> Text -> Text -> IO {r *pollWakeup, r *serverGeneration, r *sessions, rw *activePolls, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} {authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int}
+handlePoll = \cursor generation authorization clientIp -> do
   t <- now
   serverGen <- *serverGeneration
   g <- checkGlobalRate t
   let cursorWasReset = generation != serverGen && cursor > 0
-  let er = \auth rate retryRate -> yield (respond (emptyPollResp 0 auth rate serverGen retryRate cursorWasReset))
+  let er = \auth rate retryRate -> yield (emptyPollResp 0 auth rate serverGen retryRate cursorWasReset)
   if g
   then er (False {}) (True {}) globalRateWindowMs
-  else pollOnce authorization (if cursorWasReset then 0 else cursor) cursorWasReset clientIp serverGen respond t
+  else pollOnce authorization (if cursorWasReset then 0 else cursor) cursorWasReset clientIp serverGen t
 
 -- Body of a single poll. Treats the cursor advance as an implicit ack
 -- (`ackPolledMessages`), acquires a per-pubkey poll slot, runs `doPoll` to
 -- collect events (or block until wakeup), then assembles the response.
-pollOnce : Text -> Int -> Bool -> Text -> Int -> ({authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int} -> Response) -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *activePolls, rw *forwards, rw *messages, clock} Response
-pollOnce = \authorization cursor cursorWasReset clientIp serverGen respond t -> do
+pollOnce : Text -> Int -> Bool -> Text -> Int -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *activePolls, rw *forwards, rw *messages, clock} {authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int}
+pollOnce = \authorization cursor cursorWasReset clientIp serverGen t -> do
   setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
     let clampedCursor = clamp 0 t cursor
     when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
     startWakeup <- *pollWakeup
     yield (Just {value: {pubkey, clampedCursor, startWakeup}}))
   case setup of
-    Nothing {} -> yield (respond (emptyPollResp 0 (False {}) (False {}) serverGen 0 cursorWasReset))
+    Nothing {} -> yield (emptyPollResp 0 (False {}) (False {}) serverGen 0 cursorWasReset)
     Just {value: s} -> do
       acquired <- atomic (do
         aps <- *activePolls
@@ -1291,11 +1291,11 @@ pollOnce = \authorization cursor cursorWasReset clientIp serverGen respond t -> 
           *activePolls = union aps [{s.pubkey, startedAt: t}]
           yield (True {}))
       if not acquired
-      then yield (respond (emptyPollResp cursor (True {}) (True {}) serverGen pollTimeoutMs cursorWasReset))
+      then yield (emptyPollResp cursor (True {}) (True {}) serverGen pollTimeoutMs cursorWasReset)
       else do
         pollResult <- doPoll s t
         atomic (do aps <- *activePolls; *activePolls = filter aps (\p -> p.pubkey != s.pubkey))
-        yield (respond {
+        yield {
           pollResult.events,
           pollResult.cursor,
           authorized: True {},
@@ -1307,7 +1307,7 @@ pollOnce = \authorization cursor cursorWasReset clientIp serverGen respond t -> 
           pollResult.hasMore,
           cursorStale: False {},
           loadPct: 0
-        })
+        }
 
 -- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
 -- (bumped by send/heartbeat) and re-collect once at the new wall time.
@@ -1358,17 +1358,17 @@ ackPolledMessages = \pubkey cursor -> do
 -- the rest; federated forwards are forked per entry. Top-level `error`
 -- carries global gate failures ("rate_limited" | "unauthorized") and
 -- short-circuits with empty `results`.
-handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> ({error: Text, results: [{error: Text, messageId: MessageIdHex}], retryAfterMs: Int} -> b) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} b
-handleSendMessages = \messages authorization clientIp respond -> do
+handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {error: Text, results: [{error: Text, messageId: MessageIdHex}], retryAfterMs: Int}
+handleSendMessages = \messages authorization clientIp -> do
   t <- now
   let mkErr = \e -> {results: [], error: e, retryAfterMs: 0}
-  gateAuth authorization clientIp t respond mkErr (\senderKey -> do
+  gateAuth authorization clientIp t mkErr (\senderKey -> do
     results <- mapEach (takeRelation maxBatchSize messages) (\m -> do
       let effMsgId = messageIdOf m.encryptedBlob
       r <- atomic (do sendMessageCore senderKey m.to m.encryptedBlob t)
       when federationEnabled (fork (forkForwardsTo m.to m.encryptedBlob r.remoteServers))
       yield {messageId: effMsgId, r.error})
-    yield (respond {results, error: "", retryAfterMs: 0}))
+    yield {results, error: "", retryAfterMs: 0})
 
 -- Atomic core of /messages. Charges send/pair/recv rate
 -- counters together (so any limit denies the message), enforces caps and
@@ -1470,45 +1470,41 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
 -- GET /lookup/{pubkey}: return our local server name if the key is here,
 -- "remote" if known on a peer, "" otherwise. Peer hostnames are deliberately
 -- masked (see section header).
-handleLookupPresence : PubkeyHex -> Text -> Text -> ({authorized: Bool, error: Text, server: Text} -> a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
-handleLookupPresence = \pubkey authorization clientIp respond -> do
+handleLookupPresence : PubkeyHex -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, error: Text, server: Text}
+handleLookupPresence = \pubkey authorization clientIp -> do
   t <- now
   let mkErr = \e -> {server: "", authorized: False {}, error: if e == "rate_limited" then e else ""}
-  gateLookup authorization clientIp t respond mkErr {
-    server: "",
-    authorized: True {},
-    error: "rate_limited"
-  } (\_ -> do
+  gateLookup authorization clientIp t mkErr {server: "", authorized: True {}, error: "rate_limited"} (\_ -> do
     pres <- *presence
-    yield (respond {server: maskedServer pres pubkey t, authorized: True {}, error: ""}))
+    yield {server: maskedServer pres pubkey t, authorized: True {}, error: ""})
 
 -- POST /lookup/batch: same masking as `handleLookupPresence`, but for up to
 -- 50 pubkeys in one round-trip.
-handleBatchLookupPresence : [PubkeyHex] -> Text -> Text -> ({authorized: Bool, error: Text, results: [{pubkey: PubkeyHex, server: Text}]} -> a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
-handleBatchLookupPresence = \pubkeys authorization clientIp respond -> do
+handleBatchLookupPresence : [PubkeyHex] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, error: Text, results: [{pubkey: PubkeyHex, server: Text}]}
+handleBatchLookupPresence = \pubkeys authorization clientIp -> do
   t <- now
   let mkErr = \e -> {
     results: [],
     authorized: False {},
     error: if e == "rate_limited" then e else ""
   }
-  gateLookup authorization clientIp t respond mkErr {
+  gateLookup authorization clientIp t mkErr {
     results: [],
     authorized: True {},
     error: "rate_limited"
   } (\_ -> do
     pres <- *presence
     let results = pluck (takeRelation 50 pubkeys) (\k -> {pubkey: k, server: maskedServer pres k t})
-    yield (respond {results, authorized: True {}, error: ""}))
+    yield {results, authorized: True {}, error: ""})
 
 -- POST /messages/status: classify a message as
 -- pending (in mailbox), forwarding (en-route to a peer),
 -- delivered (acked or terminal), or unknown.
-handleMessageStatus : PubkeyHex -> MessageIdHex -> Text -> Text -> ({authorized: Bool, status: Text} -> a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
-handleMessageStatus = \to messageId authorization clientIp respond -> do
+handleMessageStatus : PubkeyHex -> MessageIdHex -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, status: Text}
+handleMessageStatus = \to messageId authorization clientIp -> do
   t <- now
   let mkErr = \_ -> {status: "", authorized: False {}}
-  gateAuth authorization clientIp t respond mkErr (\_ -> do
+  gateAuth authorization clientIp t mkErr (\_ -> do
     msgs <- *messages
     fwds <- *forwards
     dids <- *deliveredIds
@@ -1519,7 +1515,7 @@ handleMessageStatus = \to messageId authorization clientIp respond -> do
     else if any fwds blobMatches
     then "forwarding"
     else if any dids didMatches then "delivered" else "unknown"
-    yield (respond {status: s, authorized: True {}}))
+    yield {status: s, authorized: True {}})
 
 -- ============================================
 -- Handler: ack / list / delete
@@ -1528,11 +1524,11 @@ handleMessageStatus = \to messageId authorization clientIp respond -> do
 
 -- POST /messages/ack: explicit ack by message id (alternative to the implicit
 -- cursor-based ack in /poll). Drops mailbox+forward rows.
-handleAckMessages : [MessageIdHex] -> Text -> Text -> ({ackedCount: Int, authorized: Bool, error: Text, ok: Bool} -> a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
-handleAckMessages = \messageIds authorization clientIp respond -> do
+handleAckMessages : [MessageIdHex] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {ackedCount: Int, authorized: Bool, error: Text, ok: Bool}
+handleAckMessages = \messageIds authorization clientIp -> do
   t <- now
   let mkErr = \e -> {ok: False {}, authorized: False {}, ackedCount: 0, error: e}
-  gateClientWrite authorization clientIp t respond mkErr {
+  gateClientWrite authorization clientIp t mkErr {
     ok: False {},
     authorized: True {},
     ackedCount: 0,
@@ -1541,12 +1537,12 @@ handleAckMessages = \messageIds authorization clientIp respond -> do
     ackedCount <- atomic (do
       toAck <- removeForKey (\x -> x.toKey == pubkey && elem (messageIdOf x.encryptedBlob) (dedupMessageIds messageIds))
       yield (count toAck))
-    yield (respond {ok: True {}, authorized: True {}, ackedCount, error: ""}))
+    yield {ok: True {}, authorized: True {}, ackedCount, error: ""})
 
 -- POST /messages/list: paginated peek at the caller's mailbox without acking.
 -- Returns metadata only (no ciphertext) plus the total count.
-handleListMessages : Int -> Text -> Text -> ({authorized: Bool, count: Int, error: Text, messages: [{messageId: MessageIdHex, receivedAt: Int<Ms>}]} -> a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
-handleListMessages = \offset authorization clientIp respond -> do
+handleListMessages : Int -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, count: Int, error: Text, messages: [{messageId: MessageIdHex, receivedAt: Int<Ms>}]}
+handleListMessages = \offset authorization clientIp -> do
   t <- now
   let mkErr = \e -> {
     messages: [],
@@ -1554,14 +1550,14 @@ handleListMessages = \offset authorization clientIp respond -> do
     count: 0,
     error: if e == "rate_limited" then e else ""
   }
-  gateAuth authorization clientIp t respond mkErr (\pubkey -> do
+  gateAuth authorization clientIp t mkErr (\pubkey -> do
     lim <- atomic (do
       rates <- *lookupRates
       let r = checkRate rates pubkey maxLookupRatePerKey lookupRateWindowMs t
       *lookupRates = r.entries
       yield r.limited)
     if lim
-    then yield (respond {messages: [], authorized: True {}, count: 0, error: "rate_limited"})
+    then yield {messages: [], authorized: True {}, count: 0, error: "rate_limited"}
     else do
       msgs <- *messages
       let myMsgs = sortBy (\m -> m.receivedAt) (filter msgs (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge))
@@ -1570,15 +1566,15 @@ handleListMessages = \offset authorization clientIp respond -> do
         messageId: messageIdOf m.encryptedBlob,
         m.receivedAt
       })
-      yield (respond {messages: page, authorized: True {}, count: total, error: ""}))
+      yield {messages: page, authorized: True {}, count: total, error: ""})
 
 -- POST /messages/delete: same effect as ack from the recipient's side, with
 -- a "delete" semantic for the response.
-handleDeleteMessages : [MessageIdHex] -> Text -> Text -> ({authorized: Bool, deletedCount: Int, error: Text, ok: Bool} -> a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} a
-handleDeleteMessages = \messageIds authorization clientIp respond -> do
+handleDeleteMessages : [MessageIdHex] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, deletedCount: Int, error: Text, ok: Bool}
+handleDeleteMessages = \messageIds authorization clientIp -> do
   t <- now
   let mkErr = \e -> {ok: False {}, authorized: False {}, deletedCount: 0, error: e}
-  gateClientWrite authorization clientIp t respond mkErr {
+  gateClientWrite authorization clientIp t mkErr {
     ok: False {},
     authorized: True {},
     deletedCount: 0,
@@ -1587,7 +1583,7 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
     deletedCount <- atomic (do
       toDel <- removeForKey (\x -> x.toKey == pubkey && elem (messageIdOf x.encryptedBlob) (dedupMessageIds messageIds))
       yield (count toDel))
-    yield (respond {ok: True {}, authorized: True {}, deletedCount, error: ""}))
+    yield {ok: True {}, authorized: True {}, deletedCount, error: ""})
 
 -- ============================================
 -- Handler: federation receive
@@ -1600,10 +1596,10 @@ handleDeleteMessages = \messageIds authorization clientIp respond -> do
 -- GET /federation/pubkey: publish the Ed25519 public key peers should use to
 -- verify our `Signed ...` federation auth headers. Returns ok=False when the
 -- keypair has not yet been generated (should not happen post-startup).
-handleFederationPubkey : ({pubkey: Text, ok: Bool} -> ret) -> IO {r *federationPublicKeyHex} ret
-handleFederationPubkey = \respond -> do
+handleFederationPubkey : IO {r *federationPublicKeyHex} {pubkey: Text, ok: Bool}
+handleFederationPubkey = do
   hex <- *federationPublicKeyHex
-  yield (respond {pubkey: hex, ok: hex != ""})
+  yield {pubkey: hex, ok: hex != ""}
 
 -- POST /federation/gossip: ingest peer presence events. The transport-level
 -- `fromServer` is the home server for every event. Drops every (pubkey,
@@ -1611,10 +1607,10 @@ handleFederationPubkey = \respond -> do
 -- pubkeys with a `GossipOnline` event (so Online wins on collision). For keys
 -- that transition offline → online, flushes any locally-buffered messages via
 -- `forwardQueuedToServer`.
-handleRecvGossip : [{eventType: <GossipOffline {} | GossipOnline {} | a>, pubkey: PubkeyHex | b}] -> Text -> Int -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> c) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, rw *presence, clock, network} c
-handleRecvGossip = \events fromServer requestTimestamp authorization respond -> do
+handleRecvGossip : [{eventType: <GossipOffline {} | GossipOnline {} | a>, pubkey: PubkeyHex | b}] -> Text -> Int -> Text -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, rw *presence, clock, network} {error: Text, ok: Bool, retryAfterMs: Int}
+handleRecvGossip = \events fromServer requestTimestamp authorization -> do
   t <- now
-  withFederationAuth authorization t respond fromServer "gossip" requestTimestamp (isRemote fromServer && count events <= maxGossipEvents) (do
+  withFederationAuth authorization t (\e r -> {ok: False {}, error: e, retryAfterMs: r}) fromServer "gossip" requestTimestamp (isRemote fromServer && count events <= maxGossipEvents) (do
     newlyOnline <- atomic (do
       pres <- *presence
       let touchedPubkeys = pluck events (\e -> e.pubkey)
@@ -1626,7 +1622,7 @@ handleRecvGossip = \events fromServer requestTimestamp authorization respond -> 
       *presence = union kept added
       yield (filter onlinePubkeys (\pk -> none pres (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t))))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
-    yield (respond {ok: True {}, error: "", retryAfterMs: 0}))
+    yield {ok: True {}, error: "", retryAfterMs: 0})
 
 -- Store a federated/forwarded message into the local mailbox. Caller wraps in `atomic`.
 -- Returns "" on success (including duplicates), otherwise an error code:
@@ -1671,28 +1667,27 @@ storeFederated = \toKey encryptedBlob checkRecvRate t -> do
 -- the blob ourselves so a hostile peer cannot bypass dedup by varying the
 -- id. Honest senders derive the same value, so the "forward:" ++ messageId
 -- auth scope still verifies.
-handleForwardMessage : PubkeyHex -> BlobHex -> Text -> Text -> Int -> Text -> ({error: Text, ok: Bool, retryAfterMs: Int} -> a) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock, network} a
-handleForwardMessage = \toKey encryptedBlob _ fromServer requestTimestamp authorization respond -> do
+handleForwardMessage : PubkeyHex -> BlobHex -> Text -> Text -> Int -> Text -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, r *deliveredIds, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock, network} {error: Text, ok: Bool, retryAfterMs: Int}
+handleForwardMessage = \toKey encryptedBlob _ fromServer requestTimestamp authorization -> do
   let messageId = messageIdOf encryptedBlob
   t <- now
-  withFederationAuth authorization t respond fromServer ("forward:" ++ messageId) requestTimestamp (isRemote fromServer) (do
+  withFederationAuth authorization t (\e r -> {ok: False {}, error: e, retryAfterMs: r}) fromServer ("forward:" ++ messageId) requestTimestamp (isRemote fromServer) (do
     result <- atomic storeFederated toKey encryptedBlob (True {}) t
-    yield (respond {ok: result == "", error: result, retryAfterMs: 0}))
+    yield {ok: result == "", error: result, retryAfterMs: 0})
 
 -- POST /federation/forward-batch: bulk variant of `handleForwardMessage`.
 -- Skips per-entry recv-rate charging (the per-server federation rate limit
 -- already gates the call as a whole).
-handleFederationBatchForward : [{encryptedBlob: BlobHex, messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Text -> Int -> Text -> ({error: Text, ok: Bool, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} -> b) -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, clock, network} b
-handleFederationBatchForward = \forwards fromServer requestTimestamp authorization respond -> do
+handleFederationBatchForward : [{encryptedBlob: BlobHex, messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Text -> Int -> Text -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, clock, network} {error: Text, ok: Bool, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int}
+handleFederationBatchForward = \forwards fromServer requestTimestamp authorization -> do
   t <- now
-  let batchRespond = \r -> respond {r.ok, r.error, results: [], r.retryAfterMs}
-  withFederationAuth authorization t batchRespond fromServer "forward-batch" requestTimestamp (isRemote fromServer && count forwards <= maxBatchSize) (do
+  withFederationAuth authorization t (\e r -> {ok: False {}, error: e, results: [], retryAfterMs: r}) fromServer "forward-batch" requestTimestamp (isRemote fromServer && count forwards <= maxBatchSize) (do
     results <- mapEach (takeRelation maxBatchSize forwards) (\e -> do
       -- Recompute id from blob; ignore e.messageId (untrusted, peer-chosen).
       let messageId = messageIdOf e.encryptedBlob
       result <- atomic storeFederated e.toKey e.encryptedBlob (False {}) t
       yield {messageId, ok: result == ""})
-    yield (respond {ok: True {}, error: "", results, retryAfterMs: 0}))
+    yield {ok: True {}, error: "", results, retryAfterMs: 0})
 
 -- ============================================
 -- Maintenance handlers
@@ -1705,25 +1700,25 @@ handleFederationBatchForward = \forwards fromServer requestTimestamp authorizati
 -- POST /maintenance/prune: trigger an out-of-band `pruneAndRetry` tick.
 -- Useful when the operator wants to force expiry/forward retries without
 -- waiting for the next `backgroundPrune` interval.
-handlePrune : Text -> ({ok: Bool} -> a) -> IO {r *runtimeMaintenanceSecret, rw *activePolls, r *blockedPeers, rw *challenges, rw *deliveredIds, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *sessions, clock} a
-handlePrune = \authorization respond -> do
+handlePrune : Text -> IO {r *runtimeMaintenanceSecret, rw *activePolls, r *blockedPeers, rw *challenges, rw *deliveredIds, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *sessions, clock} {ok: Bool}
+handlePrune = \authorization -> do
   t <- now
   authorized <- verifyMaintenanceAuth authorization
   when authorized (fork (pruneAndRetry t))
-  yield (respond {ok: authorized})
+  yield {ok: authorized}
 
 -- POST /maintenance/reconcile: stub. Production builds run a state
 -- reconciliation pass here; this simplified server reports zero drift.
-handleReconcile : Text -> ({messageDrift: Int, ok: Bool, presenceDrift: Int, sessionDrift: Int} -> a) -> IO {r *runtimeMaintenanceSecret} a
-handleReconcile = \authorization respond -> do
+handleReconcile : Text -> IO {r *runtimeMaintenanceSecret} {messageDrift: Int, ok: Bool, presenceDrift: Int, sessionDrift: Int}
+handleReconcile = \authorization -> do
   authorized <- verifyMaintenanceAuth authorization
-  yield (respond {ok: authorized, messageDrift: 0, presenceDrift: 0, sessionDrift: 0})
+  yield {ok: authorized, messageDrift: 0, presenceDrift: 0, sessionDrift: 0}
 
 -- GET /health: aggregate readiness flags. During an initial warmup window
 -- (3 prune intervals after startup) prune/heartbeat checks always pass to
 -- avoid false negatives before the background loops have ticked.
-handleHealth : a -> ({capacityHealthy: Bool, capacityWarning: Bool, degradedPeers: Int, federationHealthy: Bool, forwardQueueHealthy: Bool, heartbeatHealthy: Bool, nonceHealthy: Bool, ok: Bool, pruneHealthy: Bool, requestPressureHealthy: Bool, version: Text, watchdogHealthy: Bool} -> b) -> IO {r *lastHeartbeatAt, r *lastPrunedAt, r *startedAt, clock} b
-handleHealth = \authorization respond -> do
+handleHealth : a -> IO {r *lastHeartbeatAt, r *lastPrunedAt, r *startedAt, clock} {capacityHealthy: Bool, capacityWarning: Bool, degradedPeers: Int, federationHealthy: Bool, forwardQueueHealthy: Bool, heartbeatHealthy: Bool, nonceHealthy: Bool, ok: Bool, pruneHealthy: Bool, requestPressureHealthy: Bool, version: Text, watchdogHealthy: Bool}
+handleHealth = \authorization -> do
   t <- now
   lastPrune <- *lastPrunedAt
   lastHb <- *lastHeartbeatAt
@@ -1731,7 +1726,7 @@ handleHealth = \authorization respond -> do
   let warmup = t - sa < backgroundPruneInterval * 3
   let pruneOk = warmup || t - lastPrune < backgroundPruneInterval * 3
   let heartbeatOk = warmup || t - lastHb < pollTimeoutMs * 3
-  yield (respond {
+  yield {
     ok: pruneOk && heartbeatOk,
     version: serverBuildVersion,
     pruneHealthy: pruneOk,
@@ -1744,94 +1739,94 @@ handleHealth = \authorization respond -> do
     forwardQueueHealthy: True {},
     requestPressureHealthy: True {},
     degradedPeers: 0
-  })
+  }
 
 -- GET /ready: signals readiness once the first background prune has run
 -- (load-balancer / orchestrator probe).
-handleReady : ({ready: Bool} -> a) -> IO {r *lastPrunedAt, r *startedAt} a
-handleReady = \respond -> do
+handleReady : IO {r *lastPrunedAt, r *startedAt} {ready: Bool}
+handleReady = do
   sa <- *startedAt
   lastPrune <- *lastPrunedAt
-  yield (respond {ready: lastPrune > 0 && lastPrune >= sa})
+  yield {ready: lastPrune > 0 && lastPrune >= sa}
 
 -- POST /maintenance/block: deny-list a peer. Outbound retries skip blocked
 -- peers; inbound federation calls from blocked peers fail in `withFederationAuth`.
-handleBlockPeer : Text -> Text -> ({blocked: Int, ok: Bool} -> a) -> IO {rw *blockedPeers, r *runtimeMaintenanceSecret} a
-handleBlockPeer = \server authorization respond -> withMaintAuth authorization (yield (respond {
+handleBlockPeer : Text -> Text -> IO {rw *blockedPeers, r *runtimeMaintenanceSecret} {blocked: Int, ok: Bool}
+handleBlockPeer = \server authorization -> withMaintAuth authorization (yield {
   ok: False {},
   blocked: 0
-})) (do
+}) (do
   n <- atomic (do
     current <- *blockedPeers
     let updated = union current [server]
     *blockedPeers = updated
     yield (count updated))
-  yield (respond {ok: True {}, blocked: n}))
+  yield {ok: True {}, blocked: n})
 
 -- POST /maintenance/unblock: remove a peer from the deny-list.
-handleUnblockPeer : Text -> Text -> ({ok: Bool, unblocked: Bool} -> a) -> IO {rw *blockedPeers, r *runtimeMaintenanceSecret} a
-handleUnblockPeer = \server authorization respond -> withMaintAuth authorization (yield (respond {
+handleUnblockPeer : Text -> Text -> IO {rw *blockedPeers, r *runtimeMaintenanceSecret} {ok: Bool, unblocked: Bool}
+handleUnblockPeer = \server authorization -> withMaintAuth authorization (yield {
   ok: False {},
   unblocked: False {}
-})) (do
+}) (do
   removed <- atomic (do
     current <- *blockedPeers
     *blockedPeers = removeWhere current (\x -> x == server)
     yield (elem server current))
-  yield (respond {ok: True {}, unblocked: removed}))
+  yield {ok: True {}, unblocked: removed})
 
 -- GET /maintenance/blocked: list the deny-listed peers (empty for unauthorized).
-handleListBlocked : Text -> ({ok: Bool, peers: [Text]} -> a) -> IO {r *blockedPeers, r *runtimeMaintenanceSecret} a
-handleListBlocked = \authorization respond -> do
+handleListBlocked : Text -> IO {r *blockedPeers, r *runtimeMaintenanceSecret} {ok: Bool, peers: [Text]}
+handleListBlocked = \authorization -> do
   ok <- verifyMaintenanceAuth authorization
   list <- *blockedPeers
-  yield (respond {peers: if ok then list else [], ok})
+  yield {peers: if ok then list else [], ok}
 
 -- POST /maintenance/allow: when the allowed-peers list is non-empty, only
 -- federation calls from listed peers are accepted (whitelist mode). An empty
 -- list disables the whitelist.
-handleAllowPeer : Text -> Text -> ({allowed: Int, ok: Bool} -> a) -> IO {rw *allowedPeers, r *runtimeMaintenanceSecret} a
-handleAllowPeer = \server authorization respond -> withMaintAuth authorization (yield (respond {
+handleAllowPeer : Text -> Text -> IO {rw *allowedPeers, r *runtimeMaintenanceSecret} {allowed: Int, ok: Bool}
+handleAllowPeer = \server authorization -> withMaintAuth authorization (yield {
   ok: False {},
   allowed: 0
-})) (do
+}) (do
   n <- atomic (do
     current <- *allowedPeers
     let updated = union current [server]
     *allowedPeers = updated
     yield (count updated))
-  yield (respond {ok: True {}, allowed: n}))
+  yield {ok: True {}, allowed: n})
 
 -- POST /maintenance/unallow: remove an entry from the allow-list. If the
 -- list becomes empty, the whitelist gate disengages.
-handleUnallowPeer : Text -> Text -> ({ok: Bool, removed: Bool} -> a) -> IO {rw *allowedPeers, r *runtimeMaintenanceSecret} a
-handleUnallowPeer = \server authorization respond -> withMaintAuth authorization (yield (respond {
+handleUnallowPeer : Text -> Text -> IO {rw *allowedPeers, r *runtimeMaintenanceSecret} {ok: Bool, removed: Bool}
+handleUnallowPeer = \server authorization -> withMaintAuth authorization (yield {
   ok: False {},
   removed: False {}
-})) (do
+}) (do
   removed <- atomic (do
     current <- *allowedPeers
     *allowedPeers = removeWhere current (\x -> x == server)
     yield (elem server current))
-  yield (respond {ok: True {}, removed}))
+  yield {ok: True {}, removed})
 
 -- GET /maintenance/allowed: list the allow-listed peers (empty for unauthorized).
-handleListAllowed : Text -> ({ok: Bool, peers: [Text]} -> a) -> IO {r *allowedPeers, r *runtimeMaintenanceSecret} a
-handleListAllowed = \authorization respond -> do
+handleListAllowed : Text -> IO {r *allowedPeers, r *runtimeMaintenanceSecret} {ok: Bool, peers: [Text]}
+handleListAllowed = \authorization -> do
   ok <- verifyMaintenanceAuth authorization
   list <- *allowedPeers
-  yield (respond {peers: if ok then list else [], ok})
+  yield {peers: if ok then list else [], ok}
 
 -- POST /maintenance/ping: send a zero-event gossip to a peer and return the
 -- round-trip latency. Useful for diagnosing federation reachability without
 -- waiting for organic traffic.
-handlePingPeer : Text -> Text -> ({error: Text, latencyMs: Int, ok: Bool} -> a) -> IO {r *federationPrivateKeyHex, r *runtimeMaintenanceSecret, network, clock, random} a
-handlePingPeer = \server authorization respond -> withMaintAuth authorization (yield (respond {
+handlePingPeer : Text -> Text -> IO {r *federationPrivateKeyHex, r *runtimeMaintenanceSecret, network, clock, random} {error: Text, latencyMs: Int, ok: Bool}
+handlePingPeer = \server authorization -> withMaintAuth authorization (yield {
   ok: False {},
   latencyMs: 0,
   error: "unauthorized"
-})) (if isBadServerName server
-then yield (respond {ok: False {}, latencyMs: 0, error: "invalid_server"})
+}) (if isBadServerName server
+then yield {ok: False {}, latencyMs: 0, error: "invalid_server"}
 else do
   startTime <- now
   auth <- generateFederationAuth "gossip" startTime
@@ -1844,27 +1839,27 @@ else do
   })
   endTime <- now
   case result of
-    Err e -> yield (respond {ok: False {}, latencyMs: endTime - startTime, error: show e})
-    Ok {value: r} -> yield (respond {r.ok, latencyMs: endTime - startTime, r.error}))
+    Err e -> yield {ok: False {}, latencyMs: endTime - startTime, error: show e}
+    Ok {value: r} -> yield {r.ok, latencyMs: endTime - startTime, r.error})
 
 -- GET /maintenance/sessions/{pubkey}: list a single user's active sessions.
 -- Token values are masked ("***") — operators see expiry and ip only.
-handleAdminListSessions : PubkeyHex -> Text -> ({count: Int, ok: Bool, sessions: [{expiresAt: Int<Ms>, ip: Text, token: Text}]} -> a) -> IO {r *runtimeMaintenanceSecret, r *sessions} a
-handleAdminListSessions = \pubkey authorization respond -> do
+handleAdminListSessions : PubkeyHex -> Text -> IO {r *runtimeMaintenanceSecret, r *sessions} {count: Int, ok: Bool, sessions: [{expiresAt: Int<Ms>, ip: Text, token: Text}]}
+handleAdminListSessions = \pubkey authorization -> do
   ok <- verifyMaintenanceAuth authorization
   ses <- *sessions
   let mine = if ok
   then mapWhere ses (\s -> s.pubkey == pubkey) (\s -> {token: "***", s.expiresAt, s.ip})
   else []
-  yield (respond {sessions: mine, count: count mine, ok})
+  yield {sessions: mine, count: count mine, ok}
 
 -- POST /maintenance/sessions/revoke-all: drop every session and local presence
 -- row for `pubkey`. Operator-side kick for a compromised key.
-handleAdminRevokeSessions : PubkeyHex -> Text -> ({ok: Bool, revokedCount: Int} -> a) -> IO {rw *presence, r *runtimeMaintenanceSecret, rw *sessions} a
-handleAdminRevokeSessions = \pubkey authorization respond -> withMaintAuth authorization (yield (respond {
+handleAdminRevokeSessions : PubkeyHex -> Text -> IO {rw *presence, r *runtimeMaintenanceSecret, rw *sessions} {ok: Bool, revokedCount: Int}
+handleAdminRevokeSessions = \pubkey authorization -> withMaintAuth authorization (yield {
   ok: False {},
   revokedCount: 0
-})) (do
+}) (do
   revoked <- atomic (do
     ses <- *sessions
     let same = \s -> s.pubkey == pubkey
@@ -1872,16 +1867,16 @@ handleAdminRevokeSessions = \pubkey authorization respond -> withMaintAuth autho
     pres <- *presence
     *presence = filter pres (\p -> p.pubkey != pubkey || isRemote p.server)
     yield (countWhere ses same))
-  yield (respond {ok: True {}, revokedCount: revoked}))
+  yield {ok: True {}, revokedCount: revoked})
 
 -- POST /maintenance/messages/purge: drop all queued/forwarding messages
 -- destined for `pubkey`. With the federation ack flow gone, there's nothing
 -- to ack back — peers will discover the absence on their next forward attempt.
-handleAdminPurgeMessages : PubkeyHex -> Text -> ({ok: Bool, purgedCount: Int} -> a) -> IO {rw *forwards, rw *messages, r *runtimeMaintenanceSecret} a
-handleAdminPurgeMessages = \pubkey authorization respond -> withMaintAuth authorization (yield (respond {
+handleAdminPurgeMessages : PubkeyHex -> Text -> IO {rw *forwards, rw *messages, r *runtimeMaintenanceSecret} {ok: Bool, purgedCount: Int}
+handleAdminPurgeMessages = \pubkey authorization -> withMaintAuth authorization (yield {
   ok: False {},
   purgedCount: 0
-})) (do
+}) (do
   purged <- atomic (do
     msgs <- *messages
     let mine = \m -> m.toKey == pubkey
@@ -1890,16 +1885,16 @@ handleAdminPurgeMessages = \pubkey authorization respond -> withMaintAuth author
     fwds <- *forwards
     *forwards = filter fwds (\f -> f.toKey != pubkey)
     yield (count purgedMsgs))
-  yield (respond {ok: True {}, purgedCount: purged}))
+  yield {ok: True {}, purgedCount: purged})
 
 -- POST /maintenance/sessions/revoke-ip: kill every session bound to a given
 -- client IP, regardless of pubkey. Reports total revoked + distinct keys.
-handleAdminRevokeIp : Text -> Text -> ({affectedKeys: Int, ok: Bool, revokedCount: Int} -> a) -> IO {r *runtimeMaintenanceSecret, rw *sessions} a
-handleAdminRevokeIp = \ip authorization respond -> withMaintAuth authorization (yield (respond {
+handleAdminRevokeIp : Text -> Text -> IO {r *runtimeMaintenanceSecret, rw *sessions} {affectedKeys: Int, ok: Bool, revokedCount: Int}
+handleAdminRevokeIp = \ip authorization -> withMaintAuth authorization (yield {
   ok: False {},
   revokedCount: 0,
   affectedKeys: 0
-})) (do
+}) (do
   keys <- if ip == ""
   then yield []
   else atomic (do
@@ -1907,31 +1902,31 @@ handleAdminRevokeIp = \ip authorization respond -> withMaintAuth authorization (
     let same = \s -> s.ip == ip
     *sessions = removeWhere ses same
     yield (mapWhere ses same (\s -> s.pubkey)))
-  yield (respond {ok: ip != "", revokedCount: count keys, affectedKeys: count keys}))
+  yield {ok: ip != "", revokedCount: count keys, affectedKeys: count keys})
 
 -- POST /maintenance/sessions/list: paged session inventory aggregated by
 -- pubkey (count, distinct ips, latest expiry). Sorted by descending count.
-handleAdminListAllSessions : Int -> Text -> ({ok: Bool, sessions: [{count: Int, ips: [Text], latestExpiry: Int, pubkey: PubkeyHex}], total: Int} -> a) -> IO {r *runtimeMaintenanceSecret, r *sessions, clock} a
-handleAdminListAllSessions = \limit authorization respond -> withMaintAuth authorization (yield (respond {
+handleAdminListAllSessions : Int -> Text -> IO {r *runtimeMaintenanceSecret, r *sessions, clock} {ok: Bool, sessions: [{count: Int, ips: [Text], latestExpiry: Int, pubkey: PubkeyHex}], total: Int}
+handleAdminListAllSessions = \limit authorization -> withMaintAuth authorization (yield {
   sessions: [],
   ok: False {},
   total: 0
-})) (do
+}) (do
   t <- now
   ses <- *sessions
   let active = filter ses (\s -> s.expiresAt > t)
   let grouped = pluck (pluck active (\s -> s.pubkey)) (\pk -> (\mine -> {pubkey: pk, count: count mine, ips: mapWhere mine (\s -> s.ip != "") (\s -> s.ip), latestExpiry: fold (\acc s -> max acc s.expiresAt) 0 mine}) (filter active (\s -> s.pubkey == pk)))
   let cap = clamp 1 500 (if limit <= 0 then 100 else limit)
   let top = takeRelation cap (sortBy (\g -> 0 - g.count) grouped)
-  yield (respond {sessions: top, ok: True {}, total: count grouped}))
+  yield {sessions: top, ok: True {}, total: count grouped})
 
 -- GET /maintenance/rate-limits: expose the configured rate ceilings. Returns
 -- zeros for unauthenticated callers (response shape stays stable).
-handleGetRateLimits : Text -> ({authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, sendRate: Int} -> a) -> IO {r *runtimeMaintenanceSecret} a
-handleGetRateLimits = \authorization respond -> do
+handleGetRateLimits : Text -> IO {r *runtimeMaintenanceSecret} {authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, sendRate: Int}
+handleGetRateLimits = \authorization -> do
   ok <- verifyMaintenanceAuth authorization
   let v = \x -> if ok then x else 0
-  yield (respond {
+  yield {
     ok,
     globalRequest: v maxGlobalRequestRate,
     ipRate: v maxIpRatePerIp,
@@ -1943,46 +1938,46 @@ handleGetRateLimits = \authorization respond -> do
     pairRate: v maxPairRatePerPair,
     lookupRate: v maxLookupRatePerKey,
     clientWriteRate: v maxClientWriteRatePerKey
-  })
+  }
 
 -- POST /maintenance/rate-limits: stub. Rate ceilings are compile-time constants
 -- in this simplified server, so this just authorizes and returns ok=true.
-handleSetRateLimits : a -> b -> c -> d -> e -> f -> g -> h -> i -> j -> Text -> ({ok: Bool} -> k) -> IO {r *runtimeMaintenanceSecret} k
-handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization respond -> do
+handleSetRateLimits : a -> b -> c -> d -> e -> f -> g -> h -> i -> j -> Text -> IO {r *runtimeMaintenanceSecret} {ok: Bool}
+handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization -> do
   authorized <- verifyMaintenanceAuth authorization
-  yield (respond {ok: authorized})
+  yield {ok: authorized}
 
 -- POST /maintenance/nonces/flush: stub. Nonce caches were removed; the
 -- endpoint is preserved so older operator tooling keeps working.
-handleFlushNonces : Text -> ({flushedCount: Int, ok: Bool} -> a) -> IO {r *runtimeMaintenanceSecret} a
-handleFlushNonces = \authorization respond -> do
+handleFlushNonces : Text -> IO {r *runtimeMaintenanceSecret} {flushedCount: Int, ok: Bool}
+handleFlushNonces = \authorization -> do
   authorized <- verifyMaintenanceAuth authorization
-  yield (respond {ok: authorized, flushedCount: 0})
+  yield {ok: authorized, flushedCount: 0}
 
 -- POST /maintenance/rotate-secret: replace the maintenance Bearer secret.
 -- The old secret authenticates the rotation; subsequent calls must use the
 -- new value.
-handleRotateSecret : Text -> Text -> ({error: Text, ok: Bool} -> a) -> IO {rw *runtimeMaintenanceSecret} a
-handleRotateSecret = \newSecret authorization respond -> withMaintAuth authorization (yield (respond {
+handleRotateSecret : Text -> Text -> IO {rw *runtimeMaintenanceSecret} {error: Text, ok: Bool}
+handleRotateSecret = \newSecret authorization -> withMaintAuth authorization (yield {
   ok: False {},
   error: "unauthorized"
-})) (do
+}) (do
   atomic *runtimeMaintenanceSecret = newSecret
-  yield (respond {ok: True {}, error: ""}))
+  yield {ok: True {}, error: ""})
 
 -- GET /maintenance/config: expose a small set of operationally-relevant
 -- compile-time constants (poll timeout, ack grace).
-handleGetConfig : Text -> ({ackGracePeriod: Int, ok: Bool, pollTimeoutMs: Int} -> a) -> IO {r *runtimeMaintenanceSecret} a
-handleGetConfig = \authorization respond -> do
+handleGetConfig : Text -> IO {r *runtimeMaintenanceSecret} {ackGracePeriod: Int, ok: Bool, pollTimeoutMs: Int}
+handleGetConfig = \authorization -> do
   ok <- verifyMaintenanceAuth authorization
   let v = \x -> if ok then x else 0
-  yield (respond {ok, pollTimeoutMs: v pollTimeoutMs, ackGracePeriod: v ackGracePeriod})
+  yield {ok, pollTimeoutMs: v pollTimeoutMs, ackGracePeriod: v ackGracePeriod}
 
 -- GET /stats: capacity gauges + minimal federation/timing snapshot. Most of
 -- the historical metric fields are zero-filled (see `zeroStats`) — only the
 -- counts that come straight from the state refs are populated.
-handleStats : Text -> ({capacity: {activePolls: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestAckAge: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, pendingAckCleanups: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text} -> a) -> IO {r *activePolls, r *blockedPeers, r *challenges, r *deliveredIds, r *forwards, r *heartbeatCount, r *lastHeartbeatAt, r *lastPrunedAt, r *messages, r *presence, r *pruneCount, r *runtimeMaintenanceSecret, r *sessions, r *startedAt, clock} a
-handleStats = \authorization respond -> withMaintAuth authorization (yield (respond zeroStats)) (do
+handleStats : Text -> IO {r *activePolls, r *blockedPeers, r *challenges, r *deliveredIds, r *forwards, r *heartbeatCount, r *lastHeartbeatAt, r *lastPrunedAt, r *messages, r *presence, r *pruneCount, r *runtimeMaintenanceSecret, r *sessions, r *startedAt, clock} {capacity: {activePolls: Int, challenges: Int, challengesMax: Int, deliveredIds: Int, deliveredIdsMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestAckAge: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, pendingAckCleanups: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text}
+handleStats = \authorization -> withMaintAuth authorization (yield zeroStats) (do
   t <- now
   sa <- *startedAt
   sessions <- *sessions
@@ -2001,7 +1996,7 @@ handleStats = \authorization respond -> withMaintAuth authorization (yield (resp
   let mCount = count msgs
   let pCount = count pres
   let fCount = count fwds
-  yield (respond {
+  yield {
     ok: True {},
     version: serverBuildVersion,
     capacity: {
@@ -2087,7 +2082,7 @@ handleStats = \authorization respond -> withMaintAuth authorization (yield (resp
       authMaxMs: 0,
       authCount: 0
     }
-  }))
+  })
 
 -- All-zero /stats payload returned to unauthorized callers. The shape is kept
 -- in lockstep with the response in `handleStats` so older operator tooling
@@ -2183,15 +2178,12 @@ zeroStats = {
 
 -- GET /stats/peers: per-peer failure summary derived from `forwardFailures`,
 -- including current backoff and pending forward queue depth.
-handleStatsPeers : Text -> ({ok: Bool, peers: [{avgLatencyMs: Int, backoffMs: Int<Ms>, failures: Int, firstFailedAt: Int<Ms>, gossipEventsPerMin: Int, lastFailedAt: Int<Ms>, latencySamples: Int, maxLatencyMs: Int, pendingForwards: Int, retriable: Bool, server: Text}]} -> a) -> IO {r *forwardFailures, r *forwards, r *runtimeMaintenanceSecret, clock} a
-handleStatsPeers = \authorization respond -> withMaintAuth authorization (yield (respond {
-  peers: [],
-  ok: False {}
-})) (do
+handleStatsPeers : Text -> IO {r *forwardFailures, r *forwards, r *runtimeMaintenanceSecret, clock} {ok: Bool, peers: [{avgLatencyMs: Int, backoffMs: Int<Ms>, failures: Int, firstFailedAt: Int<Ms>, gossipEventsPerMin: Int, lastFailedAt: Int<Ms>, latencySamples: Int, maxLatencyMs: Int, pendingForwards: Int, retriable: Bool, server: Text}]}
+handleStatsPeers = \authorization -> withMaintAuth authorization (yield {peers: [], ok: False {}}) (do
   t <- now
   failures <- *forwardFailures
   fwds <- *forwards
-  yield (respond {
+  yield {
     peers: pluck failures (\f -> {
       f.server,
       f.failures,
@@ -2206,12 +2198,12 @@ handleStatsPeers = \authorization respond -> withMaintAuth authorization (yield 
       gossipEventsPerMin: 0
     }),
     ok: True {}
-  }))
+  })
 
 -- GET /stats/key/{pubkey}: per-key footprint — message count, presence rows,
 -- session count, queued forwards (with details), and active long-poll count.
-handleStatsKey : PubkeyHex -> Text -> ({activePolls: Int, forwardDetails: [{retries: Int, server: ServerName}], forwards: Int, messages: Int, ok: Bool, presence: [{expiresAt: Int<Ms>, server: ServerName}], sessions: Int} -> a) -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *runtimeMaintenanceSecret, r *sessions, clock} a
-handleStatsKey = \pubkey authorization respond -> withMaintAuth authorization (yield (respond {
+handleStatsKey : PubkeyHex -> Text -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *runtimeMaintenanceSecret, r *sessions, clock} {activePolls: Int, forwardDetails: [{retries: Int, server: ServerName}], forwards: Int, messages: Int, ok: Bool, presence: [{expiresAt: Int<Ms>, server: ServerName}], sessions: Int}
+handleStatsKey = \pubkey authorization -> withMaintAuth authorization (yield {
   messages: 0,
   presence: [],
   sessions: 0,
@@ -2219,7 +2211,7 @@ handleStatsKey = \pubkey authorization respond -> withMaintAuth authorization (y
   forwardDetails: [],
   activePolls: 0,
   ok: False {}
-})) (do
+}) (do
   t <- now
   msgs <- *messages
   pres <- *presence
@@ -2227,7 +2219,7 @@ handleStatsKey = \pubkey authorization respond -> withMaintAuth authorization (y
   fwds <- *forwards
   aps <- *activePolls
   let myFwds = filter fwds (\x -> x.toKey == pubkey)
-  yield (respond {
+  yield {
     messages: countWhere msgs (\x -> x.toKey == pubkey),
     presence: mapWhere pres (\x -> x.pubkey == pubkey && x.expiresAt > t) (\x -> {
       x.server,
@@ -2238,16 +2230,16 @@ handleStatsKey = \pubkey authorization respond -> withMaintAuth authorization (y
     forwardDetails: pluck myFwds (\x -> {server: x.toServer, x.retries}),
     activePolls: countWhere aps (\x -> x.pubkey == pubkey),
     ok: True {}
-  }))
+  })
 
 -- POST /stats/top-recipients: ranked list of pubkeys by mailbox depth.
 -- `limit` defaults to 20, capped at 100, used to spot hot-spots / abuse.
-handleTopRecipients : Int -> Text -> ({ok: Bool, recipients: [RecipientCount], total: Int} -> a) -> IO {r *messages, r *runtimeMaintenanceSecret} a
-handleTopRecipients = \limit authorization respond -> withMaintAuth authorization (yield (respond {
+handleTopRecipients : Int -> Text -> IO {r *messages, r *runtimeMaintenanceSecret} {ok: Bool, recipients: [RecipientCount], total: Int}
+handleTopRecipients = \limit authorization -> withMaintAuth authorization (yield {
   recipients: [],
   ok: False {},
   total: 0
-})) (do
+}) (do
   msgs <- *messages
   let counts = pluck (pluck msgs (\m -> m.toKey)) (\pk -> {
     pubkey: pk,
@@ -2255,30 +2247,30 @@ handleTopRecipients = \limit authorization respond -> withMaintAuth authorizatio
   })
   let cap = clamp 1 100 (if limit <= 0 then 20 else limit)
   let top = takeRelation cap (sortBy (\c -> 0 - c.count) counts)
-  yield (respond {recipients: top, ok: True {}, total: count counts}))
+  yield {recipients: top, ok: True {}, total: count counts})
 
 -- GET /stats/forwards: per-destination forward queue summary — count and
 -- total accumulated retries.
-handleStatsForwards : Text -> ({ok: Bool, servers: [{count: Int<u>, server: ServerName, totalRetries: Int}], total: Int} -> a) -> IO {r *forwards, r *runtimeMaintenanceSecret} a
-handleStatsForwards = \authorization respond -> withMaintAuth authorization (yield (respond {
+handleStatsForwards : Text -> IO {r *forwards, r *runtimeMaintenanceSecret} {ok: Bool, servers: [{count: Int<u>, server: ServerName, totalRetries: Int}], total: Int}
+handleStatsForwards = \authorization -> withMaintAuth authorization (yield {
   servers: [],
   ok: False {},
   total: 0
-})) (do
+}) (do
   fwds <- *forwards
-  yield (respond {
+  yield {
     servers: pluck (collectPeers fwds (\f -> f.toServer)) (\s -> (\svFwds -> {server: s, count: count svFwds, totalRetries: fold (\acc f -> acc + f.retries) 0 svFwds}) (filter fwds (\f -> f.toServer == s))),
     ok: True {},
     total: count fwds
-  }))
+  })
 
 -- GET /stats/rates: same shape as /maintenance/rate-limits with an extra
 -- scalePct field. Kept separate for backwards compatibility with older clients.
-handleStatsRates : Text -> ({authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, scalePct: Int, sendRate: Int} -> a) -> IO {r *runtimeMaintenanceSecret} a
-handleStatsRates = \authorization respond -> do
+handleStatsRates : Text -> IO {r *runtimeMaintenanceSecret} {authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, scalePct: Int, sendRate: Int}
+handleStatsRates = \authorization -> do
   ok <- verifyMaintenanceAuth authorization
   let v = \x -> if ok then x else 0
-  yield (respond {
+  yield {
     ok,
     scalePct: v 100,
     globalRequest: v maxGlobalRequestRate,
@@ -2291,13 +2283,13 @@ handleStatsRates = \authorization respond -> do
     pairRate: v maxPairRatePerPair,
     lookupRate: v maxLookupRatePerKey,
     clientWriteRate: v maxClientWriteRatePerKey
-  })
+  }
 
 -- GET /metrics: Prometheus-style text exposition of the most useful gauges.
 -- The `authorization` header is accepted but not validated here — operators
 -- relying on auth must front this endpoint with a reverse proxy that enforces it.
-handleMetrics : a -> ({metrics: Text, ok: Bool} -> b) -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *sessions, r *startedAt, clock} b
-handleMetrics = \authorization respond -> do
+handleMetrics : a -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *sessions, r *startedAt, clock} {metrics: Text, ok: Bool}
+handleMetrics = \authorization -> do
   t <- now
   msgs <- *messages
   ses <- *sessions
@@ -2305,7 +2297,7 @@ handleMetrics = \authorization respond -> do
   fwds <- *forwards
   aps <- *activePolls
   sa <- *startedAt
-  yield (respond {
+  yield {
     metrics: fold (\acc r -> acc ++ r.k ++ " " ++ show r.v ++ "\n") "" [
       {k: "skrepka_messages_total", v: count msgs},
       {k: "skrepka_sessions_total", v: count ses},
@@ -2315,7 +2307,7 @@ handleMetrics = \authorization respond -> do
       {k: "skrepka_uptime_seconds", v: (t - sa) / 1000}
     ],
     ok: True {}
-  })
+  }
 
 -- ============================================
 -- Dispatch
@@ -2326,51 +2318,52 @@ handleMetrics = \authorization respond -> do
 
 -- Top-level request dispatcher: maps each generated request constructor to
 -- its `handleXxx` function. Every route entry above must have a clause here.
-serve = \req -> case req of
-  ReqChallenge {pubkey, clientIp, respond} -> handleChallenge pubkey clientIp respond
-  VerifyAuth {pubkey, challenge, signature, revokeOthers, clientIp, respond} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp respond
-  RevokeSession {targetToken, authorization, clientIp, respond} -> handleRevoke targetToken authorization clientIp respond
-  Logout {authorization, clientIp, respond} -> handleLogout authorization clientIp respond
-  Poll {cursor, generation, authorization, clientIp, respond} -> handlePoll cursor generation authorization clientIp respond
-  SendMessages {messages, authorization, clientIp, respond} -> handleSendMessages messages authorization clientIp respond
-  MessageStatus {to, messageId, authorization, clientIp, respond} -> handleMessageStatus to messageId authorization clientIp respond
-  AckMessages {messageIds, authorization, clientIp, respond} -> handleAckMessages messageIds authorization clientIp respond
-  ListMessages {offset, authorization, clientIp, respond} -> handleListMessages offset authorization clientIp respond
-  DeleteMessages {messageIds, authorization, clientIp, respond} -> handleDeleteMessages messageIds authorization clientIp respond
-  LookupPresence {pubkey, authorization, clientIp, respond} -> handleLookupPresence pubkey authorization clientIp respond
-  BatchLookupPresence {pubkeys, authorization, clientIp, respond} -> handleBatchLookupPresence pubkeys authorization clientIp respond
-  RecvGossip {events, fromServer, requestTimestamp, authorization, respond} -> handleRecvGossip events fromServer requestTimestamp authorization respond
-  ForwardMessage {toKey, encryptedBlob, messageId, fromServer, requestTimestamp, authorization, respond} -> handleForwardMessage toKey encryptedBlob messageId fromServer requestTimestamp authorization respond
-  FederationBatchForward {forwards, fromServer, requestTimestamp, authorization, respond} -> handleFederationBatchForward forwards fromServer requestTimestamp authorization respond
-  FederationPubkey {respond} -> handleFederationPubkey respond
-  Prune {authorization, respond} -> handlePrune authorization respond
-  BlockPeer {server, authorization, respond} -> handleBlockPeer server authorization respond
-  UnblockPeer {server, authorization, respond} -> handleUnblockPeer server authorization respond
-  ListBlocked {authorization, respond} -> handleListBlocked authorization respond
-  PingPeer {server, authorization, respond} -> handlePingPeer server authorization respond
-  AdminListSessions {pubkey, authorization, respond} -> handleAdminListSessions pubkey authorization respond
-  AdminRevokeSessions {pubkey, authorization, respond} -> handleAdminRevokeSessions pubkey authorization respond
-  AdminListAllSessions {limit, authorization, respond} -> handleAdminListAllSessions limit authorization respond
-  AdminPurgeMessages {pubkey, authorization, respond} -> handleAdminPurgeMessages pubkey authorization respond
-  AdminRevokeIp {ip, authorization, respond} -> handleAdminRevokeIp ip authorization respond
-  GetRateLimits {authorization, respond} -> handleGetRateLimits authorization respond
-  SetRateLimits {globalRequest, ipRate, sendRate, federationRate, authGlobal, recvRate, challengeRate, pairRate, lookupRate, clientWriteRate, authorization, respond} -> handleSetRateLimits globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization respond
-  FlushNonces {authorization, respond} -> handleFlushNonces authorization respond
-  AllowPeer {server, authorization, respond} -> handleAllowPeer server authorization respond
-  UnallowPeer {server, authorization, respond} -> handleUnallowPeer server authorization respond
-  ListAllowed {authorization, respond} -> handleListAllowed authorization respond
-  Reconcile {authorization, respond} -> handleReconcile authorization respond
-  RotateSecret {newSecret, authorization, respond} -> handleRotateSecret newSecret authorization respond
-  GetConfig {authorization, respond} -> handleGetConfig authorization respond
-  Health {authorization, respond} -> handleHealth authorization respond
-  Stats {authorization, respond} -> handleStats authorization respond
-  StatsPeers {authorization, respond} -> handleStatsPeers authorization respond
-  StatsKey {pubkey, authorization, respond} -> handleStatsKey pubkey authorization respond
-  TopRecipients {limit, authorization, respond} -> handleTopRecipients limit authorization respond
-  StatsForwards {authorization, respond} -> handleStatsForwards authorization respond
-  StatsRates {authorization, respond} -> handleStatsRates authorization respond
-  Metrics {authorization, respond} -> handleMetrics authorization respond
-  Ready {respond} -> handleReady respond
+api : Server Api _
+api = serve Api where
+  ReqChallenge = \{pubkey, clientIp} -> handleChallenge pubkey clientIp
+  VerifyAuth = \{pubkey, challenge, signature, revokeOthers, clientIp} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp
+  RevokeSession = \{targetToken, authorization, clientIp} -> handleRevoke targetToken authorization clientIp
+  Logout = \{authorization, clientIp} -> handleLogout authorization clientIp
+  Poll = \{cursor, generation, authorization, clientIp} -> handlePoll cursor generation authorization clientIp
+  SendMessages = \{messages, authorization, clientIp} -> handleSendMessages messages authorization clientIp
+  MessageStatus = \{to, messageId, authorization, clientIp} -> handleMessageStatus to messageId authorization clientIp
+  AckMessages = \{messageIds, authorization, clientIp} -> handleAckMessages messageIds authorization clientIp
+  ListMessages = \{offset, authorization, clientIp} -> handleListMessages offset authorization clientIp
+  DeleteMessages = \{messageIds, authorization, clientIp} -> handleDeleteMessages messageIds authorization clientIp
+  LookupPresence = \{pubkey, authorization, clientIp} -> handleLookupPresence pubkey authorization clientIp
+  BatchLookupPresence = \{pubkeys, authorization, clientIp} -> handleBatchLookupPresence pubkeys authorization clientIp
+  RecvGossip = \{events, fromServer, requestTimestamp, authorization} -> handleRecvGossip events fromServer requestTimestamp authorization
+  ForwardMessage = \{toKey, encryptedBlob, messageId, fromServer, requestTimestamp, authorization} -> handleForwardMessage toKey encryptedBlob messageId fromServer requestTimestamp authorization
+  FederationBatchForward = \{forwards, fromServer, requestTimestamp, authorization} -> handleFederationBatchForward forwards fromServer requestTimestamp authorization
+  FederationPubkey = \{} -> handleFederationPubkey
+  Prune = \{authorization} -> handlePrune authorization
+  BlockPeer = \{server, authorization} -> handleBlockPeer server authorization
+  UnblockPeer = \{server, authorization} -> handleUnblockPeer server authorization
+  ListBlocked = \{authorization} -> handleListBlocked authorization
+  PingPeer = \{server, authorization} -> handlePingPeer server authorization
+  AdminListSessions = \{pubkey, authorization} -> handleAdminListSessions pubkey authorization
+  AdminRevokeSessions = \{pubkey, authorization} -> handleAdminRevokeSessions pubkey authorization
+  AdminListAllSessions = \{limit, authorization} -> handleAdminListAllSessions limit authorization
+  AdminPurgeMessages = \{pubkey, authorization} -> handleAdminPurgeMessages pubkey authorization
+  AdminRevokeIp = \{ip, authorization} -> handleAdminRevokeIp ip authorization
+  GetRateLimits = \{authorization} -> handleGetRateLimits authorization
+  SetRateLimits = \{globalRequest, ipRate, sendRate, federationRate, authGlobal, recvRate, challengeRate, pairRate, lookupRate, clientWriteRate, authorization} -> handleSetRateLimits globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization
+  FlushNonces = \{authorization} -> handleFlushNonces authorization
+  AllowPeer = \{server, authorization} -> handleAllowPeer server authorization
+  UnallowPeer = \{server, authorization} -> handleUnallowPeer server authorization
+  ListAllowed = \{authorization} -> handleListAllowed authorization
+  Reconcile = \{authorization} -> handleReconcile authorization
+  RotateSecret = \{newSecret, authorization} -> handleRotateSecret newSecret authorization
+  GetConfig = \{authorization} -> handleGetConfig authorization
+  Health = \{authorization} -> handleHealth authorization
+  Stats = \{authorization} -> handleStats authorization
+  StatsPeers = \{authorization} -> handleStatsPeers authorization
+  StatsKey = \{pubkey, authorization} -> handleStatsKey pubkey authorization
+  TopRecipients = \{limit, authorization} -> handleTopRecipients limit authorization
+  StatsForwards = \{authorization} -> handleStatsForwards authorization
+  StatsRates = \{authorization} -> handleStatsRates authorization
+  Metrics = \{authorization} -> handleMetrics authorization
+  Ready = \{} -> handleReady
 
 -- ============================================
 -- Background loops
@@ -2424,4 +2417,4 @@ main = do
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
   fork backgroundPrune
   fork pollHeartbeat
-  listenOn bindHost listenPort serve
+  listenOn bindHost listenPort api
