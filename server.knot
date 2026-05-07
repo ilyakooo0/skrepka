@@ -161,9 +161,6 @@ backgroundPruneInterval = 30000
 -- Long-poll hold timeout before returning empty to the client (25 s).
 pollTimeoutMs : Int<Ms>
 pollTimeoutMs = 25000
--- Concurrent active long-polls permitted per pubkey.
-maxPollsPerKey : Int
-maxPollsPerKey = 3
 -- Cadence at which this server refreshes its own presence to peers (5 min).
 presenceRefreshInterval : Int<Ms>
 presenceRefreshInterval = 300000
@@ -264,10 +261,6 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFa
 -- time at which the current window began; once `t - windowStart` exceeds the
 -- configured window length the entry is recycled (counter resets to 1).
 type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
--- A live long-poll slot held by a pubkey; used to cap concurrency per key.
--- `startedAt` lets `pruneExpired` reap slots whose holder vanished without
--- cleanly exiting `pollOnce` (network drop mid-poll).
-type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 
 -- ============================================
 -- Persisted State (all flat lists, no sharding)
@@ -292,8 +285,6 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 *forwards : [ForwardEntry]
 -- Per-peer failure counters; drives `retryBackoff` and the federation health view.
 *forwardFailures : [ForwardFailure]
--- Currently-blocking long-poll slots, used to cap concurrent /poll holds per pubkey.
-*activePolls : [ActivePoll]
 
 -- Per-key fixed-window counters for /messages send-side rate limiting.
 *sendRates : [RateEntry]
@@ -404,9 +395,9 @@ type KeyPresenceEntry = {server: Text, expiresAt: Timestamp}
 type RecipientCount = {pubkey: PubkeyHex, count: Int}
 
 route StatsApi where
-  GET /stats headers {authorization: Text} -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, totalMessageCount: Int, presence: Int, forwards: Int, challenges: Int, challengesMax: Int, forwardNonces: Int, forwardNoncesMax: Int, nonceEvictions: Int, activePolls: Int, recipientCounts: Int, messageBucketMax: Int, messageBucketMin: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, recentGossip: Int, blockedPeers: Int, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}], gossipSuccess: Int, gossipFail: Int, latencyBuckets: {lt100: Int, lt500: Int, lt2000: Int, gte2000: Int}}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, pollLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int, sendLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, authAvgMs: Int, authMaxMs: Int, authCount: Int}} = Stats
+  GET /stats headers {authorization: Text} -> {ok: Bool, version: Text, capacity: {sessions: Int, sessionsMax: Int, sessionsPct: Int, messages: Int, totalMessageCount: Int, presence: Int, forwards: Int, challenges: Int, challengesMax: Int, forwardNonces: Int, forwardNoncesMax: Int, nonceEvictions: Int, recipientCounts: Int, messageBucketMax: Int, messageBucketMin: Int}, federation: {enabled: Bool, inFlight: Int, hungSlots: Int, avgLatencyMs: Int, maxLatencyMs: Int, callCount: Int, slowVerifies: Int, verifyFailures: Int, forwardFailures: Int, oldestForwardAge: Int, recentGossip: Int, blockedPeers: Int, forwardServers: Int, maxForwardQueueDepth: Int, topFailingPeers: [{server: Text, failures: Int}], gossipSuccess: Int, gossipFail: Int, latencyBuckets: {lt100: Int, lt500: Int, lt2000: Int, gte2000: Int}}, rates: {send: Int, challenge: Int, federation: Int, federationPair: Int, global: Int, ip: Int, lookup: Int, recv: Int, pair: Int, gossipEvent: Int, verifyIp: Int, uniqueKeyIp: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedAuth: Int, rejectedPerKey: Int, rejectedFederation: Int}, timing: {pruneCount: Int, pruneRunning: Timestamp, heartbeatCount: Int, uptime: Int, lastPruneAt: Timestamp, lastHeartbeatAt: Timestamp, totalEntries: Int, activeRequests: Int, peakActiveRequests: Int, pollAvgMs: Int, pollMaxMs: Int, pollCount: Int, pollLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, sendAvgMs: Int, sendMaxMs: Int, sendCount: Int, sendLatencyBuckets: {lt50: Int, lt200: Int, lt1000: Int, gte1000: Int}, authAvgMs: Int, authMaxMs: Int, authCount: Int}} = Stats
   GET /stats/peers headers {authorization: Text} -> {peers: [PeerStatus], ok: Bool} = StatsPeers
-  GET /stats/key/{pubkey: PubkeyHex} headers {authorization: Text} -> {messages: Int, presence: [KeyPresenceEntry], sessions: Int, forwards: Int, forwardDetails: [{server: Text, retries: Int}], activePolls: Int, ok: Bool} = StatsKey
+  GET /stats/key/{pubkey: PubkeyHex} headers {authorization: Text} -> {messages: Int, presence: [KeyPresenceEntry], sessions: Int, forwards: Int, forwardDetails: [{server: Text, retries: Int}], ok: Bool} = StatsKey
   POST {limit: Int} /stats/top-recipients headers {authorization: Text} -> {recipients: [RecipientCount], ok: Bool, total: Int} = TopRecipients
   GET /stats/forwards headers {authorization: Text} -> {servers: [{server: Text, count: Int, totalRetries: Int}], ok: Bool, total: Int} = StatsForwards
   GET /stats/rates headers {authorization: Text} -> {ok: Bool, scalePct: Int, globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int} = StatsRates
@@ -813,7 +804,7 @@ knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.serve
 -- One sweep over every state ref: drops expired rows in a single atomic block.
 -- Returns the locally-expired presence rows whose pubkey has no other live
 -- local session, so the caller can broadcast offline gossip for them.
-pruneExpired : Int<Ms> -> IO {rw *activePolls, rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: ServerName}]
+pruneExpired : Int<Ms> -> IO {rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: ServerName}]
 pruneExpired = \t -> atomic do
   ch <- *challenges
   *challenges = filter ch (\x -> x.expiresAt > t)
@@ -823,8 +814,6 @@ pruneExpired = \t -> atomic do
   *messages = filter msgs (\m -> t - m.receivedAt < messageMaxAge)
   ff <- *forwardFailures
   *forwardFailures = filter ff (\f -> t - f.failedAt < 86400000)
-  aps <- *activePolls
-  *activePolls = filter aps (\p -> t - p.startedAt < pollTimeoutMs * 3)
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   *presence = filter pres (\p -> p.expiresAt > t)
@@ -1059,12 +1048,11 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 --   * Ack-and-drop everything <= the cursor (treating poll progress as ack).
 --   * Wait on `pollWakeup` (bumped by send/heartbeat) and return new events
 --     plus piggybacked sender-side expirations/deliveries.
--- Per-pubkey concurrency is capped via `activePolls` to bound long-poll holds.
 
 -- POST /poll: top-level dispatch. Validates the global rate gate, detects a
 -- generation mismatch (server restart) to force a cursor reset, then hands
 -- off to `pollOnce` for the actual long-poll body.
-handlePoll : Int -> Int -> Text -> Text -> IO {r *pollWakeup, r *serverGeneration, r *sessions, rw *activePolls, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} {authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int}
+handlePoll : Int -> Int -> Text -> Text -> IO {r *pollWakeup, r *serverGeneration, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} {authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int}
 handlePoll = \cursor generation authorization clientIp -> do
   t <- now
   serverGen <- *serverGeneration
@@ -1076,9 +1064,9 @@ handlePoll = \cursor generation authorization clientIp -> do
   else pollOnce authorization (if cursorWasReset then 0 else cursor) cursorWasReset clientIp serverGen t
 
 -- Body of a single poll. Treats the cursor advance as an implicit ack
--- (`ackPolledMessages`), acquires a per-pubkey poll slot, runs `doPoll` to
--- collect events (or block until wakeup), then assembles the response.
-pollOnce : Text -> Int -> Bool -> Text -> Int -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *activePolls, rw *forwards, rw *messages, clock} {authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int}
+-- (`ackPolledMessages`), then runs `doPoll` to collect events (or block
+-- until wakeup) and assembles the response.
+pollOnce : Text -> Int -> Bool -> Text -> Int -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *messages, clock} {authorized: Bool, cursor: Timestamp, cursorReset: Bool, cursorStale: Bool, events: [PollEvent], generation: Int, hasMore: Bool, heartbeat: Bool, loadPct: Int, rateLimited: Bool, retryAfterMs: Int}
 pollOnce = \authorization cursor cursorWasReset clientIp serverGen t -> do
   setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
     let clampedCursor = clamp 0 t cursor
@@ -1088,31 +1076,20 @@ pollOnce = \authorization cursor cursorWasReset clientIp serverGen t -> do
   case setup of
     Nothing {} -> yield (emptyPollResp 0 (False {}) (False {}) serverGen 0 cursorWasReset)
     Just {value: s} -> do
-      acquired <- atomic (do
-        aps <- *activePolls
-        if countWhere aps (\p -> p.pubkey == s.pubkey) >= maxPollsPerKey
-        then yield (False {})
-        else do
-          *activePolls = union aps [{s.pubkey, startedAt: t}]
-          yield (True {}))
-      if not acquired
-      then yield (emptyPollResp cursor (True {}) (True {}) serverGen pollTimeoutMs cursorWasReset)
-      else do
-        pollResult <- doPoll s t
-        atomic (do aps <- *activePolls; *activePolls = filter aps (\p -> p.pubkey != s.pubkey))
-        yield {
-          pollResult.events,
-          pollResult.cursor,
-          authorized: True {},
-          rateLimited: False {},
-          generation: serverGen,
-          heartbeat: count pollResult.events == 0,
-          retryAfterMs: 0,
-          cursorReset: cursorWasReset,
-          pollResult.hasMore,
-          cursorStale: False {},
-          loadPct: 0
-        }
+      pollResult <- doPoll s t
+      yield {
+        pollResult.events,
+        pollResult.cursor,
+        authorized: True {},
+        rateLimited: False {},
+        generation: serverGen,
+        heartbeat: count pollResult.events == 0,
+        retryAfterMs: 0,
+        cursorReset: cursorWasReset,
+        pollResult.hasMore,
+        cursorStale: False {},
+        loadPct: 0
+      }
 
 -- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
 -- (bumped by send/heartbeat) and re-collect once at the new wall time.
@@ -1400,7 +1377,7 @@ handleFederationBatchForward = \forwards _ -> do
 -- POST /maintenance/prune: trigger an out-of-band `pruneAndRetry` tick.
 -- Useful when the operator wants to force expiry/forward retries without
 -- waiting for the next `backgroundPrune` interval.
-handlePrune : Text -> IO {r *runtimeMaintenanceSecret, rw *activePolls, rw *challenges, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *sessions, clock} {ok: Bool}
+handlePrune : Text -> IO {r *runtimeMaintenanceSecret, rw *challenges, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *sessions, clock} {ok: Bool}
 handlePrune = \authorization -> do
   t <- now
   authorized <- verifyMaintenanceAuth authorization
@@ -1585,7 +1562,7 @@ handleGetConfig = \authorization -> do
 -- GET /stats: capacity gauges + minimal federation/timing snapshot. Most of
 -- the historical metric fields are zero-filled (see `zeroStats`) — only the
 -- counts that come straight from the state refs are populated.
-handleStats : Text -> IO {r *activePolls, r *challenges, r *forwards, r *heartbeatCount, r *lastHeartbeatAt, r *lastPrunedAt, r *messages, r *presence, r *pruneCount, r *runtimeMaintenanceSecret, r *sessions, r *startedAt, clock} {capacity: {activePolls: Int, challenges: Int, challengesMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text}
+handleStats : Text -> IO {r *challenges, r *forwards, r *heartbeatCount, r *lastHeartbeatAt, r *lastPrunedAt, r *messages, r *presence, r *pruneCount, r *runtimeMaintenanceSecret, r *sessions, r *startedAt, clock} {capacity: {challenges: Int, challengesMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text}
 handleStats = \authorization -> withMaintAuth authorization (yield zeroStats) (do
   t <- now
   sa <- *startedAt
@@ -1593,7 +1570,6 @@ handleStats = \authorization -> withMaintAuth authorization (yield zeroStats) (d
   msgs <- *messages
   pres <- *presence
   fwds <- *forwards
-  aps <- *activePolls
   chs <- *challenges
   pc <- *pruneCount
   hc <- *heartbeatCount
@@ -1619,7 +1595,6 @@ handleStats = \authorization -> withMaintAuth authorization (yield zeroStats) (d
       forwardNonces: 0,
       forwardNoncesMax: 0,
       nonceEvictions: 0,
-      activePolls: count aps,
       recipientCounts: 0,
       messageBucketMax: 0,
       messageBucketMin: 0
@@ -1690,7 +1665,7 @@ handleStats = \authorization -> withMaintAuth authorization (yield zeroStats) (d
 -- All-zero /stats payload returned to unauthorized callers. The shape is kept
 -- in lockstep with the response in `handleStats` so older operator tooling
 -- never sees a missing field.
-zeroStats : {capacity: {activePolls: Int, challenges: Int, challengesMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text}
+zeroStats : {capacity: {challenges: Int, challengesMax: Int, forwardNonces: Int, forwardNoncesMax: Int, forwards: Int, messageBucketMax: Int, messageBucketMin: Int, messages: Int, nonceEvictions: Int, presence: Int, recipientCounts: Int, sessions: Int, sessionsMax: Int, sessionsPct: Int, totalMessageCount: Int}, federation: {avgLatencyMs: Int, blockedPeers: Int, callCount: Int, enabled: Bool, forwardFailures: Int, forwardServers: Int, gossipFail: Int, gossipSuccess: Int, hungSlots: Int, inFlight: Int, latencyBuckets: {gte2000: Int, lt100: Int, lt2000: Int, lt500: Int}, maxForwardQueueDepth: Int, maxLatencyMs: Int, oldestForwardAge: Int, recentGossip: Int, slowVerifies: Int, topFailingPeers: [{failures: Int, server: Text}], verifyFailures: Int}, ok: Bool, rates: {challenge: Int, federation: Int, federationPair: Int, global: Int, gossipEvent: Int, ip: Int, lookup: Int, pair: Int, recv: Int, rejectedAuth: Int, rejectedFederation: Int, rejectedGlobal: Int, rejectedIp: Int, rejectedPerKey: Int, send: Int, uniqueKeyIp: Int, verifyIp: Int}, timing: {activeRequests: Int, authAvgMs: Int, authCount: Int, authMaxMs: Int, heartbeatCount: Int, lastHeartbeatAt: Timestamp, lastPruneAt: Timestamp, peakActiveRequests: Int, pollAvgMs: Int, pollCount: Int, pollLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, pollMaxMs: Int, pruneCount: Int, pruneRunning: Timestamp, sendAvgMs: Int, sendCount: Int, sendLatencyBuckets: {gte1000: Int, lt1000: Int, lt200: Int, lt50: Int}, sendMaxMs: Int, totalEntries: Int, uptime: Int}, version: Text}
 zeroStats = {
   ok: False {},
   version: serverBuildVersion,
@@ -1707,7 +1682,6 @@ zeroStats = {
     forwardNonces: 0,
     forwardNoncesMax: 0,
     nonceEvictions: 0,
-    activePolls: 0,
     recipientCounts: 0,
     messageBucketMax: 0,
     messageBucketMin: 0
@@ -1800,15 +1774,14 @@ handleStatsPeers = \authorization -> withMaintAuth authorization (yield {peers: 
   })
 
 -- GET /stats/key/{pubkey}: per-key footprint — message count, presence rows,
--- session count, queued forwards (with details), and active long-poll count.
-handleStatsKey : PubkeyHex -> Text -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *runtimeMaintenanceSecret, r *sessions, clock} {activePolls: Int, forwardDetails: [{retries: Int, server: ServerName}], forwards: Int, messages: Int, ok: Bool, presence: [{expiresAt: Int<Ms>, server: ServerName}], sessions: Int}
+-- session count, and queued forwards (with details).
+handleStatsKey : PubkeyHex -> Text -> IO {r *forwards, r *messages, r *presence, r *runtimeMaintenanceSecret, r *sessions, clock} {forwardDetails: [{retries: Int, server: ServerName}], forwards: Int, messages: Int, ok: Bool, presence: [{expiresAt: Int<Ms>, server: ServerName}], sessions: Int}
 handleStatsKey = \pubkey authorization -> withMaintAuth authorization (yield {
   messages: 0,
   presence: [],
   sessions: 0,
   forwards: 0,
   forwardDetails: [],
-  activePolls: 0,
   ok: False {}
 }) (do
   t <- now
@@ -1816,7 +1789,6 @@ handleStatsKey = \pubkey authorization -> withMaintAuth authorization (yield {
   pres <- *presence
   ses <- *sessions
   fwds <- *forwards
-  aps <- *activePolls
   let myFwds = filter fwds (\x -> x.toKey == pubkey)
   yield {
     messages: countWhere msgs (\x -> x.toKey == pubkey),
@@ -1827,7 +1799,6 @@ handleStatsKey = \pubkey authorization -> withMaintAuth authorization (yield {
     sessions: countWhere ses (\x -> x.pubkey == pubkey),
     forwards: count myFwds,
     forwardDetails: pluck myFwds (\x -> {server: x.toServer, x.retries}),
-    activePolls: countWhere aps (\x -> x.pubkey == pubkey),
     ok: True {}
   })
 
@@ -1886,14 +1857,13 @@ handleStatsRates = \authorization -> do
 -- GET /metrics: Prometheus-style text exposition of the most useful gauges.
 -- The `authorization` header is accepted but not validated here — operators
 -- relying on auth must front this endpoint with a reverse proxy that enforces it.
-handleMetrics : a -> IO {r *activePolls, r *forwards, r *messages, r *presence, r *sessions, r *startedAt, clock} {metrics: Text, ok: Bool}
+handleMetrics : a -> IO {r *forwards, r *messages, r *presence, r *sessions, r *startedAt, clock} {metrics: Text, ok: Bool}
 handleMetrics = \authorization -> do
   t <- now
   msgs <- *messages
   ses <- *sessions
   pres <- *presence
   fwds <- *forwards
-  aps <- *activePolls
   sa <- *startedAt
   yield {
     metrics: fold (\acc r -> acc ++ r.k ++ " " ++ show r.v ++ "\n") "" [
@@ -1901,7 +1871,6 @@ handleMetrics = \authorization -> do
       {k: "skrepka_sessions_total", v: count ses},
       {k: "skrepka_presence_total", v: count pres},
       {k: "skrepka_forwards_total", v: count fwds},
-      {k: "skrepka_active_polls", v: count aps},
       {k: "skrepka_uptime_seconds", v: (t - sa) / 1000}
     ],
     ok: True {}
@@ -1958,7 +1927,7 @@ api = serve Api where
 
 -- Endless tick: every `backgroundPruneInterval` run `pruneAndRetry` and bump
 -- `pruneCount` for /stats and /health.
-backgroundPrune : IO {rw *activePolls, rw *challenges, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *pruneCount, rw *sessions, clock} a
+backgroundPrune : IO {rw *challenges, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *pruneCount, rw *sessions, clock} a
 backgroundPrune = do
   sleep backgroundPruneInterval
   t <- now
