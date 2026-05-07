@@ -324,7 +324,7 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 *pairRates : [RateEntry]
 -- Per-key /auth/challenge counters (separate from `*challenges` capacity gate).
 *challengeRates : [RateEntry]
--- Per-key counters for read-only lookups (presence, /messages/list).
+-- Per-key counters for read-only lookups (presence).
 *lookupRates : [RateEntry]
 -- Per-peer counters for inbound federation calls.
 *federationRates : [RateEntry]
@@ -377,7 +377,7 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 -- ============================================
 -- Public HTTP surface, grouped by audience:
 --   AuthApi          -- challenge/verify (client identity)
---   ClientApi        -- /poll, /messages (send), /messages/list, /messages/status, presence lookup
+--   ClientApi        -- /poll, /messages (send), /messages/status, presence lookup
 --   FederationApi    -- inter-server gossip, forward (single + batch)
 --   FederationPubkey -- exposes this server's federation Ed25519 public key
 --   MaintenanceApi   -- operator endpoints (prune, peer allow/block, admin)
@@ -393,7 +393,6 @@ route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, loadPct: Int} = Poll
   POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {results: [{messageId: MessageIdHex, error: Text}], error: Text, retryAfterMs: Int} = SendMessages
   POST {to: PubkeyHex, messageId: MessageIdHex} /messages/status headers {authorization: Text, clientIp: Text} -> {status: Text, authorized: Bool} = MessageStatus
-  POST {offset: Int} /messages/list headers {authorization: Text, clientIp: Text} -> {messages: [{messageId: MessageIdHex, receivedAt: Timestamp}], authorized: Bool, count: Int, error: Text} = ListMessages
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text} -> {server: ServerName, authorized: Bool, error: Text} = LookupPresence
   POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: ServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
@@ -1473,40 +1472,6 @@ handleMessageStatus = \to messageId authorization clientIp -> do
     yield {status: s, authorized: True {}})
 
 -- ============================================
--- Handler: list
--- ============================================
--- Read-only mailbox peek by the recipient.
-
--- POST /messages/list: paginated peek at the caller's mailbox without acking.
--- Returns metadata only (no ciphertext) plus the total count.
-handleListMessages : Int -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, count: Int, error: Text, messages: [{messageId: MessageIdHex, receivedAt: Int<Ms>}]}
-handleListMessages = \offset authorization clientIp -> do
-  t <- now
-  let mkErr = \e -> {
-    messages: [],
-    authorized: False {},
-    count: 0,
-    error: if e == "rate_limited" then e else ""
-  }
-  gateAuth authorization clientIp t mkErr (\pubkey -> do
-    lim <- atomic (do
-      rates <- *lookupRates
-      let r = checkRate rates pubkey maxLookupRatePerKey lookupRateWindowMs t
-      *lookupRates = r.entries
-      yield r.limited)
-    if lim
-    then yield {messages: [], authorized: True {}, count: 0, error: "rate_limited"}
-    else do
-      msgs <- *messages
-      let myMsgs = sortBy (\m -> m.receivedAt) (filter msgs (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge))
-      let total = count myMsgs
-      let page = pluck (takeRelation maxPollEvents (dropRelation (clamp 0 total offset) myMsgs)) (\m -> {
-        messageId: messageIdOf m.encryptedBlob,
-        m.receivedAt
-      })
-      yield {messages: page, authorized: True {}, count: total, error: ""})
-
--- ============================================
 -- Handler: federation receive
 -- ============================================
 -- Inbound endpoints called peer-to-peer. Every handler funnels through
@@ -2214,7 +2179,6 @@ api = serve Api where
   Poll = \{cursor, generation, authorization, clientIp} -> handlePoll cursor generation authorization clientIp
   SendMessages = \{messages, authorization, clientIp} -> handleSendMessages messages authorization clientIp
   MessageStatus = \{to, messageId, authorization, clientIp} -> handleMessageStatus to messageId authorization clientIp
-  ListMessages = \{offset, authorization, clientIp} -> handleListMessages offset authorization clientIp
   LookupPresence = \{pubkey, authorization, clientIp} -> handleLookupPresence pubkey authorization clientIp
   BatchLookupPresence = \{pubkeys, authorization, clientIp} -> handleBatchLookupPresence pubkeys authorization clientIp
   RecvGossip = \{events, fromServer, requestTimestamp, authorization} -> handleRecvGossip events fromServer requestTimestamp authorization
