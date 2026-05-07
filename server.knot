@@ -77,9 +77,6 @@ maxForwardsPerServer = 2000
 -- Max accepted length of a server hostname.
 maxServerNameLen : Int
 maxServerNameLen = 128
--- Max accepted length of a hex-encoded message ID.
-maxMessageIdLen : Int
-maxMessageIdLen = 128
 -- Ceiling on outstanding auth challenges held in memory.
 maxChallenges : Int
 maxChallenges = 10000
@@ -204,8 +201,7 @@ requireClientIp = True {}
 -- applied at federation egress, not in the type predicate.
 
 -- One event in a /poll response: the opaque cipher blob addressed to the
--- polling pubkey. The server cannot read the blob; clients derive any
--- per-message id locally as `messageIdOf encryptedBlob`.
+-- polling pubkey. The server cannot read the blob.
 type PollEvent = {encryptedBlob: BlobHex}
 
 -- Kind of presence event flowing through federation gossip. `GossipUnknown` is
@@ -244,10 +240,6 @@ type PubkeyHex = Text where isValidExactHex pubkeyLen
 type BlobHex = Text where isValidBoundedHex maxBlobLen
 -- Hex-encoded Ed25519 signature (64 bytes → 128 chars exact).
 type SignatureHex = Text where isValidExactHex signatureLen
-isValidMessageId : Text -> Bool
-isValidMessageId = isValidBoundedHex maxMessageIdLen
--- Hex-encoded message id, length ≤ `maxMessageIdLen`.
-type MessageIdHex = Text where isValidMessageId
 -- Normalized hostname (lowercased, no trailing dot, length-bounded). The SSRF
 -- deny-list (`isBadServerName`) is enforced separately at federation egress
 -- (`withFederationAuth`, `handlePingPeer`); keeping it out of the type predicate
@@ -265,11 +257,9 @@ type Challenge = {pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp, ip: 
 -- An issued bearer token bound to (pubkey, ip, expiry).
 type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp, ip: Text}
 -- Mailbox row: a stored message awaiting recipient pickup or federation forward.
--- Identity is `messageIdOf encryptedBlob` (BLAKE3 of the ciphertext); we don't
--- persist it because it's deterministically derivable. Storage TTL is fixed
--- at `messageMaxAge`, so expiry is derived from `receivedAt`. Any send time
--- the sender wants to convey lives inside `encryptedBlob` (the server cannot
--- read it).
+-- Storage TTL is fixed at `messageMaxAge`, so expiry is derived from
+-- `receivedAt`. Any send time the sender wants to convey lives inside
+-- `encryptedBlob` (the server cannot read it).
 type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp}
 -- Last-known location of a pubkey, either local (`server == serverHostN`) or
 -- learned from a peer via gossip. Multiple entries per pubkey are allowed.
@@ -391,14 +381,14 @@ route AuthApi where
 
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, loadPct: Int} = Poll
-  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {results: [{messageId: MessageIdHex, error: Text}], error: Text, retryAfterMs: Int} = SendMessages
+  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {results: [{error: Text}], error: Text, retryAfterMs: Int} = SendMessages
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text} -> {server: ServerName, authorized: Bool, error: Text} = LookupPresence
   POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: ServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
 route FederationApi where
   POST {events: [GossipEvent], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/gossip headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = RecvGossip
-  POST {toKey: PubkeyHex, encryptedBlob: BlobHex, messageId: MessageIdHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = ForwardMessage
-  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex, messageId: MessageIdHex}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int} = FederationBatchForward
+  POST {toKey: PubkeyHex, encryptedBlob: BlobHex, fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward headers {authorization: Text} -> {ok: Bool, error: Text, retryAfterMs: Int} = ForwardMessage
+  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex}], fromServer: ServerName, requestTimestamp: Timestamp, correlationId: Text} /federation/forward-batch headers {authorization: Text} -> {ok: Bool, error: Text, results: [{ok: Bool}], retryAfterMs: Int} = FederationBatchForward
 
 route FederationPubkeyApi where
   GET /federation/pubkey -> {pubkey: Text, ok: Bool} = FederationPubkey
@@ -584,13 +574,6 @@ else do
 -- federation auth nonces (192 bits of entropy, well beyond birthday bound).
 genToken : IO {random} Text
 genToken = genTokenN 48
-
--- Canonical message identity: BLAKE3 of the encrypted blob, hex-encoded.
--- Binding the id to the payload means a hostile peer cannot multiply-store
--- the same ciphertext under different ids on /federation/forward — same
--- blob always collides with the existing dedup key.
-messageIdOf : BlobHex -> MessageIdHex
-messageIdOf = \blob -> bytesToHex (hash blob)
 
 -- True when `s` exceeds `maxLen` characters.
 tooLong : Text -> Int -> Bool
@@ -1020,12 +1003,10 @@ retryPendingForwards = do
   blocked <- *blockedPeers
   forEach (filter (collectPeers fwds (\f -> f.toServer)) (\s -> shouldRetryServer s t failures && not elem s blocked)) (\server -> forEach (takeRelation maxBatchSize (filter fwds (\f -> f.toServer == server))) (\f -> do
     t2 <- now
-    let messageId = messageIdOf f.encryptedBlob
-    auth <- generateFederationAuth ("forward:" ++ messageId) t2
+    auth <- generateFederationAuth "forward" t2
     result <- fetch (federationUrl server) (ForwardMessage {
       f.toKey,
       f.encryptedBlob,
-      messageId,
       fromServer: serverHostN,
       requestTimestamp: t2,
       authorization: auth,
@@ -1314,16 +1295,15 @@ ackPolledMessages = \pubkey cursor -> do
 -- the rest; federated forwards are forked per entry. Top-level `error`
 -- carries global gate failures ("rate_limited" | "unauthorized") and
 -- short-circuits with empty `results`.
-handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {error: Text, results: [{error: Text, messageId: MessageIdHex}], retryAfterMs: Int}
+handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {error: Text, results: [{error: Text}], retryAfterMs: Int}
 handleSendMessages = \messages authorization clientIp -> do
   t <- now
   let mkErr = \e -> {results: [], error: e, retryAfterMs: 0}
   gateAuth authorization clientIp t mkErr (\senderKey -> do
     results <- mapEach (takeRelation maxBatchSize messages) (\m -> do
-      let effMsgId = messageIdOf m.encryptedBlob
       r <- atomic (do sendMessageCore senderKey m.to m.encryptedBlob t)
       when federationEnabled (fork (forkForwardsTo m.to m.encryptedBlob r.remoteServers))
-      yield {messageId: effMsgId, r.error})
+      yield {r.error})
     yield {results, error: "", retryAfterMs: 0})
 
 -- Atomic core of /messages. Charges send/pair/recv rate
@@ -1384,18 +1364,16 @@ sendMessageCore = \senderKey to encryptedBlob t -> do
 -- stays so `retryPendingForwards` can re-attempt with backoff.
 forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {} {}
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
-  let effMsgId = messageIdOf encryptedBlob
   fwds <- *forwards
   let same = \x -> x.encryptedBlob == encryptedBlob && x.toServer == server
   case findFirst fwds same of
     Nothing {} -> yield {}
     Just {value: f} -> do
       t <- now
-      auth <- generateFederationAuth ("forward:" ++ effMsgId) t
+      auth <- generateFederationAuth "forward" t
       result <- fetch (federationUrl server) (ForwardMessage {
         toKey: to,
         encryptedBlob,
-        messageId: effMsgId,
         fromServer: serverHostN,
         requestTimestamp: t,
         authorization: auth,
@@ -1527,31 +1505,24 @@ storeFederated = \toKey encryptedBlob checkRecvRate t -> do
 
 -- POST /federation/forward: receive a single federated message destined for
 -- a local key. Delegates the actual store decision to `storeFederated`,
--- which returns "" on success. The peer-supplied messageId in the request
--- body is ignored: we derive the id from the blob ourselves so a hostile
--- peer cannot influence the auth scope by varying the id. Honest senders
--- derive the same value, so the "forward:" ++ messageId auth scope still
--- verifies.
-handleForwardMessage : PubkeyHex -> BlobHex -> Text -> Text -> Int -> Text -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock, network} {error: Text, ok: Bool, retryAfterMs: Int}
-handleForwardMessage = \toKey encryptedBlob _ fromServer requestTimestamp authorization -> do
-  let messageId = messageIdOf encryptedBlob
+-- which returns "" on success.
+handleForwardMessage : PubkeyHex -> BlobHex -> Text -> Int -> Text -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock, network} {error: Text, ok: Bool, retryAfterMs: Int}
+handleForwardMessage = \toKey encryptedBlob fromServer requestTimestamp authorization -> do
   t <- now
-  withFederationAuth authorization t (\e r -> {ok: False {}, error: e, retryAfterMs: r}) fromServer ("forward:" ++ messageId) requestTimestamp (isRemote fromServer) (do
+  withFederationAuth authorization t (\e r -> {ok: False {}, error: e, retryAfterMs: r}) fromServer "forward" requestTimestamp (isRemote fromServer) (do
     result <- atomic storeFederated toKey encryptedBlob (True {}) t
     yield {ok: result == "", error: result, retryAfterMs: 0})
 
 -- POST /federation/forward-batch: bulk variant of `handleForwardMessage`.
 -- Skips per-entry recv-rate charging (the per-server federation rate limit
 -- already gates the call as a whole).
-handleFederationBatchForward : [{encryptedBlob: BlobHex, messageId: MessageIdHex, toKey: PubkeyHex | a}] -> Text -> Int -> Text -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, clock, network} {error: Text, ok: Bool, results: [{messageId: MessageIdHex, ok: Bool}], retryAfterMs: Int}
+handleFederationBatchForward : [{encryptedBlob: BlobHex, toKey: PubkeyHex | a}] -> Text -> Int -> Text -> IO {r *allowedPeers, r *blockedPeers, rw *federationRates, clock, network} {error: Text, ok: Bool, results: [{ok: Bool}], retryAfterMs: Int}
 handleFederationBatchForward = \forwards fromServer requestTimestamp authorization -> do
   t <- now
   withFederationAuth authorization t (\e r -> {ok: False {}, error: e, results: [], retryAfterMs: r}) fromServer "forward-batch" requestTimestamp (isRemote fromServer && count forwards <= maxBatchSize) (do
     results <- mapEach (takeRelation maxBatchSize forwards) (\e -> do
-      -- Recompute id from blob; ignore e.messageId (untrusted, peer-chosen).
-      let messageId = messageIdOf e.encryptedBlob
       result <- atomic storeFederated e.toKey e.encryptedBlob (False {}) t
-      yield {messageId, ok: result == ""})
+      yield {ok: result == ""})
     yield {ok: True {}, error: "", results, retryAfterMs: 0})
 
 -- ============================================
@@ -2163,7 +2134,7 @@ api = serve Api where
   LookupPresence = \{pubkey, authorization, clientIp} -> handleLookupPresence pubkey authorization clientIp
   BatchLookupPresence = \{pubkeys, authorization, clientIp} -> handleBatchLookupPresence pubkeys authorization clientIp
   RecvGossip = \{events, fromServer, requestTimestamp, authorization} -> handleRecvGossip events fromServer requestTimestamp authorization
-  ForwardMessage = \{toKey, encryptedBlob, messageId, fromServer, requestTimestamp, authorization} -> handleForwardMessage toKey encryptedBlob messageId fromServer requestTimestamp authorization
+  ForwardMessage = \{toKey, encryptedBlob, fromServer, requestTimestamp, authorization} -> handleForwardMessage toKey encryptedBlob fromServer requestTimestamp authorization
   FederationBatchForward = \{forwards, fromServer, requestTimestamp, authorization} -> handleFederationBatchForward forwards fromServer requestTimestamp authorization
   FederationPubkey = \{} -> handleFederationPubkey
   Prune = \{authorization} -> handlePrune authorization
