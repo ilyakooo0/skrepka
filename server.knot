@@ -343,7 +343,7 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 *challengeRates : [RateEntry]
 -- Per-key counters for read-only lookups (presence, /messages/list).
 *lookupRates : [RateEntry]
--- Per-key counters for misc client writes (/auth/revoke, /auth/logout, /messages/status).
+-- Per-key counters for misc client writes (/messages/status).
 *clientWriteRates : [RateEntry]
 -- Per-peer counters for inbound federation calls.
 *federationRates : [RateEntry]
@@ -394,7 +394,7 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 -- Routes (response shapes preserved; removed metric fields are zero-filled)
 -- ============================================
 -- Public HTTP surface, grouped by audience:
---   AuthApi          -- challenge/verify/revoke/logout (client identity)
+--   AuthApi          -- challenge/verify (client identity)
 --   ClientApi        -- /poll, send/batch/list/ack/delete, presence lookup
 --   FederationApi    -- inter-server gossip, forward, ack, delivery receipts
 --   FederationPubkey -- exposes this server's federation Ed25519 public key
@@ -406,8 +406,6 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 route AuthApi where
   POST {pubkey: PubkeyHex} /auth/challenge headers {clientIp: Text} -> {challenge: Text, ok: Bool, expiresAt: Timestamp, retryAfterMs: Int, error: Text} = ReqChallenge
   POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {clientIp: Text} -> {token: Text, expiresAt: Timestamp, error: Text} = VerifyAuth
-  POST {targetToken: Text} /auth/revoke headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool} = RevokeSession
-  POST /auth/logout headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool} = Logout
 
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, loadPct: Int} = Poll
@@ -1146,7 +1144,7 @@ refreshLocalPresence = \t -> do
   when (count refreshState.refreshed > 0) (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> mkGossip (GossipOnline {}) p.pubkey))))
 
 -- ============================================
--- Handler: challenge / verify / revoke / logout
+-- Handler: challenge / verify
 -- ============================================
 -- Identity is a public key; there are no accounts. The flow is:
 --   1. Client requests a fresh nonce (`handleChallenge`).
@@ -1155,9 +1153,8 @@ refreshLocalPresence = \t -> do
 --   3. Server returns a Bearer token bound to (pubkey, ip, expiry); the new
 --      session also installs a local presence row and gossips an `online`
 --      event to known peers.
--- `handleRevoke` lets a session revoke its peers (same pubkey, different
--- token); `handleLogout` invalidates the caller's own token and, if no
--- sibling sessions remain, gossips an `offline` event.
+-- Sessions expire on their own (`sessionExpiry`); there is no client-driven
+-- revoke/logout. Operators can force-revoke via `/maintenance/sessions/*`.
 
 -- POST /auth/challenge: issue a fresh signed-nonce challenge for `pubkey`.
 -- Capped per-key (maxChallengesPerKey) and rate-limited; the IP is recorded
@@ -1241,47 +1238,6 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
         mkGossip (GossipOnline {}) pubkey
       ]))
       yield {token, expiresAt: expiry, error: ""}
-
--- POST /auth/revoke: caller (any session for the pubkey) revokes a sibling
--- session by token. Returns ok=False if no such sibling existed.
-handleRevoke : Text -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, ok: Bool}
-handleRevoke = \targetToken authorization clientIp -> do
-  t <- now
-  gateAuth authorization clientIp t (\_ -> {ok: False {}, authorized: False {}}) (\caller -> do
-    result <- atomic (do
-      ses <- *sessions
-      let pred = \s -> s.pubkey == caller && s.token == targetToken
-      *sessions = removeWhere ses pred
-      yield (any ses pred))
-    yield {ok: result, authorized: True {}})
-
--- POST /auth/logout: drop the caller's own session. If this was the last
--- session for the pubkey, also clear local presence and gossip offline.
-handleLogout : Text -> Text -> IO {rw *presence, rw *sessions, clock} {authorized: Bool, ok: Bool}
-handleLogout = \authorization clientIp -> do
-  t <- now
-  let myToken = case extractToken authorization of
-    Just {value: tk} -> tk
-    _ -> ""
-  removed <- atomic withSessionAuth authorization t clientIp (yield {
-    ok: False {},
-    pubkey: "",
-    peers: []
-  }) (\pubkey -> do
-    ses <- *sessions
-    *sessions = removeWhere ses (\s -> s.token == myToken)
-    after <- *sessions
-    peers <- if any after (\s -> s.pubkey == pubkey)
-    then yield []
-    else do
-      pres <- *presence
-      *presence = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
-      yield (knownPeerServersFromPresence pres)
-    yield {ok: True {}, pubkey, peers})
-  when (removed.ok && federationEnabled) (fork (sendBatchedGossip removed.peers [
-    mkGossip (GossipOffline {}) removed.pubkey
-  ]))
-  yield {removed.ok, authorized: removed.ok}
 
 -- ============================================
 -- Handler: poll
@@ -2337,8 +2293,6 @@ api : Server Api _
 api = serve Api where
   ReqChallenge = \{pubkey, clientIp} -> handleChallenge pubkey clientIp
   VerifyAuth = \{pubkey, challenge, signature, revokeOthers, clientIp} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp
-  RevokeSession = \{targetToken, authorization, clientIp} -> handleRevoke targetToken authorization clientIp
-  Logout = \{authorization, clientIp} -> handleLogout authorization clientIp
   Poll = \{cursor, generation, authorization, clientIp} -> handlePoll cursor generation authorization clientIp
   SendMessages = \{messages, authorization, clientIp} -> handleSendMessages messages authorization clientIp
   MessageStatus = \{to, messageId, authorization, clientIp} -> handleMessageStatus to messageId authorization clientIp
