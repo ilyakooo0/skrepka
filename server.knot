@@ -59,9 +59,6 @@ maxBlobLen = 41943040
 -- Length of a hex-encoded Ed25519 signature (64 bytes → 128 hex).
 signatureLen : Int
 signatureLen = 128
--- Cap on the number of message IDs accepted in a single ack/lookup request.
-maxMessageIds : Int
-maxMessageIds = 100
 -- Cap on items in a batched send request.
 maxBatchSize : Int
 maxBatchSize = 100
@@ -211,14 +208,6 @@ federationUrl = \server -> federationScheme ++ server
 requireClientIp : Bool
 requireClientIp = True {}
 
--- Drop the Ms unit and convert milliseconds to seconds.
-msToS : Int<Ms> -> Int<S>
-msToS = \ms -> stripUnit ms / 1000
-
--- Drop the S unit and convert seconds to milliseconds.
-sToMs : Int<S> -> Int<Ms>
-sToMs = \s -> stripUnit s * 1000
-
 -- ============================================
 -- Types
 -- ============================================
@@ -307,9 +296,13 @@ type DeliveredEntry = {messageId: MessageIdHex, toKey: PubkeyHex, deliveredAt: T
 -- Running failure counter for a peer; keyed by `server`. Drives `retryBackoff`.
 type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFailedAt: Timestamp}
 -- One fixed-window rate counter. `key` identifies the subject (pubkey, ip,
--- server, or composite "sender|recipient" string).
+-- server, or composite "sender|recipient" string). `windowStart` is the wall
+-- time at which the current window began; once `t - windowStart` exceeds the
+-- configured window length the entry is recycled (counter resets to 1).
 type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 -- A live long-poll slot held by a pubkey; used to cap concurrency per key.
+-- `startedAt` lets `pruneExpired` reap slots whose holder vanished without
+-- cleanly exiting `pollOnce` (network drop mid-poll).
 type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 
 -- ============================================
@@ -319,46 +312,81 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 -- scan is O(n); scaling is the first thing the production version replaces.
 -- Grouped here: auth (challenges/sessions), mailbox (messages/forwards/acks),
 -- presence, rate-limit windows, and bookkeeping counters.
+-- The Knot runtime persists every `*ref` declared here through restarts (see
+-- the project memory note about SQLite-backed refs); nothing in this file is
+-- truly volatile despite being typed as plain in-memory lists.
 
+-- Outstanding /auth/challenge nonces awaiting /auth/verify. Capped overall and per-pubkey.
 *challenges : [Challenge]
+-- Live bearer tokens. Source of truth for `withSessionAuth`; trimmed by `pruneExpired`.
 *sessions : [Session]
+-- Mailbox: ciphertexts addressed to local recipients, awaiting poll or federation forward.
 *messages : [Message]
+-- Last-known location of each pubkey (local sessions and gossiped remote presence).
 *presence : [PresenceEntry]
+-- Cross-server outbox: messages queued for delivery to a peer, with retry counts.
 *forwards : [ForwardEntry]
+-- Tombstones of already-delivered message ids; combined with `*messages` for dedup.
 *deliveredIds : [DeliveredEntry]
+-- Per-peer failure counters; drives `retryBackoff` and the federation health view.
 *forwardFailures : [ForwardFailure]
+-- Currently-blocking long-poll slots, used to cap concurrent /poll holds per pubkey.
 *activePolls : [ActivePoll]
 
+-- Per-key fixed-window counters for /messages send-side rate limiting.
 *sendRates : [RateEntry]
+-- Per-recipient counters; protects a popular key from being flooded by many senders.
 *recvRates : [RateEntry]
+-- Per-(sender, recipient) pair counters; second-axis brake on chat spam.
 *pairRates : [RateEntry]
+-- Per-key /auth/challenge counters (separate from `*challenges` capacity gate).
 *challengeRates : [RateEntry]
+-- Per-key counters for read-only lookups (presence, /messages/list).
 *lookupRates : [RateEntry]
+-- Per-key counters for misc client writes (/auth/revoke, /auth/logout, /messages/status).
 *clientWriteRates : [RateEntry]
+-- Per-peer counters for inbound federation calls.
 *federationRates : [RateEntry]
+-- Per-source-IP counters; gate for unauthenticated traffic.
 *ipRates : [RateEntry]
 
+-- Global request-rate gate (single counter shared across all clients).
 *globalRateCount : Int
 *globalRateWindowStart : Timestamp
+-- Global gate charged only by /auth/* endpoints, on top of `*globalRateCount`.
 *authGlobalRateCount : Int
 *authGlobalRateWindowStart : Timestamp
 
+-- Strictly-monotonic sequence used as `Message.receivedAt`; guarantees poll-cursor ordering.
 *seqCounter : Timestamp
+-- Bumped by send/heartbeat to wake all blocked /poll holders.
 *pollWakeup : Timestamp
+-- Wall time of the last completed prune sweep (for /health and /ready).
 *lastPrunedAt : Timestamp
+-- Wall time of the last poll-heartbeat tick (for /health watchdog).
 *lastHeartbeatAt : Timestamp
+-- Wall time of the last self-presence refresh broadcast to peers.
 *lastPresenceRefresh : Timestamp
+-- Wall time of process start; underpins /stats uptime and /health warmup window.
 *startedAt : Timestamp
+-- Random 64-bit-ish identity stamped at startup. Clients echo it back on /poll;
+-- any mismatch means the server restarted and the client must reset its cursor.
 *serverGeneration : Int
 
+-- Bearer secret accepted on /maintenance/* endpoints. Rotated via /maintenance/rotate-secret;
+-- empty value disables maintenance entirely (every check returns false).
 *runtimeMaintenanceSecret : Text
 
+-- Ed25519 federation keypair (hex). Generated on first startup if blank, then persisted.
 *federationPrivateKeyHex : Text
 *federationPublicKeyHex : Text
 
+-- Operator-managed peer deny-list; checked on every inbound and outbound federation call.
 *blockedPeers : [Text]
+-- Operator-managed allow-list. When non-empty, only listed peers may federate (whitelist mode).
 *allowedPeers : [Text]
 
+-- Cumulative tick counters surfaced on /stats; bumped by the background loops.
 *pruneCount : Int
 *heartbeatCount : Int
 
@@ -385,9 +413,7 @@ route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, loadPct: Int} = Poll
   POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {results: [{messageId: MessageIdHex, error: Text}], error: Text, retryAfterMs: Int} = SendMessages
   POST {to: PubkeyHex, messageId: MessageIdHex} /messages/status headers {authorization: Text, clientIp: Text} -> {status: Text, authorized: Bool} = MessageStatus
-  POST {messageIds: [MessageIdHex]} /messages/ack headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, ackedCount: Int, error: Text} = AckMessages
   POST {offset: Int} /messages/list headers {authorization: Text, clientIp: Text} -> {messages: [{messageId: MessageIdHex, receivedAt: Timestamp}], authorized: Bool, count: Int, error: Text} = ListMessages
-  POST {messageIds: [MessageIdHex]} /messages/delete headers {authorization: Text, clientIp: Text} -> {ok: Bool, authorized: Bool, deletedCount: Int, error: Text} = DeleteMessages
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text} -> {server: ServerName, authorized: Bool, error: Text} = LookupPresence
   POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: ServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
@@ -467,35 +493,44 @@ route Api = AuthApi | ClientApi | FederationApi | FederationPubkeyApi | Maintena
 -- Everything is intentionally O(n) over flat lists; performance is sacrificed
 -- for clarity per the file header.
 
+-- Keep elements satisfying `pred`. Uses Knot's relation comprehension (`where`).
 filter : a b -> (b -> Bool) -> a b
 filter = \xs pred -> do
   x <- xs
   where pred x
   yield x
+-- Inverse of `filter`: drop elements satisfying `pred`.
 removeWhere : a b -> (b -> Bool) -> a b
 removeWhere = \xs pred -> filter xs (\x -> not pred x)
+-- Map without filtering (a.k.a. classic `map`).
 pluck : a b -> (b -> c) -> a c
 pluck = \xs f -> do
   x <- xs
   yield (f x)
+-- Filter then map in one pass.
 mapWhere : a b -> (b -> Bool) -> (b -> c) -> a c
 mapWhere = \xs pred -> pluck (filter xs pred)
 countWhere : a b -> (b -> Bool) -> Int
 countWhere = \xs pred -> count (filter xs pred)
+-- True when at least one element matches.
 any : [a] -> (a -> Bool) -> Bool
 any = \xs pred -> countWhere xs pred > 0
+-- True when no element matches.
 none : [a] -> (a -> Bool) -> Bool
 none = \xs pred -> not any xs pred
+-- True when every element matches.
 all : [a] -> (a -> Bool) -> Bool
 all = \xs pred -> none xs (\x -> not pred x)
 findFirst : [a] -> (a -> Bool) -> Maybe a
 findFirst = \xs pred -> headOf (filter xs pred)
+-- Run `action` only when `cond` is True; otherwise no-op.
 when : Bool -> IO {} {} -> IO {} {}
 when = \cond action -> if cond then action else yield {}
 min : a -> a -> a
 min = \a b -> if a < b then a else b
 max : a -> a -> a
 max = \a b -> if a > b then a else b
+-- Confine `x` to the closed interval [lo, hi].
 clamp : a -> a -> a -> a
 clamp = \lo hi x -> max lo (min hi x)
 abs : Int -> Int
@@ -509,6 +544,8 @@ headOf : [a] -> Maybe a
 headOf = \items -> fold (\_ x -> Just {value: x}) (Nothing {}) (takeRelation 1 items)
 
 -- Cap to maxN by dropping the smallest-key entries (LRU-style). Always sorts.
+-- For session/challenge/rate caps, `getKey` is typically `expiresAt` or
+-- `windowStart` so the oldest entries are evicted first.
 capList : [a] -> Int -> (a -> b) -> [a]
 capList = \items maxN getKey -> dropRelation (max 0 (count items - maxN)) (sortBy getKey items)
 
@@ -516,16 +553,10 @@ capList = \items maxN getKey -> dropRelation (max 0 (count items - maxN)) (sortB
 pct : Int -> Int -> Int
 pct = \cur maxN -> if maxN > 0 then cur * 100 / maxN else 0
 
--- Common ack/delete tail: pull matching messages, drop them and their forwards.
-removeForKey : (forall r. {toKey: PubkeyHex, encryptedBlob: BlobHex | r} -> Bool) -> IO {rw *forwards, rw *messages} [Message]
-removeForKey = \pred -> do
-  msgs <- *messages
-  fwds <- *forwards
-  *messages = removeWhere msgs pred
-  *forwards = removeWhere fwds pred
-  yield (filter msgs pred)
-
--- Cap pred-matching entries to maxN-1 (caller adds one more).
+-- Cap pred-matching entries to maxN-1 (caller adds one more). Splits the list
+-- into "doesn't match" (untouched) and "matches" (capped + LRU-evicted) so a
+-- single key can't exhaust a global pool — see `maxChallengesPerKey` and
+-- `maxSessionsPerKey`.
 capPerKey : [a] -> (a -> Bool) -> Int -> (a -> b) -> [a]
 capPerKey = \items pred maxN getKey -> union (removeWhere items pred) (capList (filter items pred) (maxN - 1) getKey)
 
@@ -545,7 +576,8 @@ emptyPollResp = \cursor authorized rateLimited gen retryAfterMs cursorWasReset -
   loadPct: 0
 }
 
--- Sequence an IO action over each item, in order.
+-- Sequence an IO action over each item, in order. Recurses through the list
+-- one element at a time; this is the closest equivalent of `mapM_` here.
 forEach : [a] -> (a -> IO {} {}) -> IO {} {}
 forEach = \items action -> case single (takeRelation 1 items) of
   Nothing {} -> yield {}
@@ -562,7 +594,8 @@ mapEach = \items action -> case headOf items of
     rest <- mapEach (dropRelation 1 items) action
     yield (union [r] rest)
 
--- Hex tokens: one random hex char per recursive call.
+-- Hex tokens: one random hex char per recursive call. `n` is the desired
+-- length in characters (so n=48 yields 24 random bytes of entropy).
 genTokenN : Int -> IO {random} Text
 genTokenN = \n -> if n <= 0
 then yield ""
@@ -571,7 +604,8 @@ else do
   rest <- genTokenN (n - 1)
   yield (take 1 (drop d "0123456789abcdef") ++ rest)
 
--- Standard 48-char hex token used for session bearers and federation nonces.
+-- Standard 48-char hex token used for session bearers, /auth challenges, and
+-- federation auth nonces (192 bits of entropy, well beyond birthday bound).
 genToken : IO {random} Text
 genToken = genTokenN 48
 
@@ -619,7 +653,12 @@ containsSuffix : Text -> Text -> Bool
 containsSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix))) s == suffix
 
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
--- tricks (octal, hex, percent-encoding) but covers the high-value cases.
+-- tricks (octal, hex, percent-encoding) but covers the high-value cases:
+-- `localhost`, RFC1918 ranges (10/8, 192.168/16, 169.254/16), the IPv4 zero
+-- net, IPv6 loopback (`::`/`::1`), bracketed IPv6 literals, and the `.local`
+-- / `.internal` / `.arpa` / `.onion` suffixes. Called at federation egress
+-- (so we never `fetch` a peer pubkey from loopback) and on inbound requests
+-- (so a peer can't claim a bogus `fromServer`).
 isBadServerName : Text -> Bool
 isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") || any [
   ".",
@@ -662,7 +701,7 @@ verifyMaintenanceAuth = \authorization -> do
 
 -- Branch on maintenance-secret auth: run `onAuth` when the bearer matches,
 -- `onUnauth` otherwise.
-withMaintAuth : Text -> IO {| effs} a -> IO {| effs} a -> IO {r *runtimeMaintenanceSecret | effs} a
+withMaintAuth : Text -> IO effs a -> IO effs a -> IO {r *runtimeMaintenanceSecret | effs} a
 withMaintAuth = \authorization onUnauth onAuth -> do
   authorized <- verifyMaintenanceAuth authorization
   if authorized then onAuth else onUnauth
@@ -701,7 +740,7 @@ gateLookup = \auth ip t mkErr rateResp onAuth ->
 
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
 -- the client IP matches. Runs `onAuth pubkey` on success, `onUnauth` otherwise.
-withSessionAuth : Text -> Int<Ms> -> Text -> IO {| e} a -> (PubkeyHex -> IO {| e} a) -> IO {r *sessions | e} a
+withSessionAuth : Text -> Int<Ms> -> Text -> IO e a -> (PubkeyHex -> IO e a) -> IO {r *sessions | e} a
 withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
   ses <- *sessions
   case extractToken authorization of
@@ -791,7 +830,10 @@ withFederationAuth = \authorization t mkErr fromServer scope requestTimestamp pr
 -- `authPreCheck` composes global + ip + auth-global into a one-shot
 -- gate for unauthenticated handlers (challenge/verify).
 
--- Returns {limited, entries}. Increments count when the key fits within the window.
+-- Returns {limited, entries}. Increments count when the key fits within the
+-- window; otherwise resets to a fresh window starting at `t`. The returned
+-- `entries` list is what the caller must write back to the corresponding ref;
+-- it has been capped at 5000 rows (LRU by `windowStart`) to bound memory.
 checkRate : [RateEntry] -> Text -> Int -> Int<Ms> -> Timestamp -> {limited: Bool, entries: [RateEntry]}
 checkRate = \entries key maxRate windowMs t -> (\cur -> if cur.count > maxRate then {limited: True {}, entries} else {limited: False {}, entries: capList (union (removeWhere entries (\x -> x.key == key)) [{key, cur.windowStart, cur.count}]) 5000 (\r -> r.windowStart)}) (case findFirst entries (\r -> r.key == key && t - r.windowStart < windowMs) of
   Just {value: r} -> {r.windowStart, count: r.count + 1}
@@ -909,10 +951,6 @@ clearFailure = \server -> atomic (do
 -- Guarantees /poll cursors order events even when many arrive in the same ms.
 nextSeqTs : Timestamp -> Timestamp -> Timestamp
 nextSeqTs = \t seqCounter -> max t (seqCounter + 1)
-
--- Drop duplicates and cap to `maxMessageIds` (defense against bloated requests).
-dedupMessageIds : [MessageIdHex] -> [MessageIdHex]
-dedupMessageIds = \ids -> takeRelation maxMessageIds ids
 
 -- All unexpired presence rows for a given pubkey (may include both local and
 -- remote entries — the recipient may live on multiple servers simultaneously).
@@ -1311,6 +1349,10 @@ pollOnce = \authorization cursor cursorWasReset clientIp serverGen t -> do
 
 -- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
 -- (bumped by send/heartbeat) and re-collect once at the new wall time.
+-- The retry uses Knot's STM `retry` primitive: the transaction blocks until
+-- some other transaction commits a change to `*pollWakeup`. Because
+-- `pollHeartbeat` bumps `*pollWakeup` every `pollTimeoutMs`, no caller waits
+-- longer than one heartbeat period before getting at least an empty response.
 doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{encryptedBlob: BlobHex}], hasMore: Bool}
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic (do
@@ -1326,6 +1368,9 @@ doPoll = \s t -> do
 
 -- Pull this pubkey's unexpired messages newer than `cursor`, sort by
 -- receivedAt, take up to `maxPollEvents`, and report `hasMore` if truncated.
+-- The returned cursor is the max `receivedAt` in the page (or the input
+-- cursor when the page is empty), which the client echoes on the next /poll
+-- to advance — and which the server treats as an implicit ack.
 collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp, hasMore: Bool}
 collectPollEvents = \messages pubkey cursor t -> (\myMsgs -> (\limited -> {events: pluck limited (\m -> {m.encryptedBlob}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited, hasMore: count myMsgs > count limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) myMsgs))) (filter messages (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor))
 
@@ -1377,6 +1422,10 @@ handleSendMessages = \messages authorization clientIp -> do
 -- presence rows that already exist for `to`. Returns the error code (empty
 -- on success or silent duplicate) and the list of remote servers the caller
 -- should kick forwards to.
+-- All three rate counters are charged unconditionally (even on a failure)
+-- so that a sender can't probe limits cheaply by sending to themselves or
+-- replaying duplicates. Order matters: send-rate is the sender's identity,
+-- pair-rate covers conversation spam, and recv-rate is per-recipient.
 sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> IO {r *deliveredIds, rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], error: Text}
 sendMessageCore = \senderKey to encryptedBlob t -> do
   msgs <- *messages
@@ -1518,26 +1567,9 @@ handleMessageStatus = \to messageId authorization clientIp -> do
     yield {status: s, authorized: True {}})
 
 -- ============================================
--- Handler: ack / list / delete
+-- Handler: list
 -- ============================================
--- Mailbox mutation by the recipient (ack, list, delete).
-
--- POST /messages/ack: explicit ack by message id (alternative to the implicit
--- cursor-based ack in /poll). Drops mailbox+forward rows.
-handleAckMessages : [MessageIdHex] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {ackedCount: Int, authorized: Bool, error: Text, ok: Bool}
-handleAckMessages = \messageIds authorization clientIp -> do
-  t <- now
-  let mkErr = \e -> {ok: False {}, authorized: False {}, ackedCount: 0, error: e}
-  gateClientWrite authorization clientIp t mkErr {
-    ok: False {},
-    authorized: True {},
-    ackedCount: 0,
-    error: "rate_limited"
-  } (\pubkey -> do
-    ackedCount <- atomic (do
-      toAck <- removeForKey (\x -> x.toKey == pubkey && elem (messageIdOf x.encryptedBlob) (dedupMessageIds messageIds))
-      yield (count toAck))
-    yield {ok: True {}, authorized: True {}, ackedCount, error: ""})
+-- Read-only mailbox peek by the recipient.
 
 -- POST /messages/list: paginated peek at the caller's mailbox without acking.
 -- Returns metadata only (no ciphertext) plus the total count.
@@ -1567,23 +1599,6 @@ handleListMessages = \offset authorization clientIp -> do
         m.receivedAt
       })
       yield {messages: page, authorized: True {}, count: total, error: ""})
-
--- POST /messages/delete: same effect as ack from the recipient's side, with
--- a "delete" semantic for the response.
-handleDeleteMessages : [MessageIdHex] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, deletedCount: Int, error: Text, ok: Bool}
-handleDeleteMessages = \messageIds authorization clientIp -> do
-  t <- now
-  let mkErr = \e -> {ok: False {}, authorized: False {}, deletedCount: 0, error: e}
-  gateClientWrite authorization clientIp t mkErr {
-    ok: False {},
-    authorized: True {},
-    deletedCount: 0,
-    error: "rate_limited"
-  } (\pubkey -> do
-    deletedCount <- atomic (do
-      toDel <- removeForKey (\x -> x.toKey == pubkey && elem (messageIdOf x.encryptedBlob) (dedupMessageIds messageIds))
-      yield (count toDel))
-    yield {ok: True {}, authorized: True {}, deletedCount, error: ""})
 
 -- ============================================
 -- Handler: federation receive
@@ -2327,9 +2342,7 @@ api = serve Api where
   Poll = \{cursor, generation, authorization, clientIp} -> handlePoll cursor generation authorization clientIp
   SendMessages = \{messages, authorization, clientIp} -> handleSendMessages messages authorization clientIp
   MessageStatus = \{to, messageId, authorization, clientIp} -> handleMessageStatus to messageId authorization clientIp
-  AckMessages = \{messageIds, authorization, clientIp} -> handleAckMessages messageIds authorization clientIp
   ListMessages = \{offset, authorization, clientIp} -> handleListMessages offset authorization clientIp
-  DeleteMessages = \{messageIds, authorization, clientIp} -> handleDeleteMessages messageIds authorization clientIp
   LookupPresence = \{pubkey, authorization, clientIp} -> handleLookupPresence pubkey authorization clientIp
   BatchLookupPresence = \{pubkeys, authorization, clientIp} -> handleBatchLookupPresence pubkeys authorization clientIp
   RecvGossip = \{events, fromServer, requestTimestamp, authorization} -> handleRecvGossip events fromServer requestTimestamp authorization
@@ -2401,7 +2414,7 @@ pollHeartbeat = do
 
 -- Entry point: stamp startup metadata, lazily generate the federation keypair
 -- on first run, fork the background loops, and start the HTTP listener.
-main : IO {| _} {}
+main : IO _ {}
 main = do
   t <- now
   genJitter <- randomInt 1000000
