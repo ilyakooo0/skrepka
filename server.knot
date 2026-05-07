@@ -377,7 +377,7 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 -- ============================================
 -- Public HTTP surface, grouped by audience:
 --   AuthApi          -- challenge/verify (client identity)
---   ClientApi        -- /poll, /messages (send), /messages/status, presence lookup
+--   ClientApi        -- /poll, /messages (send), presence lookup
 --   FederationApi    -- inter-server gossip, forward (single + batch)
 --   FederationPubkey -- exposes this server's federation Ed25519 public key
 --   MaintenanceApi   -- operator endpoints (prune, peer allow/block, admin)
@@ -392,7 +392,6 @@ route AuthApi where
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, loadPct: Int} = Poll
   POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {results: [{messageId: MessageIdHex, error: Text}], error: Text, retryAfterMs: Int} = SendMessages
-  POST {to: PubkeyHex, messageId: MessageIdHex} /messages/status headers {authorization: Text, clientIp: Text} -> {status: Text, authorized: Bool} = MessageStatus
   GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text} -> {server: ServerName, authorized: Bool, error: Text} = LookupPresence
   POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: ServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
@@ -1454,23 +1453,6 @@ handleBatchLookupPresence = \pubkeys authorization clientIp -> do
     let results = pluck (takeRelation 50 pubkeys) (\k -> {pubkey: k, server: maskedServer pres k t})
     yield {results, authorized: True {}, error: ""})
 
--- POST /messages/status: classify a message as
--- pending (in mailbox), forwarding (en-route to a peer), or unknown.
--- A message that has been polled and removed returns "unknown"; the server
--- keeps no post-delivery record, so the client must track delivery itself.
-handleMessageStatus : PubkeyHex -> MessageIdHex -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, status: Text}
-handleMessageStatus = \to messageId authorization clientIp -> do
-  t <- now
-  let mkErr = \_ -> {status: "", authorized: False {}}
-  gateAuth authorization clientIp t mkErr (\_ -> do
-    msgs <- *messages
-    fwds <- *forwards
-    let blobMatches = \x -> messageIdOf x.encryptedBlob == messageId && x.toKey == to
-    let s = if any msgs blobMatches
-    then "pending"
-    else if any fwds blobMatches then "forwarding" else "unknown"
-    yield {status: s, authorized: True {}})
-
 -- ============================================
 -- Handler: federation receive
 -- ============================================
@@ -2178,7 +2160,6 @@ api = serve Api where
   VerifyAuth = \{pubkey, challenge, signature, revokeOthers, clientIp} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp
   Poll = \{cursor, generation, authorization, clientIp} -> handlePoll cursor generation authorization clientIp
   SendMessages = \{messages, authorization, clientIp} -> handleSendMessages messages authorization clientIp
-  MessageStatus = \{to, messageId, authorization, clientIp} -> handleMessageStatus to messageId authorization clientIp
   LookupPresence = \{pubkey, authorization, clientIp} -> handleLookupPresence pubkey authorization clientIp
   BatchLookupPresence = \{pubkeys, authorization, clientIp} -> handleBatchLookupPresence pubkeys authorization clientIp
   RecvGossip = \{events, fromServer, requestTimestamp, authorization} -> handleRecvGossip events fromServer requestTimestamp authorization
