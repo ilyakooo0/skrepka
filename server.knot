@@ -358,8 +358,9 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 -- any mismatch means the server restarted and the client must reset its cursor.
 *serverGeneration : Int
 
--- Bearer secret accepted on /maintenance/* endpoints. Rotated via /maintenance/rotate-secret;
--- empty value disables maintenance entirely (every check returns false).
+-- Bearer secret accepted on /maintenance/* endpoints. Set via the
+-- `runtimeMaintenanceSecret` CLI flag at startup; empty value disables
+-- maintenance entirely (every check returns false).
 *runtimeMaintenanceSecret : Text
 
 -- Ed25519 federation keypair (hex). Generated on first startup if blank, then persisted.
@@ -420,13 +421,11 @@ route MaintenanceApi where
   POST {ip: Text} /maintenance/sessions/revoke-ip headers {authorization: Text} -> {ok: Bool, revokedCount: Int, affectedKeys: Int} = AdminRevokeIp
   POST {limit: Int} /maintenance/sessions/list headers {authorization: Text} -> {sessions: [{pubkey: PubkeyHex, count: Int, ips: [Text], latestExpiry: Timestamp}], ok: Bool, total: Int} = AdminListAllSessions
   GET /maintenance/rate-limits headers {authorization: Text} -> {ok: Bool, globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int} = GetRateLimits
-  POST {globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int} /maintenance/rate-limits headers {authorization: Text} -> {ok: Bool} = SetRateLimits
   POST /maintenance/nonces/flush headers {authorization: Text} -> {ok: Bool, flushedCount: Int} = FlushNonces
   POST {server: ServerName} /maintenance/allow headers {authorization: Text} -> {ok: Bool, allowed: Int} = AllowPeer
   POST {server: ServerName} /maintenance/unallow headers {authorization: Text} -> {ok: Bool, removed: Bool} = UnallowPeer
   GET /maintenance/allowed headers {authorization: Text} -> {peers: [Text], ok: Bool} = ListAllowed
   POST /maintenance/reconcile headers {authorization: Text} -> {ok: Bool, messageDrift: Int, presenceDrift: Int, sessionDrift: Int} = Reconcile
-  POST {newSecret: Text} /maintenance/rotate-secret headers {authorization: Text} -> {ok: Bool, error: Text} = RotateSecret
   GET /maintenance/config headers {authorization: Text} -> {ok: Bool, pollTimeoutMs: Int, ackGracePeriod: Int} = GetConfig
 
 route HealthApi where
@@ -1862,30 +1861,12 @@ handleGetRateLimits = \authorization -> do
     lookupRate: v maxLookupRatePerKey
   }
 
--- POST /maintenance/rate-limits: stub. Rate ceilings are compile-time constants
--- in this simplified server, so this just authorizes and returns ok=true.
-handleSetRateLimits : a -> b -> c -> d -> e -> f -> g -> h -> i -> Text -> IO {r *runtimeMaintenanceSecret} {ok: Bool}
-handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate authorization -> do
-  authorized <- verifyMaintenanceAuth authorization
-  yield {ok: authorized}
-
 -- POST /maintenance/nonces/flush: stub. Nonce caches were removed; the
 -- endpoint is preserved so older operator tooling keeps working.
 handleFlushNonces : Text -> IO {r *runtimeMaintenanceSecret} {flushedCount: Int, ok: Bool}
 handleFlushNonces = \authorization -> do
   authorized <- verifyMaintenanceAuth authorization
   yield {ok: authorized, flushedCount: 0}
-
--- POST /maintenance/rotate-secret: replace the maintenance Bearer secret.
--- The old secret authenticates the rotation; subsequent calls must use the
--- new value.
-handleRotateSecret : Text -> Text -> IO {rw *runtimeMaintenanceSecret} {error: Text, ok: Bool}
-handleRotateSecret = \newSecret authorization -> withMaintAuth authorization (yield {
-  ok: False {},
-  error: "unauthorized"
-}) (do
-  atomic *runtimeMaintenanceSecret = newSecret
-  yield {ok: True {}, error: ""})
 
 -- GET /maintenance/config: expose a small set of operationally-relevant
 -- compile-time constants (poll timeout, ack grace).
@@ -2259,13 +2240,11 @@ api = serve Api where
   AdminPurgeMessages = \{pubkey, authorization} -> handleAdminPurgeMessages pubkey authorization
   AdminRevokeIp = \{ip, authorization} -> handleAdminRevokeIp ip authorization
   GetRateLimits = \{authorization} -> handleGetRateLimits authorization
-  SetRateLimits = \{globalRequest, ipRate, sendRate, federationRate, authGlobal, recvRate, challengeRate, pairRate, lookupRate, authorization} -> handleSetRateLimits globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate authorization
   FlushNonces = \{authorization} -> handleFlushNonces authorization
   AllowPeer = \{server, authorization} -> handleAllowPeer server authorization
   UnallowPeer = \{server, authorization} -> handleUnallowPeer server authorization
   ListAllowed = \{authorization} -> handleListAllowed authorization
   Reconcile = \{authorization} -> handleReconcile authorization
-  RotateSecret = \{newSecret, authorization} -> handleRotateSecret newSecret authorization
   GetConfig = \{authorization} -> handleGetConfig authorization
   Health = \{authorization} -> handleHealth authorization
   Stats = \{authorization} -> handleStats authorization
