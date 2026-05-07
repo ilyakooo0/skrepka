@@ -131,12 +131,6 @@ maxLookupRatePerKey = 5
 -- Window for the per-key lookup rate limit (1 s).
 lookupRateWindowMs : Int<Ms>
 lookupRateWindowMs = 1000
--- Other client write requests permitted per key per window.
-maxClientWriteRatePerKey : Int
-maxClientWriteRatePerKey = 10
--- Window for the per-key client-write rate limit (1 s).
-clientWriteRateWindowMs : Int<Ms>
-clientWriteRateWindowMs = 1000
 -- Requests permitted per source IP per window (covers unauthenticated traffic).
 maxIpRatePerIp : Int
 maxIpRatePerIp = 10
@@ -336,8 +330,6 @@ type ActivePoll = {pubkey: PubkeyHex, startedAt: Timestamp}
 *challengeRates : [RateEntry]
 -- Per-key counters for read-only lookups (presence, /messages/list).
 *lookupRates : [RateEntry]
--- Per-key counters for misc client writes (/messages/status).
-*clientWriteRates : [RateEntry]
 -- Per-peer counters for inbound federation calls.
 *federationRates : [RateEntry]
 -- Per-source-IP counters; gate for unauthenticated traffic.
@@ -427,8 +419,8 @@ route MaintenanceApi where
   POST {pubkey: PubkeyHex} /maintenance/messages/purge headers {authorization: Text} -> {ok: Bool, purgedCount: Int} = AdminPurgeMessages
   POST {ip: Text} /maintenance/sessions/revoke-ip headers {authorization: Text} -> {ok: Bool, revokedCount: Int, affectedKeys: Int} = AdminRevokeIp
   POST {limit: Int} /maintenance/sessions/list headers {authorization: Text} -> {sessions: [{pubkey: PubkeyHex, count: Int, ips: [Text], latestExpiry: Timestamp}], ok: Bool, total: Int} = AdminListAllSessions
-  GET /maintenance/rate-limits headers {authorization: Text} -> {ok: Bool, globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int, clientWriteRate: Int} = GetRateLimits
-  POST {globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int, clientWriteRate: Int} /maintenance/rate-limits headers {authorization: Text} -> {ok: Bool} = SetRateLimits
+  GET /maintenance/rate-limits headers {authorization: Text} -> {ok: Bool, globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int} = GetRateLimits
+  POST {globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int} /maintenance/rate-limits headers {authorization: Text} -> {ok: Bool} = SetRateLimits
   POST /maintenance/nonces/flush headers {authorization: Text} -> {ok: Bool, flushedCount: Int} = FlushNonces
   POST {server: ServerName} /maintenance/allow headers {authorization: Text} -> {ok: Bool, allowed: Int} = AllowPeer
   POST {server: ServerName} /maintenance/unallow headers {authorization: Text} -> {ok: Bool, removed: Bool} = UnallowPeer
@@ -466,7 +458,7 @@ route StatsApi where
   GET /stats/key/{pubkey: PubkeyHex} headers {authorization: Text} -> {messages: Int, presence: [KeyPresenceEntry], sessions: Int, forwards: Int, forwardDetails: [{server: Text, retries: Int}], activePolls: Int, ok: Bool} = StatsKey
   POST {limit: Int} /stats/top-recipients headers {authorization: Text} -> {recipients: [RecipientCount], ok: Bool, total: Int} = TopRecipients
   GET /stats/forwards headers {authorization: Text} -> {servers: [{server: Text, count: Int, totalRetries: Int}], ok: Bool, total: Int} = StatsForwards
-  GET /stats/rates headers {authorization: Text} -> {ok: Bool, scalePct: Int, globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int, clientWriteRate: Int} = StatsRates
+  GET /stats/rates headers {authorization: Text} -> {ok: Bool, scalePct: Int, globalRequest: Int, ipRate: Int, sendRate: Int, federationRate: Int, authGlobal: Int, recvRate: Int, challengeRate: Int, pairRate: Int, lookupRate: Int} = StatsRates
 
 route MetricsApi where
   GET /metrics headers {authorization: Text} -> {metrics: Text, ok: Bool} = Metrics
@@ -667,8 +659,8 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c
 -- Auth helpers
 -- ============================================
 -- Bearer token extraction, session lookup, maintenance secret check, and the
--- `gateAuth`/`gateClientWrite`/`gateLookup` combinators that every client
--- handler funnels through (global rate → per-key rate → session).
+-- `gateAuth`/`gateLookup` combinators that every client handler funnels
+-- through (global rate → per-key rate → session).
 -- Federation requests use a separate path (`withFederationAuth`) using
 -- Ed25519-signed auth verified via the peer's published public key.
 
@@ -705,19 +697,8 @@ gateAuth = \auth ip t mkErr onAuth -> do
   let err = \e -> yield (mkErr e)
   if g then err "rate_limited" else withSessionAuth auth t ip (err "unauthorized") onAuth
 
--- gateAuth + per-key rate gate. `rateResp` is the response value when the per-key gate trips.
-gateClientWrite : Text -> Text -> Int<Ms> -> (Text -> a) -> a -> (Text -> IO {} a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} a
-gateClientWrite = \auth ip t mkErr rateResp onAuth ->
-  gateAuth auth ip t mkErr (\pk -> do
-    lim <- atomic do
-      rates <- *clientWriteRates
-      let r = checkRate rates pk maxClientWriteRatePerKey clientWriteRateWindowMs t
-      -- TODO: make this no be a `replace`
-      *clientWriteRates = r.entries
-      yield r.limited
-    if lim then yield rateResp else onAuth pk)
-
--- Variant of `gateClientWrite` that uses the per-key lookup-rate window instead.
+-- gateAuth + per-key lookup-rate gate. `rateResp` is the response value when
+-- the per-key gate trips.
 gateLookup : Text -> Text -> Int<Ms> -> (Text -> a) -> a -> (Text -> IO {} a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} a
 gateLookup = \auth ip t mkErr rateResp onAuth ->
   gateAuth auth ip t mkErr (\pk -> do
@@ -1864,7 +1845,7 @@ handleAdminListAllSessions = \limit authorization -> withMaintAuth authorization
 
 -- GET /maintenance/rate-limits: expose the configured rate ceilings. Returns
 -- zeros for unauthenticated callers (response shape stays stable).
-handleGetRateLimits : Text -> IO {r *runtimeMaintenanceSecret} {authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, sendRate: Int}
+handleGetRateLimits : Text -> IO {r *runtimeMaintenanceSecret} {authGlobal: Int, challengeRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, sendRate: Int}
 handleGetRateLimits = \authorization -> do
   ok <- verifyMaintenanceAuth authorization
   let v = \x -> if ok then x else 0
@@ -1878,14 +1859,13 @@ handleGetRateLimits = \authorization -> do
     recvRate: v maxRecvRatePerKey,
     challengeRate: v maxChallengeRatePerKey,
     pairRate: v maxPairRatePerPair,
-    lookupRate: v maxLookupRatePerKey,
-    clientWriteRate: v maxClientWriteRatePerKey
+    lookupRate: v maxLookupRatePerKey
   }
 
 -- POST /maintenance/rate-limits: stub. Rate ceilings are compile-time constants
 -- in this simplified server, so this just authorizes and returns ok=true.
-handleSetRateLimits : a -> b -> c -> d -> e -> f -> g -> h -> i -> j -> Text -> IO {r *runtimeMaintenanceSecret} {ok: Bool}
-handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization -> do
+handleSetRateLimits : a -> b -> c -> d -> e -> f -> g -> h -> i -> Text -> IO {r *runtimeMaintenanceSecret} {ok: Bool}
+handleSetRateLimits = \globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate authorization -> do
   authorized <- verifyMaintenanceAuth authorization
   yield {ok: authorized}
 
@@ -2203,7 +2183,7 @@ handleStatsForwards = \authorization -> withMaintAuth authorization (yield {
 
 -- GET /stats/rates: same shape as /maintenance/rate-limits with an extra
 -- scalePct field. Kept separate for backwards compatibility with older clients.
-handleStatsRates : Text -> IO {r *runtimeMaintenanceSecret} {authGlobal: Int, challengeRate: Int, clientWriteRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, scalePct: Int, sendRate: Int}
+handleStatsRates : Text -> IO {r *runtimeMaintenanceSecret} {authGlobal: Int, challengeRate: Int, federationRate: Int, globalRequest: Int, ipRate: Int, lookupRate: Int, ok: Bool, pairRate: Int, recvRate: Int, scalePct: Int, sendRate: Int}
 handleStatsRates = \authorization -> do
   ok <- verifyMaintenanceAuth authorization
   let v = \x -> if ok then x else 0
@@ -2218,8 +2198,7 @@ handleStatsRates = \authorization -> do
     recvRate: v maxRecvRatePerKey,
     challengeRate: v maxChallengeRatePerKey,
     pairRate: v maxPairRatePerPair,
-    lookupRate: v maxLookupRatePerKey,
-    clientWriteRate: v maxClientWriteRatePerKey
+    lookupRate: v maxLookupRatePerKey
   }
 
 -- GET /metrics: Prometheus-style text exposition of the most useful gauges.
@@ -2280,7 +2259,7 @@ api = serve Api where
   AdminPurgeMessages = \{pubkey, authorization} -> handleAdminPurgeMessages pubkey authorization
   AdminRevokeIp = \{ip, authorization} -> handleAdminRevokeIp ip authorization
   GetRateLimits = \{authorization} -> handleGetRateLimits authorization
-  SetRateLimits = \{globalRequest, ipRate, sendRate, federationRate, authGlobal, recvRate, challengeRate, pairRate, lookupRate, clientWriteRate, authorization} -> handleSetRateLimits globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate clientWriteRate authorization
+  SetRateLimits = \{globalRequest, ipRate, sendRate, federationRate, authGlobal, recvRate, challengeRate, pairRate, lookupRate, authorization} -> handleSetRateLimits globalRequest ipRate sendRate federationRate authGlobal recvRate challengeRate pairRate lookupRate authorization
   FlushNonces = \{authorization} -> handleFlushNonces authorization
   AllowPeer = \{server, authorization} -> handleAllowPeer server authorization
   UnallowPeer = \{server, authorization} -> handleUnallowPeer server authorization
