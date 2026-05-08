@@ -99,12 +99,6 @@ maxSendRatePerKey = 20
 -- Window for the per-key send rate limit (1 s).
 sendRateWindowMs : Int<Ms>
 sendRateWindowMs = 1000
--- Receive/poll requests permitted per key per window.
-maxRecvRatePerKey : Int
-maxRecvRatePerKey = 10
--- Window for the per-key receive rate limit (1 s).
-recvRateWindowMs : Int<Ms>
-recvRateWindowMs = 1000
 -- Requests permitted per source IP per window (covers unauthenticated traffic).
 maxIpRatePerIp : Int
 maxIpRatePerIp = 10
@@ -268,8 +262,6 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 
 -- Per-key fixed-window counters for /messages send-side rate limiting.
 *sendRates : [RateEntry]
--- Per-recipient counters; protects a popular key from being flooded by many senders.
-*recvRates : [RateEntry]
 -- Per-key /auth/challenge counters (separate from `*challenges` capacity gate).
 *challengeRates : [RateEntry]
 -- Per-source-IP counters; gate for unauthenticated traffic.
@@ -470,7 +462,7 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c
 -- Bearer token extraction, session lookup, and the `gateAuth` combinator that
 -- every client handler funnels through (global rate → session).
 -- Federation requests are unauthenticated: anyone can hit /federation/*.
--- Per-recipient `recvRate` and `no_presence` checks bound the spam ceiling.
+-- The `no_presence` check bounds federated forwards to currently-online keys.
 
 -- Plain ip match (sessions with empty ip skip the check).
 matchIp : Text -> Text -> Bool
@@ -913,7 +905,7 @@ pollOnce = \authorization cursor clientIp t -> do
 -- some other transaction commits a change to `*pollWakeup`. Because
 -- `pollHeartbeat` bumps `*pollWakeup` every `pollTimeoutMs`, no caller waits
 -- longer than one heartbeat period before getting at least an empty response.
-doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{encryptedBlob: BlobHex}]}
+doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp | a} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{encryptedBlob: BlobHex}]}
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic (do
     msgs <- *messages
@@ -954,17 +946,17 @@ ackPolledMessages = \pubkey cursor -> do
 -- either succeeds (every message enqueued) or fails with a non-2xx HTTP
 -- status carrying the rejection code ("rate_limited" | "self_send" | ...).
 -- Duplicates are silently treated as success so retries are idempotent.
--- Send is gated by global rate and the per-sender / per-pair / per-recipient
--- rate limits charged together inside `checkSendRate`.
+-- Send is gated by global rate and the per-sender rate limit charged inside
+-- `checkSendRate`.
 -- Federated forwards are kicked off in background forks after the atomic.
 
 -- POST /messages: send a list of ciphertexts atomically. Every message is
--- validated (self-send + send/recv rate windows) inside a single atomic
+-- validated (self-send + per-sender rate window) inside a single atomic
 -- block; if any one would be rejected, none are enqueued and the call returns
--- a non-2xx HTTP status. Rate counters are still charged for every attempted
--- message even when the batch is rejected, so a sender can't probe limits
--- cheaply (e.g. by sending to themselves). Federation forwards are kicked
--- per message after commit.
+-- a non-2xx HTTP status. The send-rate counter is still charged for every
+-- attempted message even when the batch is rejected, so a sender can't probe
+-- limits cheaply (e.g. by sending to themselves). Federation forwards are
+-- kicked per message after commit.
 handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} (Result HttpError {})
 handleSendMessages = \messages authorization clientIp -> do
   t <- now
@@ -987,23 +979,20 @@ handleSendMessages = \messages authorization clientIp -> do
         when federationEnabled (forEach checked (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
         yield (Ok {value: {}}))
 
--- Charge send/recv rate counters for one (sender, recipient) pair and
--- decide whether the message would be accepted. Mutates only the rate
--- counters, never the mailbox; the caller commits via `commitSendMessage`
--- only after every message in the batch has passed.
--- Both rate counters are charged unconditionally (even on a failure)
--- so that a sender can't probe limits cheaply by sending to themselves.
-checkSendRate : PubkeyHex -> PubkeyHex -> Int<Ms> -> IO {r *presence, rw *recvRates, rw *sendRates} {remoteServers: [Text], error: Text}
+-- Charge the send rate counter for the sender and decide whether the message
+-- would be accepted. Mutates only the rate counter, never the mailbox; the
+-- caller commits via `commitSendMessage` only after every message in the
+-- batch has passed. The counter is charged unconditionally (even on a
+-- failure) so that a sender can't probe limits cheaply by sending to
+-- themselves.
+checkSendRate : PubkeyHex -> PubkeyHex -> Int<Ms> -> IO {r *presence, rw *sendRates} {remoteServers: [Text], error: Text}
 checkSendRate = \senderKey to t -> do
   sRates <- *sendRates
   let sR = checkRate sRates senderKey maxSendRatePerKey sendRateWindowMs t
   *sendRates = sR.entries
-  rRates <- *recvRates
-  let rR = checkRate rRates to maxRecvRatePerKey recvRateWindowMs t
-  *recvRates = rR.entries
   if senderKey == to
   then yield {error: "self_send", remoteServers: []}
-  else if sR.limited || rR.limited
+  else if sR.limited
   then yield {error: "rate_limited", remoteServers: []}
   else do
     pres <- *presence
@@ -1070,8 +1059,8 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
 -- Handler: federation receive
 -- ============================================
 -- Inbound peer-to-peer endpoints. Federation is open and unauthenticated:
--- the per-recipient `recvRate` and `no_presence` checks in `storeFederated`
--- do the actual spam-bounding.
+-- the `no_presence` check in `storeFederated` bounds forwards to currently-
+-- online local keys.
 
 -- POST /federation/gossip: ingest peer presence events. The transport-level
 -- `fromServer` is the home server for every event. Drops every (pubkey,
@@ -1107,43 +1096,37 @@ handleRecvGossip = \events fromServer -> do
     yield (Ok {value: {}})
 
 -- Store a federated/forwarded message into the local mailbox. Caller wraps in `atomic`.
--- Returns "" on success, otherwise an error code: "no_presence" | "rate_limited".
+-- Returns "" on success, otherwise the error code "no_presence".
 --
 -- The presence gate requires the recipient to be **currently locally online**
 -- (not just visible to gossip somewhere). Without that, an A → B forward based
 -- on stale gossip about R could land on B with no actively-polling client and
 -- get stuck. If B refuses, A retries via `retryPendingForwards` against the
 -- next presence target.
-storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter} Text
+storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter} Text
 storeFederated = \toKey encryptedBlob t -> do
   pres <- *presence
   msgs <- *messages
   if not any pres (\p -> p.pubkey == toKey && isLocalServer p.server && p.expiresAt > t)
   then yield "no_presence"
   else do
-    rRates <- *recvRates
-    let r = checkRate rRates toKey maxRecvRatePerKey recvRateWindowMs t
-    *recvRates = r.entries
-    if r.limited
-    then yield "rate_limited"
-    else do
-      seq <- *seqCounter
-      let seqTs = nextSeqTs t seq
-      *seqCounter = seqTs
-      *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
-      *pollWakeup = seqTs
-      yield ""
+    seq <- *seqCounter
+    let seqTs = nextSeqTs t seq
+    *seqCounter = seqTs
+    *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
+    *pollWakeup = seqTs
+    yield ""
 
 -- POST /federation/forward: receive a single federated message destined for
 -- a local key. Delegates the actual store decision to `storeFederated`,
 -- which returns "" on success.
-handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock} (Result HttpError {})
+handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter, clock} (Result HttpError {})
 handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
   result <- atomic storeFederated toKey encryptedBlob t
   if result == ""
   then yield (Ok {value: {}})
-  else yield (Err {error: {status: if result == "no_presence" then 404 else 429, message: result}})
+  else yield (Err {error: {status: 404, message: result}})
 
 -- ============================================
 -- Dispatch
