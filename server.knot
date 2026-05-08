@@ -158,9 +158,6 @@ federationEnabled : Bool
 federationEnabled = True {}
 federationUrl : Text -> Text
 federationUrl = \server -> federationScheme ++ server
--- When True, reject requests that arrive without a client-IP header (for IP-based rate limits).
-requireClientIp : Bool
-requireClientIp = True {}
 
 -- ============================================
 -- Types
@@ -307,12 +304,12 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 -- `{"error": "<code>"}`.
 
 route AuthApi where
-  POST {pubkey: PubkeyHex} /auth/challenge headers {clientIp: Text} -> {challenge: Text, expiresAt: Timestamp} = ReqChallenge
-  POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {clientIp: Text} -> {token: Text, expiresAt: Timestamp} = VerifyAuth
+  POST {pubkey: PubkeyHex} /auth/challenge headers {xForwardedFor: Maybe Text} -> {challenge: Text, expiresAt: Timestamp} = ReqChallenge
+  POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {xForwardedFor: Maybe Text} -> {token: Text, expiresAt: Timestamp} = VerifyAuth
 
 route ClientApi where
-  POST {cursor: Timestamp} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp} = Poll
-  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {} = SendMessages
+  POST {cursor: Timestamp} /poll headers {authorization: Text, xForwardedFor: Maybe Text} -> {events: [PollEvent], cursor: Timestamp} = Poll
+  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, xForwardedFor: Maybe Text} -> {} = SendMessages
 
 route FederationApi where
   POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
@@ -485,6 +482,14 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c
 matchIp : Text -> Text -> Bool
 matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
+-- Unwrap an X-Forwarded-For header value to a plain IP string. Empty when the
+-- header is absent (no reverse proxy in front), which downstream gates treat
+-- as "skip IP-based rate limiting".
+clientIpOf : Maybe Text -> Text
+clientIpOf = \h -> case h of
+  Just {value: ip} -> ip
+  Nothing {} -> ""
+
 -- Pull the token out of an `Authorization: Bearer <token>` header. Returns
 -- Nothing if the prefix is missing or the token is empty.
 extractToken : Text -> Maybe Text
@@ -567,7 +572,9 @@ checkAuthGlobalRate = \t -> atomic (do
     *authGlobalRateCount = c + 1
     yield (False {}))
 
--- Per-source-IP rate gate (skipped when the IP is unknown — see `requireClientIp`).
+-- Per-source-IP rate gate. When the IP is unknown (no X-Forwarded-For from a
+-- reverse proxy), the gate is skipped — direct deployments without a proxy
+-- still rely on global rate limits.
 checkIpRateGate : Text -> Int<Ms> -> IO {rw *ipRates} Bool
 checkIpRateGate = \ip t -> if ip == ""
 then yield (False {})
@@ -816,13 +823,9 @@ refreshLocalPresence = \t -> do
 handleChallenge : PubkeyHex -> Text -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challengeRates, rw *challenges, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, clock, random} (Result HttpError {challenge: Text, expiresAt: Int})
 handleChallenge = \pubkey clientIp -> do
   t <- now
-  preErr <- if requireClientIp && clientIp == ""
-  then yield "client_ip_required"
-  else authPreCheck clientIp t
+  preErr <- authPreCheck clientIp t
   if preErr != ""
-  then yield (Err {
-    error: {status: if preErr == "client_ip_required" then 400 else 429, message: preErr}
-  })
+  then yield (Err {error: {status: 429, message: preErr}})
   else do
     challenge <- genToken
     result <- atomic (do
@@ -1191,10 +1194,10 @@ handleFederationBatchForward = \forwards _ -> do
 -- its `handleXxx` function. Every route entry above must have a clause here.
 api : Server Api _
 api = serve Api where
-  ReqChallenge = \{pubkey, clientIp} -> handleChallenge pubkey clientIp
-  VerifyAuth = \{pubkey, challenge, signature, revokeOthers, clientIp} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp
-  Poll = \{cursor, authorization, clientIp} -> handlePoll cursor authorization clientIp
-  SendMessages = \{messages, authorization, clientIp} -> handleSendMessages messages authorization clientIp
+  ReqChallenge = \{pubkey, xForwardedFor} -> handleChallenge pubkey (clientIpOf xForwardedFor)
+  VerifyAuth = \{pubkey, challenge, signature, revokeOthers, xForwardedFor} -> handleVerifyAuth pubkey challenge signature revokeOthers (clientIpOf xForwardedFor)
+  Poll = \{cursor, authorization, xForwardedFor} -> handlePoll cursor authorization (clientIpOf xForwardedFor)
+  SendMessages = \{messages, authorization, xForwardedFor} -> handleSendMessages messages authorization (clientIpOf xForwardedFor)
   RecvGossip = \{events, fromServer} -> handleRecvGossip events fromServer
   ForwardMessage = \{toKey, encryptedBlob, fromServer} -> handleForwardMessage toKey encryptedBlob fromServer
   FederationBatchForward = \{forwards, fromServer} -> handleFederationBatchForward forwards fromServer
