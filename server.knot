@@ -165,10 +165,6 @@ pollTimeoutMs = 25000
 presenceRefreshInterval : Int<Ms>
 presenceRefreshInterval = 300000
 
--- Human-readable build identifier returned by the /health endpoint.
-serverBuildVersion : Text
-serverBuildVersion = "2026-04-27-simple"
-
 -- Master switch for federation; when False the server runs in single-node mode.
 federationEnabled : Bool
 federationEnabled = True {}
@@ -283,7 +279,7 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 *presence : [PresenceEntry]
 -- Cross-server outbox: messages queued for delivery to a peer, with retry counts.
 *forwards : [ForwardEntry]
--- Per-peer failure counters; drives `retryBackoff` and the federation health view.
+-- Per-peer failure counters; drives `retryBackoff`.
 *forwardFailures : [ForwardFailure]
 
 -- Per-key fixed-window counters for /messages send-side rate limiting.
@@ -310,14 +306,11 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 *seqCounter : Timestamp
 -- Bumped by send/heartbeat to wake all blocked /poll holders.
 *pollWakeup : Timestamp
--- Wall time of the last completed prune sweep (for /health and /ready).
+-- Wall time of the last completed prune sweep (gates /ready).
 *lastPrunedAt : Timestamp
--- Wall time of the last poll-heartbeat tick (for /health watchdog).
-*lastHeartbeatAt : Timestamp
 -- Wall time of the last self-presence refresh broadcast to peers.
 *lastPresenceRefresh : Timestamp
--- Wall time of process start; underpins the /health warmup window and
--- /metrics uptime gauge.
+-- Wall time of process start; gates /ready (must be ≤ lastPrunedAt).
 *startedAt : Timestamp
 -- Random 64-bit-ish identity stamped at startup. Clients echo it back on /poll;
 -- any mismatch means the server restarted and the client must reset its cursor.
@@ -330,7 +323,7 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 --   AuthApi          -- challenge/verify (client identity)
 --   ClientApi        -- /poll, /messages (send), presence lookup
 --   FederationApi    -- inter-server gossip, forward (single + batch)
---   HealthApi/MetricsApi/ReadyApi -- observability
+--   ReadyApi         -- observability
 -- Response field shapes are kept stable for backwards compatibility even when
 -- the underlying value is no longer computed (zero-filled).
 
@@ -349,16 +342,10 @@ route FederationApi where
   POST {toKey: PubkeyHex, encryptedBlob: BlobHex, fromServer: ServerName} /federation/forward -> {ok: Bool, error: Text, retryAfterMs: Int} = ForwardMessage
   POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex}], fromServer: ServerName} /federation/forward-batch -> {ok: Bool, error: Text, results: [{ok: Bool}], retryAfterMs: Int} = FederationBatchForward
 
-route HealthApi where
-  GET /health headers {authorization: Text} -> {ok: Bool, version: Text, pruneHealthy: Bool, heartbeatHealthy: Bool, capacityHealthy: Bool, capacityWarning: Bool, federationHealthy: Bool, watchdogHealthy: Bool, nonceHealthy: Bool, forwardQueueHealthy: Bool, requestPressureHealthy: Bool, degradedPeers: Int} = Health
-
-route MetricsApi where
-  GET /metrics headers {authorization: Text} -> {metrics: Text, ok: Bool} = Metrics
-
 route ReadyApi where
   GET /ready -> {ready: Bool} = Ready
 
-route Api = AuthApi | ClientApi | FederationApi | HealthApi | MetricsApi | ReadyApi
+route Api = AuthApi | ClientApi | FederationApi | ReadyApi
 
 -- ============================================
 -- Generic helpers
@@ -672,7 +659,7 @@ shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
 shouldRetryServer = \server t failures -> none failures (\f -> f.server == server && t - f.failedAt < retryBackoff f.failures)
 
 -- Bump the failure counter for `server`. Preserves `firstFailedAt` across
--- subsequent failures so health views can show the outage age.
+-- subsequent failures.
 recordFailure : Text -> IO {rw *forwardFailures, clock} {}
 recordFailure = \server -> do
   t <- now
@@ -1293,35 +1280,8 @@ handleFederationBatchForward = \forwards _ -> do
     yield {ok: True {}, error: "", results, retryAfterMs: 0}
 
 -- ============================================
--- Health / readiness handlers
+-- Readiness handlers
 -- ============================================
-
--- GET /health: aggregate readiness flags. During an initial warmup window
--- (3 prune intervals after startup) prune/heartbeat checks always pass to
--- avoid false negatives before the background loops have ticked.
-handleHealth : a -> IO {r *lastHeartbeatAt, r *lastPrunedAt, r *startedAt, clock} {capacityHealthy: Bool, capacityWarning: Bool, degradedPeers: Int, federationHealthy: Bool, forwardQueueHealthy: Bool, heartbeatHealthy: Bool, nonceHealthy: Bool, ok: Bool, pruneHealthy: Bool, requestPressureHealthy: Bool, version: Text, watchdogHealthy: Bool}
-handleHealth = \authorization -> do
-  t <- now
-  lastPrune <- *lastPrunedAt
-  lastHb <- *lastHeartbeatAt
-  sa <- *startedAt
-  let warmup = t - sa < backgroundPruneInterval * 3
-  let pruneOk = warmup || t - lastPrune < backgroundPruneInterval * 3
-  let heartbeatOk = warmup || t - lastHb < pollTimeoutMs * 3
-  yield {
-    ok: pruneOk && heartbeatOk,
-    version: serverBuildVersion,
-    pruneHealthy: pruneOk,
-    heartbeatHealthy: heartbeatOk,
-    capacityHealthy: True {},
-    capacityWarning: False {},
-    federationHealthy: True {},
-    watchdogHealthy: True {},
-    nonceHealthy: True {},
-    forwardQueueHealthy: True {},
-    requestPressureHealthy: True {},
-    degradedPeers: 0
-  }
 
 -- GET /ready: signals readiness once the first background prune has run
 -- (load-balancer / orchestrator probe).
@@ -1330,28 +1290,6 @@ handleReady = do
   sa <- *startedAt
   lastPrune <- *lastPrunedAt
   yield {ready: lastPrune > 0 && lastPrune >= sa}
-
--- GET /metrics: Prometheus-style text exposition of the most useful gauges.
--- The `authorization` header is accepted but not validated here — operators
--- relying on auth must front this endpoint with a reverse proxy that enforces it.
-handleMetrics : a -> IO {r *forwards, r *messages, r *presence, r *sessions, r *startedAt, clock} {metrics: Text, ok: Bool}
-handleMetrics = \authorization -> do
-  t <- now
-  msgs <- *messages
-  ses <- *sessions
-  pres <- *presence
-  fwds <- *forwards
-  sa <- *startedAt
-  yield {
-    metrics: fold (\acc r -> acc ++ r.k ++ " " ++ show r.v ++ "\n") "" [
-      {k: "skrepka_messages_total", v: count msgs},
-      {k: "skrepka_sessions_total", v: count ses},
-      {k: "skrepka_presence_total", v: count pres},
-      {k: "skrepka_forwards_total", v: count fwds},
-      {k: "skrepka_uptime_seconds", v: (t - sa) / 1000}
-    ],
-    ok: True {}
-  }
 
 -- ============================================
 -- Dispatch
@@ -1373,8 +1311,6 @@ api = serve Api where
   RecvGossip = \{events, fromServer} -> handleRecvGossip events fromServer
   ForwardMessage = \{toKey, encryptedBlob, fromServer} -> handleForwardMessage toKey encryptedBlob fromServer
   FederationBatchForward = \{forwards, fromServer} -> handleFederationBatchForward forwards fromServer
-  Health = \{authorization} -> handleHealth authorization
-  Metrics = \{authorization} -> handleMetrics authorization
   Ready = \{} -> handleReady
 
 -- ============================================
@@ -1395,11 +1331,11 @@ backgroundPrune = do
 
 -- Endless tick that bumps `pollWakeup` every `pollTimeoutMs` so any blocked
 -- /poll holders unblock and return an empty heartbeat response.
-pollHeartbeat : IO {rw *lastHeartbeatAt, rw *pollWakeup, clock} a
+pollHeartbeat : IO {rw *pollWakeup, clock} a
 pollHeartbeat = do
   sleep pollTimeoutMs
   t <- now
-  atomic (do *pollWakeup = t; *lastHeartbeatAt = t)
+  *pollWakeup = t
   pollHeartbeat
 
 -- ============================================
