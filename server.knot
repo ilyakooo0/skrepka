@@ -308,8 +308,8 @@ route ClientApi where
 
 route FederationApi where
   POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
-  POST {toKey: PubkeyHex, encryptedBlob: BlobHex, fromServer: ServerName} /federation/forward -> {} = ForwardMessage
-  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex}], fromServer: ServerName} /federation/forward-batch -> {results: [{ok: Bool}]} = FederationBatchForward
+  POST {toKey: PubkeyHex, encryptedBlob: BlobHex} /federation/forward -> {} = ForwardMessage
+  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex}]} /federation/forward-batch -> {results: [{ok: Bool}]} = FederationBatchForward
 
 route Api = AuthApi | ClientApi | FederationApi
 
@@ -728,8 +728,7 @@ retryPendingForwards = do
   forEach (filter (collectPeers fwds (\f -> f.toServer)) (\s -> shouldRetryServer s t failures)) (\server -> forEach (takeRelation maxBatchSize (filter fwds (\f -> f.toServer == server))) (\f -> do
     result <- fetch (federationUrl server) (ForwardMessage {
       f.toKey,
-      f.encryptedBlob,
-      fromServer: serverHost
+      f.encryptedBlob
     })
     success <- case result of
       Err _ -> do
@@ -1051,8 +1050,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
       t <- now
       result <- fetch (federationUrl server) (ForwardMessage {
         toKey: to,
-        encryptedBlob,
-        fromServer: serverHost
+        encryptedBlob
       })
       case result of
         Err _ -> recordFailure server
@@ -1145,8 +1143,8 @@ storeFederated = \toKey encryptedBlob checkRecvRate t -> do
 -- POST /federation/forward: receive a single federated message destined for
 -- a local key. Delegates the actual store decision to `storeFederated`,
 -- which returns "" on success.
-handleForwardMessage : PubkeyHex -> BlobHex -> Text -> IO {rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock} (Result HttpError {})
-handleForwardMessage = \toKey encryptedBlob _ -> do
+handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock} (Result HttpError {})
+handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
   result <- atomic storeFederated toKey encryptedBlob (True {}) t
   if result == ""
@@ -1155,8 +1153,8 @@ handleForwardMessage = \toKey encryptedBlob _ -> do
 
 -- POST /federation/forward-batch: bulk variant of `handleForwardMessage`.
 -- Skips per-entry recv-rate charging.
-handleFederationBatchForward : [{encryptedBlob: BlobHex, toKey: PubkeyHex | a}] -> Text -> IO {clock} (Result HttpError {results: [{ok: Bool}]})
-handleFederationBatchForward = \forwards _ -> do
+handleFederationBatchForward : [{encryptedBlob: BlobHex, toKey: PubkeyHex | a}] -> IO {clock} (Result HttpError {results: [{ok: Bool}]})
+handleFederationBatchForward = \forwards -> do
   t <- now
   if count forwards > maxBatchSize
   then yield (Err {error: {status: 400, message: "invalid_request"}})
@@ -1182,8 +1180,8 @@ api = serve Api where
   Poll = \{cursor, authorization, xForwardedFor} -> handlePoll cursor authorization (clientIpOf xForwardedFor)
   SendMessages = \{messages, authorization, xForwardedFor} -> handleSendMessages messages authorization (clientIpOf xForwardedFor)
   RecvGossip = \{events, fromServer} -> handleRecvGossip events fromServer
-  ForwardMessage = \{toKey, encryptedBlob, fromServer} -> handleForwardMessage toKey encryptedBlob fromServer
-  FederationBatchForward = \{forwards, fromServer} -> handleFederationBatchForward forwards fromServer
+  ForwardMessage = \{toKey, encryptedBlob} -> handleForwardMessage toKey encryptedBlob
+  FederationBatchForward = \{forwards} -> handleFederationBatchForward forwards
 
 -- ============================================
 -- Background loops
