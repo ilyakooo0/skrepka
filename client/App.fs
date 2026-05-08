@@ -132,6 +132,7 @@ module App =
           Messages = Map.empty
           Error = None
           PollCursor = 0L
+          ServerGeneration = 0L
           Profile = None
           FlushingOutbox = false
           PollRetries = 0
@@ -181,7 +182,7 @@ module App =
                     Error = None
                     PollStatus = "polling..."
                     FlushingOutbox = true },
-                [ CmdPoll(session, model.PollCursor, 0); CmdFlushOutbox session ]
+                [ CmdPoll(session, model.PollCursor, model.ServerGeneration, 0); CmdFlushOutbox session ]
             | _ -> model, []
 
         | AuthErr err ->
@@ -261,7 +262,7 @@ module App =
             else
                 { model with FlushingOutbox = false }, []
 
-        | PollResult(events, status, newCursor) ->
+        | PollResult(events, status, newCursor, newGeneration) ->
             let retries =
                 if events.IsEmpty && status.StartsWith("poll error") then
                     model.PollRetries + 1
@@ -275,11 +276,12 @@ module App =
                     { model with
                         PollStatus = status
                         PollCursor = newCursor
+                        ServerGeneration = newGeneration
                         PollRetries = retries }
 
             model',
             [ match trySession model' with
-              | Some session -> CmdPoll(session, model'.PollCursor, model'.PollRetries)
+              | Some session -> CmdPoll(session, model'.PollCursor, model'.ServerGeneration, model'.PollRetries)
               | None -> ()
               if not events.IsEmpty then
                   saveCmdMsg model' ]
@@ -591,75 +593,73 @@ module App =
                 }
                 |> Async.Start)
 
-        | CmdPoll(session, cursor, retries) ->
+        | CmdPoll(session, cursor, generation, retries) ->
             Cmd.ofEffect (fun dispatch ->
                 async {
                     log $"poll start cursor={cursor}"
 
                     try
-                        let! response = poll session.Url session.Token cursor
+                        let! response = poll session.Url session.Token cursor generation
                         log $"poll response: {response.Events.Length} events, cursor={response.Cursor}"
 
-                        if not response.Authorized then
-                            log "poll unauthorized, reauthenticating"
-                            dispatch TokenExpired
-                        else
+                        let results =
+                            response.Events
+                            |> Array.map (fun evt -> decryptEvent session.Identity.PrivKey evt)
 
-                            let results =
-                                response.Events
-                                |> Array.map (fun evt -> decryptEvent session.Identity.PrivKey evt)
+                        let events = results |> Array.choose Result.toOption |> Array.toList
 
-                            let events = results |> Array.choose Result.toOption |> Array.toList
+                        let errors =
+                            results
+                            |> Array.choose (function
+                                | Error e -> Some e
+                                | _ -> None)
+                            |> Array.toList
 
-                            let errors =
-                                results
-                                |> Array.choose (function
-                                    | Error e -> Some e
-                                    | _ -> None)
-                                |> Array.toList
+                        for e in errors do
+                            log $"decrypt error: {e}"
 
-                            for e in errors do
-                                log $"decrypt error: {e}"
-
-                            if not events.IsEmpty then
-                                let acksBySender =
-                                    events
-                                    |> List.choose (fun evt ->
-                                        match evt.Envelope with
-                                        | Envelope.TextMessage(id, _) -> Some(evt.Sender, id)
-                                        | _ -> None)
-                                    |> List.groupBy fst
-                                    |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
-
-                                for sender, msgIds in acksBySender do
-                                    try
-                                        do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
-                                    with ex ->
-                                        log $"delivery ack error: {ex.Message}"
-
-                            let chatCount =
+                        if not events.IsEmpty then
+                            let acksBySender =
                                 events
-                                |> List.sumBy (fun e ->
-                                    match e.Envelope with
-                                    | Envelope.TextMessage _ -> 1
-                                    | _ -> 0)
+                                |> List.choose (fun evt ->
+                                    match evt.Envelope with
+                                    | Envelope.TextMessage(id, _) -> Some(evt.Sender, id)
+                                    | _ -> None)
+                                |> List.groupBy fst
+                                |> List.map (fun (sender, pairs) -> sender, List.map snd pairs)
 
-                            let status =
-                                $"evts:{response.Events.Length} msgs:{chatCount} errs:{errors.Length}"
-                                + (match List.tryHead errors with
-                                   | Some e -> $" [{e}]"
-                                   | None -> "")
+                            for sender, msgIds in acksBySender do
+                                try
+                                    do! sendEnvelope session sender (Envelope.DeliveryAck msgIds)
+                                with ex ->
+                                    log $"delivery ack error: {ex.Message}"
 
-                            dispatch (PollResult(events, status, response.Cursor))
+                        let chatCount =
+                            events
+                            |> List.sumBy (fun e ->
+                                match e.Envelope with
+                                | Envelope.TextMessage _ -> 1
+                                | _ -> 0)
+
+                        let status =
+                            $"evts:{response.Events.Length} msgs:{chatCount} errs:{errors.Length}"
+                            + (match List.tryHead errors with
+                               | Some e -> $" [{e}]"
+                               | None -> "")
+
+                        dispatch (PollResult(events, status, response.Cursor, response.Generation))
                     with
                     | :? TimeoutException ->
                         log "poll timeout"
-                        dispatch (PollResult([], "polling...", cursor))
+                        dispatch (PollResult([], "polling...", cursor, generation))
+                    | Unauthorized ->
+                        log "poll unauthorized, reauthenticating"
+                        dispatch TokenExpired
                     | ex ->
                         log $"poll error: {ex.Message}"
                         let delay = min (Constants.pollRetryBaseMs * (pown 2 retries)) 30000
                         do! Async.Sleep delay
-                        dispatch (PollResult([], $"poll error: {ex.Message}", cursor))
+                        dispatch (PollResult([], $"poll error: {ex.Message}", cursor, generation))
                 }
                 |> Async.Start)
 

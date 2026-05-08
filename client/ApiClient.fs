@@ -17,7 +17,7 @@ module ApiClient =
     type PollEvent = { EncryptedBlob: string }
 
     [<CLIMutable>]
-    type PollResponse = { Cursor: int64; Events: PollEvent array; Authorized: bool; Heartbeat: bool }
+    type PollResponse = { Cursor: int64; Events: PollEvent array; Generation: int64; HasMore: bool }
 
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
@@ -98,7 +98,7 @@ module ApiClient =
                     return raise (ApiError $"{serverUrl}/messages: {entryErr}")
         }
 
-    let poll (serverUrl: string) (token: string) (cursor: int64) =
-        let body = JsonSerializer.Serialize({| cursor = cursor |})
+    let poll (serverUrl: string) (token: string) (cursor: int64) (generation: int64) =
+        let body = JsonSerializer.Serialize({| cursor = cursor; generation = generation |})
         postJson<PollResponse> pollClient $"{serverUrl}/poll" body (Some token)
 

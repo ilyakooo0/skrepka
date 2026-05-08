@@ -57,6 +57,7 @@ module AppTypes =
           Messages: Map<string, ChatMessage list>
           Error: string option
           PollCursor: int64
+          ServerGeneration: int64
           Profile: Profile option
           FlushingOutbox: bool
           PollRetries: int
@@ -76,7 +77,7 @@ module AppTypes =
         | DoDisconnect
         | DoSend
         | DoSaveContact
-        | PollResult of events: IncomingEvent list * status: string * cursor: int64
+        | PollResult of events: IncomingEvent list * status: string * cursor: int64 * generation: int64
         | CopyPubKey
         | DismissError
         | StateLoaded of Identity option * Data option * Profile option
@@ -98,7 +99,7 @@ module AppTypes =
         | CmdConnect of url: string * identity: Identity
         | CmdEnqueue of recipientHex: string * envelope: Envelope
         | CmdFlushOutbox of session: Session
-        | CmdPoll of session: Session * cursor: int64 * retries: int
+        | CmdPoll of session: Session * cursor: int64 * generation: int64 * retries: int
         | CmdCopyToClipboard of string
         | CmdLoadState
         | CmdSaveIdentity of Identity
