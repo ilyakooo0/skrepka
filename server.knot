@@ -325,7 +325,7 @@ route AuthApi where
   POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {clientIp: Text} -> {token: Text, expiresAt: Timestamp} = VerifyAuth
 
 route ClientApi where
-  POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, generation: Int, hasMore: Bool} = Poll
+  POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, generation: Int} = Poll
   POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {results: [{error: Text}]} = SendMessages
 
 route FederationApi where
@@ -923,7 +923,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 -- generation mismatch (server restart) to force a cursor reset, then hands
 -- off to `pollOnce` for the actual long-poll body. Clients detect a server
 -- restart by comparing the `generation` they sent to the one returned.
-handlePoll : Int -> Int -> Text -> Text -> IO {r *pollWakeup, r *serverGeneration, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent], generation: Int, hasMore: Bool})
+handlePoll : Int -> Int -> Text -> Text -> IO {r *pollWakeup, r *serverGeneration, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent], generation: Int})
 handlePoll = \cursor generation authorization clientIp -> do
   t <- now
   serverGen <- *serverGeneration
@@ -937,7 +937,7 @@ handlePoll = \cursor generation authorization clientIp -> do
 -- Body of a single poll. Treats the cursor advance as an implicit ack
 -- (`ackPolledMessages`), then runs `doPoll` to collect events (or block
 -- until wakeup) and assembles the response.
-pollOnce : Text -> Int -> Text -> Int -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent], generation: Int, hasMore: Bool})
+pollOnce : Text -> Int -> Text -> Int -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent], generation: Int})
 pollOnce = \authorization cursor clientIp serverGen t -> do
   setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
     let clampedCursor = clamp 0 t cursor
@@ -949,7 +949,7 @@ pollOnce = \authorization cursor clientIp serverGen t -> do
     Just {value: s} -> do
       pollResult <- doPoll s t
       yield (Ok {
-        value: {pollResult.events, pollResult.cursor, generation: serverGen, pollResult.hasMore}
+        value: {pollResult.events, pollResult.cursor, generation: serverGen}
       })
 
 -- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
@@ -958,7 +958,7 @@ pollOnce = \authorization cursor clientIp serverGen t -> do
 -- some other transaction commits a change to `*pollWakeup`. Because
 -- `pollHeartbeat` bumps `*pollWakeup` every `pollTimeoutMs`, no caller waits
 -- longer than one heartbeat period before getting at least an empty response.
-doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{encryptedBlob: BlobHex}], hasMore: Bool}
+doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{encryptedBlob: BlobHex}]}
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic (do
     msgs <- *messages
@@ -972,12 +972,12 @@ doPoll = \s t -> do
     collectAt t2
 
 -- Pull this pubkey's unexpired messages newer than `cursor`, sort by
--- receivedAt, take up to `maxPollEvents`, and report `hasMore` if truncated.
--- The returned cursor is the max `receivedAt` in the page (or the input
--- cursor when the page is empty), which the client echoes on the next /poll
--- to advance — and which the server treats as an implicit ack.
-collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp, hasMore: Bool}
-collectPollEvents = \messages pubkey cursor t -> (\myMsgs -> (\limited -> {events: pluck limited (\m -> {m.encryptedBlob}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited, hasMore: count myMsgs > count limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) myMsgs))) (filter messages (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor))
+-- receivedAt, take up to `maxPollEvents`. The returned cursor is the max
+-- `receivedAt` in the page (or the input cursor when the page is empty),
+-- which the client echoes on the next /poll to advance — and which the
+-- server treats as an implicit ack.
+collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp}
+collectPollEvents = \messages pubkey cursor t -> (\limited -> {events: pluck limited (\m -> {m.encryptedBlob}), cursor: fold (\acc m -> max acc m.receivedAt) cursor limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (filter messages (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor))))
 
 -- Treat the supplied cursor as an ack: drop all messages with
 -- receivedAt <= cursor, plus their pending forwards.

@@ -17,7 +17,7 @@ module ApiClient =
     type PollEvent = { EncryptedBlob: string }
 
     [<CLIMutable>]
-    type PollResponse = { Cursor: int64; Events: PollEvent array; Generation: int64; HasMore: bool }
+    type PollResponse = { Cursor: int64; Events: PollEvent array; Generation: int64 }
 
     /// Awaits a Task without converting TaskCanceledException to F# async
     /// cancellation (which bypasses try...with). Re-raises it as a regular exception.
