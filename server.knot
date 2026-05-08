@@ -196,11 +196,12 @@ impl FromJSON GossipEventType where
 -- One presence change exchanged between federated servers.
 type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex}
 
--- /messages signals failure via the per-entry `error` field on each result:
--- empty = success (delivered, federated, or queued),
--- non-empty = "rate_limited" | "self_send". Top-level rejections (auth,
--- global rate limit) come back as a non-2xx HTTP status with an empty
--- response body.
+-- /messages is all-or-nothing per call: either every message in the batch is
+-- enqueued (delivered, federated, or buffered for federation), or none are
+-- and the call returns a non-2xx HTTP status. Per-message rejection codes
+-- ("self_send", "rate_limited") surface as the HTTP error body. Rate
+-- counters are still charged for every attempted message even on rejection,
+-- so a sender can't probe limits cheaply.
 -- The sender's UI treats every success the same and learns "they got it"
 -- only via the recipient's E2E ack.
 
@@ -326,7 +327,7 @@ route AuthApi where
 
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, generation: Int} = Poll
-  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {results: [{error: Text}]} = SendMessages
+  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {} = SendMessages
 
 route FederationApi where
   POST {events: [GossipEvent], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
@@ -994,78 +995,92 @@ ackPolledMessages = \pubkey cursor -> do
 -- ============================================
 -- Handler: send
 -- ============================================
--- Accept a message for a recipient pubkey. Placement (live local session,
--- federated forward, or held-for-presence) is internal; the response only
--- says whether the message was accepted (`error: ""`) or refused (`error:
--- "rate_limited" | "unauthorized" | "self_send"`). Duplicates are silently
--- treated as success so retries are idempotent.
+-- Accept a batch of messages for recipient pubkeys. Placement (live local
+-- session, federated forward, or held-for-presence) is internal; the call
+-- either succeeds (every message enqueued) or fails with a non-2xx HTTP
+-- status carrying the rejection code ("rate_limited" | "self_send" | ...).
+-- Duplicates are silently treated as success so retries are idempotent.
 -- Send is gated by global rate and the per-sender / per-pair / per-recipient
--- rate limits charged together inside `sendMessageCore`.
--- Federated forwards are kicked off in a background fork after the atomic.
+-- rate limits charged together inside `checkSendRate`.
+-- Federated forwards are kicked off in background forks after the atomic.
 
--- POST /messages: send a list of ciphertexts. Each entry runs through
--- `sendMessageCore` separately so per-entry rate limits/errors don't abort
--- the rest; federated forwards are forked per entry. Top-level rejections
--- (auth, global rate) come back as a non-2xx HTTP status via `gateAuth`.
-handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} (Result HttpError {results: [{error: Text}]})
+-- POST /messages: send a list of ciphertexts atomically. Every message is
+-- validated (self-send + send/pair/recv rate windows) inside a single atomic
+-- block; if any one would be rejected, none are enqueued and the call returns
+-- a non-2xx HTTP status. Rate counters are still charged for every attempted
+-- message even when the batch is rejected, so a sender can't probe limits
+-- cheaply (e.g. by sending to themselves). Federation forwards are kicked
+-- per message after commit.
+handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} (Result HttpError {})
 handleSendMessages = \messages authorization clientIp -> do
   t <- now
   gateAuth authorization clientIp t (\senderKey -> do
-    results <- mapEach (takeRelation maxBatchSize messages) (\m -> do
-      r <- atomic (do sendMessageCore senderKey m.to m.encryptedBlob t)
-      when federationEnabled (fork (forkForwardsTo m.to m.encryptedBlob r.remoteServers))
-      yield {r.error})
-    yield (Ok {value: {results}}))
+    let limited = takeRelation maxBatchSize messages
+    decision <- atomic (do
+      checked <- mapEach limited (\m -> do
+        c <- checkSendRate senderKey m.to t
+        yield {error: c.error, remoteServers: c.remoteServers, to: m.to, encryptedBlob: m.encryptedBlob})
+      case findFirst checked (\c -> c.error != "") of
+        Just {value: bad} -> yield (Err {error: bad.error})
+        Nothing {} -> do
+          forEach checked (\c -> commitSendMessage c.to c.encryptedBlob c.remoteServers t)
+          yield (Ok {value: checked}))
+    case decision of
+      Err {error: code} -> yield (Err {error: {status: if code == "self_send" then 400 else 429, message: code}})
+      Ok {value: checked} -> do
+        when federationEnabled (forEach checked (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
+        yield (Ok {value: {}}))
 
--- Atomic core of /messages. Charges send/pair/recv rate
--- counters together (so any limit denies the message), enforces caps and
--- self-send rejections, allocates a monotonic receivedAt via `seqCounter`,
--- appends the message, and pre-stages forwards for any remote presence rows
--- that already exist for `to`. Returns the error code (empty on success) and
--- the list of remote servers the caller should kick forwards to.
+-- Charge send/pair/recv rate counters for one (sender, recipient) pair and
+-- decide whether the message would be accepted. Mutates only the rate
+-- counters, never the mailbox; the caller commits via `commitSendMessage`
+-- only after every message in the batch has passed.
 -- All three rate counters are charged unconditionally (even on a failure)
 -- so that a sender can't probe limits cheaply by sending to themselves.
 -- Order matters: send-rate is the sender's identity, pair-rate covers
 -- conversation spam, and recv-rate is per-recipient.
-sendMessageCore : PubkeyHex -> PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *forwards, rw *messages, rw *pairRates, rw *pollWakeup, r *presence, rw *recvRates, rw *sendRates, rw *seqCounter} {remoteServers: [Text], error: Text}
-sendMessageCore = \senderKey to encryptedBlob t -> do
-  msgs <- *messages
+checkSendRate : PubkeyHex -> PubkeyHex -> Int<Ms> -> IO {rw *pairRates, r *presence, rw *recvRates, rw *sendRates} {remoteServers: [Text], error: Text}
+checkSendRate = \senderKey to t -> do
   sRates <- *sendRates
   let sR = checkRate sRates senderKey maxSendRatePerKey sendRateWindowMs t
   *sendRates = sR.entries
-  let srLim = sR.limited
   pRates <- *pairRates
   let pR = checkRate pRates (senderKey ++ "|" ++ to) maxPairRatePerPair pairRateWindowMs t
   *pairRates = pR.entries
-  let prLim = pR.limited
   rRates <- *recvRates
   let rR = checkRate rRates to maxRecvRatePerKey recvRateWindowMs t
   *recvRates = rR.entries
-  let rrLim = rR.limited
-  let reject = \e -> yield {error: e, remoteServers: []}
   if senderKey == to
-  then reject "self_send"
-  else if srLim || prLim || rrLim
-  then reject "rate_limited"
+  then yield {error: "self_send", remoteServers: []}
+  else if sR.limited || pR.limited || rR.limited
+  then yield {error: "rate_limited", remoteServers: []}
   else do
     pres <- *presence
-    seq <- *seqCounter
-    let seqTs = nextSeqTs t seq
-    *seqCounter = seqTs
-    *messages = union msgs [{toKey: to, encryptedBlob, receivedAt: seqTs}]
-    *pollWakeup = seqTs
     let toPresence = presenceForKey pres to t
     let remoteServers = collectPeers toPresence (\p -> p.server)
-    when federationEnabled (do
-      fwds <- *forwards
-      let newFwds = mapWhere remoteServers (\s -> none fwds (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s)) (\s -> {
-        toServer: s,
-        toKey: to,
-        encryptedBlob,
-        retries: 0
-      })
-      *forwards = union fwds newFwds)
     yield {error: "", remoteServers}
+
+-- Allocate a monotonic receivedAt via `seqCounter`, append the message to
+-- the mailbox, and pre-stage forwards for any remote presence rows that
+-- already exist for `to`. Caller must have already validated the message
+-- via `checkSendRate`.
+commitSendMessage : PubkeyHex -> BlobHex -> [Text] -> Int<Ms> -> IO {rw *forwards, rw *messages, rw *pollWakeup, rw *seqCounter} {}
+commitSendMessage = \to encryptedBlob remoteServers t -> do
+  msgs <- *messages
+  seq <- *seqCounter
+  let seqTs = nextSeqTs t seq
+  *seqCounter = seqTs
+  *messages = union msgs [{toKey: to, encryptedBlob, receivedAt: seqTs}]
+  *pollWakeup = seqTs
+  when federationEnabled (do
+    fwds <- *forwards
+    let newFwds = mapWhere remoteServers (\s -> none fwds (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s)) (\s -> {
+      toServer: s,
+      toKey: to,
+      encryptedBlob,
+      retries: 0
+    })
+    *forwards = union fwds newFwds)
 
 -- Fire one /federation/forward call per pre-staged server. On success the
 -- corresponding row in `forwards` is pruned, and if no other forwards remain
