@@ -309,7 +309,6 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 --   AuthApi          -- challenge/verify (client identity)
 --   ClientApi        -- /poll, /messages (send)
 --   FederationApi    -- inter-server gossip, forward (single + batch)
---   ReadyApi         -- observability
 -- Handlers return `Result HttpError T`: `Ok` produces a 200 with the
 -- declared body shape, `Err` produces a non-2xx response whose body is
 -- `{"error": "<code>"}`.
@@ -327,10 +326,7 @@ route FederationApi where
   POST {toKey: PubkeyHex, encryptedBlob: BlobHex, fromServer: ServerName} /federation/forward -> {} = ForwardMessage
   POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex}], fromServer: ServerName} /federation/forward-batch -> {results: [{ok: Bool}]} = FederationBatchForward
 
-route ReadyApi where
-  GET /ready -> {ready: Bool} = Ready
-
-route Api = AuthApi | ClientApi | FederationApi | ReadyApi
+route Api = AuthApi | ClientApi | FederationApi
 
 -- ============================================
 -- Generic helpers
@@ -1191,16 +1187,6 @@ handleFederationBatchForward = \forwards _ -> do
     yield (Ok {value: {results}})
 
 -- ============================================
--- Readiness handlers
--- ============================================
-
--- GET /ready: liveness probe (load-balancer / orchestrator). The process runs
--- a synchronous prune sweep before opening the listener, so any response at
--- all means housekeeping has already happened.
-handleReady : IO {} (Result HttpError {ready: Bool})
-handleReady = yield (Ok {value: {ready: True}})
-
--- ============================================
 -- Dispatch
 -- ============================================
 -- Single match from generated request constructor (one per route entry above)
@@ -1218,7 +1204,6 @@ api = serve Api where
   RecvGossip = \{events, fromServer} -> handleRecvGossip events fromServer
   ForwardMessage = \{toKey, encryptedBlob, fromServer} -> handleForwardMessage toKey encryptedBlob fromServer
   FederationBatchForward = \{forwards, fromServer} -> handleFederationBatchForward forwards fromServer
-  Ready = \{} -> handleReady
 
 -- ============================================
 -- Background loops
