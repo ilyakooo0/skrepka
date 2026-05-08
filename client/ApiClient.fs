@@ -49,14 +49,19 @@ module ApiClient =
             token |> Option.iter (fun t -> request.Headers.Add("Authorization", $"Bearer {t}"))
             use! response = httpClient.SendAsync(request) |> awaitTask
             let! text = response.Content.ReadAsStringAsync() |> awaitTask
-            let doc = JsonDocument.Parse(text)
-            match doc.RootElement.TryGetProperty("error") with
-            | true, err when not (String.IsNullOrEmpty(err.GetString())) ->
-                let code = err.GetString()
-                doc.Dispose()
-                if code = "unauthorized" then return raise Unauthorized
-                else return raise (ApiError $"{url}: {code}")
-            | _ -> return doc
+            if response.IsSuccessStatusCode then
+                return JsonDocument.Parse(text)
+            else
+                if response.StatusCode = System.Net.HttpStatusCode.Unauthorized then
+                    return raise Unauthorized
+                let code =
+                    try
+                        use d = JsonDocument.Parse(text)
+                        match d.RootElement.TryGetProperty("error") with
+                        | true, e -> e.GetString()
+                        | _ -> string (int response.StatusCode)
+                    with _ -> string (int response.StatusCode)
+                return raise (ApiError $"{url}: {code}")
         }
 
     let private postJson<'T> httpClient url body token =
