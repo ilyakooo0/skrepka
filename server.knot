@@ -149,9 +149,6 @@ backgroundPruneInterval = 30000
 -- Long-poll hold timeout before returning empty to the client (25 s).
 pollTimeoutMs : Int<Ms>
 pollTimeoutMs = 25000
--- Cadence at which this server refreshes its own presence to peers (5 min).
-presenceRefreshInterval : Int<Ms>
-presenceRefreshInterval = 300000
 
 -- Master switch for federation; when False the server runs in single-node mode.
 federationEnabled : Bool
@@ -289,8 +286,6 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 *seqCounter : Timestamp
 -- Bumped by send/heartbeat to wake all blocked /poll holders.
 *pollWakeup : Timestamp
--- Wall time of the last self-presence refresh broadcast to peers.
-*lastPresenceRefresh : Timestamp
 
 -- ============================================
 -- Routes
@@ -769,40 +764,14 @@ forwardQueuedToServer = \pubkey server -> atomic (do
 -- Background loops
 -- ============================================
 -- Composite tick run from `backgroundPrune`: expire stale rows, then
--- opportunistically retry pending forwards and refresh local presence so peers
--- don't see us go offline mid-session.
+-- opportunistically retry pending forwards.
 
 -- One composite background tick: prune expired state, gossip offline for
--- locally-expired keys, retry pending forwards, and (occasionally) refresh
--- local presence so peers don't see us drop off.
+-- locally-expired keys, and retry pending forwards.
 pruneAndRetry = \t -> do
   expiredLocal <- pruneExpired t
   fork (broadcastOfflineGossip expiredLocal)
-  when federationEnabled (do
-    fork retryPendingForwards
-    lastRefresh <- *lastPresenceRefresh
-    when (t - lastRefresh >= presenceRefreshInterval) (do
-      *lastPresenceRefresh = t
-      refreshLocalPresence t))
-
--- Extend the expiry of local presence rows whose backing session is still live
--- but the presence entry is past half its window. Re-broadcasts an `online`
--- event for the refreshed entries so peers don't time them out.
-refreshLocalPresence : Int<Ms> -> IO {rw *presence, r *sessions} {}
-refreshLocalPresence = \t -> do
-  refreshState <- atomic (do
-    sessions <- *sessions
-    presence <- *presence
-    let sessionKeys = map (\s -> s.pubkey) sessions
-    let needsRefresh = \p -> isLocalServer p.server && elem p.pubkey sessionKeys && p.expiresAt - t < sessionExpiry / 2
-    let kept = filter presence (\p -> not needsRefresh p)
-    let refreshed = map (\p -> {p.pubkey, p.server, expiresAt: t + sessionExpiry}) (filter presence needsRefresh)
-    let updated = union kept refreshed
-    *presence = updated
-    yield {refreshed, peers: knownPeerServersFromPresence updated})
-  when (count refreshState.refreshed > 0) (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> GossipOnline {
-    p.pubkey
-  }))))
+  when federationEnabled (fork retryPendingForwards)
 
 -- ============================================
 -- Handler: challenge / verify
@@ -902,7 +871,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 
 -- POST /poll: top-level dispatch. Validates the global rate gate, then hands
 -- off to `pollOnce` for the actual long-poll body.
-handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, rw *presence, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
 handlePoll = \cursor authorization clientIp -> do
   t <- now
   g <- checkGlobalRate t
@@ -911,18 +880,32 @@ handlePoll = \cursor authorization clientIp -> do
   else pollOnce authorization cursor clientIp t
 
 -- Body of a single poll. Treats the cursor advance as an implicit ack
--- (`ackPolledMessages`), then runs `doPoll` to collect events (or block
--- until wakeup) and assembles the response.
-pollOnce : Text -> Int -> Text -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+-- (`ackPolledMessages`), refreshes the caller's local presence row so peers
+-- don't time us out mid-session, then runs `doPoll` to collect events (or
+-- block until wakeup) and assembles the response.
+pollOnce : Text -> Int -> Text -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *messages, rw *presence, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
 pollOnce = \authorization cursor clientIp t -> do
   setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
     let clampedCursor = clamp 0 t cursor
     when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
     startWakeup <- *pollWakeup
-    yield (Just {value: {pubkey, clampedCursor, startWakeup}}))
+    pres <- *presence
+    let mine = \p -> p.pubkey == pubkey && isLocalServer p.server
+    let stale = not (any pres (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2))
+    refreshPeers <- if stale
+      then do
+        let kept = removeWhere pres mine
+        let newPres = union kept [{pubkey, server: serverHost, expiresAt: t + sessionExpiry}]
+        *presence = newPres
+        yield (Just {value: knownPeerServersFromPresence newPres})
+      else yield (Nothing {})
+    yield (Just {value: {pubkey, clampedCursor, startWakeup, refreshPeers}}))
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
+      case s.refreshPeers of
+        Just {value: peers} -> when federationEnabled (fork (sendBatchedGossip peers [GossipOnline {pubkey: s.pubkey}]))
+        Nothing {} -> yield {}
       pollResult <- doPoll s t
       yield (Ok {value: {pollResult.events, pollResult.cursor}})
 
@@ -1213,7 +1196,7 @@ api = serve Api where
 -- Endless tick: prune immediately on first call, then every
 -- `backgroundPruneInterval`. The startup prune clears stale rows persisted
 -- by the previous process before the next interval elapses.
-backgroundPrune : IO {rw *challenges, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *messages, rw *presence, rw *sessions, clock} a
+backgroundPrune : IO {rw *challenges, rw *forwardFailures, r *forwards, rw *messages, rw *presence, rw *sessions, clock} a
 backgroundPrune = do
   t <- now
   pruneAndRetry t
