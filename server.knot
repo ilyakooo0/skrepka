@@ -111,12 +111,6 @@ maxPairRatePerPair = 30
 -- Window for the per-pair rate limit (1 min).
 pairRateWindowMs : Int<Ms>
 pairRateWindowMs = 60000
--- Presence/key lookups permitted per key per window.
-maxLookupRatePerKey : Int
-maxLookupRatePerKey = 5
--- Window for the per-key lookup rate limit (1 s).
-lookupRateWindowMs : Int<Ms>
-lookupRateWindowMs = 1000
 -- Requests permitted per source IP per window (covers unauthenticated traffic).
 maxIpRatePerIp : Int
 maxIpRatePerIp = 10
@@ -290,8 +284,6 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 *pairRates : [RateEntry]
 -- Per-key /auth/challenge counters (separate from `*challenges` capacity gate).
 *challengeRates : [RateEntry]
--- Per-key counters for read-only lookups (presence).
-*lookupRates : [RateEntry]
 -- Per-source-IP counters; gate for unauthenticated traffic.
 *ipRates : [RateEntry]
 
@@ -321,7 +313,7 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 -- ============================================
 -- Public HTTP surface, grouped by audience:
 --   AuthApi          -- challenge/verify (client identity)
---   ClientApi        -- /poll, /messages (send), presence lookup
+--   ClientApi        -- /poll, /messages (send)
 --   FederationApi    -- inter-server gossip, forward (single + batch)
 --   ReadyApi         -- observability
 -- Response field shapes are kept stable for backwards compatibility even when
@@ -334,8 +326,6 @@ route AuthApi where
 route ClientApi where
   POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, authorized: Bool, rateLimited: Bool, generation: Int, heartbeat: Bool, retryAfterMs: Int, cursorReset: Bool, hasMore: Bool, cursorStale: Bool, loadPct: Int} = Poll
   POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {results: [{error: Text}], error: Text, retryAfterMs: Int} = SendMessages
-  GET /lookup/{pubkey: PubkeyHex} headers {authorization: Text, clientIp: Text} -> {server: ServerName, authorized: Bool, error: Text} = LookupPresence
-  POST {pubkeys: [PubkeyHex]} /lookup/batch headers {authorization: Text, clientIp: Text} -> {results: [{pubkey: PubkeyHex, server: ServerName}], authorized: Bool, error: Text} = BatchLookupPresence
 
 route FederationApi where
   POST {events: [GossipEvent], fromServer: ServerName} /federation/gossip -> {ok: Bool, error: Text, retryAfterMs: Int} = RecvGossip
@@ -518,9 +508,8 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c
 -- ============================================
 -- Auth helpers
 -- ============================================
--- Bearer token extraction, session lookup, stats secret check, and the
--- `gateAuth`/`gateLookup` combinators that every client handler funnels
--- through (global rate → per-key rate → session).
+-- Bearer token extraction, session lookup, and the `gateAuth` combinator that
+-- every client handler funnels through (global rate → session).
 -- Federation requests are unauthenticated: anyone can hit /federation/*.
 -- Per-recipient `recvRate` and `no_presence` checks bound the spam ceiling.
 
@@ -542,19 +531,6 @@ gateAuth = \auth ip t mkErr onAuth -> do
   g <- checkGlobalRate t
   let err = \e -> yield (mkErr e)
   if g then err "rate_limited" else withSessionAuth auth t ip (err "unauthorized") onAuth
-
--- gateAuth + per-key lookup-rate gate. `rateResp` is the response value when
--- the per-key gate trips.
-gateLookup : Text -> Text -> Int<Ms> -> (Text -> a) -> a -> (Text -> IO {} a) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} a
-gateLookup = \auth ip t mkErr rateResp onAuth ->
-  gateAuth auth ip t mkErr (\pk -> do
-    lim <- atomic do
-      rates <- *lookupRates
-      let r = checkRate rates pk maxLookupRatePerKey lookupRateWindowMs t
-      -- TODO: make this no be a `replace`
-      *lookupRates = r.entries
-      yield r.limited
-    if lim then yield rateResp else onAuth pk)
 
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
 -- the client IP matches. Runs `onAuth pubkey` on success, `onUnauth` otherwise.
@@ -695,10 +671,6 @@ nextSeqTs = \t seqCounter -> max t (seqCounter + 1)
 -- remote entries — the recipient may live on multiple servers simultaneously).
 presenceForKey : [PresenceEntry] -> PubkeyHex -> Timestamp -> [PresenceEntry]
 presenceForKey = \presence pubkey t -> filter presence (\p -> p.pubkey == pubkey && p.expiresAt > t)
-
--- Resolve a key's server for client lookup, masking remote identities behind "remote".
-maskedServer : [PresenceEntry] -> PubkeyHex -> Timestamp -> Text
-maskedServer = \pres pubkey t -> (\here -> if any here (\p -> isLocalServer p.server) then serverHost else if count here > 0 then "remote" else "") (presenceForKey pres pubkey t)
 
 -- Project items through `getServer`, drop our own hostname, and dedupe.
 -- Used to derive peer recipient lists from forwards/presence/etc.
@@ -1156,43 +1128,6 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
               *messages = filter msgs (\m -> m.encryptedBlob != encryptedBlob)))))
 
 -- ============================================
--- Handler: lookup
--- ============================================
--- Presence resolution for clients deciding where to send. Remote presence is
--- masked to the literal string "remote" rather than leaking the peer hostname
--- (the routing decision is the server's, not the sender's).
-
--- GET /lookup/{pubkey}: return our local server name if the key is here,
--- "remote" if known on a peer, "" otherwise. Peer hostnames are deliberately
--- masked (see section header).
-handleLookupPresence : PubkeyHex -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, error: Text, server: Text}
-handleLookupPresence = \pubkey authorization clientIp -> do
-  t <- now
-  let mkErr = \e -> {server: "", authorized: False {}, error: if e == "rate_limited" then e else ""}
-  gateLookup authorization clientIp t mkErr {server: "", authorized: True {}, error: "rate_limited"} (\_ -> do
-    pres <- *presence
-    yield {server: maskedServer pres pubkey t, authorized: True {}, error: ""})
-
--- POST /lookup/batch: same masking as `handleLookupPresence`, but for up to
--- 50 pubkeys in one round-trip.
-handleBatchLookupPresence : [PubkeyHex] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} {authorized: Bool, error: Text, results: [{pubkey: PubkeyHex, server: Text}]}
-handleBatchLookupPresence = \pubkeys authorization clientIp -> do
-  t <- now
-  let mkErr = \e -> {
-    results: [],
-    authorized: False {},
-    error: if e == "rate_limited" then e else ""
-  }
-  gateLookup authorization clientIp t mkErr {
-    results: [],
-    authorized: True {},
-    error: "rate_limited"
-  } (\_ -> do
-    pres <- *presence
-    let results = pluck (takeRelation 50 pubkeys) (\k -> {pubkey: k, server: maskedServer pres k t})
-    yield {results, authorized: True {}, error: ""})
-
--- ============================================
 -- Handler: federation receive
 -- ============================================
 -- Inbound peer-to-peer endpoints. Federation is open and unauthenticated:
@@ -1306,8 +1241,6 @@ api = serve Api where
   VerifyAuth = \{pubkey, challenge, signature, revokeOthers, clientIp} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp
   Poll = \{cursor, generation, authorization, clientIp} -> handlePoll cursor generation authorization clientIp
   SendMessages = \{messages, authorization, clientIp} -> handleSendMessages messages authorization clientIp
-  LookupPresence = \{pubkey, authorization, clientIp} -> handleLookupPresence pubkey authorization clientIp
-  BatchLookupPresence = \{pubkeys, authorization, clientIp} -> handleBatchLookupPresence pubkeys authorization clientIp
   RecvGossip = \{events, fromServer} -> handleRecvGossip events fromServer
   ForwardMessage = \{toKey, encryptedBlob, fromServer} -> handleForwardMessage toKey encryptedBlob fromServer
   FederationBatchForward = \{forwards, fromServer} -> handleFederationBatchForward forwards fromServer
