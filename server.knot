@@ -299,12 +299,8 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 *seqCounter : Timestamp
 -- Bumped by send/heartbeat to wake all blocked /poll holders.
 *pollWakeup : Timestamp
--- Wall time of the last completed prune sweep (gates /ready).
-*lastPrunedAt : Timestamp
 -- Wall time of the last self-presence refresh broadcast to peers.
 *lastPresenceRefresh : Timestamp
--- Wall time of process start; gates /ready (must be ≤ lastPrunedAt).
-*startedAt : Timestamp
 
 -- ============================================
 -- Routes
@@ -786,7 +782,6 @@ forwardQueuedToServer = \pubkey server -> atomic (do
 -- locally-expired keys, retry pending forwards, and (occasionally) refresh
 -- local presence so peers don't see us drop off.
 pruneAndRetry = \t -> do
-  *lastPrunedAt = t
   expiredLocal <- pruneExpired t
   fork (broadcastOfflineGossip expiredLocal)
   when federationEnabled (do
@@ -1199,13 +1194,11 @@ handleFederationBatchForward = \forwards _ -> do
 -- Readiness handlers
 -- ============================================
 
--- GET /ready: signals readiness once the first background prune has run
--- (load-balancer / orchestrator probe).
-handleReady : IO {r *lastPrunedAt, r *startedAt} (Result HttpError {ready: Bool})
-handleReady = do
-  sa <- *startedAt
-  lastPrune <- *lastPrunedAt
-  yield (Ok {value: {ready: lastPrune > 0 && lastPrune >= sa}})
+-- GET /ready: liveness probe (load-balancer / orchestrator). The process runs
+-- a synchronous prune sweep before opening the listener, so any response at
+-- all means housekeeping has already happened.
+handleReady : IO {} (Result HttpError {ready: Bool})
+handleReady = yield (Ok {value: {ready: True}})
 
 -- ============================================
 -- Dispatch
@@ -1235,12 +1228,14 @@ api = serve Api where
 -- holders unblock and return an empty heartbeat response, keeping connections
 -- fresh.
 
--- Endless tick: every `backgroundPruneInterval` run `pruneAndRetry`.
-backgroundPrune : IO {rw *challenges, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *lastPrunedAt, rw *messages, rw *presence, rw *sessions, clock} a
+-- Endless tick: prune immediately on first call, then every
+-- `backgroundPruneInterval`. The startup prune clears stale rows persisted
+-- by the previous process before the next interval elapses.
+backgroundPrune : IO {rw *challenges, rw *forwardFailures, r *forwards, rw *lastPresenceRefresh, rw *messages, rw *presence, rw *sessions, clock} a
 backgroundPrune = do
-  sleep backgroundPruneInterval
   t <- now
   pruneAndRetry t
+  sleep backgroundPruneInterval
   backgroundPrune
 
 -- Endless tick that bumps `pollWakeup` every `pollTimeoutMs` so any blocked
@@ -1255,14 +1250,10 @@ pollHeartbeat = do
 -- ============================================
 -- Entry Point
 -- ============================================
--- Stamp `startedAt`, spawn the two background loops, and start the listener.
-
--- Entry point: stamp startup metadata, fork the background loops, and start
--- the HTTP listener.
+-- Fork the background loops (the prune loop runs an immediate sweep on its
+-- first tick) and start the HTTP listener.
 main : IO _ {}
 main = do
-  t <- now
-  atomic (do *startedAt = t)
   logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
   fork backgroundPrune
