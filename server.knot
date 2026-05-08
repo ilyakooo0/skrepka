@@ -27,7 +27,7 @@
 -- and other private/reserved names), so two default-built servers cannot
 -- federate with each other. The default is only suitable for a single-node,
 -- non-federated deployment.
-serverHost : Text
+serverHost : ServerName
 serverHost = "localhost"
 -- Network interface the HTTP listener binds to. "0.0.0.0" accepts connections
 -- on every IPv4 interface (the typical default behind a reverse proxy);
@@ -247,7 +247,7 @@ type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp, ip: Text}
 -- `receivedAt`. Any send time the sender wants to convey lives inside
 -- `encryptedBlob` (the server cannot read it).
 type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp}
--- Last-known location of a pubkey, either local (`server == serverHostN`) or
+-- Last-known location of a pubkey, either local (`server == serverHost`) or
 -- learned from a peer via gossip. Multiple entries per pubkey are allowed.
 type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp}
 -- A message queued for cross-server delivery to `toServer`. `retries` is
@@ -547,12 +547,9 @@ else s
 normalizeServerName : Text -> Text
 normalizeServerName = \s -> toLower (stripTrailingDot s)
 
--- This server's own hostname in canonical form (used everywhere for self-checks).
-serverHostN : Text
-serverHostN = normalizeServerName serverHost
 -- True when `s` refers to this server.
 isLocalServer : Text -> Bool
-isLocalServer = \s -> s == serverHostN
+isLocalServer = \s -> s == serverHost
 -- True when `s` refers to any server other than this one.
 isRemote : Text -> Bool
 isRemote = \s -> not isLocalServer s
@@ -782,7 +779,7 @@ presenceForKey = \presence pubkey t -> filter presence (\p -> p.pubkey == pubkey
 
 -- Resolve a key's server for client lookup, masking remote identities behind "remote".
 maskedServer : [PresenceEntry] -> PubkeyHex -> Timestamp -> Text
-maskedServer = \pres pubkey t -> (\here -> if any here (\p -> isLocalServer p.server) then serverHostN else if count here > 0 then "remote" else "") (presenceForKey pres pubkey t)
+maskedServer = \pres pubkey t -> (\here -> if any here (\p -> isLocalServer p.server) then serverHost else if count here > 0 then "remote" else "") (presenceForKey pres pubkey t)
 
 -- Project items through `getServer`, drop our own hostname, and dedupe.
 -- Used to derive peer recipient lists from forwards/presence/etc.
@@ -838,10 +835,7 @@ sendBatchedGossip = \peers events -> forEach peers (\server -> do
   t <- now
   failures <- *forwardFailures
   when (shouldRetryServer server t failures) (do
-    result <- fetch (federationUrl server) (RecvGossip {
-      events,
-      fromServer: serverHostN
-    })
+    result <- fetch (federationUrl server) (RecvGossip {events, fromServer: serverHost})
     case result of
       Err _ -> recordFailure server
       Ok _ -> clearFailure server))
@@ -874,7 +868,7 @@ retryPendingForwards = do
     result <- fetch (federationUrl server) (ForwardMessage {
       f.toKey,
       f.encryptedBlob,
-      fromServer: serverHostN
+      fromServer: serverHost
     })
     success <- case result of
       Err _ -> do
@@ -1028,7 +1022,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
         *sessions = capList (union pruned [newSession]) maxSessions (\s -> s.expiresAt)
         pres <- *presence
         let prunedPres = removeWhere pres (\p -> p.pubkey == pubkey && isLocalServer p.server)
-        let newPres = union prunedPres [{pubkey, server: serverHostN, expiresAt: expiry}]
+        let newPres = union prunedPres [{pubkey, server: serverHost, expiresAt: expiry}]
         *presence = newPres
         yield {valid: True {}, peers: knownPeerServersFromPresence newPres})
     if not result.valid
@@ -1225,7 +1219,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
       result <- fetch (federationUrl server) (ForwardMessage {
         toKey: to,
         encryptedBlob,
-        fromServer: serverHostN
+        fromServer: serverHost
       })
       case result of
         Err _ -> recordFailure server
@@ -1438,10 +1432,7 @@ handlePingPeer = \server authorization -> withMaintAuth authorization (yield {
 then yield {ok: False {}, latencyMs: 0, error: "invalid_server"}
 else do
   startTime <- now
-  result <- fetch (federationUrl server) (RecvGossip {
-    events: [],
-    fromServer: serverHostN
-  })
+  result <- fetch (federationUrl server) (RecvGossip {events: [], fromServer: serverHost})
   endTime <- now
   case result of
     Err e -> yield {ok: False {}, latencyMs: endTime - startTime, error: show e}
