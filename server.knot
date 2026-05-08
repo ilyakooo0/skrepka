@@ -180,21 +180,22 @@ requireClientIp = True {}
 -- polling pubkey. The server cannot read the blob.
 type PollEvent = {encryptedBlob: BlobHex}
 
--- Kind of presence event flowing through federation gossip. `GossipUnknown` is
--- the parser's fallback for forward-compatibility with future event types.
-data GossipEventType = GossipOnline {} | GossipOffline {} | GossipUnknown {}
+-- One presence change exchanged between federated servers. Per-variant
+-- payloads keep room for future event kinds that aren't tied to a pubkey.
+-- `GossipUnknown` is the parser's fallback for forward-compatibility.
+data GossipEventType
+  = GossipOnline {pubkey: PubkeyHex}
+  | GossipOffline {pubkey: PubkeyHex}
+  | GossipUnknown {}
 
 impl ToJSON GossipEventType where
-  toJson et = toJson (case et of
-    GossipOnline {} -> "online"
-    GossipOffline {} -> "offline"
-    GossipUnknown {} -> "unknown")
+  toJson et = case et of
+    GossipOnline {pubkey} -> toJson {eventType: "online", pubkey}
+    GossipOffline {pubkey} -> toJson {eventType: "offline", pubkey}
+    GossipUnknown {} -> toJson {eventType: "unknown"}
 
 impl FromJSON GossipEventType where
-  parseJson t = (\s -> if s == "online" then GossipOnline {} else if s == "offline" then GossipOffline {} else GossipUnknown {}) (parseJson t : Text)
-
--- One presence change exchanged between federated servers.
-type GossipEvent = {eventType: GossipEventType, pubkey: PubkeyHex}
+  parseJson t = (\raw -> if raw.eventType == "online" then GossipOnline {raw.pubkey} else if raw.eventType == "offline" then GossipOffline {raw.pubkey} else GossipUnknown {}) (parseJson t : {eventType: Text, pubkey: PubkeyHex})
 
 -- /messages is all-or-nothing per call: either every message in the batch is
 -- enqueued (delivered, federated, or buffered for federation), or none are
@@ -322,7 +323,7 @@ route ClientApi where
   POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {} = SendMessages
 
 route FederationApi where
-  POST {events: [GossipEvent], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
+  POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
   POST {toKey: PubkeyHex, encryptedBlob: BlobHex, fromServer: ServerName} /federation/forward -> {} = ForwardMessage
   POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex}], fromServer: ServerName} /federation/forward-batch -> {results: [{ok: Bool}]} = FederationBatchForward
 
@@ -692,13 +693,9 @@ pruneExpired = \t -> atomic do
 -- a peer record into `forwardFailures` (shared with forward retries) so both
 -- subsystems back off together.
 
--- Build a gossip event with the originating pubkey's status.
-mkGossip : GossipEventType -> PubkeyHex -> GossipEvent
-mkGossip = \etype pk -> {eventType: etype, pubkey: pk}
-
 -- Fan out one bundle of gossip events to each peer, skipping peers in backoff.
 -- Records or clears federation-failure counters per call.
-sendBatchedGossip : [Text] -> [GossipEvent] -> IO {} {}
+sendBatchedGossip : [Text] -> [GossipEventType] -> IO {} {}
 sendBatchedGossip = \peers events -> forEach peers (\server -> do
   t <- now
   failures <- *forwardFailures
@@ -713,7 +710,9 @@ sendBatchedGossip = \peers events -> forEach peers (\server -> do
 broadcastOfflineGossip : [{pubkey: PubkeyHex | a}] -> IO {r *presence} {}
 broadcastOfflineGossip = \expiredLocal -> do
   presence <- *presence
-  when (federationEnabled && count expiredLocal > 0) (sendBatchedGossip (knownPeerServersFromPresence presence) (pluck expiredLocal (\p -> mkGossip (GossipOffline {}) p.pubkey)))
+  when (federationEnabled && count expiredLocal > 0) (sendBatchedGossip (knownPeerServersFromPresence presence) (pluck expiredLocal (\p -> GossipOffline {
+    p.pubkey
+  })))
 
 -- ============================================
 -- Forward retries
@@ -802,7 +801,9 @@ refreshLocalPresence = \t -> do
     let updated = union kept refreshed
     *presence = updated
     yield {refreshed, peers: knownPeerServersFromPresence updated})
-  when (count refreshState.refreshed > 0) (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> mkGossip (GossipOnline {}) p.pubkey))))
+  when (count refreshState.refreshed > 0) (fork (sendBatchedGossip refreshState.peers (pluck refreshState.refreshed (\p -> GossipOnline {
+    p.pubkey
+  }))))
 
 -- ============================================
 -- Handler: challenge / verify
@@ -893,9 +894,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
     if not result.valid
     then yield (Err {error: {status: 401, message: "invalid"}})
     else do
-      when federationEnabled (fork (sendBatchedGossip result.peers [
-        mkGossip (GossipOnline {}) pubkey
-      ]))
+      when federationEnabled (fork (sendBatchedGossip result.peers [GossipOnline {pubkey}]))
       yield (Ok {value: {token, expiresAt: expiry}})
 
 -- ============================================
@@ -930,9 +929,7 @@ pollOnce = \authorization cursor clientIp t -> do
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
       pollResult <- doPoll s t
-      yield (Ok {
-        value: {pollResult.events, pollResult.cursor}
-      })
+      yield (Ok {value: {pollResult.events, pollResult.cursor}})
 
 -- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
 -- (bumped by send/heartbeat) and re-collect once at the new wall time.
@@ -1000,14 +997,16 @@ handleSendMessages = \messages authorization clientIp -> do
     decision <- atomic (do
       checked <- mapEach limited (\m -> do
         c <- checkSendRate senderKey m.to t
-        yield {error: c.error, remoteServers: c.remoteServers, to: m.to, encryptedBlob: m.encryptedBlob})
+        yield {c.error, c.remoteServers, m.to, m.encryptedBlob})
       case findFirst checked (\c -> c.error != "") of
-        Just {value: bad} -> yield (Err {error: bad.error})
+        Just {value: bad} -> yield (Err {bad.error})
         Nothing {} -> do
           forEach checked (\c -> commitSendMessage c.to c.encryptedBlob c.remoteServers t)
           yield (Ok {value: checked}))
     case decision of
-      Err {error: code} -> yield (Err {error: {status: if code == "self_send" then 400 else 429, message: code}})
+      Err {error: code} -> yield (Err {
+        error: {status: if code == "self_send" then 400 else 429, message: code}
+      })
       Ok {value: checked} -> do
         when federationEnabled (forEach checked (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
         yield (Ok {value: {}}))
@@ -1110,7 +1109,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
 -- pubkeys with a `GossipOnline` event (so Online wins on collision). For keys
 -- that transition offline → online, flushes any locally-buffered messages via
 -- `forwardQueuedToServer`.
-handleRecvGossip : [{eventType: <GossipOffline {} | GossipOnline {} | a>, pubkey: PubkeyHex | b}] -> Text -> IO {rw *presence, clock} (Result HttpError {})
+handleRecvGossip : [GossipEventType] -> Text -> IO {rw *presence, clock} (Result HttpError {})
 handleRecvGossip = \events fromServer -> do
   t <- now
   if not isRemote fromServer || isBadServerName fromServer || count events > maxGossipEvents
@@ -1118,10 +1117,18 @@ handleRecvGossip = \events fromServer -> do
   else do
     newlyOnline <- atomic (do
       pres <- *presence
-      let touchedPubkeys = pluck events (\e -> e.pubkey)
-      let onlinePubkeys = pluck (filter events (\e -> case e.eventType of
-        GossipOnline {} -> True {}
-        _ -> False {})) (\e -> e.pubkey)
+      let isOnline = \e -> case e of
+        GossipOnline {pubkey: _} -> True {}
+        _ -> False {}
+      let isOffline = \e -> case e of
+        GossipOffline {pubkey: _} -> True {}
+        _ -> False {}
+      let pubkeyOf = \e -> case e of
+        GossipOnline {pubkey} -> pubkey
+        GossipOffline {pubkey} -> pubkey
+        _ -> ""
+      let onlinePubkeys = pluck (filter events isOnline) pubkeyOf
+      let touchedPubkeys = pluck (filter events (\e -> isOnline e || isOffline e)) pubkeyOf
       let kept = filter pres (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys)
       let added = map (\pk -> {pubkey: pk, server: fromServer, expiresAt: t + onlineGossipTtl}) onlinePubkeys
       *presence = union kept added
