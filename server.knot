@@ -309,7 +309,6 @@ route ClientApi where
 route FederationApi where
   POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
   POST {toKey: PubkeyHex, encryptedBlob: BlobHex} /federation/forward -> {} = ForwardMessage
-  POST {forwards: [{toKey: PubkeyHex, encryptedBlob: BlobHex}]} /federation/forward-batch -> {results: [{ok: Bool}]} = FederationBatchForward
 
 route Api = AuthApi | ClientApi | FederationApi
 
@@ -1108,29 +1107,24 @@ handleRecvGossip = \events fromServer -> do
     yield (Ok {value: {}})
 
 -- Store a federated/forwarded message into the local mailbox. Caller wraps in `atomic`.
--- Returns "" on success, otherwise an error code:
--- "no_presence" | "rate_limited" (only when checkRecvRate).
+-- Returns "" on success, otherwise an error code: "no_presence" | "rate_limited".
 --
 -- The presence gate requires the recipient to be **currently locally online**
 -- (not just visible to gossip somewhere). Without that, an A → B forward based
 -- on stale gossip about R could land on B with no actively-polling client and
 -- get stuck. If B refuses, A retries via `retryPendingForwards` against the
 -- next presence target.
-storeFederated : PubkeyHex -> BlobHex -> Bool -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter} Text
-storeFederated = \toKey encryptedBlob checkRecvRate t -> do
+storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter} Text
+storeFederated = \toKey encryptedBlob t -> do
   pres <- *presence
   msgs <- *messages
   if not any pres (\p -> p.pubkey == toKey && isLocalServer p.server && p.expiresAt > t)
   then yield "no_presence"
   else do
-    limited <- if checkRecvRate
-    then do
-      rRates <- *recvRates
-      let r = checkRate rRates toKey maxRecvRatePerKey recvRateWindowMs t
-      *recvRates = r.entries
-      yield r.limited
-    else yield (False {})
-    if limited
+    rRates <- *recvRates
+    let r = checkRate rRates toKey maxRecvRatePerKey recvRateWindowMs t
+    *recvRates = r.entries
+    if r.limited
     then yield "rate_limited"
     else do
       seq <- *seqCounter
@@ -1146,23 +1140,10 @@ storeFederated = \toKey encryptedBlob checkRecvRate t -> do
 handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, rw *pollWakeup, r *presence, rw *recvRates, rw *seqCounter, clock} (Result HttpError {})
 handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
-  result <- atomic storeFederated toKey encryptedBlob (True {}) t
+  result <- atomic storeFederated toKey encryptedBlob t
   if result == ""
   then yield (Ok {value: {}})
   else yield (Err {error: {status: if result == "no_presence" then 404 else 429, message: result}})
-
--- POST /federation/forward-batch: bulk variant of `handleForwardMessage`.
--- Skips per-entry recv-rate charging.
-handleFederationBatchForward : [{encryptedBlob: BlobHex, toKey: PubkeyHex | a}] -> IO {clock} (Result HttpError {results: [{ok: Bool}]})
-handleFederationBatchForward = \forwards -> do
-  t <- now
-  if count forwards > maxBatchSize
-  then yield (Err {error: {status: 400, message: "invalid_request"}})
-  else do
-    results <- mapEach (takeRelation maxBatchSize forwards) (\e -> do
-      result <- atomic storeFederated e.toKey e.encryptedBlob (False {}) t
-      yield {ok: result == ""})
-    yield (Ok {value: {results}})
 
 -- ============================================
 -- Dispatch
@@ -1181,7 +1162,6 @@ api = serve Api where
   SendMessages = \{messages, authorization, xForwardedFor} -> handleSendMessages messages authorization (clientIpOf xForwardedFor)
   RecvGossip = \{events, fromServer} -> handleRecvGossip events fromServer
   ForwardMessage = \{toKey, encryptedBlob} -> handleForwardMessage toKey encryptedBlob
-  FederationBatchForward = \{forwards} -> handleFederationBatchForward forwards
 
 -- ============================================
 -- Background loops
