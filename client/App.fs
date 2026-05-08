@@ -132,7 +132,6 @@ module App =
           Messages = Map.empty
           Error = None
           PollCursor = 0L
-          ServerGeneration = 0L
           Profile = None
           FlushingOutbox = false
           PollRetries = 0
@@ -182,7 +181,7 @@ module App =
                     Error = None
                     PollStatus = "polling..."
                     FlushingOutbox = true },
-                [ CmdPoll(session, model.PollCursor, model.ServerGeneration, 0); CmdFlushOutbox session ]
+                [ CmdPoll(session, model.PollCursor, 0); CmdFlushOutbox session ]
             | _ -> model, []
 
         | AuthErr err ->
@@ -262,7 +261,7 @@ module App =
             else
                 { model with FlushingOutbox = false }, []
 
-        | PollResult(events, status, newCursor, newGeneration) ->
+        | PollResult(events, status, newCursor) ->
             let retries =
                 if events.IsEmpty && status.StartsWith("poll error") then
                     model.PollRetries + 1
@@ -276,12 +275,11 @@ module App =
                     { model with
                         PollStatus = status
                         PollCursor = newCursor
-                        ServerGeneration = newGeneration
                         PollRetries = retries }
 
             model',
             [ match trySession model' with
-              | Some session -> CmdPoll(session, model'.PollCursor, model'.ServerGeneration, model'.PollRetries)
+              | Some session -> CmdPoll(session, model'.PollCursor, model'.PollRetries)
               | None -> ()
               if not events.IsEmpty then
                   saveCmdMsg model' ]
@@ -593,13 +591,13 @@ module App =
                 }
                 |> Async.Start)
 
-        | CmdPoll(session, cursor, generation, retries) ->
+        | CmdPoll(session, cursor, retries) ->
             Cmd.ofEffect (fun dispatch ->
                 async {
                     log $"poll start cursor={cursor}"
 
                     try
-                        let! response = poll session.Url session.Token cursor generation
+                        let! response = poll session.Url session.Token cursor
                         log $"poll response: {response.Events.Length} events, cursor={response.Cursor}"
 
                         let results =
@@ -647,11 +645,11 @@ module App =
                                | Some e -> $" [{e}]"
                                | None -> "")
 
-                        dispatch (PollResult(events, status, response.Cursor, response.Generation))
+                        dispatch (PollResult(events, status, response.Cursor))
                     with
                     | :? TimeoutException ->
                         log "poll timeout"
-                        dispatch (PollResult([], "polling...", cursor, generation))
+                        dispatch (PollResult([], "polling...", cursor))
                     | Unauthorized ->
                         log "poll unauthorized, reauthenticating"
                         dispatch TokenExpired
@@ -659,7 +657,7 @@ module App =
                         log $"poll error: {ex.Message}"
                         let delay = min (Constants.pollRetryBaseMs * (pown 2 retries)) 30000
                         do! Async.Sleep delay
-                        dispatch (PollResult([], $"poll error: {ex.Message}", cursor, generation))
+                        dispatch (PollResult([], $"poll error: {ex.Message}", cursor))
                 }
                 |> Async.Start)
 

@@ -305,9 +305,6 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 *lastPresenceRefresh : Timestamp
 -- Wall time of process start; gates /ready (must be ≤ lastPrunedAt).
 *startedAt : Timestamp
--- Random 64-bit-ish identity stamped at startup. Clients echo it back on /poll;
--- any mismatch means the server restarted and the client must reset its cursor.
-*serverGeneration : Int
 
 -- ============================================
 -- Routes
@@ -326,7 +323,7 @@ route AuthApi where
   POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {clientIp: Text} -> {token: Text, expiresAt: Timestamp} = VerifyAuth
 
 route ClientApi where
-  POST {cursor: Timestamp, generation: Int} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp, generation: Int} = Poll
+  POST {cursor: Timestamp} /poll headers {authorization: Text, clientIp: Text} -> {events: [PollEvent], cursor: Timestamp} = Poll
   POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, clientIp: Text} -> {} = SendMessages
 
 route FederationApi where
@@ -913,33 +910,26 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 -- ============================================
 -- Handler: poll
 -- ============================================
--- Long-poll. The client supplies a cursor (last-seen `receivedAt`) and the
--- server's last-known `generation` (server identity for cursor validity). We:
---   * If the generation mismatches, reset the cursor and signal `cursorReset`.
+-- Long-poll. The client supplies a cursor (last-seen `receivedAt`). We:
 --   * Ack-and-drop everything <= the cursor (treating poll progress as ack).
 --   * Wait on `pollWakeup` (bumped by send/heartbeat) and return new events
 --     plus piggybacked sender-side expirations/deliveries.
 
--- POST /poll: top-level dispatch. Validates the global rate gate, detects a
--- generation mismatch (server restart) to force a cursor reset, then hands
--- off to `pollOnce` for the actual long-poll body. Clients detect a server
--- restart by comparing the `generation` they sent to the one returned.
-handlePoll : Int -> Int -> Text -> Text -> IO {r *pollWakeup, r *serverGeneration, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent], generation: Int})
-handlePoll = \cursor generation authorization clientIp -> do
+-- POST /poll: top-level dispatch. Validates the global rate gate, then hands
+-- off to `pollOnce` for the actual long-poll body.
+handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+handlePoll = \cursor authorization clientIp -> do
   t <- now
-  serverGen <- *serverGeneration
   g <- checkGlobalRate t
   if g
   then yield (Err {error: {status: 429, message: "rate_limited"}})
-  else do
-    let cursorWasReset = generation != serverGen && cursor > 0
-    pollOnce authorization (if cursorWasReset then 0 else cursor) clientIp serverGen t
+  else pollOnce authorization cursor clientIp t
 
 -- Body of a single poll. Treats the cursor advance as an implicit ack
 -- (`ackPolledMessages`), then runs `doPoll` to collect events (or block
 -- until wakeup) and assembles the response.
-pollOnce : Text -> Int -> Text -> Int -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent], generation: Int})
-pollOnce = \authorization cursor clientIp serverGen t -> do
+pollOnce : Text -> Int -> Text -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *messages, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+pollOnce = \authorization cursor clientIp t -> do
   setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
     let clampedCursor = clamp 0 t cursor
     when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
@@ -950,7 +940,7 @@ pollOnce = \authorization cursor clientIp serverGen t -> do
     Just {value: s} -> do
       pollResult <- doPoll s t
       yield (Ok {
-        value: {pollResult.events, pollResult.cursor, generation: serverGen}
+        value: {pollResult.events, pollResult.cursor}
       })
 
 -- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
@@ -1230,7 +1220,7 @@ api : Server Api _
 api = serve Api where
   ReqChallenge = \{pubkey, clientIp} -> handleChallenge pubkey clientIp
   VerifyAuth = \{pubkey, challenge, signature, revokeOthers, clientIp} -> handleVerifyAuth pubkey challenge signature revokeOthers clientIp
-  Poll = \{cursor, generation, authorization, clientIp} -> handlePoll cursor generation authorization clientIp
+  Poll = \{cursor, authorization, clientIp} -> handlePoll cursor authorization clientIp
   SendMessages = \{messages, authorization, clientIp} -> handleSendMessages messages authorization clientIp
   RecvGossip = \{events, fromServer} -> handleRecvGossip events fromServer
   ForwardMessage = \{toKey, encryptedBlob, fromServer} -> handleForwardMessage toKey encryptedBlob fromServer
@@ -1265,17 +1255,14 @@ pollHeartbeat = do
 -- ============================================
 -- Entry Point
 -- ============================================
--- Stamp `startedAt` and a fresh `serverGeneration` (used by clients to detect
--- server restarts and reset their poll cursor), spawn the two background
--- loops, and start the listener.
+-- Stamp `startedAt`, spawn the two background loops, and start the listener.
 
 -- Entry point: stamp startup metadata, fork the background loops, and start
 -- the HTTP listener.
 main : IO _ {}
 main = do
   t <- now
-  genJitter <- randomInt 1000000
-  atomic (do *startedAt = t; *serverGeneration = t * 1000 + genJitter)
+  atomic (do *startedAt = t)
   logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
   fork backgroundPrune
