@@ -105,12 +105,6 @@ maxRecvRatePerKey = 10
 -- Window for the per-key receive rate limit (1 s).
 recvRateWindowMs : Int<Ms>
 recvRateWindowMs = 1000
--- Messages permitted per (sender, recipient) pair within the pair window.
-maxPairRatePerPair : Int
-maxPairRatePerPair = 30
--- Window for the per-pair rate limit (1 min).
-pairRateWindowMs : Int<Ms>
-pairRateWindowMs = 60000
 -- Requests permitted per source IP per window (covers unauthenticated traffic).
 maxIpRatePerIp : Int
 maxIpRatePerIp = 10
@@ -282,8 +276,6 @@ type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
 *sendRates : [RateEntry]
 -- Per-recipient counters; protects a popular key from being flooded by many senders.
 *recvRates : [RateEntry]
--- Per-(sender, recipient) pair counters; second-axis brake on chat spam.
-*pairRates : [RateEntry]
 -- Per-key /auth/challenge counters (separate from `*challenges` capacity gate).
 *challengeRates : [RateEntry]
 -- Per-source-IP counters; gate for unauthenticated traffic.
@@ -983,7 +975,7 @@ ackPolledMessages = \pubkey cursor -> do
 -- Federated forwards are kicked off in background forks after the atomic.
 
 -- POST /messages: send a list of ciphertexts atomically. Every message is
--- validated (self-send + send/pair/recv rate windows) inside a single atomic
+-- validated (self-send + send/recv rate windows) inside a single atomic
 -- block; if any one would be rejected, none are enqueued and the call returns
 -- a non-2xx HTTP status. Rate counters are still charged for every attempted
 -- message even when the batch is rejected, so a sender can't probe limits
@@ -1011,28 +1003,23 @@ handleSendMessages = \messages authorization clientIp -> do
         when federationEnabled (forEach checked (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
         yield (Ok {value: {}}))
 
--- Charge send/pair/recv rate counters for one (sender, recipient) pair and
+-- Charge send/recv rate counters for one (sender, recipient) pair and
 -- decide whether the message would be accepted. Mutates only the rate
 -- counters, never the mailbox; the caller commits via `commitSendMessage`
 -- only after every message in the batch has passed.
--- All three rate counters are charged unconditionally (even on a failure)
+-- Both rate counters are charged unconditionally (even on a failure)
 -- so that a sender can't probe limits cheaply by sending to themselves.
--- Order matters: send-rate is the sender's identity, pair-rate covers
--- conversation spam, and recv-rate is per-recipient.
-checkSendRate : PubkeyHex -> PubkeyHex -> Int<Ms> -> IO {rw *pairRates, r *presence, rw *recvRates, rw *sendRates} {remoteServers: [Text], error: Text}
+checkSendRate : PubkeyHex -> PubkeyHex -> Int<Ms> -> IO {r *presence, rw *recvRates, rw *sendRates} {remoteServers: [Text], error: Text}
 checkSendRate = \senderKey to t -> do
   sRates <- *sendRates
   let sR = checkRate sRates senderKey maxSendRatePerKey sendRateWindowMs t
   *sendRates = sR.entries
-  pRates <- *pairRates
-  let pR = checkRate pRates (senderKey ++ "|" ++ to) maxPairRatePerPair pairRateWindowMs t
-  *pairRates = pR.entries
   rRates <- *recvRates
   let rR = checkRate rRates to maxRecvRatePerKey recvRateWindowMs t
   *recvRates = rR.entries
   if senderKey == to
   then yield {error: "self_send", remoteServers: []}
-  else if sR.limited || pR.limited || rR.limited
+  else if sR.limited || rR.limited
   then yield {error: "rate_limited", remoteServers: []}
   else do
     pres <- *presence
