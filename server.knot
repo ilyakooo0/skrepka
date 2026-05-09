@@ -307,25 +307,14 @@ route Api = AuthApi | ClientApi | FederationApi
 -- ============================================
 -- Generic helpers
 -- ============================================
--- List/predicate combinators (filter/any/none/findFirst/...), token generation,
+-- List/predicate combinators (filter/all/findFirst/...), token generation,
 -- and small text/server-name utilities used throughout the rest of the file.
 -- Everything is intentionally O(n) over flat lists; performance is sacrificed
 -- for clarity per the file header.
 
--- Filter then map in one pass.
-mapWhere : a b -> (b -> Bool) -> (b -> c) -> a c
-mapWhere = \xs pred fn -> map fn (filter pred xs)
-countWhere : a b -> (b -> Bool) -> Int
-countWhere = \xs pred -> count (filter pred xs)
--- True when at least one element matches.
-any : [a] -> (a -> Bool) -> Bool
-any = \xs pred -> countWhere xs pred > 0
--- True when no element matches.
-none : [a] -> (a -> Bool) -> Bool
-none = \xs pred -> not any xs pred
 -- True when every element matches.
 all : [a] -> (a -> Bool) -> Bool
-all = \xs pred -> none xs (\x -> not pred x)
+all = \xs pred -> not (any (\x -> not pred x) xs)
 findFirst : [a] -> (a -> Bool) -> Maybe a
 findFirst = \xs pred -> headOf (filter pred xs)
 -- Run `action` only when `cond` is True; otherwise no-op.
@@ -341,7 +330,7 @@ clamp = \lo hi x -> max lo (min hi x)
 
 -- First element of a list, or Nothing for an empty list.
 headOf : [a] -> Maybe a
-headOf = \items -> fold (\_ x -> Just {value: x}) (Nothing {}) (takeRelation 1 items)
+headOf = \items -> fold (\_ x -> Just {value: x}) (Nothing {}) (take 1 items)
 
 -- Cap to maxN by dropping the smallest-key entries (LRU-style). Always sorts.
 -- For session/challenge/rate caps, `getKey` is typically `expiresAt` or
@@ -359,7 +348,7 @@ capPerKey = \items pred maxN getKey -> union (filter (\x -> not pred x) items) (
 -- Sequence an IO action over each item, in order. Recurses through the list
 -- one element at a time; this is the closest equivalent of `mapM_` here.
 forEach : [a] -> (a -> IO {} {}) -> IO {} {}
-forEach = \items action -> case single (takeRelation 1 items) of
+forEach = \items action -> case single (take 1 items) of
   Nothing {} -> yield {}
   Just {value: x} -> do
     action x
@@ -430,7 +419,7 @@ containsSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix
 -- (so we never `fetch` a peer pubkey from loopback) and on inbound requests
 -- (so a peer can't claim a bogus `fromServer`).
 isBadServerName : Text -> Bool
-isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") || any [
+isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") || any (\p -> hasPrefix p sn) [
   ".",
   ":",
   "[",
@@ -440,7 +429,7 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c
   "169.254.",
   "0.",
   "::"
-] (\p -> hasPrefix p sn) || any [".localhost", ".local", ".internal", ".arpa", ".onion"] (\s -> containsSuffix s sn)
+] || any (\s -> containsSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
 
 -- ============================================
 -- Auth helpers
@@ -581,7 +570,7 @@ retryBackoff = \failures -> min retryBackoffMax (retryBackoffBase * max 1 failur
 -- True when enough time has passed since the last failure for `server` to be
 -- worth retrying (or no failure recorded at all).
 shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
-shouldRetryServer = \server t failures -> none failures (\f -> f.server == server && t - f.failedAt < retryBackoff f.failures)
+shouldRetryServer = \server t failures -> not (any (\f -> f.server == server && t - f.failedAt < retryBackoff f.failures) failures)
 
 -- Bump the failure counter for `server`. Preserves `firstFailedAt` across
 -- subsequent failures.
@@ -654,7 +643,7 @@ pruneExpired = \t -> atomic do
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   *presence = filter (\p -> p.expiresAt > t) pres
-  let stillLive = \pk -> any pres (\k -> isLocalServer k.server && k.pubkey == pk && k.expiresAt > t)
+  let stillLive = \pk -> any (\k -> isLocalServer k.server && k.pubkey == pk && k.expiresAt > t) pres
   yield (filter (\p -> p.expiresAt <= t && isLocalServer p.server && not (stillLive p.pubkey)) pres)
 
 -- ============================================
@@ -702,7 +691,7 @@ retryPendingForwards = do
   t <- now
   fwds <- *forwards
   failures <- *forwardFailures
-  forEach (filter (\s -> shouldRetryServer s t failures) (collectPeers fwds (\f -> f.toServer))) (\server -> forEach (takeRelation maxBatchSize (filter (\f -> f.toServer == server) fwds)) (\f -> do
+  forEach (filter (\s -> shouldRetryServer s t failures) (collectPeers fwds (\f -> f.toServer))) (\server -> forEach (take maxBatchSize (filter (\f -> f.toServer == server) fwds)) (\f -> do
     result <- fetch (federationUrl server) (ForwardMessage {f.toKey, f.encryptedBlob})
     success <- case result of
       Err _ -> do
@@ -724,13 +713,13 @@ forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages
 forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
   fwds <- *forwards
-  let candidates = filter (\m -> m.toKey == pubkey && none fwds (\f -> f.encryptedBlob == m.encryptedBlob && f.toServer == server)) msgs
+  let candidates = filter (\m -> m.toKey == pubkey && not (any (\f -> f.encryptedBlob == m.encryptedBlob && f.toServer == server) fwds)) msgs
   let newFwds = map (\m -> {
     toServer: server,
     m.toKey,
     m.encryptedBlob,
     retries: 0
-  }) (takeRelation maxForwardsPerServer candidates)
+  }) (take maxForwardsPerServer candidates)
   *forwards = union fwds newFwds)
 
 -- ============================================
@@ -811,7 +800,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
           Just {value: sigBytes} -> verify pk (textToBytes challenge) sigBytes
           _ -> False {}
         _ -> False {}
-      let valid = any ch (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip) && sigValid
+      let valid = any (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip) ch && sigValid
       if not valid
       then yield {valid: False {}, peers: []}
       else do
@@ -864,7 +853,7 @@ pollOnce = \authorization cursor clientIp t -> do
     startWakeup <- *pollWakeup
     pres <- *presence
     let mine = \p -> p.pubkey == pubkey && isLocalServer p.server
-    let stale = not any pres (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2)
+    let stale = not (any (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2) pres)
     refreshPeers <- if stale
     then do
       let kept = filter (\p -> not mine p) pres
@@ -909,7 +898,7 @@ doPoll = \s t -> do
 -- which the client echoes on the next /poll to advance — and which the
 -- server treats as an implicit ack.
 collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp}
-collectPollEvents = \messages pubkey cursor t -> (\limited -> {events: map (\m -> {m.encryptedBlob}) limited, cursor: fold (\acc m -> max acc m.receivedAt) cursor limited}) (takeRelation maxPollEvents (sortBy (\m -> m.receivedAt) (filter (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor) messages)))
+collectPollEvents = \messages pubkey cursor t -> (\limited -> {events: map (\m -> {m.encryptedBlob}) limited, cursor: fold (\acc m -> max acc m.receivedAt) cursor limited}) (take maxPollEvents (sortBy (\m -> m.receivedAt) (filter (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor) messages)))
 
 -- Treat the supplied cursor as an ack: drop all messages with
 -- receivedAt <= cursor, plus their pending forwards.
@@ -946,7 +935,7 @@ handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Te
 handleSendMessages = \messages authorization clientIp -> do
   t <- now
   gateAuth authorization clientIp t (\senderKey -> do
-    let limited = takeRelation maxBatchSize messages
+    let limited = take maxBatchSize messages
     decision <- atomic (do
       checked <- mapEach limited (\m -> do
         c <- checkSendRate senderKey m.to t
@@ -999,12 +988,12 @@ commitSendMessage = \to encryptedBlob remoteServers t -> do
   *pollWakeup = seqTs
   when federationEnabled (do
     fwds <- *forwards
-    let newFwds = mapWhere remoteServers (\s -> none fwds (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s)) (\s -> {
+    let newFwds = map (\s -> {
       toServer: s,
       toKey: to,
       encryptedBlob,
       retries: 0
-    })
+    }) (filter (\s -> not (any (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s) fwds)) remoteServers)
     *forwards = union fwds newFwds)
 
 -- Fire one /federation/forward call per pre-staged server. On success the
@@ -1031,8 +1020,8 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
             let remaining = filter (\x -> not same x) fwds2
             *forwards = remaining
             pres <- *presence
-            let stillLocal = any pres (\p -> p.pubkey == to && isLocalServer p.server && p.expiresAt > t)
-            let othersPending = any remaining (\x -> x.encryptedBlob == encryptedBlob)
+            let stillLocal = any (\p -> p.pubkey == to && isLocalServer p.server && p.expiresAt > t) pres
+            let othersPending = any (\x -> x.encryptedBlob == encryptedBlob) remaining
             when (not stillLocal && not othersPending) (do
               msgs <- *messages
               *messages = filter (\m -> m.encryptedBlob != encryptedBlob) msgs)))
@@ -1073,7 +1062,7 @@ handleRecvGossip = \events fromServer -> do
       let kept = filter (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys) pres
       let added = map (\pk -> {pubkey: pk, server: fromServer, expiresAt: t + onlineGossipTtl}) onlinePubkeys
       *presence = union kept added
-      yield (filter (\pk -> none pres (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t)) onlinePubkeys))
+      yield (filter (\pk -> not (any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres)) onlinePubkeys))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
@@ -1089,7 +1078,7 @@ storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWa
 storeFederated = \toKey encryptedBlob t -> do
   pres <- *presence
   msgs <- *messages
-  if not any pres (\p -> p.pubkey == toKey && isLocalServer p.server && p.expiresAt > t)
+  if not (any (\p -> p.pubkey == toKey && isLocalServer p.server && p.expiresAt > t) pres)
   then yield "no_presence"
   else do
     seq <- *seqCounter
