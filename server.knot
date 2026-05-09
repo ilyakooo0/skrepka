@@ -48,15 +48,9 @@ federationScheme = "https://"
 -- long after `receivedAt`; expired rows are pruned by `pruneExpired` (30 days).
 messageMaxAge : Int<Ms>
 messageMaxAge = 2592000000
--- Length (chars) of a hex-encoded Ed25519 pubkey (32 bytes → 64 hex).
-pubkeyLen : Int
-pubkeyLen = 64
 -- Max length of a hex-encoded message body / opaque blob (40 MiB hex ≈ 20 MiB bytes).
 maxBlobLen : Int
 maxBlobLen = 41943040
--- Length of a hex-encoded Ed25519 signature (64 bytes → 128 hex).
-signatureLen : Int
-signatureLen = 128
 -- Cap on items in a batched send request.
 maxBatchSize : Int
 maxBatchSize = 100
@@ -195,11 +189,11 @@ isValidBoundedHex = \maxLen s -> not tooLong s maxLen && isValidHex s
 isValidExactHex : Int -> Text -> Bool
 isValidExactHex = \exactLen s -> count (chars s) == exactLen && isValidHex s
 -- Hex-encoded Ed25519 public key (32 bytes → 64 chars exact).
-type PubkeyHex = Text where isValidExactHex pubkeyLen
+type PubkeyHex = Text where isValidExactHex 64
 -- Hex-encoded ciphertext or opaque blob; capped at `maxBlobLen` (~20 MiB).
 type BlobHex = Text where isValidBoundedHex maxBlobLen
 -- Hex-encoded Ed25519 signature (64 bytes → 128 chars exact).
-type SignatureHex = Text where isValidExactHex signatureLen
+type SignatureHex = Text where isValidExactHex 128
 -- Normalized hostname (lowercased, no trailing dot, length-bounded). The SSRF
 -- deny-list (`isBadServerName`) is enforced separately at federation egress
 -- (`handleRecvGossip`); keeping it out of the type predicate lets the default
