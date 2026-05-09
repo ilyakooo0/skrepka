@@ -314,15 +314,15 @@ clamp = \lo hi x -> max lo (min hi x)
 -- Cap to maxN by dropping the smallest-key entries (LRU-style). Always sorts.
 -- For session/challenge/rate caps, `getKey` is typically `expiresAt` or
 -- `windowStart` so the oldest entries are evicted first.
-capList : [a] -> Int -> (a -> b) -> [a]
+capList : [a] -> Int -> (a -> Timestamp) -> [a]
 capList = \items maxN getKey -> drop (max 0 (count items - maxN)) (sortBy getKey items)
 
--- Cap pred-matching entries to maxN-1 (caller adds one more). Splits the list
--- into "doesn't match" (untouched) and "matches" (capped + LRU-evicted) so a
--- single key can't exhaust a global pool — see `maxChallengesPerKey` and
--- `maxSessionsPerKey`.
-capPerKey : [a] -> (a -> Bool) -> Int -> (a -> b) -> [a]
-capPerKey = \items pred maxN getKey -> union (filter (\x -> not pred x) items) (capList (filter pred items) (maxN - 1) getKey)
+-- Cap entries matching `pubkey` to maxN-1 (caller adds one more). Splits the
+-- list into "different pubkey" (untouched) and "same pubkey" (capped +
+-- LRU-evicted) so a single key can't exhaust a global pool — see
+-- `maxChallengesPerKey` and `maxSessionsPerKey`.
+capPerKey : [{pubkey: PubkeyHex | r}] -> PubkeyHex -> Int -> ({pubkey: PubkeyHex | r} -> Timestamp) -> [{pubkey: PubkeyHex | r}]
+capPerKey = \items pubkey maxN getKey -> union (filter (\x -> not (x.pubkey == pubkey)) items) (capList (filter (\x -> x.pubkey == pubkey) items) (maxN - 1) getKey)
 
 -- Sequence an IO action over each item, in order. Recurses through the list
 -- one element at a time; this is the closest equivalent of `mapM_` here.
@@ -735,7 +735,7 @@ handleChallenge = \pubkey clientIp -> do
     challenge <- genToken
     result <- atomic (do
       ch <- *challenges
-      let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) (\c -> c.pubkey == pubkey) maxChallengesPerKey (\c -> c.expiresAt)
+      let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey (\c -> c.expiresAt)
       if count cappedActive >= maxChallenges
       then yield "capacity"
       else do
@@ -780,10 +780,9 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
       else do
         *challenges = filter (\c -> not same c) ch
         ses <- *sessions
-        let mine = \s -> s.pubkey == pubkey
         let pruned = if revokeOthers
-        then filter (\s -> not mine s) ses
-        else capPerKey ses mine maxSessionsPerKey (\s -> s.expiresAt)
+        then filter (\s -> not (s.pubkey == pubkey)) ses
+        else capPerKey ses pubkey maxSessionsPerKey (\s -> s.expiresAt)
         let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
         *sessions = capList (union pruned [newSession]) maxSessions (\s -> s.expiresAt)
         pres <- *presence
