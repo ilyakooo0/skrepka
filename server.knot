@@ -225,10 +225,10 @@ type ForwardEntry = {toServer: ServerName, toKey: PubkeyHex, encryptedBlob: Blob
 -- Running failure counter for a peer; keyed by `server`. Drives `retryBackoff`.
 type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFailedAt: Timestamp}
 -- One fixed-window rate counter. `key` identifies the subject (pubkey, ip,
--- server, or composite "sender|recipient" string). `windowStart` is the wall
--- time at which the current window began; once `t - windowStart` exceeds the
--- configured window length the entry is recycled (counter resets to 1).
-type RateEntry = {key: Text, windowStart: Timestamp, count: Int}
+-- server, or composite "sender|recipient" string). `expiresAt` is the wall
+-- time at which the current window ends; once `t >= expiresAt` the entry is
+-- recycled (counter resets to 1).
+type RateEntry = {key: Text, expiresAt: Timestamp, count: Int}
 
 -- ============================================
 -- Persisted State (all flat lists, no sharding)
@@ -311,18 +311,17 @@ route Api = AuthApi | ClientApi | FederationApi
 clamp : Ord a => a -> a -> a -> a
 clamp = \lo hi x -> max lo (min hi x)
 
--- Cap to maxN by dropping the smallest-key entries (LRU-style). Always sorts.
--- For session/challenge/rate caps, `getKey` is typically `expiresAt` or
--- `windowStart` so the oldest entries are evicted first.
-capList : [a] -> Int -> (a -> Timestamp) -> [a]
-capList = \items maxN getKey -> drop (max 0 (count items - maxN)) (sortBy getKey items)
+-- Cap to maxN by dropping the soonest-to-expire entries (LRU-style). Always
+-- sorts by `expiresAt` so the oldest/most-stale entries are evicted first.
+capList : [{expiresAt: Timestamp | r}] -> Int -> [{expiresAt: Timestamp | r}]
+capList = \items maxN -> drop (max 0 (count items - maxN)) (sortBy (\x -> x.expiresAt) items)
 
 -- Cap entries matching `pubkey` to maxN-1 (caller adds one more). Splits the
 -- list into "different pubkey" (untouched) and "same pubkey" (capped +
 -- LRU-evicted) so a single key can't exhaust a global pool — see
 -- `maxChallengesPerKey` and `maxSessionsPerKey`.
-capPerKey : [{pubkey: PubkeyHex | r}] -> PubkeyHex -> Int -> ({pubkey: PubkeyHex | r} -> Timestamp) -> [{pubkey: PubkeyHex | r}]
-capPerKey = \items pubkey maxN getKey -> union (filter (\x -> not (x.pubkey == pubkey)) items) (capList (filter (\x -> x.pubkey == pubkey) items) (maxN - 1) getKey)
+capPerKey : [{pubkey: PubkeyHex, expiresAt: Timestamp | r}] -> PubkeyHex -> Int -> [{pubkey: PubkeyHex, expiresAt: Timestamp | r}]
+capPerKey = \items pubkey maxN -> union (filter (\x -> not (x.pubkey == pubkey)) items) (capList (filter (\x -> x.pubkey == pubkey) items) (maxN - 1))
 
 -- Sequence an IO action over each item, in order. Recurses through the list
 -- one element at a time; this is the closest equivalent of `mapM_` here.
@@ -470,13 +469,14 @@ withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
 -- gate for unauthenticated handlers (challenge/verify).
 
 -- Returns {limited, entries}. Increments count when the key fits within the
--- window; otherwise resets to a fresh window starting at `t`. The returned
--- `entries` list is what the caller must write back to the corresponding ref;
--- it has been capped at 5000 rows (LRU by `windowStart`) to bound memory.
+-- window; otherwise resets to a fresh window expiring at `t + windowMs`. The
+-- returned `entries` list is what the caller must write back to the
+-- corresponding ref; it has been capped at 5000 rows (LRU by `expiresAt`) to
+-- bound memory.
 checkRate : [RateEntry] -> Text -> Int -> Int<Ms> -> Timestamp -> {limited: Bool, entries: [RateEntry]}
-checkRate = \entries key maxRate windowMs t -> (\cur -> if cur.count > maxRate then {limited: True {}, entries} else {limited: False {}, entries: capList (union (filter (\x -> not (x.key == key)) entries) [{key, cur.windowStart, cur.count}]) 5000 (\r -> r.windowStart)}) (case findFirst entries (\r -> r.key == key && t - r.windowStart < windowMs) of
-  Just {value: r} -> {r.windowStart, count: r.count + 1}
-  _ -> {windowStart: t, count: 1})
+checkRate = \entries key maxRate windowMs t -> (\cur -> if cur.count > maxRate then {limited: True {}, entries} else {limited: False {}, entries: capList (union (filter (\x -> not (x.key == key)) entries) [{key, cur.expiresAt, cur.count}]) 5000}) (case findFirst entries (\r -> r.key == key && r.expiresAt > t) of
+  Just {value: r} -> {r.expiresAt, count: r.count + 1}
+  _ -> {expiresAt: t + windowMs, count: 1})
 
 -- Single-counter global rate gate. Resets the counter when the window expires;
 -- returns True when the limit has been hit (caller responds rate_limited).
@@ -735,7 +735,7 @@ handleChallenge = \pubkey clientIp -> do
     challenge <- genToken
     result <- atomic (do
       ch <- *challenges
-      let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey (\c -> c.expiresAt)
+      let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey
       if count cappedActive >= maxChallenges
       then yield "capacity"
       else do
@@ -782,9 +782,9 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
         ses <- *sessions
         let pruned = if revokeOthers
         then filter (\s -> not (s.pubkey == pubkey)) ses
-        else capPerKey ses pubkey maxSessionsPerKey (\s -> s.expiresAt)
+        else capPerKey ses pubkey maxSessionsPerKey
         let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
-        *sessions = capList (union pruned [newSession]) maxSessions (\s -> s.expiresAt)
+        *sessions = capList (union pruned [newSession]) maxSessions
         pres <- *presence
         let prunedPres = filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres
         let newPres = union prunedPres [{pubkey, server: serverHost, expiresAt: expiry}]
