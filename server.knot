@@ -313,8 +313,6 @@ route Api = AuthApi | ClientApi | FederationApi
 -- for clarity per the file header.
 
 -- True when every element matches.
-all : [a] -> (a -> Bool) -> Bool
-all = \xs pred -> not (any (\x -> not pred x) xs)
 findFirst : [a] -> (a -> Bool) -> Maybe a
 findFirst = \xs pred -> headOf (filter pred xs)
 -- Run `action` only when `cond` is True; otherwise no-op.
@@ -330,13 +328,15 @@ clamp = \lo hi x -> max lo (min hi x)
 
 -- First element of a list, or Nothing for an empty list.
 headOf : [a] -> Maybe a
-headOf = \items -> fold (\_ x -> Just {value: x}) (Nothing {}) (take 1 items)
+headOf = \items -> case items of
+  Cons x _ -> Just {value: x}
+  [] -> Nothing {}
 
 -- Cap to maxN by dropping the smallest-key entries (LRU-style). Always sorts.
 -- For session/challenge/rate caps, `getKey` is typically `expiresAt` or
 -- `windowStart` so the oldest entries are evicted first.
 capList : [a] -> Int -> (a -> b) -> [a]
-capList = \items maxN getKey -> dropRelation (max 0 (count items - maxN)) (sortBy getKey items)
+capList = \items maxN getKey -> drop (max 0 (count items - maxN)) (sortBy getKey items)
 
 -- Cap pred-matching entries to maxN-1 (caller adds one more). Splits the list
 -- into "doesn't match" (untouched) and "matches" (capped + LRU-evicted) so a
@@ -348,20 +348,20 @@ capPerKey = \items pred maxN getKey -> union (filter (\x -> not pred x) items) (
 -- Sequence an IO action over each item, in order. Recurses through the list
 -- one element at a time; this is the closest equivalent of `mapM_` here.
 forEach : [a] -> (a -> IO {} {}) -> IO {} {}
-forEach = \items action -> case single (take 1 items) of
-  Nothing {} -> yield {}
-  Just {value: x} -> do
+forEach = \items action -> case items of
+  [] -> yield {}
+  Cons x rest -> do
     action x
-    forEach (dropRelation 1 items) action
+    forEach rest action
 
 -- Like forEach, but collects each action's result into a list.
 mapEach : [a] -> (a -> IO {} b) -> IO {} [b]
-mapEach = \items action -> case headOf items of
-  Nothing {} -> yield []
-  Just {value: x} -> do
+mapEach = \items action -> case items of
+  [] -> yield []
+  Cons x rest -> do
     r <- action x
-    rest <- mapEach (dropRelation 1 items) action
-    yield (union [r] rest)
+    rs <- mapEach rest action
+    yield (union [r] rs)
 
 -- Hex tokens: one random hex char per recursive call. `n` is the desired
 -- length in characters (so n=48 yields 24 random bytes of entropy).
