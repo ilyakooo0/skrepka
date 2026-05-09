@@ -323,15 +323,6 @@ capList = \items maxN -> drop (max 0 (count items - maxN)) (sortBy (\x -> x.expi
 capPerKey : [{pubkey: PubkeyHex, expiresAt: Timestamp | r}] -> PubkeyHex -> Int -> [{pubkey: PubkeyHex, expiresAt: Timestamp | r}]
 capPerKey = \items pubkey maxN -> union (filter (\x -> not (x.pubkey == pubkey)) items) (capList (filter (\x -> x.pubkey == pubkey) items) (maxN - 1))
 
--- Sequence an IO action over each item, in order. Recurses through the list
--- one element at a time; this is the closest equivalent of `mapM_` here.
-forEach : [a] -> (a -> IO eff {}) -> IO eff {}
-forEach = \items action -> case items of
-  [] -> yield {}
-  Cons x rest -> do
-    action x
-    forEach rest action
-
 -- Like forEach, but collects each action's result into a list.
 mapEach : [a] -> (a -> IO {} b) -> IO {} [b]
 mapEach = \items action -> case items of
