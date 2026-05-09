@@ -312,25 +312,10 @@ route Api = AuthApi | ClientApi | FederationApi
 -- Everything is intentionally O(n) over flat lists; performance is sacrificed
 -- for clarity per the file header.
 
--- True when every element matches.
-findFirst : [a] -> (a -> Bool) -> Maybe a
-findFirst = \xs pred -> headOf (filter pred xs)
 -- Run `action` only when `cond` is True; otherwise no-op.
-when : Bool -> IO {} {} -> IO {} {}
-when = \cond action -> if cond then action else yield {}
-min : a -> a -> a
-min = \a b -> if a < b then a else b
-max : a -> a -> a
-max = \a b -> if a > b then a else b
 -- Confine `x` to the closed interval [lo, hi].
-clamp : a -> a -> a -> a
+clamp : Ord a => a -> a -> a -> a
 clamp = \lo hi x -> max lo (min hi x)
-
--- First element of a list, or Nothing for an empty list.
-headOf : [a] -> Maybe a
-headOf = \items -> case items of
-  Cons x _ -> Just {value: x}
-  [] -> Nothing {}
 
 -- Cap to maxN by dropping the smallest-key entries (LRU-style). Always sorts.
 -- For session/challenge/rate caps, `getKey` is typically `expiresAt` or
@@ -347,7 +332,7 @@ capPerKey = \items pred maxN getKey -> union (filter (\x -> not pred x) items) (
 
 -- Sequence an IO action over each item, in order. Recurses through the list
 -- one element at a time; this is the closest equivalent of `mapM_` here.
-forEach : [a] -> (a -> IO {} {}) -> IO {} {}
+forEach : [a] -> (a -> IO eff {}) -> IO eff {}
 forEach = \items action -> case items of
   [] -> yield {}
   Cons x rest -> do
@@ -570,7 +555,7 @@ retryBackoff = \failures -> min retryBackoffMax (retryBackoffBase * max 1 failur
 -- True when enough time has passed since the last failure for `server` to be
 -- worth retrying (or no failure recorded at all).
 shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
-shouldRetryServer = \server t failures -> not (any (\f -> f.server == server && t - f.failedAt < retryBackoff f.failures) failures)
+shouldRetryServer = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < retryBackoff f.failures) failures
 
 -- Bump the failure counter for `server`. Preserves `firstFailedAt` across
 -- subsequent failures.
@@ -655,7 +640,7 @@ pruneExpired = \t -> atomic do
 
 -- Fan out one bundle of gossip events to each peer, skipping peers in backoff.
 -- Records or clears federation-failure counters per call.
-sendBatchedGossip : [Text] -> [GossipEventType] -> IO {} {}
+sendBatchedGossip : [Text] -> [GossipEventType] -> IO {rw *forwardFailures, network, clock} {}
 sendBatchedGossip = \peers events -> forEach peers (\server -> do
   t <- now
   failures <- *forwardFailures
@@ -667,7 +652,7 @@ sendBatchedGossip = \peers events -> forEach peers (\server -> do
 
 -- Tell known peers that the listed local pubkeys just went offline. No-op when
 -- federation is disabled or the list is empty.
-broadcastOfflineGossip : [{pubkey: PubkeyHex | a}] -> IO {r *presence} {}
+broadcastOfflineGossip : [{pubkey: PubkeyHex | a}] -> IO {r *presence, rw *forwardFailures, network, clock} {}
 broadcastOfflineGossip = \expiredLocal -> do
   presence <- *presence
   when (federationEnabled && count expiredLocal > 0) (sendBatchedGossip (knownPeerServersFromPresence presence) (map (\p -> GossipOffline {
@@ -686,7 +671,7 @@ broadcastOfflineGossip = \expiredLocal -> do
 -- Walk pending forwards grouped by destination, retry each (up to maxBatchSize
 -- per peer) using `/federation/forward`. Drops successful entries; for failures
 -- bumps the retry count and gives up after `maxForwardRetries`.
-retryPendingForwards : IO {r *forwardFailures, r *forwards, clock} {}
+retryPendingForwards : IO {rw *forwardFailures, rw *forwards, network, clock} {}
 retryPendingForwards = do
   t <- now
   fwds <- *forwards
@@ -713,13 +698,8 @@ forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages
 forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
   fwds <- *forwards
-  let candidates = filter (\m -> m.toKey == pubkey && not (any (\f -> f.encryptedBlob == m.encryptedBlob && f.toServer == server) fwds)) msgs
-  let newFwds = map (\m -> {
-    toServer: server,
-    m.toKey,
-    m.encryptedBlob,
-    retries: 0
-  }) (take maxForwardsPerServer candidates)
+  let candidates = filter (\m -> m.toKey == pubkey && not any (\f -> f.encryptedBlob == m.encryptedBlob && f.toServer == server) fwds) msgs
+  let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take maxForwardsPerServer candidates)
   *forwards = union fwds newFwds)
 
 -- ============================================
@@ -783,7 +763,7 @@ handleChallenge = \pubkey clientIp -> do
 -- On success, mints a session token, records local presence (`pubkey` is now
 -- live on this server), and gossips an `online` event to known peers. If
 -- `revokeOthers` is set, all other sessions for the same pubkey are dropped.
-handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challenges, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, rw *presence, rw *sessions, clock, random} (Result HttpError {expiresAt: Int, token: Text})
+handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challenges, rw *forwardFailures, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, rw *presence, rw *sessions, network, clock, random} (Result HttpError {expiresAt: Int, token: Text})
 handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
   preErr <- authPreCheck clientIp t
@@ -833,7 +813,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 
 -- POST /poll: top-level dispatch. Validates the global rate gate, then hands
 -- off to `pollOnce` for the actual long-poll body.
-handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, rw *presence, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
 handlePoll = \cursor authorization clientIp -> do
   t <- now
   g <- checkGlobalRate t
@@ -845,7 +825,7 @@ handlePoll = \cursor authorization clientIp -> do
 -- (`ackPolledMessages`), refreshes the caller's local presence row so peers
 -- don't time us out mid-session, then runs `doPoll` to collect events (or
 -- block until wakeup) and assembles the response.
-pollOnce : Text -> Int -> Text -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwards, rw *messages, rw *presence, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+pollOnce : Text -> Int -> Text -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
 pollOnce = \authorization cursor clientIp t -> do
   setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
     let clampedCursor = clamp 0 t cursor
@@ -853,7 +833,7 @@ pollOnce = \authorization cursor clientIp t -> do
     startWakeup <- *pollWakeup
     pres <- *presence
     let mine = \p -> p.pubkey == pubkey && isLocalServer p.server
-    let stale = not (any (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2) pres)
+    let stale = not any (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2) pres
     refreshPeers <- if stale
     then do
       let kept = filter (\p -> not mine p) pres
@@ -988,12 +968,7 @@ commitSendMessage = \to encryptedBlob remoteServers t -> do
   *pollWakeup = seqTs
   when federationEnabled (do
     fwds <- *forwards
-    let newFwds = map (\s -> {
-      toServer: s,
-      toKey: to,
-      encryptedBlob,
-      retries: 0
-    }) (filter (\s -> not (any (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s) fwds)) remoteServers)
+    let newFwds = map (\s -> {toServer: s, toKey: to, encryptedBlob, retries: 0}) (filter (\s -> not any (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s) fwds) remoteServers)
     *forwards = union fwds newFwds)
 
 -- Fire one /federation/forward call per pre-staged server. On success the
@@ -1002,7 +977,7 @@ commitSendMessage = \to encryptedBlob remoteServers t -> do
 -- `*messages` row is dropped too: the origin's job is done and the message
 -- now lives on the receiving peer's mailbox. On failure the forwards row
 -- stays so `retryPendingForwards` can re-attempt with backoff.
-forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {} {}
+forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {r *presence, rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
   fwds <- *forwards
   let same = \x -> x.encryptedBlob == encryptedBlob && x.toServer == server
@@ -1039,7 +1014,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
 -- pubkeys with a `GossipOnline` event (so Online wins on collision). For keys
 -- that transition offline → online, flushes any locally-buffered messages via
 -- `forwardQueuedToServer`.
-handleRecvGossip : [GossipEventType] -> Text -> IO {rw *presence, clock} (Result HttpError {})
+handleRecvGossip : [GossipEventType] -> Text -> IO {r *messages, rw *forwards, rw *presence, clock} (Result HttpError {})
 handleRecvGossip = \events fromServer -> do
   t <- now
   if not isRemote fromServer || isBadServerName fromServer || count events > maxGossipEvents
@@ -1062,7 +1037,7 @@ handleRecvGossip = \events fromServer -> do
       let kept = filter (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys) pres
       let added = map (\pk -> {pubkey: pk, server: fromServer, expiresAt: t + onlineGossipTtl}) onlinePubkeys
       *presence = union kept added
-      yield (filter (\pk -> not (any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres)) onlinePubkeys))
+      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) onlinePubkeys))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
@@ -1078,7 +1053,7 @@ storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWa
 storeFederated = \toKey encryptedBlob t -> do
   pres <- *presence
   msgs <- *messages
-  if not (any (\p -> p.pubkey == toKey && isLocalServer p.server && p.expiresAt > t) pres)
+  if not any (\p -> p.pubkey == toKey && isLocalServer p.server && p.expiresAt > t) pres
   then yield "no_presence"
   else do
     seq <- *seqCounter
@@ -1128,7 +1103,7 @@ api = serve Api where
 -- Endless tick: prune immediately on first call, then every
 -- `backgroundPruneInterval`. The startup prune clears stale rows persisted
 -- by the previous process before the next interval elapses.
-backgroundPrune : IO {rw *challenges, rw *forwardFailures, r *forwards, rw *messages, rw *presence, rw *sessions, clock} a
+backgroundPrune : IO {rw *challenges, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions, network, clock} a
 backgroundPrune = do
   t <- now
   pruneAndRetry t
