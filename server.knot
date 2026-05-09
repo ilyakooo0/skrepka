@@ -384,7 +384,7 @@ tooLong = \s maxLen -> count (chars s) > maxLen
 
 -- True when `s` is non-empty, even-length, and only lowercase hex digits.
 isValidHex : Text -> Bool
-isValidHex = \s -> (\cs -> (\n -> n > 0 && n / 2 * 2 == n && all cs (\c -> contains c "0123456789abcdef")) (count cs)) (chars s)
+isValidHex = \s -> (\cs -> (\n -> n > 0 && n / 2 * 2 == n && all (\c -> contains c "0123456789abcdef") cs) (count cs)) (chars s)
 
 -- Recursively strip every trailing "." from `s` (DNS root form).
 stripTrailingDot : Text -> Text
@@ -419,7 +419,7 @@ containsSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix
 -- (so we never `fetch` a peer pubkey from loopback) and on inbound requests
 -- (so a peer can't claim a bogus `fromServer`).
 isBadServerName : Text -> Bool
-isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (chars sn) (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") || any (\p -> hasPrefix p sn) [
+isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || any (\p -> hasPrefix p sn) [
   ".",
   ":",
   "[",
