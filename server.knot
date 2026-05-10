@@ -439,12 +439,10 @@ recordFailure = \server -> do
   atomic (do
     failures <- *forwardFailures
     let same = \f -> f.server == server
-    let prev = case findFirst failures same of
-      Just {value: f} -> {failures: f.failures + 1, f.firstFailedAt}
-      _ -> {failures: 1, firstFailedAt: t}
-    *forwardFailures = union (filter (\f -> not same f) failures) [
-      {server, failedAt: t, prev.failures, prev.firstFailedAt}
-    ])
+    let new = case findFirst failures same of
+      Just {value: f} -> {server, failedAt: t, failures: f.failures + 1, f.firstFailedAt}
+      _ -> {server, failedAt: t, failures: 1, firstFailedAt: t}
+    *forwardFailures = union (filter (\f -> not same f) failures) [new])
 
 -- Drop the failure record for `server` (called after any successful peer call).
 -- Single-success recovery — there is no half-open state.
@@ -630,7 +628,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
       _ -> False {}
     let valid = any (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip) ch && sigValid
     if not valid
-    then yield {valid: False {}, peers: []}
+    then yield (Nothing {})
     else do
       *challenges = filter (\c -> not same c) ch
       ses <- *sessions
@@ -643,12 +641,12 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
       let prunedPres = filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres
       let newPres = union prunedPres [{pubkey, server: serverHost, expiresAt: expiry}]
       *presence = newPres
-      yield {valid: True {}, peers: knownPeerServersFromPresence newPres})
-  if not result.valid
-  then yield (Err {error: {status: 401, message: "invalid"}})
-  else do
-    when federationEnabled (fork (sendBatchedGossip result.peers [GossipOnline {pubkey}]))
-    yield (Ok {value: {token, expiresAt: expiry}})
+      yield (Just {value: knownPeerServersFromPresence newPres}))
+  case result of
+    Nothing {} -> yield (Err {error: {status: 401, message: "invalid"}})
+    Just {value: peers} -> do
+      when federationEnabled (fork (sendBatchedGossip peers [GossipOnline {pubkey}]))
+      yield (Ok {value: {token, expiresAt: expiry}})
 
 -- ============================================
 -- Handler: poll
@@ -853,37 +851,32 @@ handleRecvGossip = \events fromServer -> do
     yield (Ok {value: {}})
 
 -- Store a federated/forwarded message into the local mailbox. Caller wraps in `atomic`.
--- Returns "" on success, otherwise the error code "no_presence".
 --
 -- The presence gate requires the recipient to be **currently locally online**
 -- (not just visible to gossip somewhere). Without that, an A → B forward based
 -- on stale gossip about R could land on B with no actively-polling client and
 -- get stuck. If B refuses, A retries via `retryPendingForwards` against the
 -- next presence target.
-storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter} Text
+storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter} (Result HttpError {})
 storeFederated = \toKey encryptedBlob t -> do
   pres <- *presence
   msgs <- *messages
   if not (hasLocalPresence pres toKey t)
-  then yield "no_presence"
+  then yield (Err {error: {status: 404, message: "no_presence"}})
   else do
     seq <- *seqCounter
     let seqTs = nextSeqTs t seq
     *seqCounter = seqTs
     *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
     *pollWakeup = seqTs
-    yield ""
+    yield (Ok {value: {}})
 
 -- POST /federation/forward: receive a single federated message destined for
--- a local key. Delegates the actual store decision to `storeFederated`,
--- which returns "" on success.
+-- a local key. Delegates the store decision to `storeFederated`.
 handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter, clock} (Result HttpError {})
 handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
-  result <- atomic storeFederated toKey encryptedBlob t
-  if result == ""
-  then yield (Ok {value: {}})
-  else yield (Err {error: {status: 404, message: result}})
+  atomic storeFederated toKey encryptedBlob t
 
 -- ============================================
 -- Dispatch
