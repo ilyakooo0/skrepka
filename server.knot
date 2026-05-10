@@ -400,15 +400,6 @@ authedPubkey = \authorization t clientIp -> do
       Just {value: s} -> yield (Just {value: s.pubkey})
       _ -> yield (Nothing {})
 
--- True when `signature` is a valid Ed25519 signature by `pubkey` over `challenge`.
--- False on any hex-decoding failure.
-verifySignature : PubkeyHex -> SignatureHex -> Text -> Bool
-verifySignature = \pubkey signature challenge -> case bytesFromHex pubkey of
-  Just {value: pk} -> case bytesFromHex signature of
-    Just {value: sigBytes} -> verify pk (textToBytes challenge) sigBytes
-    _ -> False {}
-  _ -> False {}
-
 -- ============================================
 -- Federation failure tracking (simple, no circuit breaker)
 -- ============================================
@@ -470,6 +461,11 @@ appendMessage = \toKey encryptedBlob t -> do
   *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
   *pollWakeup = seqTs
 
+-- True when `f` is the queued forward of `blob` to `server`. Used to dedupe
+-- per-(blob, server) entries on the forwards outbox.
+forwardMatches : BlobHex -> ServerName -> ForwardEntry -> Bool
+forwardMatches = \blob server f -> f.encryptedBlob == blob && f.toServer == server
+
 -- Replace any local presence rows for `pubkey` with one fresh row at
 -- `expiry`, and return the post-update peer broadcast set. Caller wraps in
 -- `atomic`.
@@ -512,25 +508,17 @@ pruneExpired = \t -> atomic do
 -- subsystems back off together.
 
 -- Fan out one bundle of gossip events to each peer, skipping peers in backoff.
--- Records or clears federation-failure counters per call.
+-- No-op when `events` is empty so callers don't need to guard. Records or
+-- clears federation-failure counters per call.
 sendBatchedGossip : [Text] -> [GossipEventType] -> IO {rw *forwardFailures, network, clock} {}
-sendBatchedGossip = \peers events -> do
+sendBatchedGossip = \peers events -> when (count events > 0) (do
   t <- now
   failures <- *forwardFailures
   forEach peers (\server -> when (shouldRetryServer server t failures) (do
     result <- fetch (federationUrl server) (RecvGossip {events, fromServer: serverHost})
     case result of
       Err _ -> recordFailure server
-      Ok _ -> clearFailure server))
-
--- Tell known peers that the listed local pubkeys just went offline. No-op when
--- the list is empty. Caller is responsible for the `federationEnabled` gate.
-broadcastOfflineGossip : [{pubkey: PubkeyHex | a}] -> IO {r *presence, rw *forwardFailures, network, clock} {}
-broadcastOfflineGossip = \expiredLocal -> when (count expiredLocal > 0) (do
-  presence <- *presence
-  sendBatchedGossip (collectPeers presence (\p -> p.server)) (map (\p -> GossipOffline {
-    p.pubkey
-  }) expiredLocal))
+      Ok _ -> clearFailure server)))
 
 -- ============================================
 -- Forward retries
@@ -558,7 +546,7 @@ retryPendingForwards = do
       Ok _ -> do
         clearFailure server
         yield (True {})
-    let isMatch = \x -> x.encryptedBlob == f.encryptedBlob && x.toServer == server
+    let isMatch = forwardMatches f.encryptedBlob server
     let isDone = \x -> isMatch x && (success || x.retries + 1 >= maxForwardRetries)
     atomic (do
       cur <- *forwards
@@ -571,7 +559,7 @@ forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages
 forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
   fwds <- *forwards
-  let candidates = filter (\m -> m.toKey == pubkey && not any (\f -> f.encryptedBlob == m.encryptedBlob && f.toServer == server) fwds) msgs
+  let candidates = filter (\m -> m.toKey == pubkey && not any (forwardMatches m.encryptedBlob server) fwds) msgs
   let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take maxForwardsPerServer candidates)
   *forwards = union fwds newFwds)
 
@@ -616,7 +604,11 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
   let expiry = t + sessionExpiry
   token <- genToken 48
-  let sigValid = verifySignature pubkey signature challenge
+  let sigValid = case bytesFromHex pubkey of
+    Just {value: pk} -> case bytesFromHex signature of
+      Just {value: sigBytes} -> verify pk (textToBytes challenge) sigBytes
+      _ -> False {}
+    _ -> False {}
   result <- atomic (do
     ch <- *challenges
     let same = \c -> c.pubkey == pubkey && c.challenge == challenge
@@ -671,7 +663,7 @@ handlePoll = \cursor authorization clientIp -> do
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
-      when (federationEnabled && count s.refreshPeers > 0) (fork (sendBatchedGossip s.refreshPeers [
+      when federationEnabled (fork (sendBatchedGossip s.refreshPeers [
         GossipOnline {s.pubkey}
       ]))
       pollResult <- doPoll s t
@@ -752,7 +744,7 @@ handleSendMessages = \messages authorization clientIp -> do
             appendMessage c.to c.encryptedBlob t
             when federationEnabled (do
               fwds <- *forwards
-              let newFwds = map (\s -> {toServer: s, toKey: c.to, encryptedBlob: c.encryptedBlob, retries: 0}) (filter (\s -> not any (\f -> f.encryptedBlob == c.encryptedBlob && f.toServer == s) fwds) c.remoteServers)
+              let newFwds = map (\s -> {toServer: s, toKey: c.to, encryptedBlob: c.encryptedBlob, retries: 0}) (filter (\s -> not any (forwardMatches c.encryptedBlob s) fwds) c.remoteServers)
               *forwards = union fwds newFwds))
           yield staged)
         when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
@@ -767,7 +759,7 @@ handleSendMessages = \messages authorization clientIp -> do
 forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {r *presence, rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
   fwds <- *forwards
-  let same = \x -> x.encryptedBlob == encryptedBlob && x.toServer == server
+  let same = forwardMatches encryptedBlob server
   when (any same fwds) (do
     t <- now
     result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
@@ -868,7 +860,9 @@ backgroundPrune = do
   t <- now
   expiredLocal <- pruneExpired t
   when federationEnabled (do
-    fork (broadcastOfflineGossip expiredLocal)
+    fork (do
+      pres <- *presence
+      sendBatchedGossip (collectPeers pres (\p -> p.server)) (map (\p -> GossipOffline {p.pubkey}) expiredLocal))
     fork retryPendingForwards)
   sleep backgroundPruneInterval
   backgroundPrune
