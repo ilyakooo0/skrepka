@@ -82,21 +82,6 @@ maxSessionsPerKey = 10
 -- Validity window for an auth challenge before it must be re-issued (1 min).
 challengeExpiry : Int<Ms>
 challengeExpiry = 60000
--- Challenge requests permitted per pubkey inside its rate window.
--- Wired into the /auth/challenge route's `rateLimit` clause.
-maxChallengeRatePerKey : Int
-maxChallengeRatePerKey = 5
--- Window over which the per-pubkey challenge rate is measured (1 s).
-challengeRateWindowMs : Int<Ms>
-challengeRateWindowMs = 1000
--- Send-message requests permitted per session token per window.
--- Wired into the /messages route's `rateLimit` clause.
-maxSendRatePerKey : Int
-maxSendRatePerKey = 20
--- Window for the per-session send rate limit (1 s).
-sendRateWindowMs : Int<Ms>
-sendRateWindowMs = 1000
-
 -- How long a session token remains valid after issue (1 hour).
 sessionExpiry : Int<Ms>
 sessionExpiry = 3600000
@@ -160,11 +145,7 @@ impl ToJSON GossipEventType where
     GossipUnknown {} -> toJson {eventType: "unknown"}
 
 impl FromJSON GossipEventType where
-  parseJson t =
-    let raw = parseJson t : {eventType: Text, pubkey: PubkeyHex}
-    if raw.eventType == "online" then GossipOnline {raw.pubkey}
-    else if raw.eventType == "offline" then GossipOffline {raw.pubkey}
-    else GossipUnknown {}
+  parseJson t = (\raw -> if raw.eventType == "online" then GossipOnline {raw.pubkey} else if raw.eventType == "offline" then GossipOffline {raw.pubkey} else GossipUnknown {}) (parseJson t : {eventType: Text, pubkey: PubkeyHex})
 
 -- /messages is all-or-nothing per call: either every message in the batch is
 -- enqueued (delivered, federated, or buffered for federation), or none are
@@ -260,30 +241,13 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 -- declared body shape, `Err` produces a non-2xx response whose body is
 -- `{"error": "<code>"}`.
 
--- Per-pubkey token bucket on /auth/challenge: prevents one key from
--- exhausting the challenge pool by repeated nonce requests.
-challengeRateLimit = {
-  key: \input ctx -> Just {value: input.pubkey},
-  limit: {requests: maxChallengeRatePerKey, window: challengeRateWindowMs}
-}
-
--- Per-session token bucket on /messages, keyed by the Bearer token. A pubkey
--- is capped at `maxSessionsPerKey` live sessions, so the effective per-pubkey
--- send budget is bounded as well.
-sendRateLimit = {
-  key: \input ctx -> Just {value: input.authorization},
-  limit: {requests: maxSendRatePerKey, window: sendRateWindowMs}
-}
-
 route AuthApi where
-  POST {pubkey: PubkeyHex} /auth/challenge headers {xForwardedFor: Maybe Text} -> {challenge: Text, expiresAt: Timestamp}
-    rateLimit challengeRateLimit = ReqChallenge
+  POST {pubkey: PubkeyHex} /auth/challenge headers {xForwardedFor: Maybe Text} -> {challenge: Text, expiresAt: Timestamp} = ReqChallenge
   POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {xForwardedFor: Maybe Text} -> {token: Text, expiresAt: Timestamp} = VerifyAuth
 
 route ClientApi where
   POST {cursor: Timestamp} /poll headers {authorization: Text, xForwardedFor: Maybe Text} -> {events: [PollEvent], cursor: Timestamp} = Poll
-  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, xForwardedFor: Maybe Text} -> {}
-    rateLimit sendRateLimit = SendMessages
+  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, xForwardedFor: Maybe Text} -> {} = SendMessages
 
 route FederationApi where
   POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
@@ -471,7 +435,9 @@ forwardMatches = \blob server f -> f.encryptedBlob == blob && f.toServer == serv
 refreshLocalPresence : PubkeyHex -> Timestamp -> IO {rw *presence} [Text]
 refreshLocalPresence = \pubkey expiry -> do
   pres <- *presence
-  *presence = union (filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres) [{pubkey, server: serverHost, expiresAt: expiry}]
+  *presence = union (filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres) [
+    {pubkey, server: serverHost, expiresAt: expiry}
+  ]
   yield (collectPeers pres (\p -> p.server))
 
 -- ============================================
@@ -654,9 +620,7 @@ handlePoll = \cursor authorization clientIp -> do
         startWakeup <- *pollWakeup
         pres <- *presence
         let stale = not any (\p -> p.pubkey == pubkey && isLocalServer p.server && p.expiresAt - t >= sessionExpiry / 2) pres
-        refreshPeers <- if stale
-        then refreshLocalPresence pubkey (t + sessionExpiry)
-        else yield []
+        refreshPeers <- if stale then refreshLocalPresence pubkey (t + sessionExpiry) else yield []
         yield (Just {value: {pubkey, clampedCursor, startWakeup, refreshPeers}}))
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
@@ -682,7 +646,10 @@ doPoll = \s t -> do
     msgs <- *messages
     let fresh = filter (\m -> m.toKey == s.pubkey && tnow - m.receivedAt < messageMaxAge && m.receivedAt > s.clampedCursor) msgs
     let limited = take maxPollEvents (sortBy (\m -> m.receivedAt) fresh)
-    yield {events: map (\m -> {m.encryptedBlob}) limited, cursor: fold (\acc m -> max acc m.receivedAt) s.clampedCursor limited})
+    yield {
+      events: map (\m -> {m.encryptedBlob}) limited,
+      cursor: fold (\acc m -> max acc m.receivedAt) s.clampedCursor limited
+    })
   initial <- collectAt t
   if count initial.events > 0
   then yield initial
@@ -740,7 +707,7 @@ handleSendMessages = \messages authorization clientIp -> do
             appendMessage c.to c.encryptedBlob t
             when federationEnabled (do
               fwds <- *forwards
-              let newFwds = map (\s -> {toServer: s, toKey: c.to, encryptedBlob: c.encryptedBlob, retries: 0}) (filter (\s -> not any (forwardMatches c.encryptedBlob s) fwds) c.remoteServers)
+              let newFwds = map (\s -> {toServer: s, toKey: c.to, c.encryptedBlob, retries: 0}) (filter (\s -> not any (forwardMatches c.encryptedBlob s) fwds) c.remoteServers)
               *forwards = union fwds newFwds))
           yield staged)
         when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
@@ -796,7 +763,10 @@ handleRecvGossip = \events fromServer -> do
     newlyOnline <- atomic (do
       pres <- *presence
       let combined = fold (\acc e -> case e of
-        GossipOnline {pubkey} -> {touchedPubkeys: union acc.touchedPubkeys [pubkey], added: union acc.added [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]}
+        GossipOnline {pubkey} -> {
+          touchedPubkeys: union acc.touchedPubkeys [pubkey],
+          added: union acc.added [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
+        }
         GossipOffline {pubkey} -> {touchedPubkeys: union acc.touchedPubkeys [pubkey], acc.added}
         _ -> acc) {touchedPubkeys: [], added: []} events
       let kept = filter (\p -> p.server != fromServer || not elem p.pubkey combined.touchedPubkeys) pres
@@ -816,7 +786,7 @@ handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
   atomic (do
     pres <- *presence
-    if not (hasLocalPresence pres toKey t)
+    if not hasLocalPresence pres toKey t
     then yield (Err {error: {status: 404, message: "no_presence"}})
     else do
       appendMessage toKey encryptedBlob t
