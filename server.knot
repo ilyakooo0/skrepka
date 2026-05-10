@@ -720,29 +720,29 @@ handleChallenge : PubkeyHex -> Text -> IO {rw *authGlobalRateCount, rw *authGlob
 handleChallenge = \pubkey clientIp -> do
   t <- now
   preErr <- authPreCheck clientIp t
-  if preErr != ""
-  then yield (Err {error: {status: 429, message: preErr}})
-  else do
+  if preErr == ""
+  then do
     challenge <- genToken
     result <- atomic (do
       ch <- *challenges
       let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey
-      if count cappedActive >= maxChallenges
-      then yield "capacity"
-      else do
+      if not (count cappedActive >= maxChallenges)
+      then do
         chRates <- *challengeRates
         let chR = checkRate chRates pubkey maxChallengeRatePerKey challengeRateWindowMs t
         *challengeRates = chR.entries
-        if chR.limited
-        then yield "rate_limited"
-        else do
+        if not chR.limited
+        then do
           *challenges = union cappedActive [
             {pubkey, challenge, expiresAt: t + challengeExpiry, ip: clientIp}
           ]
-          yield "")
+          yield ""
+        else yield "rate_limited"
+      else yield "capacity")
     if result == ""
     then yield (Ok {value: {challenge, expiresAt: t + challengeExpiry}})
     else yield (Err {error: {status: if result == "capacity" then 503 else 429, message: result}})
+  else yield (Err {error: {status: 429, message: preErr}})
 
 -- POST /auth/verify: validate `signature` over `challenge` for `pubkey`.
 -- On success, mints a session token, records local presence (`pubkey` is now
