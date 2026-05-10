@@ -399,9 +399,9 @@ clientIpOf = \h -> case h of
 -- Pull the token out of an `Authorization: Bearer <token>` header. Returns
 -- Nothing if the prefix is missing or the token is empty.
 extractToken : Text -> Maybe Text
-extractToken = \h -> if hasPrefix "Bearer " h && drop 7 h != ""
-then Just {value: drop 7 h}
-else Nothing {}
+extractToken = \h -> (\token -> if hasPrefix "Bearer " h && token != ""
+then Just {value: token}
+else Nothing {}) (drop 7 h)
 
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
 -- the client IP matches. Runs `onAuth pubkey` on success, `onUnauth` otherwise.
@@ -469,6 +469,10 @@ nextSeqTs = \t seqCounter -> max t (seqCounter + 1)
 presenceForKey : [PresenceEntry] -> PubkeyHex -> Timestamp -> [PresenceEntry]
 presenceForKey = \presence pubkey t -> filter (\p -> p.pubkey == pubkey && p.expiresAt > t) presence
 
+-- True when `pk` has a live local presence row (i.e. is currently online here).
+hasLocalPresence : [PresenceEntry] -> PubkeyHex -> Timestamp -> Bool
+hasLocalPresence = \pres pk t -> any (\p -> p.pubkey == pk && isLocalServer p.server && p.expiresAt > t) pres
+
 -- Project items through `getServer`, drop our own hostname, and dedupe.
 -- Used to derive peer recipient lists from forwards/presence/etc.
 collectPeers : [a] -> (a -> Text) -> [Text]
@@ -502,8 +506,7 @@ pruneExpired = \t -> atomic do
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   *presence = filter (\p -> p.expiresAt > t) pres
-  let stillLive = \pk -> any (\k -> isLocalServer k.server && k.pubkey == pk && k.expiresAt > t) pres
-  yield (filter (\p -> p.expiresAt <= t && isLocalServer p.server && not (stillLive p.pubkey)) pres)
+  yield (filter (\p -> p.expiresAt <= t && isLocalServer p.server && not (hasLocalPresence pres p.pubkey t)) pres)
 
 -- ============================================
 -- Federation gossip
@@ -577,19 +580,6 @@ forwardQueuedToServer = \pubkey server -> atomic (do
   *forwards = union fwds newFwds)
 
 -- ============================================
--- Background loops
--- ============================================
--- Composite tick run from `backgroundPrune`: expire stale rows, then
--- opportunistically retry pending forwards.
-
--- One composite background tick: prune expired state, gossip offline for
--- locally-expired keys, and retry pending forwards.
-pruneAndRetry = \t -> do
-  expiredLocal <- pruneExpired t
-  fork (broadcastOfflineGossip expiredLocal)
-  when federationEnabled (fork retryPendingForwards)
-
--- ============================================
 -- Handler: challenge / verify
 -- ============================================
 -- Identity is a public key; there are no accounts. The flow is:
@@ -610,19 +600,16 @@ handleChallenge : PubkeyHex -> Text -> IO {rw *challenges, clock, random} (Resul
 handleChallenge = \pubkey clientIp -> do
   t <- now
   challenge <- genToken
-  full <- atomic (do
+  atomic (do
     ch <- *challenges
     let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey
     if count cappedActive >= maxChallenges
-    then yield (True {})
+    then yield (Err {error: {status: 503, message: "capacity"}})
     else do
       *challenges = union cappedActive [
         {pubkey, challenge, expiresAt: t + challengeExpiry, ip: clientIp}
       ]
-      yield (False {}))
-  if full
-  then yield (Err {error: {status: 503, message: "capacity"}})
-  else yield (Ok {value: {challenge, expiresAt: t + challengeExpiry}})
+      yield (Ok {value: {challenge, expiresAt: t + challengeExpiry}}))
 
 -- POST /auth/verify: validate `signature` over `challenge` for `pubkey`.
 -- On success, mints a session token, records local presence (`pubkey` is now
@@ -671,19 +658,13 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 --   * Wait on `pollWakeup` (bumped by send/heartbeat) and return new events
 --     plus piggybacked sender-side expirations/deliveries.
 
--- POST /poll: top-level dispatch. Hands off to `pollOnce` for the actual
--- long-poll body.
-handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
-handlePoll = \cursor authorization clientIp -> do
-  t <- now
-  pollOnce authorization cursor clientIp t
-
--- Body of a single poll. Treats the cursor advance as an implicit ack
+-- POST /poll: long-poll body. Treats the cursor advance as an implicit ack
 -- (`ackPolledMessages`), refreshes the caller's local presence row so peers
 -- don't time us out mid-session, then runs `doPoll` to collect events (or
 -- block until wakeup) and assembles the response.
-pollOnce : Text -> Int -> Text -> Int<Ms> -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
-pollOnce = \authorization cursor clientIp t -> do
+handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+handlePoll = \cursor authorization clientIp -> do
+  t <- now
   setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
     let clampedCursor = clamp 0 t cursor
     when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
@@ -825,7 +806,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
             let remaining = filter (\x -> not same x) fwds2
             *forwards = remaining
             pres <- *presence
-            let stillLocal = any (\p -> p.pubkey == to && isLocalServer p.server && p.expiresAt > t) pres
+            let stillLocal = hasLocalPresence pres to t
             let othersPending = any (\x -> x.encryptedBlob == encryptedBlob) remaining
             when (not stillLocal && not othersPending) (do
               msgs <- *messages
@@ -883,7 +864,7 @@ storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWa
 storeFederated = \toKey encryptedBlob t -> do
   pres <- *presence
   msgs <- *messages
-  if not any (\p -> p.pubkey == toKey && isLocalServer p.server && p.expiresAt > t) pres
+  if not (hasLocalPresence pres toKey t)
   then yield "no_presence"
   else do
     seq <- *seqCounter
@@ -925,18 +906,20 @@ api = serve Api where
 -- ============================================
 -- Background loops
 -- ============================================
--- `backgroundPrune` runs `pruneAndRetry` every `backgroundPruneInterval` ms.
+-- `backgroundPrune` runs the prune/retry sweep every `backgroundPruneInterval` ms.
 -- `pollHeartbeat` bumps `pollWakeup` every `pollTimeoutMs` so long-poll
 -- holders unblock and return an empty heartbeat response, keeping connections
 -- fresh.
 
--- Endless tick: prune immediately on first call, then every
--- `backgroundPruneInterval`. The startup prune clears stale rows persisted
--- by the previous process before the next interval elapses.
+-- Endless tick: prune expired state, gossip offline for locally-expired keys,
+-- and retry pending forwards. First sweep happens immediately so stale rows
+-- persisted by the previous process clear before the next interval elapses.
 backgroundPrune : IO {rw *challenges, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions, network, clock} a
 backgroundPrune = do
   t <- now
-  pruneAndRetry t
+  expiredLocal <- pruneExpired t
+  fork (broadcastOfflineGossip expiredLocal)
+  when federationEnabled (fork retryPendingForwards)
   sleep backgroundPruneInterval
   backgroundPrune
 
