@@ -115,6 +115,10 @@ retryBackoffBase = 30000
 -- Cap on federation retry backoff (8 min).
 retryBackoffMax : Int<Ms>
 retryBackoffMax = 480000
+-- How long a peer's failure record survives past its most recent failure (24 h).
+-- After this, accumulated backoff resets — the next attempt is treated as fresh.
+forwardFailureMaxAge : Int<Ms>
+forwardFailureMaxAge = 86400000
 
 -- Cadence of the background prune/cleanup task (30 s).
 backgroundPruneInterval : Int<Ms>
@@ -399,25 +403,18 @@ clientIpOf = \h -> case h of
   Just {value: ip} -> ip
   Nothing {} -> ""
 
--- Pull the token out of an `Authorization: Bearer <token>` header. Returns
--- Nothing if the prefix is missing or the token is empty.
-extractToken : Text -> Maybe Text
-extractToken = \h ->
-  let token = drop 7 h
-  if hasPrefix "Bearer " h && token != ""
-  then Just {value: token}
-  else Nothing {}
-
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
 -- the client IP matches. Runs `onAuth pubkey` on success, `onUnauth` otherwise.
 withSessionAuth : Text -> Int<Ms> -> Text -> IO e a -> (PubkeyHex -> IO e a) -> IO {r *sessions | e} a
 withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
   ses <- *sessions
-  case extractToken authorization of
-    Nothing {} -> onUnauth
-    Just {value: token} -> case findFirst ses (\s -> s.expiresAt > t && s.token == token && matchIp clientIp s.ip) of
-      Just {value: s} -> onAuth s.pubkey
-      _ -> onUnauth
+  let token = drop 7 authorization
+  let match = if hasPrefix "Bearer " authorization && token != ""
+    then findFirst ses (\s -> s.expiresAt > t && s.token == token && matchIp clientIp s.ip)
+    else Nothing {}
+  case match of
+    Just {value: s} -> onAuth s.pubkey
+    _ -> onUnauth
 
 -- True when `signature` is a valid Ed25519 signature by `pubkey` over `challenge`.
 -- False on any hex-decoding failure.
@@ -471,11 +468,6 @@ clearFailure = \server -> atomic (do
 -- generation, presence queries, and atomic mailbox/presence writes
 -- (callers supply the surrounding `atomic` block).
 
--- All unexpired presence rows for a given pubkey (may include both local and
--- remote entries — the recipient may live on multiple servers simultaneously).
-presenceForKey : [PresenceEntry] -> PubkeyHex -> Timestamp -> [PresenceEntry]
-presenceForKey = \presence pubkey t -> filter (\p -> p.pubkey == pubkey && p.expiresAt > t) presence
-
 -- True when `pk` has a live local presence row (i.e. is currently online here).
 hasLocalPresence : [PresenceEntry] -> PubkeyHex -> Timestamp -> Bool
 hasLocalPresence = \pres pk t -> any (\p -> p.pubkey == pk && isLocalServer p.server && p.expiresAt > t) pres
@@ -527,7 +519,7 @@ pruneExpired = \t -> atomic do
   msgs <- *messages
   *messages = filter (\m -> t - m.receivedAt < messageMaxAge) msgs
   ff <- *forwardFailures
-  *forwardFailures = filter (\f -> t - f.failedAt < 86400000) ff
+  *forwardFailures = filter (\f -> t - f.failedAt < forwardFailureMaxAge) ff
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   *presence = filter (\p -> p.expiresAt > t) pres
@@ -688,8 +680,7 @@ handlePoll = \cursor authorization clientIp -> do
     when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
     startWakeup <- *pollWakeup
     pres <- *presence
-    let mine = \p -> p.pubkey == pubkey && isLocalServer p.server
-    let stale = not any (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2) pres
+    let stale = not any (\p -> p.pubkey == pubkey && isLocalServer p.server && p.expiresAt - t >= sessionExpiry / 2) pres
     refreshPeers <- if stale
     then refreshLocalPresence pubkey (t + sessionExpiry)
     else yield []
@@ -773,7 +764,7 @@ handleSendMessages = \messages authorization clientIp -> do
         let staged = map (\m -> {
           m.to,
           m.encryptedBlob,
-          remoteServers: collectPeers (presenceForKey pres m.to t) (\p -> p.server)
+          remoteServers: collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server)
         }) limited
         forEach staged (\c -> commitSendMessage c.to c.encryptedBlob c.remoteServers t)
         yield staged)
