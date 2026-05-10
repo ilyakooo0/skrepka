@@ -662,11 +662,9 @@ handlePoll = \cursor authorization clientIp -> do
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
-      when federationEnabled (fork (sendBatchedGossip s.refreshPeers [
-        GossipOnline {s.pubkey}
-      ]))
+      when federationEnabled (fork (sendBatchedGossip s.refreshPeers [GossipOnline {s.pubkey}]))
       pollResult <- doPoll s t
-      yield (Ok {value: {pollResult.events, pollResult.cursor}})
+      yield (Ok {value: pollResult})
 
 -- One pass: collect this pubkey's unexpired messages newer than the cursor,
 -- sort by receivedAt, take up to `maxPollEvents`. The returned cursor is the
