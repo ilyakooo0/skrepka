@@ -549,11 +549,11 @@ sendBatchedGossip = \peers events -> forEach peers (\server -> do
       Ok _ -> clearFailure server))
 
 -- Tell known peers that the listed local pubkeys just went offline. No-op when
--- federation is disabled or the list is empty.
+-- the list is empty. Caller is responsible for the `federationEnabled` gate.
 broadcastOfflineGossip : [{pubkey: PubkeyHex | a}] -> IO {r *presence, rw *forwardFailures, network, clock} {}
-broadcastOfflineGossip = \expiredLocal -> do
+broadcastOfflineGossip = \expiredLocal -> when (count expiredLocal > 0) (do
   presence <- *presence
-  when (federationEnabled && count expiredLocal > 0) (sendBatchedGossip (knownPeerServersFromPresence presence) (map (\p -> GossipOffline {
+  sendBatchedGossip (knownPeerServersFromPresence presence) (map (\p -> GossipOffline {
     p.pubkey
   }) expiredLocal))
 
@@ -804,25 +804,23 @@ forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {r *presence, rw *forwardF
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
   fwds <- *forwards
   let same = \x -> x.encryptedBlob == encryptedBlob && x.toServer == server
-  case findFirst fwds same of
-    Nothing {} -> yield {}
-    Just {value: f} -> do
-      t <- now
-      result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
-      case result of
-        Err _ -> recordFailure server
-        Ok _ -> do
-          clearFailure server
-          atomic (do
-            fwds2 <- *forwards
-            let remaining = filter (\x -> not same x) fwds2
-            *forwards = remaining
-            pres <- *presence
-            let stillLocal = hasLocalPresence pres to t
-            let othersPending = any (\x -> x.encryptedBlob == encryptedBlob) remaining
-            when (not stillLocal && not othersPending) (do
-              msgs <- *messages
-              *messages = filter (\m -> m.encryptedBlob != encryptedBlob) msgs)))
+  when (any same fwds) (do
+    t <- now
+    result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
+    case result of
+      Err _ -> recordFailure server
+      Ok _ -> do
+        clearFailure server
+        atomic (do
+          fwds2 <- *forwards
+          let remaining = filter (\x -> not same x) fwds2
+          *forwards = remaining
+          pres <- *presence
+          let stillLocal = hasLocalPresence pres to t
+          let othersPending = any (\x -> x.encryptedBlob == encryptedBlob) remaining
+          when (not stillLocal && not othersPending) (do
+            msgs <- *messages
+            *messages = filter (\m -> m.encryptedBlob != encryptedBlob) msgs))))
 
 -- ============================================
 -- Handler: federation receive
@@ -848,15 +846,12 @@ handleRecvGossip = \events fromServer -> do
       let isOnline = \e -> case e of
         GossipOnline {pubkey: _} -> True {}
         _ -> False {}
-      let isOffline = \e -> case e of
-        GossipOffline {pubkey: _} -> True {}
-        _ -> False {}
       let pubkeyOf = \e -> case e of
         GossipOnline {pubkey} -> pubkey
         GossipOffline {pubkey} -> pubkey
         _ -> ""
       let onlinePubkeys = map pubkeyOf (filter isOnline events)
-      let touchedPubkeys = map pubkeyOf (filter (\e -> isOnline e || isOffline e) events)
+      let touchedPubkeys = filter (\pk -> pk != "") (map pubkeyOf events)
       let kept = filter (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys) pres
       let added = map (\pk -> {pubkey: pk, server: fromServer, expiresAt: t + onlineGossipTtl}) onlinePubkeys
       *presence = union kept added
@@ -920,8 +915,9 @@ backgroundPrune : IO {rw *challenges, rw *forwardFailures, rw *forwards, rw *mes
 backgroundPrune = do
   t <- now
   expiredLocal <- pruneExpired t
-  fork (broadcastOfflineGossip expiredLocal)
-  when federationEnabled (fork retryPendingForwards)
+  when federationEnabled (do
+    fork (broadcastOfflineGossip expiredLocal)
+    fork retryPendingForwards)
   sleep backgroundPruneInterval
   backgroundPrune
 
