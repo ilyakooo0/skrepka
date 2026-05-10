@@ -215,7 +215,7 @@ type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestam
 -- incremented by `retryPendingForwards` until `maxForwardRetries` is hit.
 -- Identity is derived from `encryptedBlob` (see `Message`).
 type ForwardEntry = {toServer: ServerName, toKey: PubkeyHex, encryptedBlob: BlobHex, retries: Int}
--- Running failure counter for a peer; keyed by `server`. Drives `retryBackoff`.
+-- Running failure counter for a peer; keyed by `server`. Drives `shouldRetryServer`.
 type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFailedAt: Timestamp}
 
 -- ============================================
@@ -241,7 +241,7 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFa
 *presence : [PresenceEntry]
 -- Cross-server outbox: messages queued for delivery to a peer, with retry counts.
 *forwards : [ForwardEntry]
--- Per-peer failure counters; drives `retryBackoff`.
+-- Per-peer failure counters; drives `shouldRetryServer`.
 *forwardFailures : [ForwardFailure]
 
 -- Strictly-monotonic sequence used as `Message.receivedAt`; guarantees poll-cursor ordering.
@@ -332,7 +332,7 @@ isValidHex = \s -> do
 
 -- Recursively strip every trailing "." from `s` (DNS root form).
 stripTrailingDot : Text -> Text
-stripTrailingDot = \s -> if containsSuffix "." s
+stripTrailingDot = \s -> if hasSuffix "." s
 then stripTrailingDot (take (count (chars s) - 1) s)
 else s
 
@@ -345,8 +345,8 @@ hasPrefix : Text -> Text -> Bool
 hasPrefix = \pre s -> take (count (chars pre)) s == pre
 
 -- True when `s` ends with `suffix`.
-containsSuffix : Text -> Text -> Bool
-containsSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix))) s == suffix
+hasSuffix : Text -> Text -> Bool
+hasSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix))) s == suffix
 
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
 -- tricks (octal, hex, percent-encoding) but covers the high-value cases:
@@ -365,7 +365,7 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contain
   "192.168.",
   "169.254.",
   "0."
-] || any (\s -> containsSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
+] || any (\s -> hasSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
 
 -- ============================================
 -- Auth helpers
@@ -417,14 +417,11 @@ verifySignature = \pubkey signature challenge -> case bytesFromHex pubkey of
 -- single read-side gate; `recordFailure`/`clearFailure` are the write side.
 -- There is no half-open state — a single success clears all accumulated failures.
 
--- Linear backoff: `retryBackoffBase * failures`, capped at `retryBackoffMax`.
-retryBackoff : Int -> Int<Ms>
-retryBackoff = \failures -> min retryBackoffMax (retryBackoffBase * max 1 failures)
-
 -- True when enough time has passed since the last failure for `server` to be
--- worth retrying (or no failure recorded at all).
+-- worth retrying (or no failure recorded at all). Linear backoff:
+-- `retryBackoffBase * failures`, capped at `retryBackoffMax`.
 shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
-shouldRetryServer = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < retryBackoff f.failures) failures
+shouldRetryServer = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < min retryBackoffMax (retryBackoffBase * max 1 f.failures)) failures
 
 -- Bump the failure counter for `server`. Preserves `firstFailedAt` across
 -- subsequent failures.
@@ -479,10 +476,8 @@ appendMessage = \toKey encryptedBlob t -> do
 refreshLocalPresence : PubkeyHex -> Timestamp -> IO {rw *presence} [Text]
 refreshLocalPresence = \pubkey expiry -> do
   pres <- *presence
-  let kept = filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres
-  let newPres = union kept [{pubkey, server: serverHost, expiresAt: expiry}]
-  *presence = newPres
-  yield (collectPeers newPres (\p -> p.server))
+  *presence = union (filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres) [{pubkey, server: serverHost, expiresAt: expiry}]
+  yield (collectPeers pres (\p -> p.server))
 
 -- ============================================
 -- Pruning
