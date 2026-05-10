@@ -156,7 +156,11 @@ impl ToJSON GossipEventType where
     GossipUnknown {} -> toJson {eventType: "unknown"}
 
 impl FromJSON GossipEventType where
-  parseJson t = (\raw -> if raw.eventType == "online" then GossipOnline {raw.pubkey} else if raw.eventType == "offline" then GossipOffline {raw.pubkey} else GossipUnknown {}) (parseJson t : {eventType: Text, pubkey: PubkeyHex})
+  parseJson t =
+    let raw = parseJson t : {eventType: Text, pubkey: PubkeyHex}
+    if raw.eventType == "online" then GossipOnline {raw.pubkey}
+    else if raw.eventType == "offline" then GossipOffline {raw.pubkey}
+    else GossipUnknown {}
 
 -- /messages is all-or-nothing per call: either every message in the batch is
 -- enqueued (delivered, federated, or buffered for federation), or none are
@@ -329,7 +333,7 @@ tooLong = \s maxLen -> count (chars s) > maxLen
 
 -- True when `s` is non-empty, even-length, and only lowercase hex digits.
 isValidHex : Text -> Bool
-isValidHex = \s ->
+isValidHex = \s -> do
   let cs = chars s
   let n = count cs
   n > 0 && n / 2 * 2 == n && all (\c -> contains c "0123456789abcdef") cs
@@ -440,11 +444,10 @@ recordFailure = \server -> do
   t <- now
   atomic (do
     failures <- *forwardFailures
-    let same = \f -> f.server == server
-    let new = case findFirst failures same of
+    let new = case findFirst failures (\f -> f.server == server) of
       Just {value: f} -> {server, failedAt: t, failures: f.failures + 1, f.firstFailedAt}
       _ -> {server, failedAt: t, failures: 1, firstFailedAt: t}
-    *forwardFailures = union (filter (\f -> not same f) failures) [new])
+    *forwardFailures = union (filter (\f -> f.server != server) failures) [new])
 
 -- Drop the failure record for `server` (called after any successful peer call).
 -- Single-success recovery — there is no half-open state.
@@ -838,14 +841,14 @@ handleRecvGossip = \events fromServer -> do
   else do
     newlyOnline <- atomic (do
       pres <- *presence
-      let touched = \pk -> any (\e -> case e of
-        GossipOnline {pubkey} -> pubkey == pk
-        GossipOffline {pubkey} -> pubkey == pk
-        _ -> False {}) events
+      let touchedPubkeys = fold (\acc e -> case e of
+        GossipOnline {pubkey} -> union acc [pubkey]
+        GossipOffline {pubkey} -> union acc [pubkey]
+        _ -> acc) [] events
       let added = fold (\acc e -> case e of
         GossipOnline {pubkey} -> union acc [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
         _ -> acc) [] events
-      let kept = filter (\p -> p.server != fromServer || not touched p.pubkey) pres
+      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys) pres
       *presence = union kept added
       yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) added)))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
