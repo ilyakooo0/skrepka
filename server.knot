@@ -452,10 +452,11 @@ clearFailure = \server -> atomic (do
   *forwardFailures = filter (\f -> f.server != server) forwardFailures)
 
 -- ============================================
--- Common utility queries
+-- Common helpers
 -- ============================================
--- Pure helpers shared by send/poll/federation paths: monotonic sequence
--- generation and presence lookup.
+-- Helpers shared by send/poll/federation paths: monotonic sequence
+-- generation, presence queries, and atomic mailbox/presence writes
+-- (callers supply the surrounding `atomic` block).
 
 -- Strictly-monotonic next sequence timestamp: max of wall clock and prior+1.
 -- Guarantees /poll cursors order events even when many arrive in the same ms.
@@ -480,6 +481,28 @@ collectPeers = \items getServer -> filter isRemote (map getServer items)
 -- broadcast set we know about, less ourselves).
 knownPeerServersFromPresence : [PresenceEntry] -> [Text]
 knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.server)
+
+-- Append one ciphertext to the local mailbox under a fresh monotonic
+-- sequence and bump pollWakeup so blocked /poll holders unblock. Caller
+-- wraps in `atomic`.
+appendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, rw *seqCounter} {}
+appendMessage = \toKey encryptedBlob t -> do
+  msgs <- *messages
+  seq <- *seqCounter
+  let seqTs = nextSeqTs t seq
+  *seqCounter = seqTs
+  *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
+  *pollWakeup = seqTs
+
+-- Replace any local presence rows for `pubkey` with one fresh row at
+-- `expiry`, and return the post-update peer broadcast set. Caller wraps in
+-- `atomic`.
+refreshLocalPresence : [PresenceEntry] -> PubkeyHex -> Timestamp -> IO {rw *presence} [Text]
+refreshLocalPresence = \pres pubkey expiry -> do
+  let kept = filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres
+  let newPres = union kept [{pubkey, server: serverHost, expiresAt: expiry}]
+  *presence = newPres
+  yield (knownPeerServersFromPresence newPres)
 
 -- ============================================
 -- Pruning
@@ -638,10 +661,8 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
       let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
       *sessions = capList (union pruned [newSession]) maxSessions
       pres <- *presence
-      let prunedPres = filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres
-      let newPres = union prunedPres [{pubkey, server: serverHost, expiresAt: expiry}]
-      *presence = newPres
-      yield (Just {value: knownPeerServersFromPresence newPres}))
+      peers <- refreshLocalPresence pres pubkey expiry
+      yield (Just {value: peers}))
   case result of
     Nothing {} -> yield (Err {error: {status: 401, message: "invalid"}})
     Just {value: peers} -> do
@@ -672,10 +693,8 @@ handlePoll = \cursor authorization clientIp -> do
     let stale = not any (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2) pres
     refreshPeers <- if stale
     then do
-      let kept = filter (\p -> not mine p) pres
-      let newPres = union kept [{pubkey, server: serverHost, expiresAt: t + sessionExpiry}]
-      *presence = newPres
-      yield (Just {value: knownPeerServersFromPresence newPres})
+      peers <- refreshLocalPresence pres pubkey (t + sessionExpiry)
+      yield (Just {value: peers})
     else yield (Nothing {})
     yield (Just {value: {pubkey, clampedCursor, startWakeup, refreshPeers}}))
   case setup of
@@ -769,12 +788,7 @@ handleSendMessages = \messages authorization clientIp -> do
 -- via `resolveSendTarget`.
 commitSendMessage : PubkeyHex -> BlobHex -> [Text] -> Int<Ms> -> IO {rw *forwards, rw *messages, rw *pollWakeup, rw *seqCounter} {}
 commitSendMessage = \to encryptedBlob remoteServers t -> do
-  msgs <- *messages
-  seq <- *seqCounter
-  let seqTs = nextSeqTs t seq
-  *seqCounter = seqTs
-  *messages = union msgs [{toKey: to, encryptedBlob, receivedAt: seqTs}]
-  *pollWakeup = seqTs
+  appendMessage to encryptedBlob t
   when federationEnabled (do
     fwds <- *forwards
     let newFwds = map (\s -> {toServer: s, toKey: to, encryptedBlob, retries: 0}) (filter (\s -> not any (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s) fwds) remoteServers)
@@ -860,15 +874,10 @@ handleRecvGossip = \events fromServer -> do
 storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter} (Result HttpError {})
 storeFederated = \toKey encryptedBlob t -> do
   pres <- *presence
-  msgs <- *messages
   if not (hasLocalPresence pres toKey t)
   then yield (Err {error: {status: 404, message: "no_presence"}})
   else do
-    seq <- *seqCounter
-    let seqTs = nextSeqTs t seq
-    *seqCounter = seqTs
-    *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
-    *pollWakeup = seqTs
+    appendMessage toKey encryptedBlob t
     yield (Ok {value: {}})
 
 -- POST /federation/forward: receive a single federated message destined for
