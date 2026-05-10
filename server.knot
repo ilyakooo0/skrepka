@@ -254,9 +254,7 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFa
 
 -- Per-pubkey token bucket on /auth/challenge: prevents one key from
 -- exhausting the challenge pool by repeated nonce requests.
--- (`export` is a workaround for a compiler bug where the unused-name pass
--- doesn't walk route `rateLimit` clauses.)
-export challengeRateLimit = {
+challengeRateLimit = {
   key: \input ctx -> Just {value: input.pubkey},
   limit: {requests: maxChallengeRatePerKey, window: challengeRateWindowMs}
 }
@@ -264,7 +262,7 @@ export challengeRateLimit = {
 -- Per-session token bucket on /messages, keyed by the Bearer token. A pubkey
 -- is capped at `maxSessionsPerKey` live sessions, so the effective per-pubkey
 -- send budget is bounded as well.
-export sendRateLimit = {
+sendRateLimit = {
   key: \input ctx -> Just {value: input.authorization},
   limit: {requests: maxSendRatePerKey, window: sendRateWindowMs}
 }
