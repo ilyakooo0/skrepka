@@ -299,11 +299,6 @@ route Api = AuthApi | ClientApi | FederationApi
 -- Everything is intentionally O(n) over flat lists; performance is sacrificed
 -- for clarity per the file header.
 
--- Run `action` only when `cond` is True; otherwise no-op.
--- Confine `x` to the closed interval [lo, hi].
-clamp : Ord a => a -> a -> a -> a
-clamp = \lo hi x -> max lo (min hi x)
-
 -- Cap to maxN by dropping the soonest-to-expire entries (LRU-style). Always
 -- sorts by `expiresAt` so the oldest/most-stale entries are evicted first.
 capList : [{expiresAt: Timestamp | r}] -> Int -> [{expiresAt: Timestamp | r}]
@@ -376,7 +371,7 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contain
 -- Auth helpers
 -- ============================================
 -- Bearer token extraction and session lookup. Authenticated handlers funnel
--- through `withSessionAuth`; per-endpoint rate limiting is enforced by the
+-- through `authedPubkey`; per-endpoint rate limiting is enforced by the
 -- compiler-generated `rateLimit` clauses on each route.
 -- Federation requests are unauthenticated: anyone can hit /federation/*.
 -- The `no_presence` check bounds federated forwards to currently-online keys.
@@ -393,17 +388,17 @@ clientIpOf = \h -> case h of
   Nothing {} -> ""
 
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
--- the client IP matches. Runs `onAuth pubkey` on success, `onUnauth` otherwise.
-withSessionAuth : Text -> Int<Ms> -> Text -> IO e a -> (PubkeyHex -> IO e a) -> IO {r *sessions | e} a
-withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
+-- the client IP matches. Returns Nothing on missing/invalid token.
+authedPubkey : Text -> Int<Ms> -> Text -> IO {r *sessions} (Maybe PubkeyHex)
+authedPubkey = \authorization t clientIp -> do
   ses <- *sessions
-  let token = drop 7 authorization
-  let match = if hasPrefix "Bearer " authorization && token != ""
-    then findFirst ses (\s -> s.expiresAt > t && s.token == token && matchIp clientIp s.ip)
-    else Nothing {}
-  case match of
-    Just {value: s} -> onAuth s.pubkey
-    _ -> onUnauth
+  if not hasPrefix "Bearer " authorization
+  then yield (Nothing {})
+  else do
+    let token = drop 7 authorization
+    case findFirst ses (\s -> s.expiresAt > t && s.token == token && matchIp clientIp s.ip) of
+      Just {value: s} -> yield (Just {value: s.pubkey})
+      _ -> yield (Nothing {})
 
 -- True when `signature` is a valid Ed25519 signature by `pubkey` over `challenge`.
 -- False on any hex-decoding failure.
@@ -524,10 +519,10 @@ pruneExpired = \t -> atomic do
 -- Fan out one bundle of gossip events to each peer, skipping peers in backoff.
 -- Records or clears federation-failure counters per call.
 sendBatchedGossip : [Text] -> [GossipEventType] -> IO {rw *forwardFailures, network, clock} {}
-sendBatchedGossip = \peers events -> forEach peers (\server -> do
+sendBatchedGossip = \peers events -> do
   t <- now
   failures <- *forwardFailures
-  when (shouldRetryServer server t failures) (do
+  forEach peers (\server -> when (shouldRetryServer server t failures) (do
     result <- fetch (federationUrl server) (RecvGossip {events, fromServer: serverHost})
     case result of
       Err _ -> recordFailure server
@@ -637,7 +632,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
       *challenges = filter (\c -> not same c) ch
       ses <- *sessions
       let pruned = if revokeOthers
-      then filter (\s -> not (s.pubkey == pubkey)) ses
+      then filter (\s -> s.pubkey != pubkey) ses
       else capPerKey ses pubkey maxSessionsPerKey
       let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
       *sessions = capList (union pruned [newSession]) maxSessions
@@ -664,16 +659,20 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
 handlePoll = \cursor authorization clientIp -> do
   t <- now
-  setup <- atomic withSessionAuth authorization t clientIp (yield (Nothing {})) (\pubkey -> do
-    let clampedCursor = clamp 0 t cursor
-    when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
-    startWakeup <- *pollWakeup
-    pres <- *presence
-    let stale = not any (\p -> p.pubkey == pubkey && isLocalServer p.server && p.expiresAt - t >= sessionExpiry / 2) pres
-    refreshPeers <- if stale
-    then refreshLocalPresence pubkey (t + sessionExpiry)
-    else yield []
-    yield (Just {value: {pubkey, clampedCursor, startWakeup, refreshPeers}}))
+  setup <- atomic (do
+    auth <- authedPubkey authorization t clientIp
+    case auth of
+      Nothing {} -> yield (Nothing {})
+      Just {value: pubkey} -> do
+        let clampedCursor = max 0 (min t cursor)
+        when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
+        startWakeup <- *pollWakeup
+        pres <- *presence
+        let stale = not any (\p -> p.pubkey == pubkey && isLocalServer p.server && p.expiresAt - t >= sessionExpiry / 2) pres
+        refreshPeers <- if stale
+        then refreshLocalPresence pubkey (t + sessionExpiry)
+        else yield []
+        yield (Just {value: {pubkey, clampedCursor, startWakeup, refreshPeers}}))
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
@@ -739,27 +738,30 @@ ackPolledMessages = \pubkey cursor -> do
 handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {r *presence, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *pollWakeup, rw *seqCounter, network, clock} (Result HttpError {})
 handleSendMessages = \messages authorization clientIp -> do
   t <- now
-  withSessionAuth authorization t clientIp (yield (Err {error: {status: 401, message: "unauthorized"}})) (\senderKey -> do
-    let limited = take maxBatchSize messages
-    if any (\m -> m.to == senderKey) limited
-    then yield (Err {error: {status: 400, message: "self_send"}})
-    else do
-      committed <- atomic (do
-        pres <- *presence
-        let staged = map (\m -> {
-          m.to,
-          m.encryptedBlob,
-          remoteServers: collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server)
-        }) limited
-        forEach staged (\c -> do
-          appendMessage c.to c.encryptedBlob t
-          when federationEnabled (do
-            fwds <- *forwards
-            let newFwds = map (\s -> {toServer: s, toKey: c.to, encryptedBlob: c.encryptedBlob, retries: 0}) (filter (\s -> not any (\f -> f.encryptedBlob == c.encryptedBlob && f.toServer == s) fwds) c.remoteServers)
-            *forwards = union fwds newFwds))
-        yield staged)
-      when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
-      yield (Ok {value: {}}))
+  auth <- authedPubkey authorization t clientIp
+  case auth of
+    Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
+    Just {value: senderKey} -> do
+      let limited = take maxBatchSize messages
+      if any (\m -> m.to == senderKey) limited
+      then yield (Err {error: {status: 400, message: "self_send"}})
+      else do
+        committed <- atomic (do
+          pres <- *presence
+          let staged = map (\m -> {
+            m.to,
+            m.encryptedBlob,
+            remoteServers: collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server)
+          }) limited
+          forEach staged (\c -> do
+            appendMessage c.to c.encryptedBlob t
+            when federationEnabled (do
+              fwds <- *forwards
+              let newFwds = map (\s -> {toServer: s, toKey: c.to, encryptedBlob: c.encryptedBlob, retries: 0}) (filter (\s -> not any (\f -> f.encryptedBlob == c.encryptedBlob && f.toServer == s) fwds) c.remoteServers)
+              *forwards = union fwds newFwds))
+          yield staged)
+        when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
+        yield (Ok {value: {}})
 
 -- Fire one /federation/forward call per pre-staged server. On success the
 -- corresponding row in `forwards` is pruned, and if no other forwards remain
