@@ -177,7 +177,7 @@ impl FromJSON GossipEventType where
 
 -- True when `s` is non-empty lowercase hex of even length, with `maxLen` ceiling.
 isValidBoundedHex : Int -> Text -> Bool
-isValidBoundedHex = \maxLen s -> not tooLong s maxLen && isValidHex s
+isValidBoundedHex = \maxLen s -> count (chars s) <= maxLen && isValidHex s
 -- True when `s` is lowercase hex of exactly `exactLen` characters (even by definition).
 isValidExactHex : Int -> Text -> Bool
 isValidExactHex = \exactLen s -> count (chars s) == exactLen && isValidHex s
@@ -193,7 +193,7 @@ type SignatureHex = Text where isValidExactHex 128
 -- `serverHost = "localhost"` flow through presence rows in a non-federated
 -- single-node deployment.
 isValidServerName : Text -> Bool
-isValidServerName = \s -> not tooLong s maxServerNameLen && s == normalizeServerName s
+isValidServerName = \s -> count (chars s) <= maxServerNameLen && s == toLower (stripTrailingDot s)
 type ServerName = Text where isValidServerName
 
 -- Wall-clock time in milliseconds since epoch.
@@ -331,10 +331,6 @@ else do
 genToken : IO {random} Text
 genToken = genTokenN 48
 
--- True when `s` exceeds `maxLen` characters.
-tooLong : Text -> Int -> Bool
-tooLong = \s maxLen -> count (chars s) > maxLen
-
 -- True when `s` is non-empty, even-length, and only lowercase hex digits.
 isValidHex : Text -> Bool
 isValidHex = \s -> do
@@ -347,10 +343,6 @@ stripTrailingDot : Text -> Text
 stripTrailingDot = \s -> if containsSuffix "." s
 then stripTrailingDot (take (count (chars s) - 1) s)
 else s
-
--- Canonical form of a hostname: lowercase, no trailing dot.
-normalizeServerName : Text -> Text
-normalizeServerName = \s -> toLower (stripTrailingDot s)
 
 -- True when `s` refers to this server.
 isLocalServer : Text -> Bool
@@ -372,7 +364,7 @@ containsSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix
 -- (so we never `fetch` a peer pubkey from loopback) and on inbound requests
 -- (so a peer can't claim a bogus `fromServer`).
 isBadServerName : Text -> Bool
-isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (\c -> contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || any (\p -> hasPrefix p sn) [
+isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || any (\p -> hasPrefix p sn) [
   ".",
   ":",
   "[",
@@ -766,22 +758,15 @@ handleSendMessages = \messages authorization clientIp -> do
           m.encryptedBlob,
           remoteServers: collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server)
         }) limited
-        forEach staged (\c -> commitSendMessage c.to c.encryptedBlob c.remoteServers t)
+        forEach staged (\c -> do
+          appendMessage c.to c.encryptedBlob t
+          when federationEnabled (do
+            fwds <- *forwards
+            let newFwds = map (\s -> {toServer: s, toKey: c.to, encryptedBlob: c.encryptedBlob, retries: 0}) (filter (\s -> not any (\f -> f.encryptedBlob == c.encryptedBlob && f.toServer == s) fwds) c.remoteServers)
+            *forwards = union fwds newFwds))
         yield staged)
       when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
       yield (Ok {value: {}}))
-
--- Allocate a monotonic receivedAt via `seqCounter`, append the message to
--- the mailbox, and pre-stage forwards for any remote presence rows that
--- already exist for `to`. Caller must have already validated the message
--- via `resolveSendTarget`.
-commitSendMessage : PubkeyHex -> BlobHex -> [Text] -> Int<Ms> -> IO {rw *forwards, rw *messages, rw *pollWakeup, rw *seqCounter} {}
-commitSendMessage = \to encryptedBlob remoteServers t -> do
-  appendMessage to encryptedBlob t
-  when federationEnabled (do
-    fwds <- *forwards
-    let newFwds = map (\s -> {toServer: s, toKey: to, encryptedBlob, retries: 0}) (filter (\s -> not any (\f -> f.encryptedBlob == encryptedBlob && f.toServer == s) fwds) remoteServers)
-    *forwards = union fwds newFwds)
 
 -- Fire one /federation/forward call per pre-staged server. On success the
 -- corresponding row in `forwards` is pruned, and if no other forwards remain
@@ -832,16 +817,13 @@ handleRecvGossip = \events fromServer -> do
   else do
     newlyOnline <- atomic (do
       pres <- *presence
-      let touchedPubkeys = fold (\acc e -> case e of
-        GossipOnline {pubkey} -> union acc [pubkey]
-        GossipOffline {pubkey} -> union acc [pubkey]
-        _ -> acc) [] events
-      let added = fold (\acc e -> case e of
-        GossipOnline {pubkey} -> union acc [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
-        _ -> acc) [] events
-      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys) pres
-      *presence = union kept added
-      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) added)))
+      let combined = fold (\acc e -> case e of
+        GossipOnline {pubkey} -> {touchedPubkeys: union acc.touchedPubkeys [pubkey], added: union acc.added [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]}
+        GossipOffline {pubkey} -> {touchedPubkeys: union acc.touchedPubkeys [pubkey], acc.added}
+        _ -> acc) {touchedPubkeys: [], added: []} events
+      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey combined.touchedPubkeys) pres
+      *presence = union kept combined.added
+      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) combined.added)))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
