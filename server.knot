@@ -329,7 +329,10 @@ tooLong = \s maxLen -> count (chars s) > maxLen
 
 -- True when `s` is non-empty, even-length, and only lowercase hex digits.
 isValidHex : Text -> Bool
-isValidHex = \s -> (\cs -> (\n -> n > 0 && n / 2 * 2 == n && all (\c -> contains c "0123456789abcdef") cs) (count cs)) (chars s)
+isValidHex = \s ->
+  let cs = chars s
+  let n = count cs
+  n > 0 && n / 2 * 2 == n && all (\c -> contains c "0123456789abcdef") cs
 
 -- Recursively strip every trailing "." from `s` (DNS root form).
 stripTrailingDot : Text -> Text
@@ -344,9 +347,6 @@ normalizeServerName = \s -> toLower (stripTrailingDot s)
 -- True when `s` refers to this server.
 isLocalServer : Text -> Bool
 isLocalServer = \s -> s == serverHost
--- True when `s` refers to any server other than this one.
-isRemote : Text -> Bool
-isRemote = \s -> not isLocalServer s
 
 -- True when `s` starts with `pre`.
 hasPrefix : Text -> Text -> Bool
@@ -399,9 +399,11 @@ clientIpOf = \h -> case h of
 -- Pull the token out of an `Authorization: Bearer <token>` header. Returns
 -- Nothing if the prefix is missing or the token is empty.
 extractToken : Text -> Maybe Text
-extractToken = \h -> (\token -> if hasPrefix "Bearer " h && token != ""
-then Just {value: token}
-else Nothing {}) (drop 7 h)
+extractToken = \h ->
+  let token = drop 7 h
+  if hasPrefix "Bearer " h && token != ""
+  then Just {value: token}
+  else Nothing {}
 
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
 -- the client IP matches. Runs `onAuth pubkey` on success, `onUnauth` otherwise.
@@ -458,11 +460,6 @@ clearFailure = \server -> atomic (do
 -- generation, presence queries, and atomic mailbox/presence writes
 -- (callers supply the surrounding `atomic` block).
 
--- Strictly-monotonic next sequence timestamp: max of wall clock and prior+1.
--- Guarantees /poll cursors order events even when many arrive in the same ms.
-nextSeqTs : Timestamp -> Timestamp -> Timestamp
-nextSeqTs = \t seqCounter -> max t (seqCounter + 1)
-
 -- All unexpired presence rows for a given pubkey (may include both local and
 -- remote entries — the recipient may live on multiple servers simultaneously).
 presenceForKey : [PresenceEntry] -> PubkeyHex -> Timestamp -> [PresenceEntry]
@@ -475,12 +472,7 @@ hasLocalPresence = \pres pk t -> any (\p -> p.pubkey == pk && isLocalServer p.se
 -- Project items through `getServer`, drop our own hostname, and dedupe.
 -- Used to derive peer recipient lists from forwards/presence/etc.
 collectPeers : [a] -> (a -> Text) -> [Text]
-collectPeers = \items getServer -> filter isRemote (map getServer items)
-
--- All distinct remote hostnames currently appearing in `presence` (the gossip
--- broadcast set we know about, less ourselves).
-knownPeerServersFromPresence : [PresenceEntry] -> [Text]
-knownPeerServersFromPresence = \presence -> collectPeers presence (\p -> p.server)
+collectPeers = \items getServer -> filter (\s -> not isLocalServer s) (map getServer items)
 
 -- Append one ciphertext to the local mailbox under a fresh monotonic
 -- sequence and bump pollWakeup so blocked /poll holders unblock. Caller
@@ -489,7 +481,7 @@ appendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWak
 appendMessage = \toKey encryptedBlob t -> do
   msgs <- *messages
   seq <- *seqCounter
-  let seqTs = nextSeqTs t seq
+  let seqTs = max t (seq + 1)
   *seqCounter = seqTs
   *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
   *pollWakeup = seqTs
@@ -497,12 +489,13 @@ appendMessage = \toKey encryptedBlob t -> do
 -- Replace any local presence rows for `pubkey` with one fresh row at
 -- `expiry`, and return the post-update peer broadcast set. Caller wraps in
 -- `atomic`.
-refreshLocalPresence : [PresenceEntry] -> PubkeyHex -> Timestamp -> IO {rw *presence} [Text]
-refreshLocalPresence = \pres pubkey expiry -> do
+refreshLocalPresence : PubkeyHex -> Timestamp -> IO {rw *presence} [Text]
+refreshLocalPresence = \pubkey expiry -> do
+  pres <- *presence
   let kept = filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres
   let newPres = union kept [{pubkey, server: serverHost, expiresAt: expiry}]
   *presence = newPres
-  yield (knownPeerServersFromPresence newPres)
+  yield (collectPeers newPres (\p -> p.server))
 
 -- ============================================
 -- Pruning
@@ -553,7 +546,7 @@ sendBatchedGossip = \peers events -> forEach peers (\server -> do
 broadcastOfflineGossip : [{pubkey: PubkeyHex | a}] -> IO {r *presence, rw *forwardFailures, network, clock} {}
 broadcastOfflineGossip = \expiredLocal -> when (count expiredLocal > 0) (do
   presence <- *presence
-  sendBatchedGossip (knownPeerServersFromPresence presence) (map (\p -> GossipOffline {
+  sendBatchedGossip (collectPeers presence (\p -> p.server)) (map (\p -> GossipOffline {
     p.pubkey
   }) expiredLocal))
 
@@ -660,8 +653,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
       else capPerKey ses pubkey maxSessionsPerKey
       let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
       *sessions = capList (union pruned [newSession]) maxSessions
-      pres <- *presence
-      peers <- refreshLocalPresence pres pubkey expiry
+      peers <- refreshLocalPresence pubkey expiry
       yield (Just {value: peers}))
   case result of
     Nothing {} -> yield (Err {error: {status: 401, message: "invalid"}})
@@ -693,7 +685,7 @@ handlePoll = \cursor authorization clientIp -> do
     let stale = not any (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2) pres
     refreshPeers <- if stale
     then do
-      peers <- refreshLocalPresence pres pubkey (t + sessionExpiry)
+      peers <- refreshLocalPresence pubkey (t + sessionExpiry)
       yield (Just {value: peers})
     else yield (Nothing {})
     yield (Just {value: {pubkey, clampedCursor, startWakeup, refreshPeers}}))
@@ -733,7 +725,10 @@ doPoll = \s t -> do
 -- which the client echoes on the next /poll to advance — and which the
 -- server treats as an implicit ack.
 collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp}
-collectPollEvents = \messages pubkey cursor t -> (\limited -> {events: map (\m -> {m.encryptedBlob}) limited, cursor: fold (\acc m -> max acc m.receivedAt) cursor limited}) (take maxPollEvents (sortBy (\m -> m.receivedAt) (filter (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor) messages)))
+collectPollEvents = \messages pubkey cursor t ->
+  let fresh = filter (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor) messages
+  let limited = take maxPollEvents (sortBy (\m -> m.receivedAt) fresh)
+  {events: map (\m -> {m.encryptedBlob}) limited, cursor: fold (\acc m -> max acc m.receivedAt) cursor limited}
 
 -- Treat the supplied cursor as an ack: drop all messages with
 -- receivedAt <= cursor, plus their pending forwards.
@@ -838,24 +833,21 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
 handleRecvGossip : [GossipEventType] -> Text -> IO {r *messages, rw *forwards, rw *presence, clock} (Result HttpError {})
 handleRecvGossip = \events fromServer -> do
   t <- now
-  if not isRemote fromServer || isBadServerName fromServer || count events > maxGossipEvents
+  if isLocalServer fromServer || isBadServerName fromServer || count events > maxGossipEvents
   then yield (Err {error: {status: 400, message: "invalid_request"}})
   else do
     newlyOnline <- atomic (do
       pres <- *presence
-      let isOnline = \e -> case e of
-        GossipOnline {pubkey: _} -> True {}
-        _ -> False {}
-      let pubkeyOf = \e -> case e of
-        GossipOnline {pubkey} -> pubkey
-        GossipOffline {pubkey} -> pubkey
-        _ -> ""
-      let onlinePubkeys = map pubkeyOf (filter isOnline events)
-      let touchedPubkeys = filter (\pk -> pk != "") (map pubkeyOf events)
-      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys) pres
-      let added = map (\pk -> {pubkey: pk, server: fromServer, expiresAt: t + onlineGossipTtl}) onlinePubkeys
+      let touched = \pk -> any (\e -> case e of
+        GossipOnline {pubkey} -> pubkey == pk
+        GossipOffline {pubkey} -> pubkey == pk
+        _ -> False {}) events
+      let added = fold (\acc e -> case e of
+        GossipOnline {pubkey} -> union acc [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
+        _ -> acc) [] events
+      let kept = filter (\p -> p.server != fromServer || not touched p.pubkey) pres
       *presence = union kept added
-      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) onlinePubkeys))
+      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) added)))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
