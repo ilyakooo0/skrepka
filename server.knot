@@ -1,6 +1,7 @@
 -- Skrepka Relay Server (maximally simplified)
 -- Single-server implementation of the Skrepka protocol (v0.1).
--- Every collection is a flat list; rate limiters are plain count-per-window.
+-- Every collection is a flat list; rate limiting is delegated to the
+-- compiler's per-endpoint `rateLimit` clauses on each route.
 -- Token comparison is plain `==` (timing-attack vulnerable), retry backoff is linear,
 -- and many helpers are inlined. Performance suffers; clarity is the only goal.
 
@@ -8,7 +9,7 @@
 -- Configuration
 -- ============================================
 -- Top-level constants: bind address, federation identity, capacity ceilings,
--- per-key/window rate limits, and expiry/backoff/TTL durations.
+-- per-endpoint rate-limit budgets, and expiry/backoff/TTL durations.
 -- Values written here are defaults; every scalar (Int/Float/Text/Bool/Maybe ...)
 -- top-level constant can be overridden at startup via `--name=value` on the
 -- command line (see Knot's `knot_override_lookup`). Run with `--help` for the
@@ -81,36 +82,20 @@ maxSessionsPerKey = 10
 -- Validity window for an auth challenge before it must be re-issued (1 min).
 challengeExpiry : Int<Ms>
 challengeExpiry = 60000
--- Challenge requests permitted per key inside its rate window.
+-- Challenge requests permitted per pubkey inside its rate window.
+-- Wired into the /auth/challenge route's `rateLimit` clause.
 maxChallengeRatePerKey : Int
 maxChallengeRatePerKey = 5
--- Window over which the per-key challenge rate is measured (1 s).
+-- Window over which the per-pubkey challenge rate is measured (1 s).
 challengeRateWindowMs : Int<Ms>
 challengeRateWindowMs = 1000
--- Send-message requests permitted per key per window.
+-- Send-message requests permitted per session token per window.
+-- Wired into the /messages route's `rateLimit` clause.
 maxSendRatePerKey : Int
 maxSendRatePerKey = 20
--- Window for the per-key send rate limit (1 s).
+-- Window for the per-session send rate limit (1 s).
 sendRateWindowMs : Int<Ms>
 sendRateWindowMs = 1000
--- Requests permitted per source IP per window (covers unauthenticated traffic).
-maxIpRatePerIp : Int
-maxIpRatePerIp = 10
--- Window for the per-IP rate limit (1 s).
-ipRateWindowMs : Int<Ms>
-ipRateWindowMs = 1000
--- Global ceiling on total request rate across all clients.
-maxGlobalRequestRate : Int
-maxGlobalRequestRate = 1000
--- Window for the global request rate limit (1 s).
-globalRateWindowMs : Int<Ms>
-globalRateWindowMs = 1000
--- Global ceiling on auth-endpoint requests (challenge + verify combined).
-maxAuthGlobalRate : Int
-maxAuthGlobalRate = 200
--- Window for the global auth rate limit (1 s).
-authGlobalRateWindowMs : Int<Ms>
-authGlobalRateWindowMs = 1000
 
 -- How long a session token remains valid after issue (1 hour).
 sessionExpiry : Int<Ms>
@@ -175,10 +160,10 @@ impl FromJSON GossipEventType where
 
 -- /messages is all-or-nothing per call: either every message in the batch is
 -- enqueued (delivered, federated, or buffered for federation), or none are
--- and the call returns a non-2xx HTTP status. Per-message rejection codes
--- ("self_send", "rate_limited") surface as the HTTP error body. Rate
--- counters are still charged for every attempted message even on rejection,
--- so a sender can't probe limits cheaply.
+-- and the call returns a non-2xx HTTP status. The per-message rejection code
+-- "self_send" surfaces in the HTTP error body. Per-session rate limiting is
+-- enforced by the route's `rateLimit` clause, which short-circuits with 429
+-- before the handler runs.
 -- The sender's UI treats every success the same and learns "they got it"
 -- only via the recipient's E2E ack.
 
@@ -224,11 +209,6 @@ type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestam
 type ForwardEntry = {toServer: ServerName, toKey: PubkeyHex, encryptedBlob: BlobHex, retries: Int}
 -- Running failure counter for a peer; keyed by `server`. Drives `retryBackoff`.
 type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int, firstFailedAt: Timestamp}
--- One fixed-window rate counter. `key` identifies the subject (pubkey, ip,
--- server, or composite "sender|recipient" string). `expiresAt` is the wall
--- time at which the current window ends; once `t >= expiresAt` the entry is
--- recycled (counter resets to 1).
-type RateEntry = {key: Text, expiresAt: Timestamp, count: Int}
 
 -- ============================================
 -- Persisted State (all flat lists, no sharding)
@@ -236,7 +216,9 @@ type RateEntry = {key: Text, expiresAt: Timestamp, count: Int}
 -- Mutable refs (`*x`) holding the entire server state in memory. Every list
 -- scan is O(n); scaling is the first thing the production version replaces.
 -- Grouped here: auth (challenges/sessions), mailbox (messages/forwards),
--- presence, rate-limit windows, and bookkeeping counters.
+-- presence, and bookkeeping counters. Per-endpoint rate-limit buckets live
+-- in the runtime's hidden `_knot_rate_limits` SQLite table and don't appear
+-- here.
 -- The Knot runtime persists every `*ref` declared here through restarts (see
 -- the project memory note about SQLite-backed refs); nothing in this file is
 -- truly volatile despite being typed as plain in-memory lists.
@@ -254,20 +236,6 @@ type RateEntry = {key: Text, expiresAt: Timestamp, count: Int}
 -- Per-peer failure counters; drives `retryBackoff`.
 *forwardFailures : [ForwardFailure]
 
--- Per-key fixed-window counters for /messages send-side rate limiting.
-*sendRates : [RateEntry]
--- Per-key /auth/challenge counters (separate from `*challenges` capacity gate).
-*challengeRates : [RateEntry]
--- Per-source-IP counters; gate for unauthenticated traffic.
-*ipRates : [RateEntry]
-
--- Global request-rate gate (single counter shared across all clients).
-*globalRateCount : Int
-*globalRateWindowStart : Timestamp
--- Global gate charged only by /auth/* endpoints, on top of `*globalRateCount`.
-*authGlobalRateCount : Int
-*authGlobalRateWindowStart : Timestamp
-
 -- Strictly-monotonic sequence used as `Message.receivedAt`; guarantees poll-cursor ordering.
 *seqCounter : Timestamp
 -- Bumped by send/heartbeat to wake all blocked /poll holders.
@@ -284,13 +252,32 @@ type RateEntry = {key: Text, expiresAt: Timestamp, count: Int}
 -- declared body shape, `Err` produces a non-2xx response whose body is
 -- `{"error": "<code>"}`.
 
+-- Per-pubkey token bucket on /auth/challenge: prevents one key from
+-- exhausting the challenge pool by repeated nonce requests.
+-- (`export` is a workaround for a compiler bug where the unused-name pass
+-- doesn't walk route `rateLimit` clauses.)
+export challengeRateLimit = {
+  key: \input ctx -> Just {value: input.pubkey},
+  limit: {requests: maxChallengeRatePerKey, window: challengeRateWindowMs}
+}
+
+-- Per-session token bucket on /messages, keyed by the Bearer token. A pubkey
+-- is capped at `maxSessionsPerKey` live sessions, so the effective per-pubkey
+-- send budget is bounded as well.
+export sendRateLimit = {
+  key: \input ctx -> Just {value: input.authorization},
+  limit: {requests: maxSendRatePerKey, window: sendRateWindowMs}
+}
+
 route AuthApi where
-  POST {pubkey: PubkeyHex} /auth/challenge headers {xForwardedFor: Maybe Text} -> {challenge: Text, expiresAt: Timestamp} = ReqChallenge
+  POST {pubkey: PubkeyHex} /auth/challenge headers {xForwardedFor: Maybe Text} -> {challenge: Text, expiresAt: Timestamp}
+    rateLimit challengeRateLimit = ReqChallenge
   POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {xForwardedFor: Maybe Text} -> {token: Text, expiresAt: Timestamp} = VerifyAuth
 
 route ClientApi where
   POST {cursor: Timestamp} /poll headers {authorization: Text, xForwardedFor: Maybe Text} -> {events: [PollEvent], cursor: Timestamp} = Poll
-  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, xForwardedFor: Maybe Text} -> {} = SendMessages
+  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, xForwardedFor: Maybe Text} -> {}
+    rateLimit sendRateLimit = SendMessages
 
 route FederationApi where
   POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
@@ -322,15 +309,6 @@ capList = \items maxN -> drop (max 0 (count items - maxN)) (sortBy (\x -> x.expi
 -- `maxChallengesPerKey` and `maxSessionsPerKey`.
 capPerKey : [{pubkey: PubkeyHex, expiresAt: Timestamp | r}] -> PubkeyHex -> Int -> [{pubkey: PubkeyHex, expiresAt: Timestamp | r}]
 capPerKey = \items pubkey maxN -> union (filter (\x -> not (x.pubkey == pubkey)) items) (capList (filter (\x -> x.pubkey == pubkey) items) (maxN - 1))
-
--- Like forEach, but collects each action's result into a list.
-mapEach : [a] -> (a -> IO {} b) -> IO {} [b]
-mapEach = \items action -> case items of
-  [] -> yield []
-  Cons x rest -> do
-    r <- action x
-    rs <- mapEach rest action
-    yield (union [r] rs)
 
 -- Hex tokens: one random hex char per recursive call. `n` is the desired
 -- length in characters (so n=48 yields 24 random bytes of entropy).
@@ -403,8 +381,9 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (\c -> contain
 -- ============================================
 -- Auth helpers
 -- ============================================
--- Bearer token extraction, session lookup, and the `gateAuth` combinator that
--- every client handler funnels through (global rate → session).
+-- Bearer token extraction and session lookup. Authenticated handlers funnel
+-- through `withSessionAuth`; per-endpoint rate limiting is enforced by the
+-- compiler-generated `rateLimit` clauses on each route.
 -- Federation requests are unauthenticated: anyone can hit /federation/*.
 -- The `no_presence` check bounds federated forwards to currently-online keys.
 
@@ -413,8 +392,7 @@ matchIp : Text -> Text -> Bool
 matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
 -- Unwrap an X-Forwarded-For header value to a plain IP string. Empty when the
--- header is absent (no reverse proxy in front), which downstream gates treat
--- as "skip IP-based rate limiting".
+-- header is absent (no reverse proxy in front).
 clientIpOf : Maybe Text -> Text
 clientIpOf = \h -> case h of
   Just {value: ip} -> ip
@@ -427,16 +405,6 @@ extractToken = \h -> if hasPrefix "Bearer " h && drop 7 h != ""
 then Just {value: drop 7 h}
 else Nothing {}
 
--- Common gate for handlers: global rate, session auth. Short-circuits with
--- an `Err` response on failure; the `onAuth` callback returns its own
--- `Result HttpError T` for the success path.
-gateAuth : Text -> Text -> Timestamp -> (PubkeyHex -> IO {} (Result HttpError t)) -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions} (Result HttpError t)
-gateAuth = \auth ip t onAuth -> do
-  g <- checkGlobalRate t
-  if g
-  then yield (Err {error: {status: 429, message: "rate_limited"}})
-  else withSessionAuth auth t ip (yield (Err {error: {status: 401, message: "unauthorized"}})) onAuth
-
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
 -- the client IP matches. Runs `onAuth pubkey` on success, `onUnauth` otherwise.
 withSessionAuth : Text -> Int<Ms> -> Text -> IO e a -> (PubkeyHex -> IO e a) -> IO {r *sessions | e} a
@@ -447,83 +415,6 @@ withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
     Just {value: token} -> case findFirst ses (\s -> s.expiresAt > t && s.token == token && matchIp clientIp s.ip) of
       Just {value: s} -> onAuth s.pubkey
       _ -> onUnauth
-
--- ============================================
--- Rate limiting (plain count-per-window, no sliding interpolation)
--- ============================================
--- Two flavors of fixed-window counters:
---   * Per-key (`checkRate`) — keyed by pubkey, ip, server, or pair string;
---     entries live in a `RateEntry` list ref capped at 5000 with LRU eviction.
---   * Global (`checkGlobalRate`/`checkAuthGlobalRate`) — single counter+windowStart
---     pair, used for the request-wide and auth-wide ceilings.
--- `authPreCheck` composes global + ip + auth-global into a one-shot
--- gate for unauthenticated handlers (challenge/verify).
-
--- Returns {limited, entries}. Increments count when the key fits within the
--- window; otherwise resets to a fresh window expiring at `t + windowMs`. The
--- returned `entries` list is what the caller must write back to the
--- corresponding ref; it has been capped at 5000 rows (LRU by `expiresAt`) to
--- bound memory.
-checkRate : [RateEntry] -> Text -> Int -> Int<Ms> -> Timestamp -> {limited: Bool, entries: [RateEntry]}
-checkRate = \entries key maxRate windowMs t -> (\cur -> if cur.count > maxRate then {limited: True {}, entries} else {limited: False {}, entries: capList (union (filter (\x -> not (x.key == key)) entries) [{key, cur.expiresAt, cur.count}]) 5000}) (case findFirst entries (\r -> r.key == key && r.expiresAt > t) of
-  Just {value: r} -> {r.expiresAt, count: r.count + 1}
-  _ -> {expiresAt: t + windowMs, count: 1})
-
--- Single-counter global rate gate. Resets the counter when the window expires;
--- returns True when the limit has been hit (caller responds rate_limited).
-checkGlobalRate : Timestamp -> IO {rw *globalRateCount, rw *globalRateWindowStart} Bool
-checkGlobalRate = \t -> atomic (do
-  ws <- *globalRateWindowStart
-  c <- *globalRateCount
-  if t - ws >= globalRateWindowMs
-  then do
-    *globalRateWindowStart = t
-    *globalRateCount = 1
-    yield (False {})
-  else if c >= maxGlobalRequestRate
-  then yield (True {})
-  else do
-    *globalRateCount = c + 1
-    yield (False {}))
-
--- Same shape as `checkGlobalRate` but charged only by the auth endpoints
--- (challenge + verify). Stops a single attacker from exhausting the global
--- counter via auth churn.
-checkAuthGlobalRate = \t -> atomic (do
-  ws <- *authGlobalRateWindowStart
-  c <- *authGlobalRateCount
-  if t - ws >= authGlobalRateWindowMs
-  then do
-    *authGlobalRateWindowStart = t
-    *authGlobalRateCount = 1
-    yield (False {})
-  else if c >= maxAuthGlobalRate
-  then yield (True {})
-  else do
-    *authGlobalRateCount = c + 1
-    yield (False {}))
-
--- Per-source-IP rate gate. When the IP is unknown (no X-Forwarded-For from a
--- reverse proxy), the gate is skipped — direct deployments without a proxy
--- still rely on global rate limits.
-checkIpRateGate : Text -> Int<Ms> -> IO {rw *ipRates} Bool
-checkIpRateGate = \ip t -> if ip == ""
-then yield (False {})
-else atomic (do
-  rates <- *ipRates
-  let r = checkRate rates ip maxIpRatePerIp ipRateWindowMs t
-  *ipRates = r.entries
-  yield r.limited)
-
--- Pre-auth gate: global + ip + auth-global. Returns "" when ok, else an error code.
-authPreCheck : Text -> Int<Ms> -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates} Text
-authPreCheck = \clientIp t -> do
-  g <- checkGlobalRate t
-  i <- checkIpRateGate clientIp t
-  a <- checkAuthGlobalRate t
-  yield (if g
-  then "global_rate_limited"
-  else if i then "ip_rate_limited" else if a then "auth_rate_limited" else "")
 
 -- ============================================
 -- Federation failure tracking (simple, no circuit breaker)
@@ -714,78 +605,65 @@ pruneAndRetry = \t -> do
 -- revoke/logout.
 
 -- POST /auth/challenge: issue a fresh signed-nonce challenge for `pubkey`.
--- Capped per-key (maxChallengesPerKey) and rate-limited; the IP is recorded
--- so /auth/verify can require the same client.
-handleChallenge : PubkeyHex -> Text -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challengeRates, rw *challenges, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, clock, random} (Result HttpError {challenge: Text, expiresAt: Int})
+-- Capped per-key (maxChallengesPerKey); per-pubkey rate limiting is enforced
+-- by the route's `rateLimit` clause. The IP is recorded so /auth/verify can
+-- require the same client.
+handleChallenge : PubkeyHex -> Text -> IO {rw *challenges, clock, random} (Result HttpError {challenge: Text, expiresAt: Int})
 handleChallenge = \pubkey clientIp -> do
   t <- now
-  preErr <- authPreCheck clientIp t
-  if preErr == ""
-  then do
-    challenge <- genToken
-    result <- atomic (do
-      ch <- *challenges
-      let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey
-      if not (count cappedActive >= maxChallenges)
-      then do
-        chRates <- *challengeRates
-        let chR = checkRate chRates pubkey maxChallengeRatePerKey challengeRateWindowMs t
-        *challengeRates = chR.entries
-        if not chR.limited
-        then do
-          *challenges = union cappedActive [
-            {pubkey, challenge, expiresAt: t + challengeExpiry, ip: clientIp}
-          ]
-          yield ""
-        else yield "rate_limited"
-      else yield "capacity")
-    if result == ""
-    then yield (Ok {value: {challenge, expiresAt: t + challengeExpiry}})
-    else yield (Err {error: {status: if result == "capacity" then 503 else 429, message: result}})
-  else yield (Err {error: {status: 429, message: preErr}})
+  challenge <- genToken
+  full <- atomic (do
+    ch <- *challenges
+    let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey
+    if count cappedActive >= maxChallenges
+    then yield (True {})
+    else do
+      *challenges = union cappedActive [
+        {pubkey, challenge, expiresAt: t + challengeExpiry, ip: clientIp}
+      ]
+      yield (False {}))
+  if full
+  then yield (Err {error: {status: 503, message: "capacity"}})
+  else yield (Ok {value: {challenge, expiresAt: t + challengeExpiry}})
 
 -- POST /auth/verify: validate `signature` over `challenge` for `pubkey`.
 -- On success, mints a session token, records local presence (`pubkey` is now
 -- live on this server), and gossips an `online` event to known peers. If
 -- `revokeOthers` is set, all other sessions for the same pubkey are dropped.
-handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *authGlobalRateCount, rw *authGlobalRateWindowStart, rw *challenges, rw *forwardFailures, rw *globalRateCount, rw *globalRateWindowStart, rw *ipRates, rw *presence, rw *sessions, network, clock, random} (Result HttpError {expiresAt: Int, token: Text})
+handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *challenges, rw *forwardFailures, rw *presence, rw *sessions, network, clock, random} (Result HttpError {expiresAt: Int, token: Text})
 handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
-  preErr <- authPreCheck clientIp t
-  if preErr != ""
-  then yield (Err {error: {status: 429, message: preErr}})
-  else do
-    let expiry = t + sessionExpiry
-    token <- genToken
-    result <- atomic (do
-      ch <- *challenges
-      let same = \c -> c.pubkey == pubkey && c.challenge == challenge
-      let sigValid = case bytesFromHex pubkey of
-        Just {value: pk} -> case bytesFromHex signature of
-          Just {value: sigBytes} -> verify pk (textToBytes challenge) sigBytes
-          _ -> False {}
+  let expiry = t + sessionExpiry
+  token <- genToken
+  result <- atomic (do
+    ch <- *challenges
+    let same = \c -> c.pubkey == pubkey && c.challenge == challenge
+    let sigValid = case bytesFromHex pubkey of
+      Just {value: pk} -> case bytesFromHex signature of
+        Just {value: sigBytes} -> verify pk (textToBytes challenge) sigBytes
         _ -> False {}
-      let valid = any (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip) ch && sigValid
-      if not valid
-      then yield {valid: False {}, peers: []}
-      else do
-        *challenges = filter (\c -> not same c) ch
-        ses <- *sessions
-        let pruned = if revokeOthers
-        then filter (\s -> not (s.pubkey == pubkey)) ses
-        else capPerKey ses pubkey maxSessionsPerKey
-        let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
-        *sessions = capList (union pruned [newSession]) maxSessions
-        pres <- *presence
-        let prunedPres = filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres
-        let newPres = union prunedPres [{pubkey, server: serverHost, expiresAt: expiry}]
-        *presence = newPres
-        yield {valid: True {}, peers: knownPeerServersFromPresence newPres})
-    if not result.valid
-    then yield (Err {error: {status: 401, message: "invalid"}})
+      _ -> False {}
+    let valid = any (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip) ch && sigValid
+    if not valid
+    then yield {valid: False {}, peers: []}
     else do
-      when federationEnabled (fork (sendBatchedGossip result.peers [GossipOnline {pubkey}]))
-      yield (Ok {value: {token, expiresAt: expiry}})
+      *challenges = filter (\c -> not same c) ch
+      ses <- *sessions
+      let pruned = if revokeOthers
+      then filter (\s -> not (s.pubkey == pubkey)) ses
+      else capPerKey ses pubkey maxSessionsPerKey
+      let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
+      *sessions = capList (union pruned [newSession]) maxSessions
+      pres <- *presence
+      let prunedPres = filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres
+      let newPres = union prunedPres [{pubkey, server: serverHost, expiresAt: expiry}]
+      *presence = newPres
+      yield {valid: True {}, peers: knownPeerServersFromPresence newPres})
+  if not result.valid
+  then yield (Err {error: {status: 401, message: "invalid"}})
+  else do
+    when federationEnabled (fork (sendBatchedGossip result.peers [GossipOnline {pubkey}]))
+    yield (Ok {value: {token, expiresAt: expiry}})
 
 -- ============================================
 -- Handler: poll
@@ -795,15 +673,12 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 --   * Wait on `pollWakeup` (bumped by send/heartbeat) and return new events
 --     plus piggybacked sender-side expirations/deliveries.
 
--- POST /poll: top-level dispatch. Validates the global rate gate, then hands
--- off to `pollOnce` for the actual long-poll body.
-handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *globalRateCount, rw *globalRateWindowStart, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+-- POST /poll: top-level dispatch. Hands off to `pollOnce` for the actual
+-- long-poll body.
+handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
 handlePoll = \cursor authorization clientIp -> do
   t <- now
-  g <- checkGlobalRate t
-  if g
-  then yield (Err {error: {status: 429, message: "rate_limited"}})
-  else pollOnce authorization cursor clientIp t
+  pollOnce authorization cursor clientIp t
 
 -- Body of a single poll. Treats the cursor advance as an implicit ack
 -- (`ackPolledMessages`), refreshes the caller's local presence row so peers
@@ -882,66 +757,39 @@ ackPolledMessages = \pubkey cursor -> do
 -- Accept a batch of messages for recipient pubkeys. Placement (live local
 -- session, federated forward, or held-for-presence) is internal; the call
 -- either succeeds (every message enqueued) or fails with a non-2xx HTTP
--- status carrying the rejection code ("rate_limited" | "self_send" | ...).
+-- status carrying the rejection code ("self_send" | ...).
 -- Duplicates are silently treated as success so retries are idempotent.
--- Send is gated by global rate and the per-sender rate limit charged inside
--- `checkSendRate`.
+-- Per-session send rate is enforced by the route's `rateLimit` clause.
 -- Federated forwards are kicked off in background forks after the atomic.
 
--- POST /messages: send a list of ciphertexts atomically. Every message is
--- validated (self-send + per-sender rate window) inside a single atomic
--- block; if any one would be rejected, none are enqueued and the call returns
--- a non-2xx HTTP status. The send-rate counter is still charged for every
--- attempted message even when the batch is rejected, so a sender can't probe
--- limits cheaply (e.g. by sending to themselves). Federation forwards are
--- kicked per message after commit.
-handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {rw *globalRateCount, rw *globalRateWindowStart, r *sessions, clock} (Result HttpError {})
+-- POST /messages: send a list of ciphertexts atomically. Self-send is
+-- rejected up-front; the remaining batch is committed inside one atomic
+-- block (all-or-nothing) which reads presence to pre-stage federation
+-- forwards. Federation forwards are kicked per message after commit.
+handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {r *presence, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *pollWakeup, rw *seqCounter, network, clock} (Result HttpError {})
 handleSendMessages = \messages authorization clientIp -> do
   t <- now
-  gateAuth authorization clientIp t (\senderKey -> do
+  withSessionAuth authorization t clientIp (yield (Err {error: {status: 401, message: "unauthorized"}})) (\senderKey -> do
     let limited = take maxBatchSize messages
-    decision <- atomic (do
-      checked <- mapEach limited (\m -> do
-        c <- checkSendRate senderKey m.to t
-        yield {c.error, c.remoteServers, m.to, m.encryptedBlob})
-      case findFirst checked (\c -> c.error != "") of
-        Just {value: bad} -> yield (Err {bad.error})
-        Nothing {} -> do
-          forEach checked (\c -> commitSendMessage c.to c.encryptedBlob c.remoteServers t)
-          yield (Ok {value: checked}))
-    case decision of
-      Err {error: code} -> yield (Err {
-        error: {status: if code == "self_send" then 400 else 429, message: code}
-      })
-      Ok {value: checked} -> do
-        when federationEnabled (forEach checked (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
-        yield (Ok {value: {}}))
-
--- Charge the send rate counter for the sender and decide whether the message
--- would be accepted. Mutates only the rate counter, never the mailbox; the
--- caller commits via `commitSendMessage` only after every message in the
--- batch has passed. The counter is charged unconditionally (even on a
--- failure) so that a sender can't probe limits cheaply by sending to
--- themselves.
-checkSendRate : PubkeyHex -> PubkeyHex -> Int<Ms> -> IO {r *presence, rw *sendRates} {remoteServers: [Text], error: Text}
-checkSendRate = \senderKey to t -> do
-  sRates <- *sendRates
-  let sR = checkRate sRates senderKey maxSendRatePerKey sendRateWindowMs t
-  *sendRates = sR.entries
-  if senderKey == to
-  then yield {error: "self_send", remoteServers: []}
-  else if sR.limited
-  then yield {error: "rate_limited", remoteServers: []}
-  else do
-    pres <- *presence
-    let toPresence = presenceForKey pres to t
-    let remoteServers = collectPeers toPresence (\p -> p.server)
-    yield {error: "", remoteServers}
+    if any (\m -> m.to == senderKey) limited
+    then yield (Err {error: {status: 400, message: "self_send"}})
+    else do
+      committed <- atomic (do
+        pres <- *presence
+        let staged = map (\m -> {
+          m.to,
+          m.encryptedBlob,
+          remoteServers: collectPeers (presenceForKey pres m.to t) (\p -> p.server)
+        }) limited
+        forEach staged (\c -> commitSendMessage c.to c.encryptedBlob c.remoteServers t)
+        yield staged)
+      when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
+      yield (Ok {value: {}}))
 
 -- Allocate a monotonic receivedAt via `seqCounter`, append the message to
 -- the mailbox, and pre-stage forwards for any remote presence rows that
 -- already exist for `to`. Caller must have already validated the message
--- via `checkSendRate`.
+-- via `resolveSendTarget`.
 commitSendMessage : PubkeyHex -> BlobHex -> [Text] -> Int<Ms> -> IO {rw *forwards, rw *messages, rw *pollWakeup, rw *seqCounter} {}
 commitSendMessage = \to encryptedBlob remoteServers t -> do
   msgs <- *messages
