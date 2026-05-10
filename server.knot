@@ -316,20 +316,17 @@ capList = \items maxN -> drop (max 0 (count items - maxN)) (sortBy (\x -> x.expi
 capPerKey : [{pubkey: PubkeyHex, expiresAt: Timestamp | r}] -> PubkeyHex -> Int -> [{pubkey: PubkeyHex, expiresAt: Timestamp | r}]
 capPerKey = \items pubkey maxN -> union (filter (\x -> not (x.pubkey == pubkey)) items) (capList (filter (\x -> x.pubkey == pubkey) items) (maxN - 1))
 
--- Hex tokens: one random hex char per recursive call. `n` is the desired
--- length in characters (so n=48 yields 24 random bytes of entropy).
-genTokenN : Int -> IO {random} Text
-genTokenN = \n -> if n <= 0
+-- Random hex token: one random hex char per recursive call. `n` is the
+-- desired length in characters (so n=48 yields 24 random bytes of entropy).
+-- Session bearers, /auth challenges, and federation auth nonces all use n=48
+-- (192 bits of entropy, well beyond birthday bound).
+genToken : Int -> IO {random} Text
+genToken = \n -> if n <= 0
 then yield ""
 else do
   d <- randomInt 16
-  rest <- genTokenN (n - 1)
+  rest <- genToken (n - 1)
   yield (take 1 (drop d "0123456789abcdef") ++ rest)
-
--- Standard 48-char hex token used for session bearers, /auth challenges, and
--- federation auth nonces (192 bits of entropy, well beyond birthday bound).
-genToken : IO {random} Text
-genToken = genTokenN 48
 
 -- True when `s` is non-empty, even-length, and only lowercase hex digits.
 isValidHex : Text -> Bool
@@ -608,7 +605,7 @@ forwardQueuedToServer = \pubkey server -> atomic (do
 handleChallenge : PubkeyHex -> Text -> IO {rw *challenges, clock, random} (Result HttpError {challenge: Text, expiresAt: Int})
 handleChallenge = \pubkey clientIp -> do
   t <- now
-  challenge <- genToken
+  challenge <- genToken 48
   atomic (do
     ch <- *challenges
     let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey
@@ -628,7 +625,7 @@ handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *challeng
 handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
   let expiry = t + sessionExpiry
-  token <- genToken
+  token <- genToken 48
   let sigValid = verifySignature pubkey signature challenge
   result <- atomic (do
     ch <- *challenges
@@ -686,17 +683,24 @@ handlePoll = \cursor authorization clientIp -> do
       pollResult <- doPoll s t
       yield (Ok {value: {pollResult.events, pollResult.cursor}})
 
--- One pass: collect events at `t`. If empty, retry-wait on `pollWakeup`
--- (bumped by send/heartbeat) and re-collect once at the new wall time.
--- The retry uses Knot's STM `retry` primitive: the transaction blocks until
--- some other transaction commits a change to `*pollWakeup`. Because
--- `pollHeartbeat` bumps `*pollWakeup` every `pollTimeoutMs`, no caller waits
--- longer than one heartbeat period before getting at least an empty response.
+-- One pass: collect this pubkey's unexpired messages newer than the cursor,
+-- sort by receivedAt, take up to `maxPollEvents`. The returned cursor is the
+-- max `receivedAt` in the page (or the input cursor when the page is empty),
+-- which the client echoes on the next /poll to advance — and which the
+-- server treats as an implicit ack.
+-- If the page is empty, retry-wait on `pollWakeup` (bumped by send/heartbeat)
+-- and re-collect once at the new wall time. The retry uses Knot's STM `retry`
+-- primitive: the transaction blocks until some other transaction commits a
+-- change to `*pollWakeup`. Because `pollHeartbeat` bumps `*pollWakeup` every
+-- `pollTimeoutMs`, no caller waits longer than one heartbeat period before
+-- getting at least an empty response.
 doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp | a} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{encryptedBlob: BlobHex}]}
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic (do
     msgs <- *messages
-    yield (collectPollEvents msgs s.pubkey s.clampedCursor tnow))
+    let fresh = filter (\m -> m.toKey == s.pubkey && tnow - m.receivedAt < messageMaxAge && m.receivedAt > s.clampedCursor) msgs
+    let limited = take maxPollEvents (sortBy (\m -> m.receivedAt) fresh)
+    yield {events: map (\m -> {m.encryptedBlob}) limited, cursor: fold (\acc m -> max acc m.receivedAt) s.clampedCursor limited})
   initial <- collectAt t
   if count initial.events > 0
   then yield initial
@@ -704,17 +708,6 @@ doPoll = \s t -> do
     atomic (do wakeup <- *pollWakeup; if wakeup > s.startWakeup then yield {} else retry)
     t2 <- now
     collectAt t2
-
--- Pull this pubkey's unexpired messages newer than `cursor`, sort by
--- receivedAt, take up to `maxPollEvents`. The returned cursor is the max
--- `receivedAt` in the page (or the input cursor when the page is empty),
--- which the client echoes on the next /poll to advance — and which the
--- server treats as an implicit ack.
-collectPollEvents : [Message] -> PubkeyHex -> Timestamp -> Timestamp -> {events: [PollEvent], cursor: Timestamp}
-collectPollEvents = \messages pubkey cursor t ->
-  let fresh = filter (\m -> m.toKey == pubkey && t - m.receivedAt < messageMaxAge && m.receivedAt > cursor) messages
-  let limited = take maxPollEvents (sortBy (\m -> m.receivedAt) fresh)
-  {events: map (\m -> {m.encryptedBlob}) limited, cursor: fold (\acc m -> max acc m.receivedAt) cursor limited}
 
 -- Treat the supplied cursor as an ack: drop all messages with
 -- receivedAt <= cursor, plus their pending forwards.
@@ -800,8 +793,8 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
 -- Handler: federation receive
 -- ============================================
 -- Inbound peer-to-peer endpoints. Federation is open and unauthenticated:
--- the `no_presence` check in `storeFederated` bounds forwards to currently-
--- online local keys.
+-- the `no_presence` check in `handleForwardMessage` bounds forwards to
+-- currently-online local keys.
 
 -- POST /federation/gossip: ingest peer presence events. The transport-level
 -- `fromServer` is the home server for every event. Drops every (pubkey,
@@ -827,28 +820,22 @@ handleRecvGossip = \events fromServer -> do
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
--- Store a federated/forwarded message into the local mailbox. Caller wraps in `atomic`.
---
--- The presence gate requires the recipient to be **currently locally online**
--- (not just visible to gossip somewhere). Without that, an A → B forward based
--- on stale gossip about R could land on B with no actively-polling client and
--- get stuck. If B refuses, A retries via `retryPendingForwards` against the
--- next presence target.
-storeFederated : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter} (Result HttpError {})
-storeFederated = \toKey encryptedBlob t -> do
-  pres <- *presence
-  if not (hasLocalPresence pres toKey t)
-  then yield (Err {error: {status: 404, message: "no_presence"}})
-  else do
-    appendMessage toKey encryptedBlob t
-    yield (Ok {value: {}})
-
 -- POST /federation/forward: receive a single federated message destined for
--- a local key. Delegates the store decision to `storeFederated`.
+-- a local key. The presence gate requires the recipient to be **currently
+-- locally online** (not just visible to gossip somewhere). Without that, an
+-- A → B forward based on stale gossip about R could land on B with no
+-- actively-polling client and get stuck. If B refuses, A retries via
+-- `retryPendingForwards` against the next presence target.
 handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter, clock} (Result HttpError {})
 handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
-  atomic storeFederated toKey encryptedBlob t
+  atomic (do
+    pres <- *presence
+    if not (hasLocalPresence pres toKey t)
+    then yield (Err {error: {status: 404, message: "no_presence"}})
+    else do
+      appendMessage toKey encryptedBlob t
+      yield (Ok {value: {}}))
 
 -- ============================================
 -- Dispatch
