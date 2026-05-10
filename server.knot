@@ -396,9 +396,9 @@ authedPubkey = \authorization t clientIp -> do
   then yield (Nothing {})
   else do
     let token = drop 7 authorization
-    case findFirst ses (\s -> s.expiresAt > t && s.token == token && matchIp clientIp s.ip) of
-      Just {value: s} -> yield (Just {value: s.pubkey})
-      _ -> yield (Nothing {})
+    yield (case findFirst ses (\s -> s.expiresAt > t && s.token == token && matchIp clientIp s.ip) of
+      Just {value: s} -> Just {value: s.pubkey}
+      _ -> Nothing {})
 
 -- ============================================
 -- Federation failure tracking (simple, no circuit breaker)
@@ -584,16 +584,15 @@ handleChallenge : PubkeyHex -> Text -> IO {rw *challenges, clock, random} (Resul
 handleChallenge = \pubkey clientIp -> do
   t <- now
   challenge <- genToken 48
+  let expiresAt = t + challengeExpiry
   atomic (do
     ch <- *challenges
     let cappedActive = capPerKey (filter (\c -> c.expiresAt > t) ch) pubkey maxChallengesPerKey
     if count cappedActive >= maxChallenges
     then yield (Err {error: {status: 503, message: "capacity"}})
     else do
-      *challenges = union cappedActive [
-        {pubkey, challenge, expiresAt: t + challengeExpiry, ip: clientIp}
-      ]
-      yield (Ok {value: {challenge, expiresAt: t + challengeExpiry}}))
+      *challenges = union cappedActive [{pubkey, challenge, expiresAt, ip: clientIp}]
+      yield (Ok {value: {challenge, expiresAt}}))
 
 -- POST /auth/verify: validate `signature` over `challenge` for `pubkey`.
 -- On success, mints a session token, records local presence (`pubkey` is now
