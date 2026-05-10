@@ -376,8 +376,7 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || not all (\c -> contain
   "10.",
   "192.168.",
   "169.254.",
-  "0.",
-  "::"
+  "0."
 ] || any (\s -> containsSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
 
 -- ============================================
@@ -419,6 +418,15 @@ withSessionAuth = \authorization t clientIp onUnauth onAuth -> do
     Just {value: token} -> case findFirst ses (\s -> s.expiresAt > t && s.token == token && matchIp clientIp s.ip) of
       Just {value: s} -> onAuth s.pubkey
       _ -> onUnauth
+
+-- True when `signature` is a valid Ed25519 signature by `pubkey` over `challenge`.
+-- False on any hex-decoding failure.
+verifySignature : PubkeyHex -> SignatureHex -> Text -> Bool
+verifySignature = \pubkey signature challenge -> case bytesFromHex pubkey of
+  Just {value: pk} -> case bytesFromHex signature of
+    Just {value: sigBytes} -> verify pk (textToBytes challenge) sigBytes
+    _ -> False {}
+  _ -> False {}
 
 -- ============================================
 -- Federation failure tracking (simple, no circuit breaker)
@@ -637,14 +645,10 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
   let expiry = t + sessionExpiry
   token <- genToken
+  let sigValid = verifySignature pubkey signature challenge
   result <- atomic (do
     ch <- *challenges
     let same = \c -> c.pubkey == pubkey && c.challenge == challenge
-    let sigValid = case bytesFromHex pubkey of
-      Just {value: pk} -> case bytesFromHex signature of
-        Just {value: sigBytes} -> verify pk (textToBytes challenge) sigBytes
-        _ -> False {}
-      _ -> False {}
     let valid = any (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip) ch && sigValid
     if not valid
     then yield (Nothing {})
@@ -687,19 +691,15 @@ handlePoll = \cursor authorization clientIp -> do
     let mine = \p -> p.pubkey == pubkey && isLocalServer p.server
     let stale = not any (\p -> mine p && p.expiresAt - t >= sessionExpiry / 2) pres
     refreshPeers <- if stale
-    then do
-      peers <- refreshLocalPresence pubkey (t + sessionExpiry)
-      yield (Just {value: peers})
-    else yield (Nothing {})
+    then refreshLocalPresence pubkey (t + sessionExpiry)
+    else yield []
     yield (Just {value: {pubkey, clampedCursor, startWakeup, refreshPeers}}))
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
-      case s.refreshPeers of
-        Just {value: peers} -> when federationEnabled (fork (sendBatchedGossip peers [
-          GossipOnline {s.pubkey}
-        ]))
-        Nothing {} -> yield {}
+      when (federationEnabled && count s.refreshPeers > 0) (fork (sendBatchedGossip s.refreshPeers [
+        GossipOnline {s.pubkey}
+      ]))
       pollResult <- doPoll s t
       yield (Ok {value: {pollResult.events, pollResult.cursor}})
 
