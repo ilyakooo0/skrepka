@@ -649,12 +649,19 @@ doPoll = \s t -> do
   if count initial.events > 0
   then yield initial
   else do
+    -- `race` requires both arms to share a single effect row, so each arm
+    -- carries the union {r *messages, clock} — the STM wait gets a `now`,
+    -- the timer gets a no-op `*messages` read.
     race
-      (atomic (do
-        msgs <- *messages
-        let fresh = filter (\m -> m.toKey == s.pubkey && m.receivedAt > s.clampedCursor) msgs
-        if count fresh > 0 then yield {} else retry))
-      (sleep pollTimeoutMs)
+      (do
+        _ <- now
+        atomic (do
+          msgs <- *messages
+          let fresh = filter (\m -> m.toKey == s.pubkey && m.receivedAt > s.clampedCursor) msgs
+          if count fresh > 0 then yield {} else retry))
+      (do
+        atomic (do _ <- *messages; yield {})
+        sleep pollTimeoutMs)
     t2 <- now
     collectAt t2
 
