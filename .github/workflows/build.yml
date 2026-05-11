@@ -5,9 +5,6 @@ on:
     branches: [master]
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   build:
     strategy:
@@ -16,48 +13,29 @@ jobs:
         include:
           - runner: ubuntu-latest
             name: linux-x86_64
-            musl-target: x86_64-unknown-linux-musl
+            knot-platform: linux-x86_64
           - runner: ubuntu-24.04-arm
             name: linux-arm64
-            musl-target: aarch64-unknown-linux-musl
+            knot-platform: linux-aarch64
           - runner: macos-26
             name: macos-arm64
-          - runner: macos-26-intel
-            name: macos-x86_64
+            knot-platform: macos-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          repository: ilyakooo0/knot
-          path: knot
-
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download knot compiler
+        run: |
+          version=$(basename "$(curl -sI -o /dev/null -w '%{redirect_url}' \
+            https://github.com/ilyakooo0/knot/releases/latest)")
+          tarball="knot-${version}-${{ matrix.knot-platform }}.tar.gz"
+          curl -fsSL "https://github.com/ilyakooo0/knot/releases/download/${version}/${tarball}" \
+            | tar xz
+          mv "knot-${version}-${{ matrix.knot-platform }}" knot-dist
 
       - name: Install musl toolchain
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          rustup target add ${{ matrix.musl-target }}
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            knot/target
-          key: ${{ matrix.name }}-cargo-${{ hashFiles('knot/Cargo.lock') }}
-
-      - name: Build knotc
-        working-directory: knot
-        run: cargo build --release -p knot-compiler
-
-      - name: Build musl runtime
-        if: runner.os == 'Linux'
-        working-directory: knot
-        run: cargo build --release -p knot-runtime --target ${{ matrix.musl-target }}
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Compile server (Linux static)
         if: runner.os == 'Linux'
@@ -65,12 +43,12 @@ jobs:
           printf '#!/bin/sh\nexec musl-gcc -static "$@"\n' > /tmp/static-cc
           chmod +x /tmp/static-cc
           CC=/tmp/static-cc \
-          KNOT_RUNTIME_LIB=${{ github.workspace }}/knot/target/${{ matrix.musl-target }}/release/libknot_runtime.a \
-          ./knot/target/release/knotc build server.knot
+          KNOT_RUNTIME_LIB=${{ github.workspace }}/knot-dist/libknot_runtime.a \
+          ./knot-dist/knot build server.knot
 
       - name: Compile server (macOS)
         if: runner.os == 'macOS'
-        run: ./knot/target/release/knotc build server.knot
+        run: ./knot-dist/knot build server.knot
 
       - name: Verify binary
         run: file server
