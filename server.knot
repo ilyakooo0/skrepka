@@ -374,7 +374,7 @@ authedPubkey = \authorization t clientIp -> do
 -- worth retrying (or no failure recorded at all). Linear backoff:
 -- `retryBackoffBase * failures`, capped at `retryBackoffMax`.
 shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
-shouldRetryServer = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < min retryBackoffMax (retryBackoffBase * max 1 f.failures)) failures
+shouldRetryServer = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < min retryBackoffMax (retryBackoffBase * f.failures)) failures
 
 -- Bump the failure counter for `server`.
 recordFailure : Text -> IO {rw *forwardFailures, clock} {}
@@ -447,7 +447,7 @@ refreshLocalPresence = \pubkey expiry -> do
 -- One sweep over every state ref: drops expired rows in a single atomic block.
 -- Returns the locally-expired presence rows whose pubkey has no other live
 -- local session, so the caller can broadcast offline gossip for them.
-pruneExpired : Int<Ms> -> IO {rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions} [{expiresAt: Timestamp, pubkey: PubkeyHex, server: ServerName}]
+pruneExpired : Int<Ms> -> IO {rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions} [PubkeyHex]
 pruneExpired = \t -> atomic do
   ch <- *challenges
   *challenges = filter (\x -> x.expiresAt > t) ch
@@ -460,7 +460,7 @@ pruneExpired = \t -> atomic do
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   *presence = filter (\p -> p.expiresAt > t) pres
-  yield (filter (\p -> p.expiresAt <= t && isLocalServer p.server && not (hasLocalPresence pres p.pubkey t)) pres)
+  yield (map (\p -> p.pubkey) (filter (\p -> p.expiresAt <= t && isLocalServer p.server && not (hasLocalPresence pres p.pubkey t)) pres))
 
 -- ============================================
 -- Federation gossip
@@ -769,16 +769,16 @@ handleRecvGossip = \events fromServer -> do
   else do
     newlyOnline <- atomic (do
       pres <- *presence
-      let combined = fold (\acc e -> case e of
-        GossipOnline {pubkey} -> {
-          touchedPubkeys: union acc.touchedPubkeys [pubkey],
-          added: union acc.added [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
-        }
-        GossipOffline {pubkey} -> {touchedPubkeys: union acc.touchedPubkeys [pubkey], acc.added}
-        _ -> acc) {touchedPubkeys: [], added: []} events
-      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey combined.touchedPubkeys) pres
-      *presence = union kept combined.added
-      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) combined.added)))
+      let touchedPubkeys = fold (\acc e -> case e of
+        GossipOnline {pubkey} -> union acc [pubkey]
+        GossipOffline {pubkey} -> union acc [pubkey]
+        _ -> acc) [] events
+      let added = fold (\acc e -> case e of
+        GossipOnline {pubkey} -> union acc [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
+        _ -> acc) [] events
+      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys) pres
+      *presence = union kept added
+      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) added)))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
@@ -832,7 +832,7 @@ backgroundPrune = do
   when federationEnabled (do
     fork (do
       pres <- *presence
-      sendBatchedGossip (collectPeers pres (\p -> p.server)) (map (\p -> GossipOffline {p.pubkey}) expiredLocal))
+      sendBatchedGossip (collectPeers pres (\p -> p.server)) (map (\pk -> GossipOffline {pubkey: pk}) expiredLocal))
     fork retryPendingForwards)
   sleep backgroundPruneInterval
   backgroundPrune
