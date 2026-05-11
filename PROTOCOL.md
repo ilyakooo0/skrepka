@@ -12,15 +12,15 @@ Skrepka is a decentralized, end-to-end encrypted messaging protocol. It has no u
 
 - **No accounts.** A user's identity is their cryptographic keypair. No registration, no passwords, no servers storing credentials.
 - **No home server.** Users connect to any server in the mesh and can switch freely. Servers are disposable relays.
-- **End-to-end encryption.** Servers see only envelope metadata. Message content is opaque.
+- **End-to-end encryption.** Servers see only routing metadata. Message content — including the sender's identity — is opaque to the server.
 - **Open federation.** Any server can join the mesh. Operators may optionally blocklist specific peers.
-- **Ephemeral.** All messages expire after 30 days — on servers and on devices. No permanent history.
+- **Ephemeral.** Server mailboxes expire after 30 days. No permanent server-side history.
 - **Simplicity.** Plain HTTP transport, no session negotiation, no ratchets.
 
 ### Non-Goals
 
 - Forward secrecy (per-message ephemeral keys provide partial protection, but no ratchet)
-- Metadata privacy (servers see sender, recipient, and timestamp)
+- Recipient metadata privacy (servers see the recipient and timestamps; the sender is not visible to servers)
 - Durable message storage (servers queue temporarily, not permanently)
 - Peer-to-peer delivery (at least one server must be reachable)
 
@@ -38,32 +38,20 @@ Each device generates its own independent keypair and is treated as a separate i
 
 ### Key Format
 
-Public keys are encoded as **base64url** (RFC 4648 §5, no padding).
+Public keys, signatures, and encrypted blobs are encoded as **lowercase hexadecimal** on the wire and in storage. An Ed25519 public key is 32 bytes (64 hex chars); a signature is 64 bytes (128 hex chars).
 
-### Identity URI
+### Sharing an Identity
 
-```
-skrepka://<base64url(ed25519_pubkey)>@<server_host>
-```
+Identities are shared out-of-band as plain text or QR codes. The client displays public keys in two forms:
 
-Example:
+- **Hex** — 64 lowercase hex characters (the canonical wire form).
+- **@p (phonetic)** — the public key rendered as Urbit-style syllables (e.g. `~ridler-binzod-mavpub-...`). Easier for humans to read and verify by voice. The client accepts either form when adding a contact.
 
-```
-skrepka://dGhpcyBpcyBhIHRlc3Q@relay.example.com
-```
-
-The URI contains everything needed to reach someone:
-
-- **Public key** — who they are
-- **Server host** — a server where they were last seen or any known relay
-
-Since there is no home server, the server component is a hint, not an authority. The recipient may be connected to a different server by the time a message is sent. The gossip layer resolves current location.
-
-Identity URIs are designed to be shared out-of-band: copied as text, embedded in links, or scanned as QR codes.
+Servers are addressed separately. A client stores a single server URL (e.g. `https://relay.example.com`) in local settings; this is purely a transport choice and has nothing to do with identity. Two users on different servers can still talk via federation.
 
 ### Trust Model
 
-**Trust-on-First-Use (TOFU).** The first time a client encounters a public key, it is accepted and cached. Optional out-of-band verification (e.g., comparing fingerprints in person) is supported but not required by the protocol.
+**Trust-on-First-Use (TOFU).** The first time a client encounters a public key, it is accepted and cached. Optional out-of-band verification (e.g., comparing fingerprints or @p syllables in person) is supported but not required by the protocol.
 
 ### Contacts
 
@@ -81,10 +69,13 @@ There is no global directory. Users assign local nicknames to public keys on the
 | Key agreement    | X25519                |
 | Key derivation   | HKDF-SHA256           |
 | Symmetric cipher | XChaCha20-Poly1305    |
+| Compression      | LZ4 (pre-encryption)  |
 
 ### Per-Message Encryption
 
 Each message is independently encrypted. There are no sessions, no ratchet, and no state between sender and recipient.
+
+The wire-visible "envelope" carries only the recipient and the opaque blob. The sender's public key and signature are placed **inside** the AEAD ciphertext, so the server learns nothing about who sent a given message. The signature is bound to the recipient's public key, preventing a captured ciphertext from being replayed against a different recipient.
 
 **Encryption flow:**
 
@@ -92,50 +83,71 @@ Each message is independently encrypted. There are no sessions, no ratchet, and 
    ```
    ephemeral_private, ephemeral_public = x25519_generate()
    ```
-2. Compute the raw shared secret using the ephemeral private key and the recipient's long-term X25519 public key:
+2. Derive the recipient's X25519 public key from their Ed25519 public key, and compute the raw shared secret:
    ```
+   recipient_x25519_public = ed25519_pk_to_curve25519(recipient_ed25519_public)
    raw_secret = x25519(ephemeral_private, recipient_x25519_public)
    ```
-3. Derive the encryption key using HKDF-SHA256:
+3. Derive the symmetric encryption key using HKDF-SHA256:
    ```
    key = hkdf_sha256(
-     ikm  = raw_secret,
+     ikm   = raw_secret,
      salt  = ephemeral_public || recipient_x25519_public,
      info  = "skrepka-v1",
      len   = 32
    )
    ```
-4. Generate a random 24-byte nonce:
+4. LZ4-compress the plaintext payload (see §4):
    ```
-   nonce = random_bytes(24)
+   compressed = lz4_pickle(plaintext_bytes)
    ```
-5. Encrypt the plaintext message:
+5. Sign the recipient pubkey concatenated with the compressed plaintext. Binding the signature to the recipient prevents the same blob from being replayed against another recipient:
    ```
-   ciphertext = xchacha20_poly1305_encrypt(key, nonce, plaintext)
+   signature = ed25519_sign(sender_ed25519_private,
+                            recipient_ed25519_public || compressed)
    ```
-6. Sign the ciphertext with the sender's Ed25519 private key:
+6. Build the inner buffer that will be encrypted:
    ```
-   signature = ed25519_sign(sender_ed25519_private, ciphertext)
+   inner = sender_ed25519_public || signature || compressed
+   ```
+7. Generate a random 24-byte nonce and AEAD-encrypt the inner buffer:
+   ```
+   nonce      = random_bytes(24)
+   ciphertext = xchacha20_poly1305_encrypt(key, nonce, inner)   // no associated data
+   ```
+8. Emit the on-wire blob:
+   ```
+   blob = ephemeral_public || nonce || ciphertext
    ```
 
 **Decryption flow:**
 
-1. Verify the signature against the sender's Ed25519 public key.
-2. Compute the raw shared secret using the recipient's long-term X25519 private key and the ephemeral public key from the message.
-3. Derive the encryption key using HKDF-SHA256 with the same parameters.
-4. Decrypt the ciphertext using the derived key and nonce.
+1. Split the blob: 32-byte `ephemeral_public`, 24-byte `nonce`, remainder is `ciphertext`.
+2. Derive the recipient's X25519 private key from the recipient's Ed25519 private key, compute the raw shared secret with `ephemeral_public`, and HKDF-derive the same `key`.
+3. AEAD-decrypt the ciphertext to recover the inner buffer.
+4. Split: 32-byte `sender_ed25519_public`, 64-byte `signature`, remainder is `compressed`.
+5. Verify the signature over `recipient_ed25519_public || compressed` using `sender_ed25519_public`. Reject the message on failure.
+6. LZ4-decompress to recover the plaintext payload.
 
 ### Encrypted Blob Format
 
+On the wire (cleartext, server-visible):
+
 ```
-ephemeral_x25519_pubkey  (32 bytes)
-nonce                    (24 bytes)
-ciphertext               (variable)
-sender_ed25519_pubkey    (32 bytes)
-signature                (64 bytes)
+ephemeral_x25519_pubkey   (32 bytes)
+nonce                     (24 bytes)
+ciphertext                (variable, includes 16-byte AEAD tag)
 ```
 
-Total overhead: 152 bytes per message.
+After AEAD decryption, the inner buffer is:
+
+```
+sender_ed25519_pubkey     (32 bytes)
+signature                 (64 bytes)
+compressed_plaintext      (variable, LZ4)
+```
+
+The sender's pubkey and signature are inside the AEAD ciphertext: the server never sees them, and only the intended recipient can recover the sender's identity. The minimum blob size is `32 + 24 + 32 + 64 + 16 = 168` bytes.
 
 ---
 
@@ -143,73 +155,81 @@ Total overhead: 152 bytes per message.
 
 ### Envelope
 
-The envelope is what servers see. It is transmitted in cleartext (not encrypted) so servers can route messages.
+The envelope is what servers see. It carries only the recipient and the opaque encrypted blob — there is **no `from` field**. The sender's identity is recoverable only by the recipient, from inside the decrypted blob.
 
 ```json
 {
-  "to": "<base64url(recipient_ed25519_pubkey)>",
-  "from": "<base64url(sender_ed25519_pubkey)>",
-  "encrypted_blob": "<base64url(encrypted_blob)>",
-  "timestamp": 1679000000
+  "to": "<hex(recipient_ed25519_pubkey)>",
+  "encryptedBlob": "<hex(encrypted_blob)>"
 }
 ```
 
-| Field            | Type   | Description                                      |
-|------------------|--------|--------------------------------------------------|
-| `to`             | string | Recipient's Ed25519 public key (base64url)       |
-| `from`           | string | Sender's Ed25519 public key (base64url)          |
-| `encrypted_blob` | string | The encrypted blob from §3 (base64url)           |
-| `timestamp`      | number | Unix timestamp (seconds) when the message was sent |
+| Field           | Type   | Description                                      |
+|-----------------|--------|--------------------------------------------------|
+| `to`            | string | Recipient's Ed25519 public key (64 lowercase hex)|
+| `encryptedBlob` | string | Hex-encoded blob from §3                         |
 
-Servers route based on `to` and `from`. They never inspect `encrypted_blob`.
+Servers route based on `to`. They cannot inspect `encryptedBlob` and they do not know the sender.
 
 ### Plaintext Payload
 
-After decryption, the plaintext is a JSON object with a `type` field:
+After decryption (and LZ4 decompression), the plaintext is a UTF-8 JSON object with a `type` field:
 
 ```json
 {
   "type": "<message_type>",
-  "id": "<unique_message_id>",
-  "timestamp": 1679000000,
+  "id":   "<unique_message_id>",
+  "ts":   1679000000000,
   ...
 }
 ```
 
-The `id` field is a client-generated UUID v4. Clients MUST deduplicate incoming messages by `id` — the same message may arrive more than once due to presence fan-out (see §7).
-
-Clients MUST silently ignore message types they do not recognize. This allows newer clients to introduce new types without breaking older ones.
+- `ts` is the sender's wall-clock at send time, in **milliseconds** since the Unix epoch.
+- `id` is a client-generated unique ID (e.g. UUID v4). Clients MUST deduplicate incoming messages by `id`.
+- Clients MUST silently ignore message types they do not recognize. This allows newer clients to introduce new types without breaking older ones.
 
 ### Message Types
 
-| Type              | Description                              | Additional Fields                              |
-|-------------------|------------------------------------------|-------------------------------------------------|
-| `text`            | A text message                           | `body` (string)                                 |
-| `media`           | An inline media attachment               | `media_type` (MIME), `filename`, `data` (base64)|
-| `group.invite`    | Invite to a group (see §8)              | `group_id`, `group_name`, `members`             |
-| `group.leave`     | Leave a group                            | `group_id`                                      |
-| `group.update`    | Update group metadata                    | `group_id`, `group_name`, `members`             |
-| `delivery.ack`    | Delivery acknowledgement                 | `ack_ids` (array of message IDs)                |
-| `read`            | Read receipt                             | `read_ids` (array of message IDs)               |
-| `profile`         | Share display name and/or photo          | `display_name` (string), `photo` (base64, optional) |
+The current implementation defines three plaintext message types:
 
-Media files are embedded inline in the encrypted payload as base64-encoded `data`. There is no separate media hosting or upload endpoint.
+| Type            | Description                              | Additional Fields                              |
+|-----------------|------------------------------------------|------------------------------------------------|
+| `text`          | A text message                           | `body` (string)                                 |
+| `delivery.ack`  | Sender-side delivery confirmation        | `ack_ids` (array of message IDs)                |
+| `profile`       | Share display name, bio, and/or photo    | `display_name`, `bio` (strings), `photo` (base64-encoded image, optional) |
+
+Future message types (media attachments, read receipts, group messages) are not part of this revision.
 
 ### Profiles
 
-Users can share a display name and photo with contacts by sending a `profile` message. This is sent as a regular encrypted message — servers never see profile data.
+Users share a display name, bio, and photo with contacts by sending a `profile` message. This is a regular encrypted message — servers never see profile data.
 
 ```json
 {
   "type": "profile",
   "id": "msg_456",
-  "timestamp": 1679000000,
+  "ts": 1679000000000,
   "display_name": "Alice",
+  "bio": "writing things",
   "photo": "<base64(jpeg_data)>"
 }
 ```
 
-Clients SHOULD send a `profile` message to a contact on first interaction and whenever the user updates their name or photo. The recipient's client caches the profile locally. The `photo` field is optional and MAY be omitted to update only the display name.
+Clients SHOULD send a `profile` message to a contact on first interaction and whenever the user updates their name, bio, or photo. The recipient's client caches the profile locally. `photo` is optional and MAY be omitted.
+
+### Delivery Acks
+
+When a recipient successfully decrypts an incoming `text` message, the recipient's client SHOULD send a `delivery.ack` message back to the sender:
+
+```json
+{
+  "type": "delivery.ack",
+  "ack_ids": ["msg_123", "msg_124"],
+  "ts": 1679000000000
+}
+```
+
+This is the only delivery-confirmation channel in the protocol: the server itself does **not** report delivery status to senders. See §9 for the full flow.
 
 ### Blocking
 
@@ -219,48 +239,44 @@ Blocking is client-side only. A blocked sender's messages are still received and
 
 ## 5. Transport
 
-All communication uses **plain HTTP**.
+All communication uses **plain HTTP**, served over TLS in production.
 
 | Direction          | Mechanism            |
 |--------------------|----------------------|
 | Client → Server    | HTTP POST            |
-| Server → Client    | Long polling             |
+| Server → Client    | Long polling (POST)  |
 | Server → Server    | HTTP POST            |
 
 **Why HTTP + long polling:**
 - No special protocols. Works through proxies, load balancers, and CDNs.
-- Long polling provides near-real-time delivery over plain HTTP request/response cycles.
+- Long polling provides near-real-time delivery over plain request/response cycles.
 - No persistent connections, no WebSocket upgrade, no gRPC toolchain, no raw TCP.
 
 ### Server Discovery
 
-New clients discover servers via a well-known URL:
-
-```
-https://skrepka.org/servers.json
-```
-
-The response is a JSON array of server hostnames:
+Skrepka has no central directory. Clients are configured with a single server URL (stored locally) and stay on it until the user changes it. The repository ships a `servers.json` file listing public relays as a convenience:
 
 ```json
-{
-  "servers": [
-    { "host": "relay1.example.com", "region": "eu" },
-    { "host": "relay2.example.com", "region": "us" },
-    { "host": "relay3.example.com", "region": "ap" }
-  ]
-}
+[
+  "https://1.skrepka.lol",
+  "https://2.skrepka.lol",
+  "https://3.skrepka.lol"
+]
 ```
 
-The client picks a server from the list (e.g., by latency or region preference) and connects. This list is a bootstrap mechanism only — once connected, the client may learn about other servers through the mesh.
+This file is a static suggestion, not a federation directory. Federation between servers is configured server-side, independently of any client-facing list.
 
 ### Content Type
 
 All request and response bodies use `application/json`.
 
+### Federation Transport
+
+Servers contact peers over `https://<peer-host>`. Federation traffic carries no bearer tokens — federation endpoints are open to any caller, with abuse-related defenses (SSRF egress filtering, presence-gated forwarding, per-peer linear backoff) handled internally. See §7.
+
 ### Message Size Limit
 
-The maximum size of an encrypted blob is **20 MB**. Servers MUST reject messages exceeding this limit. This applies to the entire encrypted payload, including inline media.
+The on-wire `encryptedBlob` (hex) is capped at **40 MiB** (about 20 MiB of binary payload). Servers reject larger messages.
 
 ---
 
@@ -273,185 +289,122 @@ When a client connects, it proves ownership of its keypair:
 1. Client sends its public key:
    ```
    POST /auth/challenge
-   { "pubkey": "<base64url(ed25519_pubkey)>" }
+   { "pubkey": "<hex(ed25519_pubkey)>" }
    ```
 
-2. Server responds with a random challenge (valid for 60 seconds):
+2. Server responds with a random challenge string (valid for 60 s):
    ```json
-   { "challenge": "<base64url(random_32_bytes)>" }
+   { "challenge": "<random_hex>", "expiresAt": 1679003660000 }
    ```
 
-3. Client signs the challenge and sends it back:
+3. Client signs the **UTF-8 bytes of the challenge string** with its Ed25519 private key and submits:
    ```
    POST /auth/verify
    {
-     "pubkey": "<base64url(ed25519_pubkey)>",
-     "challenge": "<base64url(challenge)>",
-     "signature": "<base64url(ed25519_sign(private_key, challenge))>"
+     "pubkey":        "<hex(ed25519_pubkey)>",
+     "challenge":     "<random_hex>",
+     "signature":     "<hex(ed25519_sign(private_key, utf8(challenge)))>",
+     "revokeOthers":  false
    }
    ```
+   Setting `revokeOthers: true` invalidates every other live session for this pubkey (useful for "log out other devices").
 
 4. Server verifies the signature. On success, returns a session token valid for **1 hour**:
    ```json
-   { "token": "<session_token>", "expires_at": 1679003600 }
+   { "token": "<session_token>", "expiresAt": 1679003600000 }
    ```
 
-The session token is included in all subsequent requests as a bearer token:
+The session token is included in subsequent authenticated requests as a bearer token:
 ```
 Authorization: Bearer <session_token>
 ```
 
-When a token expires, the server responds with `401`. The client re-authenticates by repeating the challenge-response flow. Servers SHOULD broadcast an `offline` gossip event only if the client does not re-authenticate within a grace period (e.g., 60 seconds).
+Sessions are also bound to the client's source IP (read from `X-Forwarded-For` when the server runs behind a reverse proxy). A request from a different IP is rejected as unauthorized.
 
-### Endpoints
+When a token expires, the server responds with `401`. The client re-authenticates by repeating the challenge-response flow.
 
-#### `POST /auth/challenge` — Request auth challenge
-
-**Request:**
-```json
-{ "pubkey": "<base64url(ed25519_pubkey)>" }
-```
-
-**Response:**
-```json
-{ "challenge": "<base64url(random_32_bytes)>" }
-```
-
-#### `POST /auth/verify` — Complete auth
-
-**Request:**
-```json
-{
-  "pubkey": "<base64url(ed25519_pubkey)>",
-  "challenge": "<base64url(challenge)>",
-  "signature": "<base64url(signature)>"
-}
-```
-
-**Response:**
-```json
-{ "token": "<session_token>", "expires_at": 1679003600 }
-```
+A successful `/auth/verify` also installs the pubkey in the local presence table and broadcasts an `online` gossip event to known peers (§7).
 
 ### Error Responses
 
-All endpoints return errors in a consistent format:
+Errors return a non-2xx HTTP status with a body of:
 
 ```json
-{
-  "error": "<error_code>",
-  "message": "<human-readable description>"
-}
+{ "error": "<code>" }
 ```
 
 | HTTP Status | Error Code           | Meaning                              |
 |-------------|----------------------|--------------------------------------|
-| 400         | `bad_request`        | Malformed request body               |
-| 401         | `unauthorized`       | Missing, invalid, or expired token   |
-| 403         | `challenge_expired`  | Auth challenge has expired (>60s)    |
-| 404         | `not_found`          | Unknown pubkey or resource           |
-| 413         | `payload_too_large`  | Encrypted blob exceeds 20 MB         |
-| 429         | `rate_limited`       | Too many requests                    |
-| 500         | `internal_error`     | Server error                         |
+| 400         | `self_send`          | A message in `/messages` is addressed to the sender |
+| 400         | `invalid_request`    | Malformed federation request         |
+| 401         | `unauthorized`       | Missing, invalid, or expired token, or wrong IP |
+| 404         | `no_presence`        | Federated forward arrived for a recipient with no live local session |
+| 413         | (HTTP only)          | Encrypted blob exceeds limit         |
+| 429         | (HTTP only)          | Per-route rate limit exceeded        |
+| 503         | `capacity`           | Server-side resource cap reached     |
 
-#### `GET /poll` — Long poll for new events
+### `POST /poll` — Long poll for new events
 
-The client makes a blocking GET request. The server holds the connection open until new events are available or a timeout is reached.
+The client makes a blocking POST. The server holds the connection open until new events are available or the long-poll timeout (25 s) elapses.
 
 **Headers:** `Authorization: Bearer <token>`
 
-**Query parameters:**
+**Request:**
+```json
+{ "cursor": 0 }
+```
 
-| Parameter    | Type   | Description                                      |
-|--------------|--------|--------------------------------------------------|
-| `after`      | string | Cursor from the previous poll response (optional) |
+`cursor` is the maximum `receivedAt` value the client has already seen (`0` on first poll).
 
 **Response:**
 ```json
 {
   "events": [
-    {
-      "type": "message",
-      "data": { "to": "...", "from": "...", "encrypted_blob": "...", "timestamp": 1679000000 },
-      "id": "evt_001"
-    }
+    { "encryptedBlob": "<hex>" }
   ],
-  "cursor": "evt_001"
+  "cursor": 1679000000123
 }
 ```
 
-- If events are available immediately, the server responds right away.
-- If no events are available, the server holds the connection for up to 20 seconds.
-- On timeout with no events, the server returns `{ "events": [], "cursor": "..." }`.
-- The client should immediately issue the next poll after receiving a response.
+- `cursor` is a server-side monotonic millisecond timestamp.
+- Advancing past a message acts as an **implicit ack**: when the next poll arrives with a `cursor` greater than or equal to a stored message's `receivedAt`, the server drops the stored message **and any pending federation forwards for it**.
+- If events are available immediately, the server responds right away. Otherwise it parks the connection on a row-level wait against the mailbox and returns when a new matching message lands or after 25 s, whichever comes first.
+- An empty page (`events: []`) is returned on timeout, with the cursor echoed back.
+- A single response is capped at 50 events; the client should poll again immediately after receiving any response.
 
-**Event types:**
-
-| Type       | Data                                |
-|------------|-------------------------------------|
-| `message`  | Envelope JSON (see §4)             |
-
-#### `POST /messages` — Send a message
+### `POST /messages` — Send messages
 
 **Headers:** `Authorization: Bearer <token>`
+
+Sends are **batched** and all-or-nothing. Up to 100 messages per request:
 
 **Request:**
 ```json
 {
-  "to": "<base64url(recipient_ed25519_pubkey)>",
-  "encrypted_blob": "<base64url(encrypted_blob)>",
-  "timestamp": 1679000000
+  "messages": [
+    { "to": "<hex(recipient_pubkey)>", "encryptedBlob": "<hex>" }
+  ]
 }
-```
-
-The server fills in `from` from the authenticated session.
-
-**Response:**
-```json
-{
-  "status": "delivered" | "federated" | "queued",
-  "message_id": "<server_assigned_id>"
-}
-```
-
-- `delivered` — recipient is online locally, message is available for polling.
-- `federated` — recipient is known to be online on a remote server; message has been accepted for federation forwarding. This does **not** guarantee delivery to the remote server — the forward is attempted asynchronously and retried on failure.
-- `queued` — recipient is offline or unknown, message is queued for later delivery.
-
-**`message_id` field:** If the client sends a non-empty `messageId` in the request, the server uses it for deduplication (idempotent sends). If omitted or empty, the server generates a unique ID and returns it. Clients that do not need idempotency may omit it.
-
-#### `POST /messages/ack` — Acknowledge receipt
-
-**Headers:** `Authorization: Bearer <token>`
-
-**Request:**
-```json
-{ "message_ids": ["id1", "id2"] }
 ```
 
 **Response:**
-```json
-{ "ok": true }
-```
+- `200 {}` on success — every message in the batch has been enqueued for delivery (locally, via federation, or both).
+- `400 { "error": "self_send" }` if any message targets the authenticated pubkey.
+- `401 / 429 / 503` per the table above.
 
-The server deletes acknowledged messages from its queue. If the message arrived via federation, the ACK is forwarded to the origin server so it can also clean up. This is a server-side queue management operation — delivery notification to the sender is handled by encrypted `delivery.ack` messages (see §4).
+The server learns the sender from the bearer token, uses it only to reject self-sends and to enforce per-session rate limits, and does **not** persist the sender alongside the stored message.
 
-#### `GET /lookup/:pubkey` — Look up a user's presence
+Whether a recipient is currently reachable, offline, or known via federation is internal to the server. The sender's UI learns "they got it" only via a returning `delivery.ack` (§4) from the recipient — there is no server-issued delivery status.
 
-**Response (online):**
-```json
-{
-  "online": true,
-  "server": "other-server.example.com"
-}
-```
+There is **no `/messages/ack` endpoint**: poll cursor advance is the only acknowledgement signal a recipient sends to the server.
 
-**Response (offline):**
-```json
-{
-  "online": false
-}
-```
+### Endpoints Not Present
+
+The following endpoints exist in earlier drafts of this spec but are **not** implemented:
+
+- `POST /messages/ack` — replaced by implicit ack on poll cursor advance.
+- `GET /lookup/:pubkey` — presence information is internal; clients have no way to query it.
+- `POST /federation/ack` — federation cleanup is driven by the receiving peer's poll-ack, not a back-channel.
 
 ---
 
@@ -459,141 +412,87 @@ The server deletes acknowledged messages from its queue. If the message arrived 
 
 ### Mesh Formation
 
-Federation is open. A server joins the mesh by connecting to one or more known peers. No approval is required.
+Federation is open. A server joins the mesh by being configured (at build/start time) with its own public hostname; peers learn of each other through gossip and through messages flowing across them. There is no central registry.
 
-Server operators configure a list of initial peers. When a server starts, it announces itself to its peers, which propagate the announcement. Over time, each server builds a view of the full mesh.
+Operators may apply an inbound blocklist; outbound federation is filtered through a built-in **SSRF deny-list** that rejects:
 
-Operators may maintain an optional **blocklist** of server hostnames or IPs to refuse connections from.
+- `localhost`, IP-literal forms (`127.0.0.0/8`, `10/8`, `192.168/16`, `169.254/16`, `0/8`)
+- IPv6 literals (`::`, `::1`, bracketed `[…]` syntax)
+- `.localhost`, `.local`, `.internal`, `.arpa`, `.onion` suffixes
+- Anything containing characters outside `[a-z0-9-.:]`
+
+This applies both to outbound `fetch` calls and to the `fromServer` field on inbound federation requests.
 
 ### Gossip (Presence Announcements)
 
-When a user connects to or disconnects from a server, the server broadcasts a presence update to all known peers:
+When a user authenticates or polls, the server marks them locally online and broadcasts an `online` event. When a session expires or the polled presence row times out, an `offline` event is sent.
 
-**Online:**
+**Event format (one entry per pubkey):**
+
 ```json
-{
-  "type": "online",
-  "pubkey": "<base64url(ed25519_pubkey)>",
-  "server": "this-server.example.com",
-  "timestamp": 1679000000,
-  "ttl": 3600
-}
+{ "eventType": "online",  "pubkey": "<hex>" }
+{ "eventType": "offline", "pubkey": "<hex>" }
 ```
 
-**Offline:**
-```json
-{
-  "type": "offline",
-  "pubkey": "<base64url(ed25519_pubkey)>",
-  "server": "this-server.example.com",
-  "timestamp": 1679000000
-}
-```
+Events carry no timestamp, no server name, and no TTL on the wire. Each receiver anchors a local TTL (90 minutes by default) at the moment of receipt; the originating server is taken from the transport-level `fromServer` field, not the event body.
 
-Each server maintains a **presence table** — a mapping of public keys to a **set of servers** where they are currently connected. A single pubkey may appear at multiple servers simultaneously (e.g., multiple devices with different keypairs connecting independently, or stale gossip). Presence entries expire after `ttl` seconds if not refreshed.
+Gossip is **single-hop**: when a server receives a gossip batch, it updates its presence table and (for newly-online keys) forwards any locally-queued messages to the originator, but it does **not** propagate the events to its own peers. There is no hop counter.
 
-Gossip messages are forwarded to peers with a decrementing hop counter to prevent infinite propagation.
+A server may hold multiple presence rows for the same pubkey — one per peer that has reported the pubkey online — to handle multi-device or in-flight handoff between servers.
 
-### Gossip Endpoint
-
-```
-POST /federation/gossip
-```
+### `POST /federation/gossip` — Ingest peer presence events
 
 **Request:**
 ```json
 {
   "events": [
-    { "type": "online", "pubkey": "...", "server": "...", "timestamp": ..., "ttl": ... },
-    { "type": "offline", "pubkey": "...", "server": "...", "timestamp": ... }
+    { "eventType": "online",  "pubkey": "<hex>" },
+    { "eventType": "offline", "pubkey": "<hex>" }
   ],
-  "hops_remaining": 3
+  "fromServer": "peer.example.com"
 }
 ```
 
-### Message Forwarding
+- Up to 100 events per request.
+- Rejected with `400 invalid_request` if `fromServer` equals this server's identity, fails the SSRF deny-list, or the event count exceeds the cap.
+- `online` events for keys not previously seen at `fromServer` trigger an immediate forward sweep: any locally-queued messages addressed to those keys are scheduled for `/federation/forward`.
 
-When a server receives a message for a recipient, it checks the presence table. If the pubkey appears at multiple servers, the message is forwarded to **all** of them. This ensures delivery even with stale gossip or multi-server presence.
-
-```
-POST /federation/forward
-```
+### `POST /federation/forward` — Receive a federated message
 
 **Request:**
 ```json
 {
-  "to": "<base64url(recipient_ed25519_pubkey)>",
-  "from": "<base64url(sender_ed25519_pubkey)>",
-  "encrypted_blob": "<base64url(encrypted_blob)>",
-  "timestamp": 1679000000,
-  "origin_server": "sender-server.example.com",
-  "message_id": "<id>"
+  "toKey":         "<hex(recipient_pubkey)>",
+  "encryptedBlob": "<hex>"
 }
 ```
 
-The receiving server delivers the message to the connected client on its next poll.
+There is no `from`, no origin-server hint, and no sender timestamp — the receiving server simply records the blob for the recipient.
 
-### ACK Forwarding
+The receiver **requires the recipient to be currently locally online** (i.e. have an unexpired local presence row). If not, it returns `404 no_presence` and the origin retries (see below) or holds the message in its own mailbox.
 
-When a recipient ACKs a message, the ACK is forwarded back to the origin server so it can delete the queued blob:
+### Forward Retries
 
-```
-POST /federation/ack
-```
+Forwards that fail (network error or `no_presence`) remain queued at the origin and are retried by a background loop:
 
-**Request:**
-```json
-{
-  "message_ids": ["id1", "id2"],
-  "origin_server": "sender-server.example.com"
-}
-```
+- Linear per-peer backoff: `retryBackoffBase × failures`, capped at `retryBackoffMax` (defaults: base 30 s, cap 8 min).
+- Up to `maxForwardRetries` attempts (default 10), then the forward is dropped.
+- Per-peer failure counters age out after 24 h, after which the next attempt is treated as fresh.
+- A single successful call to a peer clears its failure counter (no half-open state).
+
+When the recipient finally polls a server holding their mail (local or federated), the implicit ack on cursor advance flushes the stored blob and prunes any remaining outbound forwards for it.
+
+### What's NOT Federated
+
+- **Message ack roundtrips.** There is no `/federation/ack`; the origin server learns "the message landed" by observing that its outbound forward succeeded and that no other forwards for the same blob remain pending.
+- **Multi-hop gossip.** Each server only sees the presence events of peers it directly federates with.
+- **Cross-server presence queries.** Servers do not ask each other "is this key online?" — they wait for a gossip update.
 
 ---
 
 ## 8. Group Messaging
 
-Groups are a **client-side concept**. Servers are entirely unaware of groups — they see only individual messages between pairs of public keys.
-
-### Group Structure
-
-A group is defined locally on each member's device:
-
-```json
-{
-  "group_id": "<random_uuid>",
-  "group_name": "Weekend Plans",
-  "members": [
-    "<base64url(pubkey_alice)>",
-    "<base64url(pubkey_bob)>",
-    "<base64url(pubkey_carol)>"
-  ]
-}
-```
-
-### Sending to a Group
-
-When a user sends a message to a group, the client **fans out** — it encrypts and sends the message individually to each group member. Each fan-out message includes the `group_id` in the plaintext payload so the recipient's client can display it in the correct conversation:
-
-```json
-{
-  "type": "text",
-  "id": "msg_123",
-  "timestamp": 1679000000,
-  "group_id": "550e8400-e29b-41d4-a716-446655440000",
-  "body": "See you Saturday!"
-}
-```
-
-From the server's perspective, a group message of N members is N separate 1:1 messages.
-
-### Membership Management
-
-- **Invite:** Send a `group.invite` message to the new member containing the group ID, name, and member list.
-- **Leave:** Send a `group.leave` message to all remaining members.
-- **Update:** Send a `group.update` message to all members when the name or membership changes.
-
-All membership operations are performed by the client. There is no server-side group state, no group admin role enforced by the protocol, and no consensus mechanism. Clients trust the membership updates they receive from other members.
+Group messaging is **not implemented** in the current version. Future revisions may add it as a client-side concept (encrypting one message per group member, with a shared `group_id` in the plaintext payload). Servers would remain entirely unaware of groups.
 
 ---
 
@@ -601,50 +500,51 @@ All membership operations are performed by the client. There is no server-side g
 
 ### Queuing
 
-When a server receives a message for a recipient who is not currently online (not in the presence table), the **sender's server queues** the encrypted blob.
+When a server accepts a message via `/messages`, it always writes the blob to its **local mailbox** under a fresh monotonic `receivedAt`. In parallel, if the recipient is known (via gossip) to be online at one or more remote servers, a federation `forward` is queued and attempted asynchronously per server.
 
-The sender's server continues to listen to gossip. When a presence announcement indicates the recipient is online at some server, the sender's server forwards the queued message to that server.
+If the recipient is not online anywhere, the message simply stays in the local mailbox until either:
+
+- The recipient connects to this server and polls (and acks via cursor advance), or
+- An `online` gossip event arrives naming a server where the recipient is now reachable, at which point the queued message is forwarded there.
 
 ### TTL
 
-All messages have a **30-day TTL**, enforced in two places:
-
-- **Server-side:** Queued messages are deleted 30 days after their timestamp. Servers are temporary relays, not long-term storage.
-- **Client-side:** Clients MUST delete messages from local storage 30 days after their timestamp. There is no permanent message history.
+All messages have a **30-day TTL**, enforced server-side: queued messages are deleted 30 days after their `receivedAt`. Servers are temporary relays, not long-term storage. Clients SHOULD also age out local message history.
 
 ### Delivery Flow
 
 ```
 1. Alice sends a message to Bob (offline).
-2. Alice's server queues the encrypted blob.
-   Returns: { "status": "queued" }
+2. Alice's server appends the encrypted blob to its local mailbox.
+   Returns: 200 {}
 
 3. ...time passes...
 
-4. Bob connects to Server C.
-5. Server C gossips: ONLINE { bob_pubkey, server_c }
-6. Alice's server sees the gossip, forwards the queued message to Server C.
-7. Server C delivers to Bob on his next poll.
-8. Bob's client sends ACK to Server C (queue cleanup).
-9. Server C forwards ACK to Alice's server.
-10. Alice's server deletes the blob.
-11. Bob's client sends an encrypted `delivery.ack` message to Alice.
-12. When Alice receives it, she marks the message as delivered.
+4. Bob connects to Server C; Server C marks Bob locally online and gossips
+   { eventType: "online", pubkey: bob } to its peers.
+5. Alice's server receives the gossip and queues a /federation/forward to Server C.
+6. Server C accepts the forward (Bob is locally online) and appends to Bob's mailbox.
+7. Bob's client polls Server C, receives the event, advances its cursor.
+8. Cursor advance acts as an implicit ack: Server C deletes the stored blob and
+   the corresponding pending forward (so the chain does not double-deliver).
+9. Bob's client sends an encrypted `delivery.ack` message back to Alice.
+10. When Alice next polls and decrypts that, her UI marks her message delivered.
 ```
 
-Alice does not need to stay online. Her server handles delivery independently.
+Note: Alice does not need to stay online for steps 4–9. Her server handles federation independently.
 
 ### Failure Modes
 
 - If the sender's server goes down before delivering, queued messages are **lost**. This is an accepted tradeoff — servers are disposable.
-- If the recipient never comes back online within 30 days, the message is deleted.
-- The sender sees `queued` status until ACK is received, at which point it becomes `delivered`.
+- If forwarding to a peer fails repeatedly, the forward is dropped after `maxForwardRetries`; the message remains in the origin's mailbox and will only be delivered if the recipient ever polls the origin directly.
+- If the recipient never comes back online within 30 days, the message is deleted by the server-side TTL.
+- The sender's UI sees no delivery status until a `delivery.ack` is received from the recipient.
 
 ### Message Ordering
 
-Message ordering is **best-effort** and guaranteed only within a single server. Each server maintains a monotonic sequence counter (`receivedAt`) that provides strict ordering for locally stored messages. The `cursor` returned by `/poll` reflects this sequence.
+Message ordering is **best-effort** and guaranteed only within a single server. Each server's `receivedAt` provides strict ordering for that server's mailbox, and the `cursor` returned by `/poll` reflects this sequence.
 
-Across federated servers, messages may arrive out of order due to network latency, retry delays, or differing reception times. Clients SHOULD use the sender-provided `timestamp` field for display ordering and treat `cursor` as a polling checkpoint only, not a global ordering guarantee.
+Across federated servers, messages may arrive out of order due to network latency, retry delays, or differing reception times. Clients SHOULD use the sender-provided `ts` field (from the decrypted plaintext payload, §4) for display ordering and treat `cursor` as a polling checkpoint only, not a global ordering guarantee.
 
 ---
 
@@ -652,32 +552,33 @@ Across federated servers, messages may arrive out of order due to network latenc
 
 ### Threat Model
 
-Skrepka protects message **content** from servers and network observers. It does not attempt to hide **metadata**.
+Skrepka protects message **content and sender identity** from servers and network observers. It does not attempt to hide the recipient.
 
 ### What Is Protected
 
-| Property              | Mechanism                                    |
-|-----------------------|----------------------------------------------|
-| Message confidentiality | E2E encryption (X25519 + HKDF-SHA256 + XChaCha20-Poly1305) |
-| Sender authenticity    | Ed25519 signature on every message           |
-| Replay protection      | Unique nonce per message                     |
-| Key compromise (partial) | Ephemeral keys per message — past messages whose blobs were already discarded cannot be decrypted even if the recipient's long-term key is compromised |
+| Property                  | Mechanism                                                  |
+|---------------------------|------------------------------------------------------------|
+| Message confidentiality   | E2E encryption (X25519 + HKDF-SHA256 + XChaCha20-Poly1305) |
+| Sender authenticity       | Ed25519 signature on every message                         |
+| Sender anonymity vs. server | Sender pubkey is inside the AEAD ciphertext — servers see the recipient but not the sender |
+| Replay protection         | Unique nonce per message; signature binds the recipient pubkey, so a captured blob cannot be replayed against a different recipient |
+| Partial post-compromise   | Ephemeral X25519 keys per message — once the blob is no longer stored anywhere, even compromising the recipient's long-term key does not recover the message |
 
 ### What Is NOT Protected
 
-| Risk                         | Details                                             |
-|------------------------------|-----------------------------------------------------|
-| **No forward secrecy**       | If a message blob is captured *and* the recipient's long-term X25519 key is later compromised, that specific message can be decrypted. No ratchet means no post-compromise recovery. |
-| **Metadata exposure**        | Servers see `{to, from, timestamp}` in the envelope. They know who is talking to whom and when. Message size is also visible. |
-| **Presence gossip leaks location** | All servers in the mesh learn which server a user is connected to. |
-| **No durable delivery**      | If the sender's server goes down, queued messages are lost. |
-| **No server authentication** | Servers are not authenticated to each other by default. A malicious server could join the mesh and observe gossip. |
-| **Group membership visible to members** | Group member lists are shared in plaintext among members. A compromised member reveals the full group. |
+| Risk                              | Details                                             |
+|-----------------------------------|-----------------------------------------------------|
+| **No forward secrecy**            | If a message blob is captured *and* the recipient's long-term X25519 key is later compromised, that specific message can be decrypted. No ratchet means no post-compromise recovery. |
+| **Recipient metadata exposure**   | Servers see the recipient pubkey and arrival time of every message, plus the rough size of each blob. They do **not** see the sender. |
+| **Presence gossip leaks location** | Federated peers learn which server a user is currently connected to. |
+| **No durable delivery**           | If the sender's server goes down or all forward retries fail, messages may be lost. |
+| **Open federation**               | Federation endpoints are unauthenticated. The SSRF deny-list and `no_presence` gate limit abuse but do not authenticate peers; a hostile server can join the mesh and observe gossip. |
+| **TOFU only**                     | A first-time public key is trusted on encounter; users must compare fingerprints out-of-band to detect MITM at first contact. |
 
 ### Recommendations for Implementers
 
 - Store private keys in platform-secure storage (Keychain, Keystore, etc.).
 - Warn users when a contact's public key changes (TOFU violation).
 - Consider pinning server TLS certificates for additional transport security.
-- Implement rate limiting on server endpoints to mitigate spam.
-- Servers SHOULD delete message blobs immediately after successful delivery and ACK.
+- Federate only with peers operated by trusted operators if presence metadata is sensitive.
+- Servers SHOULD delete message blobs as soon as the implicit ack (cursor advance) lands.
