@@ -7,3 +7,5 @@ server
 .fake
 client/bin
 client/obj
+.DS_Store
+.claude/
