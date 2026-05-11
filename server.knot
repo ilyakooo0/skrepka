@@ -382,10 +382,10 @@ recordFailure = \server -> do
   t <- now
   atomic (do
     failures <- *forwardFailures
-    let new = case findFirst failures (\f -> f.server == server) of
-      Just {value: f} -> {server, failedAt: t, failures: f.failures + 1}
-      _ -> {server, failedAt: t, failures: 1}
-    *forwardFailures = union (filter (\f -> f.server != server) failures) [new])
+    let prevCount = case findFirst failures (\f -> f.server == server) of
+      Just {value: f} -> f.failures
+      _ -> 0
+    *forwardFailures = union (filter (\f -> f.server != server) failures) [{server, failedAt: t, failures: prevCount + 1}])
 
 -- Drop the failure record for `server` (called after any successful peer call).
 -- Single-success recovery — there is no half-open state.
@@ -744,7 +744,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
           pres <- *presence
           let stillLocal = hasLocalPresence pres to t
           let othersPending = any (\x -> x.encryptedBlob == encryptedBlob) remaining
-          when (not stillLocal && not othersPending) (do
+          when (not (stillLocal || othersPending)) (do
             msgs <- *messages
             *messages = filter (\m -> m.encryptedBlob != encryptedBlob) msgs))))
 
