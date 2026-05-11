@@ -227,8 +227,6 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 
 -- Strictly-monotonic sequence used as `Message.receivedAt`; guarantees poll-cursor ordering.
 *seqCounter : Timestamp
--- Bumped by send/heartbeat to wake all blocked /poll holders.
-*pollWakeup : Timestamp
 
 -- ============================================
 -- Routes
@@ -413,16 +411,15 @@ collectPeers : [a] -> (a -> Text) -> [Text]
 collectPeers = \items getServer -> filter (\s -> not isLocalServer s) (map getServer items)
 
 -- Append one ciphertext to the local mailbox under a fresh monotonic
--- sequence and bump pollWakeup so blocked /poll holders unblock. Caller
--- wraps in `atomic`.
-appendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *pollWakeup, rw *seqCounter} {}
+-- sequence. Row-level STM retry on `*messages` wakes any parked /poll
+-- transaction whose filter matches the new row. Caller wraps in `atomic`.
+appendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *seqCounter} {}
 appendMessage = \toKey encryptedBlob t -> do
   msgs <- *messages
   seq <- *seqCounter
   let seqTs = max t (seq + 1)
   *seqCounter = seqTs
   *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
-  *pollWakeup = seqTs
 
 -- True when `f` is the queued forward of `blob` to `server`. Used to dedupe
 -- per-(blob, server) entries on the forwards outbox.
@@ -600,14 +597,15 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
 -- ============================================
 -- Long-poll. The client supplies a cursor (last-seen `receivedAt`). We:
 --   * Ack-and-drop everything <= the cursor (treating poll progress as ack).
---   * Wait on `pollWakeup` (bumped by send/heartbeat) and return new events
---     plus piggybacked sender-side expirations/deliveries.
+--   * Race a row-level STM wait on `*messages` against `pollTimeoutMs` and
+--     return new events plus piggybacked sender-side expirations/deliveries.
 
 -- POST /poll: long-poll body. Treats the cursor advance as an implicit ack
 -- (`ackPolledMessages`), refreshes the caller's local presence row so peers
 -- don't time us out mid-session, then runs `doPoll` to collect events (or
--- block until wakeup) and assembles the response.
-handlePoll : Int -> Text -> Text -> IO {r *pollWakeup, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
+-- block until a matching message arrives or the timeout elapses) and
+-- assembles the response.
+handlePoll : Int -> Text -> Text -> IO {r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, network, clock} (Result HttpError {cursor: Timestamp, events: [PollEvent]})
 handlePoll = \cursor authorization clientIp -> do
   t <- now
   setup <- atomic (do
@@ -617,11 +615,10 @@ handlePoll = \cursor authorization clientIp -> do
       Just {value: pubkey} -> do
         let clampedCursor = max 0 (min t cursor)
         when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
-        startWakeup <- *pollWakeup
         pres <- *presence
         let stale = not any (\p -> p.pubkey == pubkey && isLocalServer p.server && p.expiresAt - t >= sessionExpiry / 2) pres
         refreshPeers <- if stale then refreshLocalPresence pubkey (t + sessionExpiry) else yield []
-        yield (Just {value: {pubkey, clampedCursor, startWakeup, refreshPeers}}))
+        yield (Just {value: {pubkey, clampedCursor, refreshPeers}}))
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
@@ -634,13 +631,11 @@ handlePoll = \cursor authorization clientIp -> do
 -- max `receivedAt` in the page (or the input cursor when the page is empty),
 -- which the client echoes on the next /poll to advance — and which the
 -- server treats as an implicit ack.
--- If the page is empty, retry-wait on `pollWakeup` (bumped by send/heartbeat)
--- and re-collect once at the new wall time. The retry uses Knot's STM `retry`
--- primitive: the transaction blocks until some other transaction commits a
--- change to `*pollWakeup`. Because `pollHeartbeat` bumps `*pollWakeup` every
--- `pollTimeoutMs`, no caller waits longer than one heartbeat period before
--- getting at least an empty response.
-doPoll : {clampedCursor: Int, pubkey: PubkeyHex, startWakeup: Timestamp | a} -> Int<Ms> -> IO {r *pollWakeup, clock} {cursor: Int<Ms>, events: [{encryptedBlob: BlobHex}]}
+-- If the page is empty, race a row-level STM wait against `pollTimeoutMs`:
+-- the wait transaction reads `*messages` and `retry`s until a row matching
+-- this pubkey/cursor is committed; the timer wins on idle. Either way we
+-- re-collect at the new wall time, so a timeout returns an empty page.
+doPoll : {clampedCursor: Int, pubkey: PubkeyHex | a} -> Int<Ms> -> IO {r *messages, clock} {cursor: Int<Ms>, events: [{encryptedBlob: BlobHex}]}
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic (do
     msgs <- *messages
@@ -654,7 +649,12 @@ doPoll = \s t -> do
   if count initial.events > 0
   then yield initial
   else do
-    atomic (do wakeup <- *pollWakeup; if wakeup > s.startWakeup then yield {} else retry)
+    race
+      (atomic (do
+        msgs <- *messages
+        let fresh = filter (\m -> m.toKey == s.pubkey && m.receivedAt > s.clampedCursor) msgs
+        if count fresh > 0 then yield {} else retry))
+      (sleep pollTimeoutMs)
     t2 <- now
     collectAt t2
 
@@ -685,7 +685,7 @@ ackPolledMessages = \pubkey cursor -> do
 -- rejected up-front; the remaining batch is committed inside one atomic
 -- block (all-or-nothing) which reads presence to pre-stage federation
 -- forwards. Federation forwards are kicked per message after commit.
-handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {r *presence, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *pollWakeup, rw *seqCounter, network, clock} (Result HttpError {})
+handleSendMessages : [{encryptedBlob: BlobHex, to: PubkeyHex | a}] -> Text -> Text -> IO {r *presence, r *sessions, rw *forwardFailures, rw *forwards, rw *messages, rw *seqCounter, network, clock} (Result HttpError {})
 handleSendMessages = \messages authorization clientIp -> do
   t <- now
   auth <- authedPubkey authorization t clientIp
@@ -781,7 +781,7 @@ handleRecvGossip = \events fromServer -> do
 -- A → B forward based on stale gossip about R could land on B with no
 -- actively-polling client and get stuck. If B refuses, A retries via
 -- `retryPendingForwards` against the next presence target.
-handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, rw *pollWakeup, r *presence, rw *seqCounter, clock} (Result HttpError {})
+handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, r *presence, rw *seqCounter, clock} (Result HttpError {})
 handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
   atomic (do
@@ -814,9 +814,6 @@ api = serve Api where
 -- Background loops
 -- ============================================
 -- `backgroundPrune` runs the prune/retry sweep every `backgroundPruneInterval` ms.
--- `pollHeartbeat` bumps `pollWakeup` every `pollTimeoutMs` so long-poll
--- holders unblock and return an empty heartbeat response, keeping connections
--- fresh.
 
 -- Endless tick: prune expired state, gossip offline for locally-expired keys,
 -- and retry pending forwards. First sweep happens immediately so stale rows
@@ -833,24 +830,14 @@ backgroundPrune = do
   sleep backgroundPruneInterval
   backgroundPrune
 
--- Endless tick that bumps `pollWakeup` every `pollTimeoutMs` so any blocked
--- /poll holders unblock and return an empty heartbeat response.
-pollHeartbeat : IO {rw *pollWakeup, clock} a
-pollHeartbeat = do
-  sleep pollTimeoutMs
-  t <- now
-  *pollWakeup = t
-  pollHeartbeat
-
 -- ============================================
 -- Entry Point
 -- ============================================
--- Fork the background loops (the prune loop runs an immediate sweep on its
+-- Fork the background prune loop (which runs an immediate sweep on its
 -- first tick) and start the HTTP listener.
 main : IO _ {}
 main = do
   logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
   fork backgroundPrune
-  fork pollHeartbeat
   listenOn bindHost listenPort api
