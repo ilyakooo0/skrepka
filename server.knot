@@ -460,7 +460,8 @@ pruneExpired = \t -> atomic do
   -- presence: remember locally-expired keys for offline gossip
   pres <- *presence
   *presence = filter (\p -> p.expiresAt > t) pres
-  yield (map (\p -> p.pubkey) (filter (\p -> p.expiresAt <= t && isLocalServer p.server && not (hasLocalPresence pres p.pubkey t)) pres))
+  let liveLocalPubkeys = map (\p -> p.pubkey) (filter (\p -> isLocalServer p.server && p.expiresAt > t) pres)
+  yield (map (\p -> p.pubkey) (filter (\p -> p.expiresAt <= t && isLocalServer p.server && not elem p.pubkey liveLocalPubkeys) pres))
 
 -- ============================================
 -- Federation gossip
@@ -728,25 +729,23 @@ handleSendMessages = \messages authorization clientIp -> do
 -- stays so `retryPendingForwards` can re-attempt with backoff.
 forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {r *presence, rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
-  fwds <- *forwards
+  t <- now
+  result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
   let same = forwardMatches encryptedBlob server
-  when (any same fwds) (do
-    t <- now
-    result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
-    case result of
-      Err _ -> recordFailure server
-      Ok _ -> do
-        clearFailure server
-        atomic (do
-          fwds2 <- *forwards
-          let remaining = filter (\x -> not same x) fwds2
-          *forwards = remaining
-          pres <- *presence
-          let stillLocal = hasLocalPresence pres to t
-          let othersPending = any (\x -> x.encryptedBlob == encryptedBlob) remaining
-          when (not (stillLocal || othersPending)) (do
-            msgs <- *messages
-            *messages = filter (\m -> m.encryptedBlob != encryptedBlob) msgs))))
+  case result of
+    Err _ -> recordFailure server
+    Ok _ -> do
+      clearFailure server
+      atomic (do
+        fwds <- *forwards
+        let remaining = filter (\x -> not same x) fwds
+        *forwards = remaining
+        pres <- *presence
+        let stillLocal = hasLocalPresence pres to t
+        let othersPending = any (\x -> x.encryptedBlob == encryptedBlob) remaining
+        when (not (stillLocal || othersPending)) (do
+          msgs <- *messages
+          *messages = filter (\m -> m.encryptedBlob != encryptedBlob) msgs)))
 
 -- ============================================
 -- Handler: federation receive
@@ -769,16 +768,16 @@ handleRecvGossip = \events fromServer -> do
   else do
     newlyOnline <- atomic (do
       pres <- *presence
-      let touchedPubkeys = fold (\acc e -> case e of
-        GossipOnline {pubkey} -> union acc [pubkey]
-        GossipOffline {pubkey} -> union acc [pubkey]
-        _ -> acc) [] events
-      let added = fold (\acc e -> case e of
-        GossipOnline {pubkey} -> union acc [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
-        _ -> acc) [] events
-      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey touchedPubkeys) pres
-      *presence = union kept added
-      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) added)))
+      let collected = fold (\acc e -> case e of
+        GossipOnline {pubkey} -> {
+          touched: union acc.touched [pubkey],
+          added: union acc.added [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
+        }
+        GossipOffline {pubkey} -> {acc.added, touched: union acc.touched [pubkey]}
+        _ -> acc) {touched: [], added: []} events
+      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey collected.touched) pres
+      *presence = union kept collected.added
+      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) collected.added)))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
