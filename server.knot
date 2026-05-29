@@ -747,8 +747,9 @@ handleSendMessages = \messages authorization clientIp -> do
   case auth of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: senderKey} -> do
-      let limited = take maxBatchSize messages
-      if any (\m -> m.to == senderKey) limited
+      if count messages > maxBatchSize
+      then yield (Err {error: {status: 413, message: "batch_too_large"}})
+      else if any (\m -> m.to == senderKey) messages
       then yield (Err {error: {status: 400, message: "self_send"}})
       else do
         committed <- atomic (do
@@ -757,7 +758,7 @@ handleSendMessages = \messages authorization clientIp -> do
             m.to,
             m.encryptedBlob,
             remoteServers: collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server)
-          }) limited
+          }) messages
           forEach staged (\c -> do
             appendMessage c.to c.encryptedBlob t
             when federationEnabled (do
