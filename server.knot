@@ -569,8 +569,10 @@ forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages
 forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
   fwds <- *forwards
+  let existing = count (filter (\f -> f.toServer == server) fwds)
+  let budget = max 0 (maxForwardsPerServer - existing)
   let candidates = filter (\m -> m.toKey == pubkey && not any (forwardMatches m.encryptedBlob server) fwds) msgs
-  let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take maxForwardsPerServer candidates)
+  let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget candidates)
   *forwards = union fwds newFwds)
 
 -- ============================================
