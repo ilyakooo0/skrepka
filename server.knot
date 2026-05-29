@@ -882,31 +882,44 @@ api = serve Api where
 -- ============================================
 -- Background loops
 -- ============================================
--- `backgroundPrune` runs the prune/retry sweep every `backgroundPruneInterval` ms.
+-- `backgroundPrune` runs the prune sweep every `backgroundPruneInterval` ms.
+-- `backgroundRetryForwards` runs the forward-retry sweep on the same cadence
+-- but as its own sequential loop so two retries can't race.
 
--- Endless tick: prune expired state, gossip offline for locally-expired keys,
--- and retry pending forwards. First sweep happens immediately so stale rows
--- persisted by the previous process clear before the next interval elapses.
-backgroundPrune : IO {rw *challenges, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions, network, clock} a
+-- Endless tick: prune expired state and gossip offline for locally-expired
+-- keys. First sweep happens immediately so stale rows persisted by the
+-- previous process clear before the next interval elapses.
+backgroundPrune : IO {rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions, network, clock} a
 backgroundPrune = do
   t <- now
   expiredLocal <- pruneExpired t
-  when federationEnabled (do
-    fork (do
-      pres <- *presence
-      sendBatchedGossip (collectPeers pres (\p -> p.server)) (map (\pk -> GossipOffline {pubkey: pk}) expiredLocal))
-    fork retryPendingForwards)
+  when federationEnabled (fork (do
+    pres <- *presence
+    sendBatchedGossip (collectPeers pres (\p -> p.server)) (map (\pk -> GossipOffline {pubkey: pk}) expiredLocal)))
   sleep backgroundPruneInterval
   backgroundPrune
+
+-- Endless tick: retry pending cross-server forwards. Calls
+-- `retryPendingForwards` inline (not via `fork`) so a slow run blocks the
+-- next iteration instead of racing with itself — two concurrent runs would
+-- see the same `*forwards` snapshot and double-count `recordFailure`,
+-- inflating the per-peer backoff multiplier.
+backgroundRetryForwards : IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} a
+backgroundRetryForwards = do
+  retryPendingForwards
+  sleep backgroundPruneInterval
+  backgroundRetryForwards
 
 -- ============================================
 -- Entry Point
 -- ============================================
 -- Fork the background prune loop (which runs an immediate sweep on its
--- first tick) and start the HTTP listener.
+-- first tick) and start the HTTP listener. The forward-retry loop only
+-- runs when federation is enabled.
 main : IO _ {}
 main = do
   logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
   fork backgroundPrune
+  when federationEnabled (fork backgroundRetryForwards)
   listenOn bindHost listenPort api
