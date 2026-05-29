@@ -211,8 +211,10 @@ type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp, ip: Text}
 -- Mailbox row: a stored message awaiting recipient pickup or federation forward.
 -- Storage TTL is fixed at `messageMaxAge`, so expiry is derived from
 -- `receivedAt`. Any send time the sender wants to convey lives inside
--- `encryptedBlob` (the server cannot read it).
-type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp}
+-- `encryptedBlob` (the server cannot read it). `deliveredTo` records peers
+-- that have already accepted a federated forward of this blob, so a later
+-- presence re-announce of `toKey` doesn't trigger a duplicate delivery.
+type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp, deliveredTo: [ServerName]}
 -- Last-known location of a pubkey, either local (`server == serverHost`) or
 -- learned from a peer via gossip. Multiple entries per pubkey are allowed.
 type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp}
@@ -466,7 +468,7 @@ appendMessage = \toKey encryptedBlob t -> do
   seq <- *seqCounter
   let seqTs = max t (seq + 1)
   *seqCounter = seqTs
-  *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs}]
+  *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs, deliveredTo: []}]
 
 -- True when `f` is the queued forward of `blob` to `server`. Used to dedupe
 -- per-(blob, server) entries on the forwards outbox.
@@ -540,9 +542,10 @@ sendBatchedGossip = \peers events -> when (count events > 0) (do
 -- as forwards to the newly-known server.
 
 -- Walk pending forwards grouped by destination, retry each (up to maxBatchSize
--- per peer) using `/federation/forward`. Drops successful entries; for failures
--- bumps the retry count and gives up after `maxForwardRetries`.
-retryPendingForwards : IO {rw *forwardFailures, rw *forwards, network, clock} {}
+-- per peer) using `/federation/forward`. Drops successful entries and records
+-- the peer on the message's `deliveredTo`; for failures bumps the retry count
+-- and gives up after `maxForwardRetries`.
+retryPendingForwards : IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 retryPendingForwards = do
   t <- now
   fwds <- *forwards
@@ -562,16 +565,23 @@ retryPendingForwards = do
       cur <- *forwards
       *forwards = map (\x -> if isMatch x
       then {x.toServer, x.toKey, x.encryptedBlob, retries: x.retries + 1}
-      else x) (filter (\x -> not isDone x) cur))))
+      else x) (filter (\x -> not isDone x) cur)
+      when success (do
+        msgs <- *messages
+        *messages = map (\m -> if m.toKey == f.toKey && m.encryptedBlob == f.encryptedBlob && not elem server m.deliveredTo
+        then {m.toKey, m.encryptedBlob, m.receivedAt, deliveredTo: union m.deliveredTo [server]}
+        else m) msgs))))
 
 -- Forward queued messages to a server when a remote key comes online.
+-- Skips messages already delivered to `server` (tracked via Message.deliveredTo)
+-- so a presence re-announce after a TTL lapse doesn't duplicate delivery.
 forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages} {}
 forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
   fwds <- *forwards
   let existing = count (filter (\f -> f.toServer == server) fwds)
   let budget = max 0 (maxForwardsPerServer - existing)
-  let candidates = filter (\m -> m.toKey == pubkey && not any (forwardMatches m.encryptedBlob server) fwds) msgs
+  let candidates = filter (\m -> m.toKey == pubkey && not any (forwardMatches m.encryptedBlob server) fwds && not elem server m.deliveredTo) msgs
   let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget candidates)
   *forwards = union fwds newFwds)
 
@@ -772,14 +782,17 @@ handleSendMessages = \messages authorization clientIp -> do
         yield (Ok {value: {}})
 
 -- Fire one /federation/forward call per pre-staged server. On success the
--- corresponding row in `forwards` is pruned, and if no other forwards remain
--- for this blob AND the recipient has no local presence, the backing
--- `*messages` row is dropped too: the origin's job is done and the message
--- now lives on the receiving peer's mailbox. On failure the forwards row
--- stays so `retryPendingForwards` can re-attempt with backoff.
-forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {r *presence, rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
+-- corresponding row in `forwards` is pruned and the peer is appended to the
+-- message's `deliveredTo` set. The backing `*messages` row itself stays —
+-- cleaned up by `ackPolledMessages` when the recipient polls here, or by
+-- `pruneExpired` once `messageMaxAge` lapses. Keeping the row lets
+-- `forwardQueuedToServer` re-forward to peers learned after send time (so a
+-- multi-homed recipient who appears on a new peer post-send still receives
+-- the message), and `deliveredTo` prevents re-forwards to peers that already
+-- have the message. On failure the forwards row stays so
+-- `retryPendingForwards` can re-attempt with backoff.
+forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
-  t <- now
   result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
   let same = forwardMatches encryptedBlob server
   case result of
@@ -788,14 +801,11 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
       clearFailure server
       atomic (do
         fwds <- *forwards
-        let remaining = filter (\x -> not same x) fwds
-        *forwards = remaining
-        pres <- *presence
-        let stillLocal = hasLocalPresence pres to t
-        let othersPending = any (\x -> x.toKey == to && x.encryptedBlob == encryptedBlob) remaining
-        when (not (stillLocal || othersPending)) (do
-          msgs <- *messages
-          *messages = filter (\m -> not (m.toKey == to && m.encryptedBlob == encryptedBlob)) msgs)))
+        *forwards = filter (\x -> not same x) fwds
+        msgs <- *messages
+        *messages = map (\m -> if m.toKey == to && m.encryptedBlob == encryptedBlob && not elem server m.deliveredTo
+        then {m.toKey, m.encryptedBlob, m.receivedAt, deliveredTo: union m.deliveredTo [server]}
+        else m) msgs))
 
 -- ============================================
 -- Handler: federation receive
