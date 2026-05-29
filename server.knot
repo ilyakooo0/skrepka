@@ -112,6 +112,30 @@ backgroundPruneInterval = 30000
 pollTimeoutMs : Int<Ms>
 pollTimeoutMs = 25000
 
+-- Rolling window for every per-endpoint rate-limit bucket (1 min). All routes
+-- share this window; only the per-window request budget varies per endpoint.
+rateLimitWindow : Int<Ms>
+rateLimitWindow = 60000
+-- Per-pubkey budget for /auth/challenge and /auth/verify per `rateLimitWindow`.
+-- The normal handshake is one challenge + one verify, so a healthy flow uses 2.
+authRateLimit : Int
+authRateLimit = 10
+-- Per-session (bearer token) budget for /poll per `rateLimitWindow`. Clients
+-- reconnect after `pollTimeoutMs`, so steady state is ~3/min.
+pollRateLimit : Int
+pollRateLimit = 60
+-- Per-session budget for /messages per `rateLimitWindow`. Each call may carry
+-- up to `maxBatchSize` ciphertexts, so the effective message ceiling is higher.
+sendRateLimit : Int
+sendRateLimit = 60
+-- Per-peer-IP budget for /federation/gossip per `rateLimitWindow`.
+gossipRateLimit : Int
+gossipRateLimit = 60
+-- Per-peer-IP budget for /federation/forward per `rateLimitWindow`. Higher than
+-- gossip because peers fan out one call per buffered ciphertext.
+forwardRateLimit : Int
+forwardRateLimit = 600
+
 -- Master switch for federation; when False the server runs in single-node mode.
 federationEnabled : Bool
 federationEnabled = True {}
@@ -229,6 +253,27 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 *seqCounter : Timestamp
 
 -- ============================================
+-- Rate limiting
+-- ============================================
+-- Per-endpoint token-bucket configuration. Auth endpoints key on the submitted
+-- pubkey (so one keypair can't drain global capacity); authenticated client
+-- endpoints key on the bearer token (per-session); federation endpoints key on
+-- the connection IP. Each route has an independent bucket store, so endpoints
+-- using the same key strategy don't share budget across routes. Buckets persist
+-- in the runtime's `_knot_rate_limits` SQLite table; rejection responds 429
+-- before the handler runs.
+
+byPubkey = \{pubkey} _ -> Just {value: pubkey}
+byAuth = \{authorization} _ -> Just {value: authorization}
+byClientIp = \_ ctx -> Just {value: ctx.clientIp}
+
+authLimit = {key: byPubkey, limit: {requests: authRateLimit, window: rateLimitWindow}}
+pollLimit = {key: byAuth, limit: {requests: pollRateLimit, window: rateLimitWindow}}
+sendLimit = {key: byAuth, limit: {requests: sendRateLimit, window: rateLimitWindow}}
+gossipLimit = {key: byClientIp, limit: {requests: gossipRateLimit, window: rateLimitWindow}}
+forwardLimit = {key: byClientIp, limit: {requests: forwardRateLimit, window: rateLimitWindow}}
+
+-- ============================================
 -- Routes
 -- ============================================
 -- Public HTTP surface, grouped by audience:
@@ -240,16 +285,16 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 -- `{"error": "<code>"}`.
 
 route AuthApi where
-  POST {pubkey: PubkeyHex} /auth/challenge headers {xForwardedFor: Maybe Text} -> {challenge: Text, expiresAt: Timestamp} = ReqChallenge
-  POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {xForwardedFor: Maybe Text} -> {token: Text, expiresAt: Timestamp} = VerifyAuth
+  POST {pubkey: PubkeyHex} /auth/challenge headers {xForwardedFor: Maybe Text} -> {challenge: Text, expiresAt: Timestamp} rateLimit authLimit = ReqChallenge
+  POST {pubkey: PubkeyHex, challenge: Text, signature: SignatureHex, revokeOthers: Bool} /auth/verify headers {xForwardedFor: Maybe Text} -> {token: Text, expiresAt: Timestamp} rateLimit authLimit = VerifyAuth
 
 route ClientApi where
-  POST {cursor: Timestamp} /poll headers {authorization: Text, xForwardedFor: Maybe Text} -> {events: [PollEvent], cursor: Timestamp} = Poll
-  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, xForwardedFor: Maybe Text} -> {} = SendMessages
+  POST {cursor: Timestamp} /poll headers {authorization: Text, xForwardedFor: Maybe Text} -> {events: [PollEvent], cursor: Timestamp} rateLimit pollLimit = Poll
+  POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, xForwardedFor: Maybe Text} -> {} rateLimit sendLimit = SendMessages
 
 route FederationApi where
-  POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} = RecvGossip
-  POST {toKey: PubkeyHex, encryptedBlob: BlobHex} /federation/forward -> {} = ForwardMessage
+  POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} rateLimit gossipLimit = RecvGossip
+  POST {toKey: PubkeyHex, encryptedBlob: BlobHex} /federation/forward -> {} rateLimit forwardLimit = ForwardMessage
 
 route Api = AuthApi | ClientApi | FederationApi
 
@@ -385,7 +430,9 @@ recordFailure = \server -> do
     let prevCount = case findFirst failures (\f -> f.server == server) of
       Just {value: f} -> f.failures
       _ -> 0
-    *forwardFailures = union (filter (\f -> f.server != server) failures) [{server, failedAt: t, failures: prevCount + 1}])
+    *forwardFailures = union (filter (\f -> f.server != server) failures) [
+      {server, failedAt: t, failures: prevCount + 1}
+    ])
 
 -- Drop the failure record for `server` (called after any successful peer call).
 -- Single-success recovery — there is no half-open state.
