@@ -360,12 +360,15 @@ hasSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix))) s
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
 -- tricks (octal, hex, percent-encoding) but covers the high-value cases:
 -- `localhost`, RFC1918 ranges (10/8, 192.168/16, 169.254/16), the IPv4 zero
--- net, IPv6 loopback (`::`/`::1`), bracketed IPv6 literals, and the `.local`
--- / `.internal` / `.arpa` / `.onion` suffixes. Called at federation egress
--- (so we never `fetch` a peer pubkey from loopback) and on inbound requests
--- (so a peer can't claim a bogus `fromServer`).
+-- net, bare IPv6 literals (any string with more than one `:` — covers loopback
+-- `::`/`::1`, link-local `fe80::/10`, ULA `fc00::/7`, globals like `2001:db8::1`),
+-- bracketed IPv6 literals, and the `.local` / `.internal` / `.arpa` / `.onion`
+-- suffixes. Called at federation egress (so we never `fetch` a peer pubkey from
+-- loopback) and on inbound requests (so a peer can't claim a bogus `fromServer`).
+-- A legitimate `host:port` server name has exactly one `:`, so the multi-colon
+-- check leaves that case intact.
 isBadServerName : Text -> Bool
-isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || any (\p -> hasPrefix p sn) [
+isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || count (filter (\c -> c == ":") (chars sn)) > 1 || any (\p -> hasPrefix p sn) [
   ".",
   ":",
   "[",
