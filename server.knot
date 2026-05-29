@@ -792,10 +792,10 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
         *forwards = remaining
         pres <- *presence
         let stillLocal = hasLocalPresence pres to t
-        let othersPending = any (\x -> x.encryptedBlob == encryptedBlob) remaining
+        let othersPending = any (\x -> x.toKey == to && x.encryptedBlob == encryptedBlob) remaining
         when (not (stillLocal || othersPending)) (do
           msgs <- *messages
-          *messages = filter (\m -> m.encryptedBlob != encryptedBlob) msgs)))
+          *messages = filter (\m -> not (m.toKey == to && m.encryptedBlob == encryptedBlob)) msgs)))
 
 -- ============================================
 -- Handler: federation receive
