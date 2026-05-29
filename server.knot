@@ -585,7 +585,7 @@ forwardQueuedToServer = \pubkey server -> atomic (do
   let existing = count (filter (\f -> f.toServer == server) fwds)
   let budget = max 0 (maxForwardsPerServer - existing)
   let candidates = filter (\m -> m.toKey == pubkey && not any (forwardMatches m.encryptedBlob server) fwds && not elem server m.deliveredTo) msgs
-  let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget candidates)
+  let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget (sortBy (\m -> m.receivedAt) candidates))
   *forwards = union fwds newFwds)
 
 -- ============================================
