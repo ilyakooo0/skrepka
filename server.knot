@@ -862,9 +862,13 @@ handleSendMessages = \messages authorization clientIp -> do
           }) messages
           forEach staged (\c -> do
             appendMessage c.to c.encryptedBlob t
+            -- Stage outbox rows for peers under their `maxForwardsPerServer`
+            -- ceiling. Peers at the cap still get the immediate post-commit
+            -- delivery attempt (`forkForwardsTo`) — only the retry-queue row
+            -- is skipped.
             when federationEnabled (do
               fwds <- *forwards
-              let newFwds = map (\s -> {toServer: s, toKey: c.to, c.encryptedBlob, retries: 0}) (filter (\s -> not any (forwardMatches c.encryptedBlob s) fwds) c.remoteServers)
+              let newFwds = map (\s -> {toServer: s, toKey: c.to, c.encryptedBlob, retries: 0}) (filter (\s -> not (any (forwardMatches c.encryptedBlob s) fwds) && countWhere (\f -> f.toServer == s) fwds < maxForwardsPerServer) c.remoteServers)
               *forwards = union fwds newFwds))
           yield staged)
         when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
