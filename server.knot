@@ -226,7 +226,9 @@ type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp, ip: Text}
 -- `encryptedBlob` (the server cannot read it). `deliveredTo` records peers
 -- that have already accepted a federated forward of this blob, so a later
 -- presence re-announce of `toKey` doesn't trigger a duplicate delivery.
-type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp, deliveredTo: [ServerName]}
+-- (Single-field record rows, not bare names: the Knot runtime cannot persist
+-- a nested relation of scalars.)
+type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp, deliveredTo: [{server: ServerName}]}
 -- Last-known location of a pubkey, either local (`server == serverHost`) or
 -- learned from a peer via gossip. Multiple entries per pubkey are allowed.
 type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestamp}
@@ -657,8 +659,8 @@ retryPendingForwards = do
       else x) (filter (\x -> not isDone x) cur)
       when success (do
         msgs <- *messages
-        *messages = map (\m -> if m.toKey == f.toKey && m.encryptedBlob == f.encryptedBlob && not elem server m.deliveredTo
-        then {m.toKey, m.encryptedBlob, m.receivedAt, deliveredTo: union m.deliveredTo [server]}
+        *messages = map (\m -> if m.toKey == f.toKey && m.encryptedBlob == f.encryptedBlob && not any (\d -> d.server == server) m.deliveredTo
+        then {m.toKey, m.encryptedBlob, m.receivedAt, deliveredTo: union m.deliveredTo [{server}]}
         else m) msgs)))))
 
 -- Forward queued messages to a server when a remote key comes online.
@@ -670,7 +672,7 @@ forwardQueuedToServer = \pubkey server -> atomic (do
   fwds <- *forwards
   let existing = count (filter (\f -> f.toServer == server) fwds)
   let budget = max 0 (maxForwardsPerServer - existing)
-  let candidates = filter (\m -> m.toKey == pubkey && not any (forwardMatches m.encryptedBlob server) fwds && not elem server m.deliveredTo) msgs
+  let candidates = filter (\m -> m.toKey == pubkey && not any (forwardMatches m.encryptedBlob server) fwds && not any (\d -> d.server == server) m.deliveredTo) msgs
   let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget (sortBy (\m -> m.receivedAt) candidates))
   *forwards = union fwds newFwds)
 
@@ -897,8 +899,8 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> when (
         fwds <- *forwards
         *forwards = filter (\x -> not same x) fwds
         msgs <- *messages
-        *messages = map (\m -> if m.toKey == to && m.encryptedBlob == encryptedBlob && not elem server m.deliveredTo
-        then {m.toKey, m.encryptedBlob, m.receivedAt, deliveredTo: union m.deliveredTo [server]}
+        *messages = map (\m -> if m.toKey == to && m.encryptedBlob == encryptedBlob && not any (\d -> d.server == server) m.deliveredTo
+        then {m.toKey, m.encryptedBlob, m.receivedAt, deliveredTo: union m.deliveredTo [{server}]}
         else m) msgs)))
 
 -- ============================================
