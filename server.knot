@@ -406,8 +406,11 @@ else (if take 1 s == c then 1 else 0) + countChar c (drop 1 s)
 -- 169.254/16, the IPv4 zero net, bare IPv6 literals (any string with more than one `:` — covers loopback
 -- `::`/`::1`, link-local `fe80::/10`, ULA `fc00::/7`, globals like `2001:db8::1`),
 -- bracketed IPv6 literals, and the `.local` / `.internal` / `.arpa` / `.onion`
--- suffixes. Called at federation egress (so we never `fetch` a peer pubkey from
--- loopback) and on inbound requests (so a peer can't claim a bogus `fromServer`).
+-- suffixes. Enforced on inbound requests (`handleRecvGossip`, so a peer can't
+-- claim a bogus `fromServer`) and again at every federation egress site
+-- (`sendBatchedGossip`, `retryPendingForwards`, `forkForwardsTo`) as
+-- defense-in-depth — state persisted before a denylist tightening, or any
+-- future ingress gap, must not steer a `fetch` at an internal host.
 -- A legitimate `host:port` server name has exactly one `:`, so the multi-colon
 -- check leaves that case intact.
 isBadServerName : Text -> Bool
@@ -597,14 +600,14 @@ pruneExpired = \t -> atomic do
 -- a peer record into `forwardFailures` (shared with forward retries) so both
 -- subsystems back off together.
 
--- Fan out one bundle of gossip events to each peer, skipping peers in backoff.
--- No-op when `events` is empty so callers don't need to guard. Records or
--- clears federation-failure counters per call.
+-- Fan out one bundle of gossip events to each peer, skipping denylisted
+-- peers and peers in backoff. No-op when `events` is empty so callers don't
+-- need to guard. Records or clears federation-failure counters per call.
 sendBatchedGossip : [Text] -> [GossipEventType] -> IO {rw *forwardFailures, network, clock} {}
 sendBatchedGossip = \peers events -> when (count events > 0) (do
   t <- now
   failures <- *forwardFailures
-  forEach peers (\server -> when (shouldRetryServer server t failures) (do
+  forEach peers (\server -> when (not (isBadServerName server) && shouldRetryServer server t failures) (do
     result <- fetch (federationUrl server) (RecvGossip {events, fromServer: serverHost})
     case result of
       Err _ -> recordFailure server t
@@ -628,7 +631,15 @@ retryPendingForwards = do
   t <- now
   fwds <- *forwards
   failures <- *forwardFailures
-  forEach (filter (\s -> shouldRetryServer s t failures) (collectPeers fwds (\f -> f.toServer))) (\server -> forEach (take maxBatchSize (filter (\f -> f.toServer == server) fwds)) (\f -> do
+  forEach (collectPeers fwds (\f -> f.toServer)) (\server -> if isBadServerName server
+  -- Denylisted destination (state persisted before a denylist tightening):
+  -- its forwards would never be attempted, so drop them instead of letting
+  -- them sit in the outbox forever. The denylist check stays outside the
+  -- atomic predicate — only the plain equality filter is pushed down.
+  then atomic (do
+    cur <- *forwards
+    *forwards = filter (\x -> x.toServer != server) cur)
+  else when (shouldRetryServer server t failures) (forEach (take maxBatchSize (filter (\f -> f.toServer == server) fwds)) (\f -> do
     result <- fetch (federationUrl server) (ForwardMessage {f.toKey, f.encryptedBlob})
     success <- case result of
       Err _ -> do
@@ -648,7 +659,7 @@ retryPendingForwards = do
         msgs <- *messages
         *messages = map (\m -> if m.toKey == f.toKey && m.encryptedBlob == f.encryptedBlob && not elem server m.deliveredTo
         then {m.toKey, m.encryptedBlob, m.receivedAt, deliveredTo: union m.deliveredTo [server]}
-        else m) msgs))))
+        else m) msgs)))))
 
 -- Forward queued messages to a server when a remote key comes online.
 -- Skips messages already delivered to `server` (tracked via Message.deliveredTo)
@@ -870,7 +881,7 @@ handleSendMessages = \messages authorization clientIp -> do
 -- have the message. On failure the forwards row stays so
 -- `retryPendingForwards` can re-attempt with backoff.
 forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
-forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
+forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> when (not isBadServerName server) (do
   t <- now
   result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
   let same = forwardMatches encryptedBlob server
@@ -884,7 +895,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
         msgs <- *messages
         *messages = map (\m -> if m.toKey == to && m.encryptedBlob == encryptedBlob && not elem server m.deliveredTo
         then {m.toKey, m.encryptedBlob, m.receivedAt, deliveredTo: union m.deliveredTo [server]}
-        else m) msgs))
+        else m) msgs)))
 
 -- ============================================
 -- Handler: federation receive
