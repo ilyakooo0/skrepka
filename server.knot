@@ -424,7 +424,7 @@ authedPubkey = \authorization t clientIp -> do
 -- worth retrying (or no failure recorded at all). Linear backoff:
 -- `retryBackoffBase * failures`, capped at `retryBackoffMax`.
 shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
-shouldRetryServer = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < min retryBackoffMax (retryBackoffBase * f.failures)) failures
+shouldRetryServer = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < min retryBackoffMax (retryBackoffBase * (f.failures : Int))) failures
 
 -- Bump the failure counter for `server`.
 recordFailure : Text -> IO {rw *forwardFailures, clock} {}
