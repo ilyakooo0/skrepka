@@ -235,6 +235,9 @@ type PresenceEntry = {pubkey: PubkeyHex, server: ServerName, expiresAt: Timestam
 -- Identity is derived from `encryptedBlob` (see `Message`).
 type ForwardEntry = {toServer: ServerName, toKey: PubkeyHex, encryptedBlob: BlobHex, retries: Int}
 -- Running failure counter for a peer; keyed by `server`. Drives `shouldRetryServer`.
+-- `failedAt` is the start time of the last recorded attempt; `failures: 0` is
+-- the post-success tombstone (no backoff, kept so the timestamp can outrank
+-- slower concurrent failures).
 type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 
 -- ============================================
@@ -459,6 +462,12 @@ authedPubkey = \authorization t clientIp -> do
 -- `retryBackoffBase` (capped at `retryBackoffMax`). `shouldRetryServer` is the
 -- single read-side gate; `recordFailure`/`clearFailure` are the write side.
 -- There is no half-open state — a single success clears all accumulated failures.
+-- Concurrent fetches to the same peer can complete out of order, so both
+-- writers take the attempt-start time and ignore updates older than the
+-- recorded one (latest-started attempt wins). `clearFailure` therefore writes
+-- a zero-count row rather than deleting — the timestamp must survive so a
+-- slower failure can be recognized as stale. Zero-count rows impose no
+-- backoff and age out of `*forwardFailures` via `pruneExpired`.
 
 -- True when enough time has passed since the last failure for `server` to be
 -- worth retrying (or no failure recorded at all). Linear backoff:
@@ -466,25 +475,35 @@ authedPubkey = \authorization t clientIp -> do
 shouldRetryServer : Text -> Timestamp -> [ForwardFailure] -> Bool
 shouldRetryServer = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < min retryBackoffMax (retryBackoffBase * (f.failures : Int))) failures
 
--- Bump the failure counter for `server`.
-recordFailure : Text -> IO {rw *forwardFailures, clock} {}
-recordFailure = \server -> do
-  t <- now
-  atomic (do
-    failures <- *forwardFailures
-    let prevCount = case findFirst failures (\f -> f.server == server) of
+-- Bump the failure counter for `server`. `attemptAt` is when the failed call
+-- started; the update is skipped when a more recently started attempt has
+-- already written its outcome.
+recordFailure : Text -> Timestamp -> IO {rw *forwardFailures} {}
+recordFailure = \server attemptAt -> atomic (do
+  failures <- *forwardFailures
+  let prev = findFirst failures (\f -> f.server == server)
+  let stale = case prev of
+    Just {value: f} -> f.failedAt > attemptAt
+    _ -> False {}
+  when (not stale) (do
+    let prevCount = case prev of
       Just {value: f} -> f.failures
       _ -> 0
     *forwardFailures = union (filter (\f -> f.server != server) failures) [
-      {server, failedAt: t, failures: prevCount + 1}
-    ])
+      {server, failedAt: attemptAt, failures: prevCount + 1}
+    ]))
 
--- Drop the failure record for `server` (called after any successful peer call).
--- Single-success recovery — there is no half-open state.
-clearFailure : Text -> IO {rw *forwardFailures} {}
-clearFailure = \server -> atomic (do
-  forwardFailures <- *forwardFailures
-  *forwardFailures = filter (\f -> f.server != server) forwardFailures)
+-- Reset the failure counter for `server` to zero (called after any successful
+-- peer call; single-success recovery — there is no half-open state). Keeps a
+-- zero-count row so its timestamp can outrank slower concurrent failures.
+clearFailure : Text -> Timestamp -> IO {rw *forwardFailures} {}
+clearFailure = \server attemptAt -> atomic (do
+  failures <- *forwardFailures
+  let stale = any (\f -> f.server == server && f.failedAt > attemptAt) failures
+  when (not stale) (do
+    *forwardFailures = union (filter (\f -> f.server != server) failures) [
+      {server, failedAt: attemptAt, failures: 0}
+    ]))
 
 -- ============================================
 -- Common helpers
@@ -572,8 +591,8 @@ sendBatchedGossip = \peers events -> when (count events > 0) (do
   forEach peers (\server -> when (shouldRetryServer server t failures) (do
     result <- fetch (federationUrl server) (RecvGossip {events, fromServer: serverHost})
     case result of
-      Err _ -> recordFailure server
-      Ok _ -> clearFailure server)))
+      Err _ -> recordFailure server t
+      Ok _ -> clearFailure server t)))
 
 -- ============================================
 -- Forward retries
@@ -597,10 +616,10 @@ retryPendingForwards = do
     result <- fetch (federationUrl server) (ForwardMessage {f.toKey, f.encryptedBlob})
     success <- case result of
       Err _ -> do
-        recordFailure server
+        recordFailure server t
         yield (False {})
       Ok _ -> do
-        clearFailure server
+        clearFailure server t
         yield (True {})
     let isMatch = forwardMatches f.encryptedBlob server
     let isDone = \x -> isMatch x && (success || x.retries + 1 >= maxForwardRetries)
@@ -836,12 +855,13 @@ handleSendMessages = \messages authorization clientIp -> do
 -- `retryPendingForwards` can re-attempt with backoff.
 forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
+  t <- now
   result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
   let same = forwardMatches encryptedBlob server
   case result of
-    Err _ -> recordFailure server
+    Err _ -> recordFailure server t
     Ok _ -> do
-      clearFailure server
+      clearFailure server t
       atomic (do
         fwds <- *forwards
         *forwards = filter (\x -> not same x) fwds
