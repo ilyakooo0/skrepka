@@ -120,12 +120,16 @@ rateLimitWindow = 60000
 -- The normal handshake is one challenge + one verify, so a healthy flow uses 2.
 authRateLimit : Int
 authRateLimit = 10
--- Per-session (bearer token) budget for /poll per `rateLimitWindow`. Clients
--- reconnect after `pollTimeoutMs`, so steady state is ~3/min.
+-- Per-client-IP budget for /poll per `rateLimitWindow`. Clients reconnect
+-- after `pollTimeoutMs`, so steady state is ~3/min per client; the budget
+-- leaves room for several clients behind one NAT. (Keyed on IP, not bearer
+-- token — token-keyed buckets let an attacker mint a fresh bucket per
+-- invented bearer value.)
 pollRateLimit : Int
 pollRateLimit = 60
--- Per-session budget for /messages per `rateLimitWindow`. Each call may carry
--- up to `maxBatchSize` ciphertexts, so the effective message ceiling is higher.
+-- Per-client-IP budget for /messages per `rateLimitWindow`. Each call may
+-- carry up to `maxBatchSize` ciphertexts, so the effective message ceiling
+-- is higher.
 sendRateLimit : Int
 sendRateLimit = 60
 -- Per-peer-IP budget for /federation/gossip per `rateLimitWindow`.
@@ -182,7 +186,7 @@ impl FromJSON GossipEventType where
 -- /messages is all-or-nothing per call: either every message in the batch is
 -- enqueued (delivered, federated, or buffered for federation), or none are
 -- and the call returns a non-2xx HTTP status. The per-message rejection code
--- "self_send" surfaces in the HTTP error body. Per-session rate limiting is
+-- "self_send" surfaces in the HTTP error body. Per-client-IP rate limiting is
 -- enforced by the route's `rateLimit` clause, which short-circuits with 429
 -- before the handler runs.
 -- The sender's UI treats every success the same and learns "they got it"
@@ -266,10 +270,12 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 -- Rate limiting
 -- ============================================
 -- Per-endpoint token-bucket configuration. Auth endpoints key on the submitted
--- pubkey (so one keypair can't drain global capacity); authenticated client
--- endpoints key on the bearer token (per-session); federation endpoints key on
--- the client IP (last X-Forwarded-For hop behind a trusted proxy, else the
--- connection address). Each route has an independent bucket store, so endpoints
+-- pubkey (so one keypair can't drain global capacity); client and federation
+-- endpoints key on the client IP (last X-Forwarded-For hop behind a trusted
+-- proxy, else the connection address). The bearer token is deliberately not a
+-- bucket key: the limiter runs before the handler, so it can't tell valid
+-- sessions from invented ones, and an attacker varying the token would mint a
+-- fresh bucket per value. Each route has an independent bucket store, so endpoints
 -- using the same key strategy don't share budget across routes. Buckets persist
 -- in the runtime's `_knot_rate_limits` SQLite table; rejection responds 429
 -- before the handler runs.
@@ -293,12 +299,11 @@ pickClientIp = \h connIp -> case h of
   Nothing {} -> connIp
 
 byPubkey = \{pubkey} _ -> Just {value: pubkey}
-byAuth = \{authorization} _ -> Just {value: authorization}
 byClientIp = \_ ctx -> Just {value: pickClientIp (ctx.header "X-Forwarded-For") ctx.clientIp}
 
 authLimit = {key: byPubkey, limit: {requests: authRateLimit, window: rateLimitWindow}}
-pollLimit = {key: byAuth, limit: {requests: pollRateLimit, window: rateLimitWindow}}
-sendLimit = {key: byAuth, limit: {requests: sendRateLimit, window: rateLimitWindow}}
+pollLimit = {key: byClientIp, limit: {requests: pollRateLimit, window: rateLimitWindow}}
+sendLimit = {key: byClientIp, limit: {requests: sendRateLimit, window: rateLimitWindow}}
 gossipLimit = {key: byClientIp, limit: {requests: gossipRateLimit, window: rateLimitWindow}}
 forwardLimit = {key: byClientIp, limit: {requests: forwardRateLimit, window: rateLimitWindow}}
 
@@ -783,7 +788,7 @@ ackPolledMessages = \pubkey cursor -> do
 -- either succeeds (every message enqueued) or fails with a non-2xx HTTP
 -- status carrying the rejection code ("self_send" | ...).
 -- Duplicates are silently treated as success so retries are idempotent.
--- Per-session send rate is enforced by the route's `rateLimit` clause.
+-- Per-client-IP send rate is enforced by the route's `rateLimit` clause.
 -- Federated forwards are kicked off in background forks after the atomic.
 
 -- POST /messages: send a list of ciphertexts atomically. Self-send is
