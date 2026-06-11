@@ -411,7 +411,7 @@ else (if take 1 s == c then 1 else 0) + countChar c (drop 1 s)
 -- A legitimate `host:port` server name has exactly one `:`, so the multi-colon
 -- check leaves that case intact.
 isBadServerName : Text -> Bool
-isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [
+isBadServerName = \sn -> sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [
   ".",
   ":",
   "[",
