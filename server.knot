@@ -850,6 +850,9 @@ handleRecvGossip = \events fromServer -> do
 -- A → B forward based on stale gossip about R could land on B with no
 -- actively-polling client and get stuck. If B refuses, A retries via
 -- `retryPendingForwards` against the next presence target.
+-- Re-delivery of an already-stored (toKey, blob) pair is treated as success
+-- without a second append, so a sender whose success response was lost can
+-- retry without duplicating the message in the recipient's mailbox.
 handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, r *presence, rw *seqCounter, clock} (Result HttpError {})
 handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
@@ -858,7 +861,8 @@ handleForwardMessage = \toKey encryptedBlob -> do
     if not hasLocalPresence pres toKey t
     then yield (Err {error: {status: 404, message: "no_presence"}})
     else do
-      appendMessage toKey encryptedBlob t
+      msgs <- *messages
+      when (not any (\m -> m.toKey == toKey && m.encryptedBlob == encryptedBlob) msgs) (appendMessage toKey encryptedBlob t)
       yield (Ok {value: {}}))
 
 -- ============================================
