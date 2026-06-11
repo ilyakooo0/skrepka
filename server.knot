@@ -402,8 +402,8 @@ else (if take 1 s == c then 1 else 0) + countChar c (drop 1 s)
 
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
 -- tricks (octal, hex, percent-encoding) but covers the high-value cases:
--- `localhost`, RFC1918 ranges (10/8, 192.168/16, 169.254/16), the IPv4 zero
--- net, bare IPv6 literals (any string with more than one `:` — covers loopback
+-- `localhost`, RFC1918 ranges (10/8, 172.16/12, 192.168/16) plus link-local
+-- 169.254/16, the IPv4 zero net, bare IPv6 literals (any string with more than one `:` — covers loopback
 -- `::`/`::1`, link-local `fe80::/10`, ULA `fc00::/7`, globals like `2001:db8::1`),
 -- bracketed IPv6 literals, and the `.local` / `.internal` / `.arpa` / `.onion`
 -- suffixes. Called at federation egress (so we never `fetch` a peer pubkey from
@@ -419,7 +419,23 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contain
   "10.",
   "192.168.",
   "169.254.",
-  "0."
+  "0.",
+  "172.16.",
+  "172.17.",
+  "172.18.",
+  "172.19.",
+  "172.20.",
+  "172.21.",
+  "172.22.",
+  "172.23.",
+  "172.24.",
+  "172.25.",
+  "172.26.",
+  "172.27.",
+  "172.28.",
+  "172.29.",
+  "172.30.",
+  "172.31."
 ] || any (\s -> hasSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
 
 -- ============================================
