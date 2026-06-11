@@ -67,7 +67,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/skrepka-server
+# --http-max-body-bytes must exceed maxBlobLen (40 MiB hex) plus the JSON
+# envelope, otherwise the runtime's default 16 MiB body cap rejects a
+# max-size blob with 413 before the handler's BlobHex check is ever reached.
+ExecStart=/usr/local/bin/skrepka-server --http-max-body-bytes=42M
 Restart=on-failure
 RestartSec=5
 

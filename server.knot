@@ -166,22 +166,16 @@ federationUrl = \server -> federationScheme ++ server
 -- polling pubkey. The server cannot read the blob.
 type PollEvent = {encryptedBlob: BlobHex}
 
--- One presence change exchanged between federated servers. Per-variant
--- payloads keep room for future event kinds that aren't tied to a pubkey.
--- `GossipUnknown` is the parser's fallback for forward-compatibility.
-data GossipEventType
-  = GossipOnline {pubkey: PubkeyHex}
-  | GossipOffline {pubkey: PubkeyHex}
-  | GossipUnknown {}
-
-impl ToJSON GossipEventType where
-  toJson et = case et of
-    GossipOnline {pubkey} -> toJson {eventType: "online", pubkey}
-    GossipOffline {pubkey} -> toJson {eventType: "offline", pubkey}
-    GossipUnknown {} -> toJson {eventType: "unknown"}
-
-impl FromJSON GossipEventType where
-  parseJson t = (\raw -> if raw.eventType == "online" then GossipOnline {raw.pubkey} else if raw.eventType == "offline" then GossipOffline {raw.pubkey} else GossipUnknown {}) (parseJson t : {eventType: Text, pubkey: PubkeyHex})
+-- One presence change exchanged between federated servers. A flat wire record
+-- (`{"eventType": "online"|"offline", "pubkey": "<hex>"}`) rather than an ADT:
+-- the built-in record JSON round-trips it directly (a `Just` pubkey encodes as
+-- the bare hex string, `Nothing` as `null`/an absent field). `eventType` is
+-- free `Text`, so an unrecognized future event kind decodes cleanly instead of
+-- failing the whole batch, and `pubkey` is optional so a future pubkey-less
+-- kind still parses. `handleRecvGossip` ignores any event whose `eventType` it
+-- doesn't recognize or that carries no pubkey — that is the forward-compat
+-- fallback (the old `GossipUnknown` variant).
+type GossipEvent = {eventType: Text, pubkey: Maybe PubkeyHex}
 
 -- /messages is all-or-nothing per call: either every message in the batch is
 -- enqueued (delivered, federated, or buffered for federation), or none are
@@ -332,7 +326,7 @@ route ClientApi where
   POST {messages: [{to: PubkeyHex, encryptedBlob: BlobHex}]} /messages headers {authorization: Text, xForwardedFor: Maybe Text} -> {} rateLimit sendLimit = SendMessages
 
 route FederationApi where
-  POST {events: [GossipEventType], fromServer: ServerName} /federation/gossip -> {} rateLimit gossipLimit = RecvGossip
+  POST {events: [GossipEvent], fromServer: ServerName} /federation/gossip -> {} rateLimit gossipLimit = RecvGossip
   POST {toKey: PubkeyHex, encryptedBlob: BlobHex} /federation/forward -> {} rateLimit forwardLimit = ForwardMessage
 
 route Api = AuthApi | ClientApi | FederationApi
@@ -402,12 +396,30 @@ countChar = \c s -> if s == ""
 then 0
 else (if take 1 s == c then 1 else 0) + countChar c (drop 1 s)
 
--- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
--- tricks (octal, hex, percent-encoding) but covers the high-value cases:
--- `localhost`, RFC1918 ranges (10/8, 172.16/12, 192.168/16) plus link-local
+-- The host portion of `sn` — everything before the first `:`. With the
+-- one-colon ceiling enforced in `isBadServerName`, this strips an optional
+-- `:port` so `isNumericHost` sees just the host.
+beforeColon : Text -> Text
+beforeColon = \s -> if s == "" || take 1 s == ":"
+then ""
+else take 1 s ++ beforeColon (drop 1 s)
+
+-- True when the host part is a bare integer (no dots) — a decimal or octal
+-- "dword" IP like `2130706433` or `017700000001` (both = 127.0.0.1). These
+-- carry no dotted octets, so the prefix list below never matches them, yet
+-- they resolve to the same internal addresses.
+isNumericHost : Text -> Bool
+isNumericHost = \sn -> do
+  let host = beforeColon sn
+  host != "" && all (\c -> contains c "0123456789") (chars host)
+
+-- Block private/reserved/internal hostnames (SSRF defense). Skips percent-encoding
+-- tricks but covers the high-value cases: `localhost`, RFC1918 ranges (10/8,
+-- 172.16/12, 192.168/16) plus link-local
 -- 169.254/16, the IPv4 zero net, bare IPv6 literals (any string with more than one `:` — covers loopback
 -- `::`/`::1`, link-local `fe80::/10`, ULA `fc00::/7`, globals like `2001:db8::1`),
--- bracketed IPv6 literals, and the `.local` / `.internal` / `.arpa` / `.onion`
+-- bracketed IPv6 literals, integer/octal "dword" IPv4 (`isNumericHost`) and the
+-- `0x`-prefixed hex form, and the `.local` / `.internal` / `.arpa` / `.onion`
 -- suffixes. Enforced on inbound requests (`handleRecvGossip`, so a peer can't
 -- claim a bogus `fromServer`) and again at every federation egress site
 -- (`sendBatchedGossip`, `retryPendingForwards`, `forkForwardsTo`) as
@@ -416,7 +428,7 @@ else (if take 1 s == c then 1 else 0) + countChar c (drop 1 s)
 -- A legitimate `host:port` server name has exactly one `:`, so the multi-colon
 -- check leaves that case intact.
 isBadServerName : Text -> Bool
-isBadServerName = \sn -> sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [
+isBadServerName = \sn -> sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || isNumericHost sn || hasPrefix "0x" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [
   ".",
   ":",
   "[",
@@ -456,11 +468,16 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || hasPrefix "localhost:"
 matchIp : Text -> Text -> Bool
 matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
--- Unwrap an X-Forwarded-For header value to a plain IP string. Empty when the
--- header is absent (no reverse proxy in front).
+-- The client IP a session/challenge is bound to: the last (trusted) hop of the
+-- X-Forwarded-For chain, matching the rate limiter's `pickClientIp`. Taking the
+-- last hop rather than the whole header means client-supplied spoofed hops don't
+-- become part of the binding (a trusted proxy appends the real address last).
+-- Empty when the header is absent or `trustForwardedFor` is off — handlers have
+-- no access to the raw connection address, and an empty bound IP makes `matchIp`
+-- skip the check (so IP binding is simply disabled without a trusted proxy).
 clientIpOf : Maybe Text -> Text
 clientIpOf = \h -> case h of
-  Just {value: ip} -> ip
+  Just {value: ips} -> if trustForwardedFor then lastForwardedHop ips else ""
   Nothing {} -> ""
 
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
@@ -605,7 +622,7 @@ pruneExpired = \t -> atomic do
 -- Fan out one bundle of gossip events to each peer, skipping denylisted
 -- peers and peers in backoff. No-op when `events` is empty so callers don't
 -- need to guard. Records or clears federation-failure counters per call.
-sendBatchedGossip : [Text] -> [GossipEventType] -> IO {rw *forwardFailures, network, clock} {}
+sendBatchedGossip : [Text] -> [GossipEvent] -> IO {rw *forwardFailures, network, clock} {}
 sendBatchedGossip = \peers events -> when (count events > 0) (do
   t <- now
   failures <- *forwardFailures
@@ -740,7 +757,7 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   case result of
     Nothing {} -> yield (Err {error: {status: 401, message: "invalid"}})
     Just {value: peers} -> do
-      when federationEnabled (fork (sendBatchedGossip peers [GossipOnline {pubkey}]))
+      when federationEnabled (fork (sendBatchedGossip peers [{eventType: "online", pubkey: Just {value: pubkey}}]))
       yield (Ok {value: {token, expiresAt: expiry}})
 
 -- ============================================
@@ -773,7 +790,7 @@ handlePoll = \cursor authorization clientIp -> do
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
-      when federationEnabled (fork (sendBatchedGossip s.refreshPeers [GossipOnline {s.pubkey}]))
+      when federationEnabled (fork (sendBatchedGossip s.refreshPeers [{eventType: "online", pubkey: Just {value: s.pubkey}}]))
       pollResult <- doPoll s t
       yield (Ok {value: pollResult})
 
@@ -915,10 +932,11 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> when (
 -- POST /federation/gossip: ingest peer presence events. The transport-level
 -- `fromServer` is the home server for every event. Drops every (pubkey,
 -- fromServer) row touched by this batch, then re-adds fresh-TTL rows for
--- pubkeys with a `GossipOnline` event (so Online wins on collision). For keys
+-- pubkeys with an `online` event (so Online wins on collision). For keys
 -- that transition offline → online, flushes any locally-buffered messages via
--- `forwardQueuedToServer`.
-handleRecvGossip : [GossipEventType] -> Text -> IO {r *messages, rw *forwards, rw *presence, clock} (Result HttpError {})
+-- `forwardQueuedToServer`. Events with an unrecognized `eventType` or no
+-- `pubkey` are skipped (forward-compat) rather than rejecting the batch.
+handleRecvGossip : [GossipEvent] -> Text -> IO {r *messages, rw *forwards, rw *presence, clock} (Result HttpError {})
 handleRecvGossip = \events fromServer -> do
   t <- now
   if not federationEnabled
@@ -928,13 +946,16 @@ handleRecvGossip = \events fromServer -> do
   else do
     newlyOnline <- atomic (do
       pres <- *presence
-      let collected = fold (\acc e -> case e of
-        GossipOnline {pubkey} -> {
+      let collected = fold (\acc e -> case e.pubkey of
+        Just {value: pubkey} -> if e.eventType == "online"
+        then {
           touched: union acc.touched [pubkey],
           added: union acc.added [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
         }
-        GossipOffline {pubkey} -> {acc.added, touched: union acc.touched [pubkey]}
-        _ -> acc) {touched: [], added: []} events
+        else if e.eventType == "offline"
+        then {acc.added, touched: union acc.touched [pubkey]}
+        else acc
+        Nothing {} -> acc) {touched: [], added: []} events
       let kept = filter (\p -> p.server != fromServer || not elem p.pubkey collected.touched) pres
       *presence = union kept collected.added
       yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) collected.added)))
@@ -998,7 +1019,7 @@ backgroundPrune = do
   expiredLocal <- pruneExpired t
   when federationEnabled (fork (do
     pres <- *presence
-    sendBatchedGossip (collectPeers pres (\p -> p.server)) (map (\pk -> GossipOffline {pubkey: pk}) expiredLocal)))
+    sendBatchedGossip (collectPeers pres (\p -> p.server)) (map (\pk -> {eventType: "offline", pubkey: Just {value: pk}}) expiredLocal)))
   sleep backgroundPruneInterval
   backgroundPrune
 
