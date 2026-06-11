@@ -815,7 +815,9 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
 -- ============================================
 -- Inbound peer-to-peer endpoints. Federation is open and unauthenticated:
 -- the `no_presence` check in `handleForwardMessage` bounds forwards to
--- currently-online local keys.
+-- currently-online local keys. Both handlers refuse with 403 when
+-- `federationEnabled` is off, matching the outbound paths — a single-node
+-- deployment accepts no peer writes to `*presence`/`*messages`.
 
 -- POST /federation/gossip: ingest peer presence events. The transport-level
 -- `fromServer` is the home server for every event. Drops every (pubkey,
@@ -826,7 +828,9 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> do
 handleRecvGossip : [GossipEventType] -> Text -> IO {r *messages, rw *forwards, rw *presence, clock} (Result HttpError {})
 handleRecvGossip = \events fromServer -> do
   t <- now
-  if isLocalServer fromServer || isBadServerName fromServer || count events > maxGossipEvents
+  if not federationEnabled
+  then yield (Err {error: {status: 403, message: "federation_disabled"}})
+  else if isLocalServer fromServer || isBadServerName fromServer || count events > maxGossipEvents
   then yield (Err {error: {status: 400, message: "invalid_request"}})
   else do
     newlyOnline <- atomic (do
@@ -856,7 +860,9 @@ handleRecvGossip = \events fromServer -> do
 handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, r *presence, rw *seqCounter, clock} (Result HttpError {})
 handleForwardMessage = \toKey encryptedBlob -> do
   t <- now
-  atomic (do
+  if not federationEnabled
+  then yield (Err {error: {status: 403, message: "federation_disabled"}})
+  else atomic (do
     pres <- *presence
     if not hasLocalPresence pres toKey t
     then yield (Err {error: {status: 404, message: "no_presence"}})
