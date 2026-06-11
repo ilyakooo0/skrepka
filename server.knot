@@ -182,10 +182,10 @@ impl FromJSON GossipEventType where
 
 -- True when `s` is non-empty lowercase hex of even length, with `maxLen` ceiling.
 isValidBoundedHex : Int -> Text -> Bool
-isValidBoundedHex = \maxLen s -> count (chars s) <= maxLen && isValidHex s
+isValidBoundedHex = \maxLen s -> length s <= maxLen && isValidHex s
 -- True when `s` is lowercase hex of exactly `exactLen` characters (even by definition).
 isValidExactHex : Int -> Text -> Bool
-isValidExactHex = \exactLen s -> count (chars s) == exactLen && isValidHex s
+isValidExactHex = \exactLen s -> length s == exactLen && isValidHex s
 -- Hex-encoded Ed25519 public key (32 bytes → 64 chars exact).
 type PubkeyHex = Text where isValidExactHex 64
 -- Hex-encoded ciphertext or opaque blob; capped at `maxBlobLen` (~20 MiB).
@@ -198,7 +198,7 @@ type SignatureHex = Text where isValidExactHex 128
 -- `serverHost = "localhost"` flow through presence rows in a non-federated
 -- single-node deployment.
 isValidServerName : Text -> Bool
-isValidServerName = \s -> count (chars s) <= maxServerNameLen && s == toLower (stripTrailingDot s)
+isValidServerName = \s -> length s <= maxServerNameLen && s == toLower (stripTrailingDot s)
 type ServerName = Text where isValidServerName
 
 -- Wall-clock time in milliseconds since epoch.
@@ -333,16 +333,17 @@ else do
   yield (take 1 (drop d "0123456789abcdef") ++ rest)
 
 -- True when `s` is non-empty, even-length, and only lowercase hex digits.
+-- `chars` yields the *distinct* character set (relations dedupe), which is
+-- fine for the membership check; the length checks must use `length`.
 isValidHex : Text -> Bool
 isValidHex = \s -> do
-  let cs = chars s
-  let n = count cs
-  n > 0 && n / 2 * 2 == n && all (\c -> contains c "0123456789abcdef") cs
+  let n = length s
+  n > 0 && n / 2 * 2 == n && all (\c -> contains c "0123456789abcdef") (chars s)
 
 -- Recursively strip every trailing "." from `s` (DNS root form).
 stripTrailingDot : Text -> Text
 stripTrailingDot = \s -> if hasSuffix "." s
-then stripTrailingDot (take (count (chars s) - 1) s)
+then stripTrailingDot (take (length s - 1) s)
 else s
 
 -- True when `s` refers to this server.
@@ -351,11 +352,18 @@ isLocalServer = \s -> s == serverHost
 
 -- True when `s` starts with `pre`.
 hasPrefix : Text -> Text -> Bool
-hasPrefix = \pre s -> take (count (chars pre)) s == pre
+hasPrefix = \pre s -> take (length pre) s == pre
 
 -- True when `s` ends with `suffix`.
 hasSuffix : Text -> Text -> Bool
-hasSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix))) s == suffix
+hasSuffix = \suffix s -> drop (max 0 (length s - length suffix)) s == suffix
+
+-- Occurrences of the single character `c` in `s`. (`chars` can't be used for
+-- this — it returns the distinct character *set*.)
+countChar : Text -> Text -> Int
+countChar = \c s -> if s == ""
+then 0
+else (if take 1 s == c then 1 else 0) + countChar c (drop 1 s)
 
 -- Block private/reserved/internal hostnames (SSRF defense). Skips obscure encoding
 -- tricks (octal, hex, percent-encoding) but covers the high-value cases:
@@ -368,7 +376,7 @@ hasSuffix = \suffix s -> drop (max 0 (count (chars s) - count (chars suffix))) s
 -- A legitimate `host:port` server name has exactly one `:`, so the multi-colon
 -- check leaves that case intact.
 isBadServerName : Text -> Bool
-isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || count (filter (\c -> c == ":") (chars sn)) > 1 || any (\p -> hasPrefix p sn) [
+isBadServerName = \sn -> sn == "" || sn == "localhost" || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [
   ".",
   ":",
   "[",
