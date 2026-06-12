@@ -466,6 +466,23 @@ isReservedIPv4 = \host -> do
   let o2 = decimalValue (beforeDot (afterDot host))
   isDottedNumeric host && (o1 >= 224 || (o1 == 100 && o2 >= 64 && o2 <= 127) || (o1 == 198 && (o2 == 18 || o2 == 19)))
 
+-- True when a dotted-numeric host carries an octet with a redundant leading
+-- zero (e.g. "0177", "0012"). Canonical IPv4 literals never do, but the system
+-- resolver behind `fetch` (ureq -> getaddrinfo / inet_aton) reads a leading-zero
+-- octet as OCTAL: "0012.0.0.1" dials 10.0.0.1 and "0177.0.0.1" dials 127.0.0.1,
+-- while the decimal octet parse in `isReservedIPv4` (and the dotted-prefix list)
+-- sees 12.0.0.1 / 177.0.0.1 and waves them through — an SSRF bypass of the same
+-- class as the non-dotted "dword"/`0x` forms. Reject the ambiguous octal form
+-- outright. Gated by `isDottedNumeric` so a digit-led hostname label like
+-- "0foo.example.com" is never caught (it isn't all-digits-and-dots).
+hasLeadingZeroOctet : Text -> Bool
+hasLeadingZeroOctet = \host -> isDottedNumeric host && anyOctetLeadingZero host
+anyOctetLeadingZero : Text -> Bool
+anyOctetLeadingZero = \host -> do
+  let octet = beforeDot host
+  let rest = afterDot host
+  (length octet > 1 && take 1 octet == "0") || (rest != "" && anyOctetLeadingZero rest)
+
 -- Block private/reserved/internal hostnames (SSRF defense). Skips percent-encoding
 -- tricks but covers the high-value cases: `localhost`, RFC1918 ranges (10/8,
 -- 172.16/12, 192.168/16) plus link-local
@@ -474,8 +491,10 @@ isReservedIPv4 = \host -> do
 -- 224/4+240/4 (any first octet >= 224, via `isReservedIPv4`), bare IPv6
 -- literals (any string with more than one `:` — covers loopback
 -- `::`/`::1`, link-local `fe80::/10`, ULA `fc00::/7`, globals like `2001:db8::1`),
--- bracketed IPv6 literals, integer/octal "dword" IPv4 (`isNumericHost`) and the
--- `0x`-prefixed hex form, and the `.local` / `.internal` / `.arpa` / `.onion`
+-- bracketed IPv6 literals, integer/octal "dword" IPv4 (`isNumericHost`), the
+-- `0x`-prefixed hex form, octal dotted-octet IPv4 (any leading-zero octet, via
+-- `hasLeadingZeroOctet` — the resolver reads "0177.0.0.1" as 127.0.0.1), and the
+-- `.local` / `.internal` / `.arpa` / `.onion`
 -- suffixes. Enforced on inbound requests (`handleRecvGossip`, so a peer can't
 -- claim a bogus `fromServer`) and again at every federation egress site
 -- (`sendBatchedGossip`, `retryPendingForwards`, `forkForwardsTo`) as
@@ -484,7 +503,7 @@ isReservedIPv4 = \host -> do
 -- A legitimate `host:port` server name has exactly one `:`, so the multi-colon
 -- check leaves that case intact.
 isBadServerName : Text -> Bool
-isBadServerName = \sn -> sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || isNumericHost sn || isReservedIPv4 (beforeColon sn) || hasPrefix "0x" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [
+isBadServerName = \sn -> sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || isNumericHost sn || isReservedIPv4 (beforeColon sn) || hasLeadingZeroOctet (beforeColon sn) || hasPrefix "0x" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [
   ".",
   ":",
   "[",
@@ -1049,7 +1068,14 @@ handleRecvGossip = \events fromServer -> do
     newlyOnline <- atomic (do
       pres <- *presence
       let collected = fold (\acc e -> case e.pubkey of
-        Just {value: pubkey} -> if e.eventType == "online"
+        -- `pubkey` is nested inside the `events` list, so the route-boundary
+        -- refinement never validates it (same nested-list gap that `/messages`
+        -- works around with an explicit `isValidExactHex 64` check). Reject a
+        -- malformed key here so a peer can't poison `*presence` with non-hex
+        -- rows that then spawn bogus-`toKey` forward entries.
+        Just {value: pubkey} -> if not isValidExactHex 64 pubkey
+        then acc
+        else if e.eventType == "online"
         then {
           touched: union acc.touched [pubkey],
           added: union acc.added [{pubkey, server: fromServer, expiresAt: t + onlineGossipTtl}]
