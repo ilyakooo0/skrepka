@@ -262,8 +262,15 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 -- Per-peer failure counters; drives `shouldRetryServer`.
 *forwardFailures : [ForwardFailure]
 
--- Strictly-monotonic sequence used as `Message.receivedAt`; guarantees poll-cursor ordering.
-*seqCounter : Timestamp
+-- Strictly-monotonic sequence used as `Message.receivedAt`; guarantees
+-- poll-cursor ordering. Held as a 0-or-1-row wrapped relation, not a bare
+-- `Timestamp` scalar source: the runtime now panics when a scalar source's
+-- backing table is empty (it treats a missing row as corruption rather than
+-- defaulting to 0), which would 500 the very first /poll or /messages on a
+-- fresh database. Read through `currentSeq` (0 default). The `{value: ...}`
+-- record wrapper is required because a relation of bare scalars (`[Timestamp]`)
+-- also can't be persisted — same reason `Message.deliveredTo` is wrapped.
+*seqCounter : [{value: Timestamp}]
 
 -- ============================================
 -- Rate limiting
@@ -610,15 +617,22 @@ hasLocalPresence = \pres pk t -> any (\p -> p.pubkey == pk && isLocalServer p.se
 collectPeers : [a] -> (a -> Text) -> [Text]
 collectPeers = \items getServer -> filter (\s -> not isLocalServer s) (map getServer items)
 
+-- Current sequence value, or 0 before the first message seeds it. Reads the
+-- 0-or-1-row `*seqCounter` relation and folds out the value with a 0 default,
+-- rather than unwrapping a (possibly empty) scalar source — which the runtime
+-- panics on.
+currentSeq : [{value: Timestamp}] -> Timestamp
+currentSeq = \rows -> fold (\acc r -> max acc r.value) (0 : Timestamp) rows
+
 -- Append one ciphertext to the local mailbox under a fresh monotonic
 -- sequence. Row-level STM retry on `*messages` wakes any parked /poll
 -- transaction whose filter matches the new row. Caller wraps in `atomic`.
 appendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *seqCounter} {}
 appendMessage = \toKey encryptedBlob t -> do
   msgs <- *messages
-  seq <- *seqCounter
-  let seqTs = max t (seq + 1)
-  *seqCounter = seqTs
+  seqRows <- *seqCounter
+  let seqTs = max t (currentSeq seqRows + 1)
+  *seqCounter = [{value: seqTs}]
   *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs, deliveredTo: []}]
 
 -- True when `f` is the queued forward of `blob` to `server`. Used to dedupe
@@ -709,7 +723,14 @@ retryPendingForwards = do
   then atomic (do
     cur <- *forwards
     *forwards = filter (\x -> x.toServer != server) cur)
-  else when (shouldRetryServer server t failures) (forEach (take maxBatchSize (filter (\f -> f.toServer == server) fwds)) (\f -> do
+  -- Order the per-peer backlog deterministically before `take maxBatchSize`:
+  -- `[a]` is an unordered set, so an unsorted `take` returns an
+  -- implementation-defined subset that could keep retrying the same entries
+  -- while starving others past the cap. A stable key drains a fixed prefix as
+  -- entries succeed (removed) or hit `maxForwardRetries` (dropped). (Same class
+  -- of fix as `forwardQueuedToServer`'s `sortBy receivedAt`; `ForwardEntry`
+  -- carries no timestamp, so key on the unique blob.)
+  else when (shouldRetryServer server t failures) (forEach (take maxBatchSize (sortBy (\f -> f.encryptedBlob) (filter (\f -> f.toServer == server) fwds))) (\f -> do
     result <- fetch (federationUrl server) (ForwardMessage {f.toKey, f.encryptedBlob})
     success <- case result of
       Err _ -> do
@@ -839,7 +860,8 @@ handlePoll = \cursor authorization clientIp -> do
         -- in-between messages. `max t curSeq` keeps the old behaviour when the
         -- counter is idle/behind, while still refusing to ack beyond what's
         -- been issued.
-        curSeq <- *seqCounter
+        curSeqRows <- *seqCounter
+        let curSeq = currentSeq curSeqRows
         let clampedCursor = max 0 (min (max t curSeq) cursor)
         when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
         pres <- *presence
@@ -928,6 +950,13 @@ handleSendMessages = \messages authorization clientIp -> do
     Just {value: senderKey} -> do
       if count messages > maxBatchSize
       then yield (Err {error: {status: 413, message: "batch_too_large"}})
+      -- Refined-type validation at the route boundary only fires for top-level
+      -- scalar body fields; `to`/`encryptedBlob` are nested inside the `messages`
+      -- list, so the runtime does not check them. Enforce the `PubkeyHex` /
+      -- `BlobHex` contracts here so a malformed key or over-`maxBlobLen` / non-hex
+      -- blob is rejected instead of stored.
+      else if any (\m -> not (isValidExactHex 64 m.to && isValidBoundedHex maxBlobLen m.encryptedBlob)) messages
+      then yield (Err {error: {status: 400, message: "invalid_message"}})
       else if any (\m -> m.to == senderKey) messages
       then yield (Err {error: {status: 400, message: "self_send"}})
       else do
@@ -947,13 +976,20 @@ handleSendMessages = \messages authorization clientIp -> do
             -- appear twice within one batch.
             existingMsgs <- *messages
             when (not any (\m -> m.toKey == c.to && m.encryptedBlob == c.encryptedBlob) existingMsgs) (appendMessage c.to c.encryptedBlob t)
+            -- Peers that already hold this blob — from an earlier send of the
+            -- identical ciphertext that was forwarded then pruned from
+            -- `*forwards`. A brand-new message has empty `deliveredTo`, so this
+            -- is `[]` on the normal path; on a client resend it carries the real
+            -- set. Mirrors `forwardQueuedToServer`'s guard so we don't re-stage a
+            -- forward to a peer that already accepted this blob.
+            let delivered = fold (\acc m -> if m.toKey == c.to && m.encryptedBlob == c.encryptedBlob then union acc (map (\d -> d.server) m.deliveredTo) else acc) [] existingMsgs
             -- Stage outbox rows for peers under their `maxForwardsPerServer`
             -- ceiling. Peers at the cap still get the immediate post-commit
             -- delivery attempt (`forkForwardsTo`) — only the retry-queue row
             -- is skipped.
             when federationEnabled (do
               fwds <- *forwards
-              let newFwds = map (\s -> {toServer: s, toKey: c.to, c.encryptedBlob, retries: 0}) (filter (\s -> not (any (forwardMatches c.encryptedBlob s) fwds) && countWhere (\f -> f.toServer == s) fwds < maxForwardsPerServer) c.remoteServers)
+              let newFwds = map (\s -> {toServer: s, toKey: c.to, c.encryptedBlob, retries: 0}) (filter (\s -> not (any (forwardMatches c.encryptedBlob s) fwds) && not elem s delivered && countWhere (\f -> f.toServer == s) fwds < maxForwardsPerServer) c.remoteServers)
               *forwards = union fwds newFwds))
           yield staged)
         when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
