@@ -45,7 +45,7 @@ Public keys, signatures, and encrypted blobs are encoded as **lowercase hexadeci
 Identities are shared out-of-band as plain text or QR codes. The client displays public keys in two forms:
 
 - **Hex** — 64 lowercase hex characters (the canonical wire form).
-- **@p (phonetic)** — the public key rendered as Urbit-style syllables (e.g. `~ridler-binzod-mavpub-...`). Easier for humans to read and verify by voice. The client accepts either form when adding a contact.
+- **@p (phonetic)** — the public key rendered as Urbit-style syllables, hyphen-joined with no leading prefix (e.g. `ridler-binzod-marbud-...`). Easier for humans to read and verify by voice. The client accepts either form when adding a contact.
 
 Servers are addressed separately. A client stores a single server URL (e.g. `https://relay.example.com`) in local settings; this is purely a transport choice and has nothing to do with identity. Two users on different servers can still talk via federation.
 
@@ -178,14 +178,13 @@ After decryption (and LZ4 decompression), the plaintext is a UTF-8 JSON object w
 ```json
 {
   "type": "<message_type>",
-  "id":   "<unique_message_id>",
   "ts":   1679000000000,
   ...
 }
 ```
 
-- `ts` is the sender's wall-clock at send time, in **milliseconds** since the Unix epoch.
-- `id` is a client-generated unique ID (e.g. UUID v4). Clients MUST deduplicate incoming messages by `id`.
+- `type` and `ts` are present on every payload. `ts` is the sender's wall-clock at send time, in **milliseconds** since the Unix epoch.
+- `id` is a client-generated unique ID (e.g. UUID v4) carried by `text` messages only. Clients deduplicate incoming `text` messages by `id`. `delivery.ack` and `profile` payloads do not carry an `id`.
 - Clients MUST silently ignore message types they do not recognize. This allows newer clients to introduce new types without breaking older ones.
 
 ### Message Types
@@ -207,7 +206,6 @@ Users share a display name, bio, and photo with contacts by sending a `profile` 
 ```json
 {
   "type": "profile",
-  "id": "msg_456",
   "ts": 1679000000000,
   "display_name": "Alice",
   "bio": "writing things",
@@ -276,7 +274,7 @@ Servers contact peers over `https://<peer-host>`. Federation traffic carries no 
 
 ### Message Size Limit
 
-The on-wire `encryptedBlob` (hex) is capped at **40 MiB** (about 20 MiB of binary payload). Servers reject larger messages.
+The on-wire `encryptedBlob` (hex) is capped at **40 MiB** (about 20 MiB of binary payload). A blob over the cap is rejected at validation as a malformed message (`400`), not with `413`.
 
 ---
 
@@ -319,7 +317,7 @@ The session token is included in subsequent authenticated requests as a bearer t
 Authorization: Bearer <session_token>
 ```
 
-Sessions are also bound to the client's source IP (read from `X-Forwarded-For` when the server runs behind a reverse proxy). A request from a different IP is rejected as unauthorized.
+When the server trusts proxy headers (`trustForwardedFor`, on by default), sessions are bound to the client's source IP — the last `X-Forwarded-For` hop. A later request from a different IP is rejected as `unauthorized`. If proxy-header trust is disabled, or no `X-Forwarded-For` header is present, the session is not IP-bound and this check is skipped.
 
 When a token expires, the server responds with `401`. The client re-authenticates by repeating the challenge-response flow.
 
@@ -333,15 +331,18 @@ Errors return a non-2xx HTTP status with a body of:
 { "error": "<code>" }
 ```
 
-| HTTP Status | Error Code           | Meaning                              |
-|-------------|----------------------|--------------------------------------|
-| 400         | `self_send`          | A message in `/messages` is addressed to the sender |
-| 400         | `invalid_request`    | Malformed federation request         |
-| 401         | `unauthorized`       | Missing, invalid, or expired token, or wrong IP |
-| 404         | `no_presence`        | Federated forward arrived for a recipient with no live local session |
-| 413         | (HTTP only)          | Encrypted blob exceeds limit         |
-| 429         | (HTTP only)          | Per-route rate limit exceeded        |
-| 503         | `capacity`           | Server-side resource cap reached     |
+| HTTP Status | Error Code            | Meaning                              |
+|-------------|-----------------------|--------------------------------------|
+| 400         | `self_send`           | A message in `/messages` is addressed to the sender |
+| 400         | `invalid_message`     | A message in `/messages` has a malformed `to` or oversized/invalid `encryptedBlob` |
+| 400         | `invalid_request`     | Malformed federation request: `fromServer` equals this server, fails the SSRF deny-list, or the event count exceeds the cap |
+| 401         | `invalid`             | `/auth/verify` failed (bad signature, or an expired/wrong-IP challenge) |
+| 401         | `unauthorized`        | `/poll` or `/messages` with a missing, invalid, or expired token, or a request from a different IP |
+| 403         | `federation_disabled` | A `/federation/*` endpoint was called while federation is disabled |
+| 404         | `no_presence`         | Federated forward arrived for a recipient with no live local session |
+| 413         | `batch_too_large`     | A `/messages` batch exceeds the 100-message cap |
+| 429         | (HTTP only)           | Per-route rate limit exceeded        |
+| 503         | `capacity`            | Server-side resource cap reached     |
 
 ### `POST /poll` — Long poll for new events
 
@@ -416,9 +417,11 @@ Federation is open. A server joins the mesh by being configured (at build/start 
 
 Operators may apply an inbound blocklist; outbound federation is filtered through a built-in **SSRF deny-list** that rejects:
 
-- `localhost`, IP-literal forms (`127.0.0.0/8`, `10/8`, `192.168/16`, `169.254/16`, `0/8`)
-- IPv6 literals (`::`, `::1`, bracketed `[…]` syntax)
-- `.localhost`, `.local`, `.internal`, `.arpa`, `.onion` suffixes
+- `localhost`, and the `.localhost`, `.local`, `.internal`, `.arpa`, `.onion` suffixes
+- Private and special-use IPv4 ranges: `0/8`, `10/8`, `100.64/10` (CGNAT), `127.0.0.0/8`, `169.254/16` (link-local), `172.16/12`, `192.0.2/24` and `203.0.113/24` (TEST-NET), `192.168/16`, `198.18/15` (benchmarking), and everything from `224/4` upward (multicast + reserved)
+- Obfuscated IPv4 literals: bare integer/"dword" form (e.g. `2130706433`), `0x`-prefixed hex, and dotted forms with a leading-zero (octal) octet (e.g. `0177.0.0.1`)
+- IPv6 literals — any host containing more than one `:` (covering `::`, `::1`, link-local, ULA, and global addresses) and any bracketed `[…]` form
+- The empty string, and any host beginning with `.` or `:`
 - Anything containing characters outside `[a-z0-9-.:]`
 
 This applies both to outbound `fetch` calls and to the `fromServer` field on inbound federation requests.
