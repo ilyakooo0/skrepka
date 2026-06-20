@@ -75,7 +75,10 @@ module ApiClient =
             let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex |})
             use! challengeDoc = sendRequest client $"{serverUrl}/auth/challenge" body None
             let challenge = challengeDoc.RootElement.GetProperty("challenge").GetString()
-            let sigHex = Crypto.signChallenge identity.PrivKey challenge
+            // Bind the signature to the host we actually dialed, so a relay server
+            // cannot replay it to a different server (see PROTOCOL.md §6, §10).
+            let serverHost = Uri(serverUrl).Host.ToLowerInvariant().TrimEnd('.')
+            let sigHex = Crypto.signChallenge identity.PrivKey serverHost challenge
             let body = JsonSerializer.Serialize({| pubkey = identity.PubKeyHex; challenge = challenge; signature = sigHex |})
             use! tokenDoc = sendRequest client $"{serverUrl}/auth/verify" body None
             let token = tokenDoc.RootElement.GetProperty("token").GetString()

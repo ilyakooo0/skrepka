@@ -824,9 +824,13 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
   let expiry = t + sessionExpiry
   token <- genToken 48
+  -- The client signs (target host, challenge) under a domain-separation tag so a
+  -- relay server cannot replay the signature to a different server. We verify
+  -- against our own configured hostname (port stripped), which a relay cannot forge.
+  let signedText = "skrepka-auth-v1:" ++ beforeColon serverHost ++ ":" ++ challenge
   let sigValid = case bytesFromHex pubkey of
     Just {value: pk} -> case bytesFromHex signature of
-      Just {value: sigBytes} -> verify pk (textToBytes challenge) sigBytes
+      Just {value: sigBytes} -> verify pk (textToBytes signedText) sigBytes
       _ -> False {}
     _ -> False {}
   result <- atomic (do

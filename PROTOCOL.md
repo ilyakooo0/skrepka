@@ -149,6 +149,10 @@ compressed_plaintext      (variable, LZ4)
 
 The sender's pubkey and signature are inside the AEAD ciphertext: the server never sees them, and only the intended recipient can recover the sender's identity. The minimum blob size is `32 + 24 + 32 + 64 + 16 = 168` bytes.
 
+### Cryptographic Versioning
+
+There is currently **no version field** on the wire or in the plaintext payload, and the HKDF `info` string is the fixed constant `"skrepka-v1"`. The unknown-`type` rule (§4) gives forward compatibility for *payload* types, but the wire format, AEAD, KDF, and curve choices have no negotiated version, so there is no in-band path to migrate them without a flag day. A future revision should introduce an explicit protocol version (e.g. a leading version byte on the blob, or a `v` field) to allow cryptographic agility.
+
 ---
 
 ## 4. Message Format
@@ -215,6 +219,8 @@ Users share a display name, bio, and photo with contacts by sending a `profile` 
 
 Clients SHOULD send a `profile` message to a contact on first interaction and whenever the user updates their name, bio, or photo. The recipient's client caches the profile locally. `photo` is optional and MAY be omitted.
 
+Because `profile` messages carry no `id`, they are not deduplicated, and a captured `profile` blob can be replayed to the same recipient (see §10, *Same-recipient replay*). To prevent an old profile from clobbering a newer one, clients SHOULD ignore an incoming `profile` whose `ts` is older than the `ts` of the last profile already stored for that contact. **The reference client does not yet enforce this** — it applies every `profile` it decrypts unconditionally — so a replayed stale profile currently rolls a contact's cached name, bio, or photo back.
+
 ### Delivery Acks
 
 When a recipient successfully decrypts an incoming `text` message, the recipient's client SHOULD send a `delivery.ack` message back to the sender:
@@ -276,6 +282,11 @@ Servers contact peers over `https://<peer-host>`. Federation traffic carries no 
 
 The on-wire `encryptedBlob` (hex) is capped at **40 MiB** (about 20 MiB of binary payload). A blob over the cap is rejected at validation as a malformed message (`400`), not with `413`.
 
+Two limits apply to a `/messages` request, independently of the per-blob cap:
+
+- **Batch count** — at most 100 messages per request (`413 batch_too_large`).
+- **Total request body** — the runtime enforces a single HTTP body-size cap (`--http-max-body-bytes`, returning `413` with no JSON error code). Operators **must** set this above `maxBlobLen` plus the JSON envelope — the reference deployment uses `42M` — otherwise the runtime's default 16 MiB cap would reject a maximum-size blob before the per-blob `400` check is reached. Because this caps the whole body, a batch cannot smuggle 100 × 40 MiB: the total payload across all messages in one request is bounded by this cap.
+
 ---
 
 ## 6. Client ↔ Server Protocol
@@ -295,16 +306,17 @@ When a client connects, it proves ownership of its keypair:
    { "challenge": "<random_hex>", "expiresAt": 1679003660000 }
    ```
 
-3. Client signs the **UTF-8 bytes of the challenge string** with its Ed25519 private key and submits:
+3. Client signs the **UTF-8 bytes of `"skrepka-auth-v1:" + server_host + ":" + challenge`** with its Ed25519 private key and submits. `server_host` is the bare lowercased hostname of the server the client dialed (no scheme, no port, no trailing dot). The `skrepka-auth-v1:` prefix is a domain-separation tag distinguishing auth signatures from message signatures (which sign `recipientPub ++ compressed`, §4):
    ```
    POST /auth/verify
    {
      "pubkey":        "<hex(ed25519_pubkey)>",
      "challenge":     "<random_hex>",
-     "signature":     "<hex(ed25519_sign(private_key, utf8(challenge)))>",
+     "signature":     "<hex(ed25519_sign(private_key, utf8(\"skrepka-auth-v1:\" + server_host + \":\" + challenge)))>",
      "revokeOthers":  false
    }
    ```
+   The server verifies against its own configured hostname (`serverHost`, port stripped). Binding the signature to the target host prevents a malicious or relay server from forwarding a challenge it obtained from a *different* server and replaying the client's signature there to impersonate the client (§10, *Unauthenticated session relay*).
    Setting `revokeOthers: true` invalidates every other live session for this pubkey (useful for "log out other devices").
 
 4. Server verifies the signature. On success, returns a session token valid for **1 hour**:
@@ -320,6 +332,8 @@ Authorization: Bearer <session_token>
 When the server trusts proxy headers (`trustForwardedFor`, on by default), sessions are bound to the client's source IP — the last `X-Forwarded-For` hop. A later request from a different IP is rejected as `unauthorized`. If proxy-header trust is disabled, or no `X-Forwarded-For` header is present, the session is not IP-bound and this check is skipped.
 
 When a token expires, the server responds with `401`. The client re-authenticates by repeating the challenge-response flow.
+
+> **Channel binding.** The signed payload includes the target server's hostname under the `skrepka-auth-v1:` domain-separation tag (step 3). Because the client binds to the host it actually dialed and the server verifies against its own `serverHost`, a relay server cannot forward a challenge it obtained from a *different* server and replay the resulting signature to impersonate the client there: the client's signature commits to the relay's hostname, not the victim server's, so verification at the victim fails. This binding is a **breaking change** — client and server must agree on the signed payload. The host comparison is on the bare hostname only (port and scheme excluded), so the same identity authenticates regardless of the port a server listens on.
 
 A successful `/auth/verify` also installs the pubkey in the local presence table and broadcasts an `online` gossip event to known peers (§7).
 
@@ -367,7 +381,7 @@ The client makes a blocking POST. The server holds the connection open until new
 }
 ```
 
-- `cursor` is a server-side monotonic millisecond timestamp.
+- `cursor` is a server-side **strictly-monotonic sequence**, seeded from the wall-clock millisecond at assignment but bumped to `previous + 1` whenever messages arrive within the same millisecond. Two messages therefore never share a `receivedAt`, so advancing the cursor past one message can never silently drop another. Treat it as an opaque checkpoint, not a clock.
 - Advancing past a message acts as an **implicit ack**: when the next poll arrives with a `cursor` greater than or equal to a stored message's `receivedAt`, the server drops the stored message **and any pending federation forwards for it**.
 - If events are available immediately, the server responds right away. Otherwise it parks the connection on a row-level wait against the mailbox and returns when a new matching message lands or after 25 s, whichever comes first.
 - An empty page (`events: []`) is returned on timeout, with the cursor echoed back.
@@ -545,7 +559,7 @@ Note: Alice does not need to stay online for steps 4–9. Her server handles fed
 
 ### Message Ordering
 
-Message ordering is **best-effort** and guaranteed only within a single server. Each server's `receivedAt` provides strict ordering for that server's mailbox, and the `cursor` returned by `/poll` reflects this sequence.
+Message ordering is **best-effort** and guaranteed only within a single server. Each server assigns every message a strictly-monotonic `receivedAt` sequence (unique per message, never colliding even under bursts within one millisecond), which provides total ordering for that server's mailbox; the `cursor` returned by `/poll` reflects this sequence.
 
 Across federated servers, messages may arrive out of order due to network latency, retry delays, or differing reception times. Clients SHOULD use the sender-provided `ts` field (from the decrypted plaintext payload, §4) for display ordering and treat `cursor` as a polling checkpoint only, not a global ordering guarantee.
 
@@ -564,7 +578,7 @@ Skrepka protects message **content and sender identity** from servers and networ
 | Message confidentiality   | E2E encryption (X25519 + HKDF-SHA256 + XChaCha20-Poly1305) |
 | Sender authenticity       | Ed25519 signature on every message                         |
 | Sender anonymity vs. server | Sender pubkey is inside the AEAD ciphertext — servers see the recipient but not the sender |
-| Replay protection         | Unique nonce per message; signature binds the recipient pubkey, so a captured blob cannot be replayed against a different recipient |
+| Replay protection (cross-recipient) | Unique nonce per message; signature binds the recipient pubkey, so a captured blob cannot be replayed against a *different* recipient. This does **not** stop re-delivery of the same blob to the *same* recipient — see *Same-recipient replay* below |
 | Partial post-compromise   | Ephemeral X25519 keys per message — once the blob is no longer stored anywhere, even compromising the recipient's long-term key does not recover the message |
 
 ### What Is NOT Protected
@@ -573,9 +587,13 @@ Skrepka protects message **content and sender identity** from servers and networ
 |-----------------------------------|-----------------------------------------------------|
 | **No forward secrecy**            | If a message blob is captured *and* the recipient's long-term X25519 key is later compromised, that specific message can be decrypted. No ratchet means no post-compromise recovery. |
 | **Recipient metadata exposure**   | Servers see the recipient pubkey and arrival time of every message, plus the rough size of each blob. They do **not** see the sender. |
-| **Presence gossip leaks location** | Federated peers learn which server a user is currently connected to. |
+| **Presence gossip leaks location** | Federated peers learn which server a user is currently connected to. A presence row is anchored for up to 90 min (`onlineGossipTtl`), which outlives the 1 h session, so location metadata — and forwards aimed at the user — can linger for up to ~90 min after the user disconnects. |
 | **No durable delivery**           | If the sender's server goes down or all forward retries fail, messages may be lost. |
-| **Open federation**               | Federation endpoints are unauthenticated. The SSRF deny-list and `no_presence` gate limit abuse but do not authenticate peers; a hostile server can join the mesh and observe gossip. |
+| **Unauthenticated session relay** (mitigated) | The auth signature is bound to the target server's hostname under a domain-separation tag (§6), so a malicious/relay server can no longer forward another server's challenge and replay the resulting signature to impersonate the client elsewhere — the signature commits to the relay's own hostname. Residual caveat: the binding is to the hostname the client dialed, so it assumes the client reaches each server under its true `serverHost` (DNS/TLS integrity); it does not defend against an attacker who fully controls name resolution and the server's certificate. |
+| **Same-recipient replay**         | Nothing stops a captured blob from being re-delivered to its original recipient. `text` is deduplicated by `id` and `delivery.ack` is idempotent, but `profile` carries no `id` and (in the reference client) is applied unconditionally, so a replayed stale `profile` rolls a contact's cached profile back (§4). |
+| **Open federation — gossip redirect** | Federation endpoints are unauthenticated. The SSRF deny-list and `no_presence` gate limit abuse but do not authenticate peers. Beyond passively observing gossip, a hostile server can *actively redirect delivery*: by announcing `{eventType:"online", pubkey:<victim>, fromServer:<attacker>}` it causes origin servers to forward the victim's queued ciphertext to the attacker, which harvests ciphertext copies plus recipient/timing/size metadata. |
+| **Open federation — forward injection** | `/federation/forward` is unauthenticated, so any host can inject arbitrary blobs into a currently-online recipient's mailbox (rate-limited per source IP, and undecryptable blobs are dropped client-side, but they still consume the recipient's poll stream). |
+| **No cryptographic agility**      | The wire format has no version field and a fixed HKDF `info` (§3); the AEAD/KDF/curve cannot be migrated in-band. |
 | **TOFU only**                     | A first-time public key is trusted on encounter; users must compare fingerprints out-of-band to detect MITM at first contact. |
 
 ### Recommendations for Implementers

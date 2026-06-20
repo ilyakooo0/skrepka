@@ -169,8 +169,12 @@ module Crypto =
         let _, sk = generateSignKeyPair ()
         sk |> identityFromPrivKey |> Option.get
 
-    let signChallenge (privKey: byte[]) (challenge: string) : string =
-        let message = Encoding.UTF8.GetBytes(challenge)
+    // Domain-separation tag binding an auth signature to (target server, challenge).
+    // Distinguishes auth signatures from message signatures (recipientPub ++ compressed)
+    // and prevents a relay server from replaying the signature to a *different* server.
+    // `serverHost` is the bare lowercased hostname of the server being authenticated to.
+    let signChallenge (privKey: byte[]) (serverHost: string) (challenge: string) : string =
+        let message = Encoding.UTF8.GetBytes($"skrepka-auth-v1:{serverHost}:{challenge}")
         signDetached message privKey |> toHex
 
     let private deriveKey ephPub recipientX25519Pub rawSecret =
