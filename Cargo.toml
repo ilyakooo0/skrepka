@@ -1,0 +1,39 @@
+[workspace]
+members = ["core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/iko/skrepka"
+
+[workspace.dependencies]
+crux_core = "0.19"
+crux_http = "0.18"
+crux_kv = "0.13"
+crux_time = "0.17"
+boltffi = "0.26"
+facet = { version = "=0.44", features = ["chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# crypto
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = "4"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+zstd = "0.13"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rand_chacha = "0.3"
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+base64 = "0.22"
+
+# codegen bin
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+pretty_env_logger = "0.5"

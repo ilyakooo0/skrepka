@@ -1,0 +1,18 @@
+[package]
+name = "skrepka_core"
+crate = "skrepka_core"
+version = "0.1.0"
+repository = "https://github.com/iko/skrepka"
+license = "MIT"
+
+[targets.apple]
+output = "../apple/generated/Shared"
+deployment_target = "17.0"
+include_macos = false
+
+[targets.apple.swift]
+module_name = "SkrepkaShared"
+
+[targets.apple.spm]
+package_name = "SkrepkaShared"
+layout = "ffi-only"

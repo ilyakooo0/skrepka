@@ -1,0 +1,5 @@
+# Pin the iOS/macOS deployment targets so the C deps (zstd-sys) and rustc agree
+# on the minimum OS version — otherwise the linker errors on a version mismatch.
+[env]
+IPHONEOS_DEPLOYMENT_TARGET = "17.0"
+MACOSX_DEPLOYMENT_TARGET = "11.0"

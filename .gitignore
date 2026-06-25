@@ -9,3 +9,12 @@ client/bin
 client/obj
 .DS_Store
 .claude/
+
+# Rust core
+/target
+
+# iOS shell (xcodegen project + boltffi/typegen output + build products are generated)
+apple/SkrepkaApp.xcodeproj
+apple/build
+apple/generated
+apple/DerivedData

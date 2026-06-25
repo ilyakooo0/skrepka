@@ -1,0 +1,41 @@
+name: SkrepkaApp
+packages:
+  Shared:
+    path: ./generated/Shared
+  App:
+    path: ./generated/App/Skrepka
+options:
+  bundleIdPrefix: lol.skrepka
+  deploymentTarget:
+    iOS: "17.0"
+attributes:
+  BuildIndependentTargetsInParallel: true
+
+targets:
+  SkrepkaApp-iOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: SkrepkaApp
+        excludes:
+          - "Info-*.plist"
+    info:
+      path: SkrepkaApp/Info-iOS.plist
+      properties:
+        CFBundleDisplayName: Skrepka
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSCameraUsageDescription: Scan a contact's QR code to add them.
+        NSPhotoLibraryUsageDescription: Choose a photo for your profile.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    dependencies:
+      - package: Shared
+        product: SkrepkaShared
+      - package: App
+        product: Skrepka
+    scheme:
+      management:
+        shared: true

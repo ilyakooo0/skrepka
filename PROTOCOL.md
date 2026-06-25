@@ -69,7 +69,7 @@ There is no global directory. Users assign local nicknames to public keys on the
 | Key agreement    | X25519                |
 | Key derivation   | HKDF-SHA256           |
 | Symmetric cipher | XChaCha20-Poly1305    |
-| Compression      | LZ4 (pre-encryption)  |
+| Compression      | zstd (pre-encryption) |
 
 ### Per-Message Encryption
 
@@ -97,9 +97,9 @@ The wire-visible "envelope" carries only the recipient and the opaque blob. The 
      len   = 32
    )
    ```
-4. LZ4-compress the plaintext payload (see §4):
+4. zstd-compress the plaintext payload (see §4):
    ```
-   compressed = lz4_pickle(plaintext_bytes)
+   compressed = zstd(plaintext_bytes)   // standard zstd frame (embeds content size)
    ```
 5. Sign the recipient pubkey concatenated with the compressed plaintext. Binding the signature to the recipient prevents the same blob from being replayed against another recipient:
    ```
@@ -127,7 +127,7 @@ The wire-visible "envelope" carries only the recipient and the opaque blob. The 
 3. AEAD-decrypt the ciphertext to recover the inner buffer.
 4. Split: 32-byte `sender_ed25519_public`, 64-byte `signature`, remainder is `compressed`.
 5. Verify the signature over `recipient_ed25519_public || compressed` using `sender_ed25519_public`. Reject the message on failure.
-6. LZ4-decompress to recover the plaintext payload.
+6. zstd-decompress to recover the plaintext payload.
 
 ### Encrypted Blob Format
 
@@ -144,7 +144,7 @@ After AEAD decryption, the inner buffer is:
 ```
 sender_ed25519_pubkey     (32 bytes)
 signature                 (64 bytes)
-compressed_plaintext      (variable, LZ4)
+compressed_plaintext      (variable, zstd)
 ```
 
 The sender's pubkey and signature are inside the AEAD ciphertext: the server never sees them, and only the intended recipient can recover the sender's identity. The minimum blob size is `32 + 24 + 32 + 64 + 16 = 168` bytes.
@@ -177,7 +177,7 @@ Servers route based on `to`. They cannot inspect `encryptedBlob` and they do not
 
 ### Plaintext Payload
 
-After decryption (and LZ4 decompression), the plaintext is a UTF-8 JSON object with a `type` field:
+After decryption (and zstd decompression), the plaintext is a UTF-8 JSON object with a `type` field:
 
 ```json
 {

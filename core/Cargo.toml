@@ -1,0 +1,58 @@
+[package]
+name = "skrepka_core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "skrepka_core"
+crate-type = ["cdylib", "lib", "staticlib"]
+
+[[bin]]
+name = "codegen"
+required-features = ["codegen"]
+
+[features]
+facet_typegen = ["crux_core/facet_typegen"]
+codegen = [
+    "dep:anyhow",
+    "dep:clap",
+    "dep:log",
+    "dep:pretty_env_logger",
+    "facet_typegen",
+]
+
+[dependencies]
+crux_core.workspace = true
+crux_http.workspace = true
+crux_kv.workspace = true
+crux_time.workspace = true
+boltffi.workspace = true
+facet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# crypto
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+curve25519-dalek.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+zstd.workspace = true
+rand_core.workspace = true
+uuid.workspace = true
+hex.workspace = true
+base64.workspace = true
+
+# optional, only for the codegen bin
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+pretty_env_logger = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand_chacha.workspace = true
+crux_core = { workspace = true, features = ["testing"] }
