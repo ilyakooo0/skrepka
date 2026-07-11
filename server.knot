@@ -411,6 +411,20 @@ stripTrailingDot = \s -> if hasSuffix "." s
 then stripTrailingDot (take (length s - 1) s)
 else s
 
+-- Compare two Text values for equality. Works around the refined-type
+-- subtyping issue where comparing a PubkeyHex with a Text using ==
+-- requires both sides to share the same type — this helper upcasts both
+-- to Text before comparing.
+textEq : Text -> Text -> Bool
+textEq = \a b -> a == b
+
+-- Membership check that works across refined-type boundaries. `elem`
+-- requires both the needle and the list elements to share a type, but
+-- `PubkeyHex` and `Text` are related by subtyping, not equality. This
+-- helper compares as `Text` on both sides.
+textElem : Text -> [Text] -> Bool
+textElem = \x xs -> any (\y -> x == y) xs
+
 -- True when `s` refers to this server.
 isLocalServer : Text -> Bool
 isLocalServer = \s -> s == serverHost
@@ -1196,10 +1210,11 @@ handleRecvGossip = \events fromServer -> do
         else if e.eventType == "offline"
         then {acc.added, touched: union acc.touched [pubkey]}
         else acc
-        Nothing {} -> acc) {touched: [], added: []} events
-      let kept = filter (\p -> p.server != fromServer || not elem p.pubkey collected.touched) pres
+        Nothing {} -> acc) {touched: ([] : [Text]), added: ([] : [PresenceEntry])} events
+      let kept = filter (\p -> p.server != fromServer || not textElem p.pubkey collected.touched) pres
       *presence = union kept collected.added
-      yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) collected.added)))
+      let addedKeys : [Text] = map (\p -> p.pubkey) collected.added
+      yield (filter (\pk -> not any (\p -> textEq p.pubkey pk && p.server == fromServer && p.expiresAt > t) pres) addedKeys))
     fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
@@ -1302,7 +1317,7 @@ backgroundRetryForwards = do
 -- Fork the background prune loop (which runs an immediate sweep on its
 -- first tick) and start the HTTP listener. The forward-retry loop only
 -- runs when federation is enabled.
-main : IO {network, console, clock, random} {}
+main : IO {network, console, clock, random, r *challenges, r *forwardFailures, r *forwards, r *messages, r *presence, r *seqCounter, r *sessions, w *challenges, w *forwardFailures, w *forwards, w *messages, w *presence, w *seqCounter, w *sessions} {}
 main = do
   logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
