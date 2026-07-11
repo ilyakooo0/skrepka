@@ -1317,10 +1317,10 @@ backgroundRetryForwards = do
 -- Fork the background prune loop (which runs an immediate sweep on its
 -- first tick) and start the HTTP listener. The forward-retry loop only
 -- runs when federation is enabled.
+main : IO {| r} {}
 main = do
   _ <- logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
   _ <- logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
   _ <- fork backgroundPrune
   _ <- when federationEnabled (fork backgroundRetryForwards)
-  _ <- listenOn bindHost listenPort api
-  yield {}
+  listenOn bindHost listenPort api
