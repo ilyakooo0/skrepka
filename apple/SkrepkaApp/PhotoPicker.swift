@@ -30,13 +30,17 @@ struct PhotoPicker: UIViewControllerRepresentable {
                 return
             }
             provider.loadObject(ofClass: UIImage.self) { object, _ in
-                guard let image = object as? UIImage,
-                      let base64 = Self.downscaledBase64(image) else { return }
-                DispatchQueue.main.async { self.onPick(base64) }
+                guard let image = object as? UIImage else { return }
+                // loadObject calls back on a background queue; the redraw below is UIKit.
+                DispatchQueue.main.async {
+                    guard let base64 = Self.downscaledBase64(image) else { return }
+                    self.onPick(base64)
+                }
             }
         }
 
         /// Resize to fit 256px and JPEG-encode, to keep the profile payload small.
+        /// Call on the main thread — UIGraphicsImageRenderer and UIImage.draw are UIKit.
         static func downscaledBase64(_ image: UIImage) -> String? {
             let maxDim: CGFloat = 256
             let scale = min(1, maxDim / max(image.size.width, image.size.height))

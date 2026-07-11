@@ -29,8 +29,14 @@ targets:
           - UIInterfaceOrientationPortrait
         NSCameraUsageDescription: Scan a contact's QR code to add them.
         NSPhotoLibraryUsageDescription: Choose a photo for your profile.
+        # Relays must be reachable over TLS. The only cleartext exception is a
+        # locally-run `just server`, for development.
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            localhost:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
     dependencies:
       - package: Shared
         product: SkrepkaShared

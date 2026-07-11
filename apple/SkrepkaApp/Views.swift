@@ -72,35 +72,44 @@ func initials(_ name: String) -> String {
     return chars.isEmpty ? "?" : String(chars).uppercased()
 }
 
+/// Toggles `Contact::blocked` in the core. Blocked peers stay in the contact list —
+/// listed apart — so the block is always reversible from the UI.
+struct BlockToggle: View {
+    @ObservedObject var core: Core
+    let peer: String
+    let blocked: Bool
+
+    var body: some View {
+        Button(role: blocked ? nil : .destructive) {
+            core.update(.setBlocked(peer: peer, blocked: !blocked))
+        } label: {
+            Label(blocked ? "Unblock" : "Block",
+                  systemImage: blocked ? "hand.raised.slash" : "hand.raised")
+        }
+    }
+}
+
 struct ConversationsView: View {
     @ObservedObject var core: Core
 
     var visible: [ContactVM] { core.view.contacts.filter { !$0.blocked } }
+    var blocked: [ContactVM] { core.view.contacts.filter { $0.blocked } }
 
     var body: some View {
         NavigationStack {
             Group {
-                if visible.isEmpty {
+                if core.view.contacts.isEmpty {
                     ContentUnavailableView(
                         "No conversations",
                         systemImage: "bubble.left.and.bubble.right",
                         description: Text("Tap + to add a contact by their key or QR code.")
                     )
                 } else {
-                    List(visible, id: \.pubkey) { contact in
-                        Button { core.update(.openChat(contact.pubkey)) } label: {
-                            HStack(spacing: 12) {
-                                Avatar(base64: contact.photo, name: contact.name)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(contact.name).font(.headline).foregroundColor(.primary)
-                                    Text(contact.lastMessage.isEmpty ? contact.ob : contact.lastMessage)
-                                        .font(.subheadline).foregroundColor(.secondary).lineLimit(1)
-                                }
-                                Spacer()
-                                if contact.lastTs > 0 {
-                                    Text(formatTime(contact.lastTs))
-                                        .font(.caption).foregroundColor(.secondary)
-                                }
+                    List {
+                        ForEach(visible, id: \.pubkey) { row($0) }
+                        if !blocked.isEmpty {
+                            Section("Blocked") {
+                                ForEach(blocked, id: \.pubkey) { row($0).opacity(0.5) }
                             }
                         }
                     }
@@ -116,6 +125,27 @@ struct ConversationsView: View {
                     Button { core.update(.showSettings) } label: { Image(systemName: "gearshape") }
                 }
             }
+        }
+    }
+
+    private func row(_ contact: ContactVM) -> some View {
+        Button { core.update(.openChat(contact.pubkey)) } label: {
+            HStack(spacing: 12) {
+                Avatar(base64: contact.photo, name: contact.name)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(contact.name).font(.headline).foregroundColor(.primary)
+                    Text(contact.lastMessage.isEmpty ? contact.ob : contact.lastMessage)
+                        .font(.subheadline).foregroundColor(.secondary).lineLimit(1)
+                }
+                Spacer()
+                if contact.lastTs > 0 {
+                    Text(formatTime(contact.lastTs))
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+        }
+        .contextMenu {
+            BlockToggle(core: core, peer: contact.pubkey, blocked: contact.blocked)
         }
     }
 }
@@ -141,6 +171,18 @@ struct ChatView: View {
                 Text(core.view.activePeerOb).font(.caption2).foregroundColor(.secondary).lineLimit(1)
             }
             Spacer()
+            if core.view.activePeerBlocked {
+                Text("Blocked").font(.caption).foregroundColor(.secondary)
+            }
+            Menu {
+                BlockToggle(
+                    core: core,
+                    peer: core.view.activePeer,
+                    blocked: core.view.activePeerBlocked
+                )
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
         }
         .padding(.horizontal).padding(.vertical, 8)
         .background(.bar)

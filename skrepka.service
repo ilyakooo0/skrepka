@@ -5,7 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/skrepka-server
+# EDIT --serverHost: replace relay.example.com with the public hostname clients
+# use to reach this relay. It is the federation identity and the hostname a
+# client binds its auth signature to ("skrepka-auth-v1:<host>:<challenge>"); the
+# built-in default is "localhost", so leaving it unset makes /auth/verify reject
+# every signature.
+# --http-max-body-bytes must exceed maxBlobLen (40 MiB hex) plus the JSON
+# envelope, otherwise the runtime's default 16 MiB body cap rejects a max-size
+# blob with 413 before the handler's BlobHex check is ever reached.
+ExecStart=/usr/local/bin/skrepka-server --serverHost=relay.example.com --http-max-body-bytes=42M
 Restart=on-failure
 RestartSec=5
 

@@ -72,14 +72,18 @@ pub fn to_ob(bytes: &[u8]) -> String {
 }
 
 /// Decode a `@p` string back to bytes. Returns `None` if any syllable is invalid.
+/// Input is case-insensitive; the syllable tables are lowercase.
 pub fn from_ob(s: &str) -> Option<Vec<u8>> {
-    let parts: Vec<&str> = s.split('-').filter(|p| !p.is_empty()).collect();
+    let lowered = s.to_lowercase();
+    let parts: Vec<&str> = lowered.split('-').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() {
         return None;
     }
     let mut out = Vec::with_capacity(parts.len() * 2);
     for part in parts {
-        if part.len() != 6 {
+        // `len` is in bytes, so the ASCII check is what makes the 3-byte slices
+        // below char-boundary-safe on arbitrary user input.
+        if part.len() != 6 || !part.is_ascii() {
             return None;
         }
         let hi = prefix_index(&part[0..3])?;
@@ -149,5 +153,25 @@ mod tests {
         assert_eq!(try_parse_pubkey("deadbeef"), None);
         assert_eq!(try_parse_pubkey("not-a-key"), None);
         assert_eq!(try_parse_pubkey(""), None);
+    }
+
+    #[test]
+    fn ob_parsing_is_case_insensitive() {
+        let key = [0xabu8; 32];
+        let hex_str = hex::encode(key);
+        let ob = to_ob(&key);
+        assert_eq!(from_ob(&ob.to_uppercase()), Some(key.to_vec()));
+        assert_eq!(try_parse_pubkey(&ob.to_uppercase()), Some(hex_str.clone()));
+        // Mixed case, as a QR scan or a paste from a title-cased field might give.
+        assert_eq!(try_parse_pubkey(&ob.replace("ler", "Ler")), Some(hex_str));
+    }
+
+    /// `part.len()` is a *byte* count, so a 6-byte syllable holding a multi-byte
+    /// char would slice mid-character and panic. Reachable from the AddContact field.
+    #[test]
+    fn multibyte_input_is_rejected_not_panicked_on() {
+        assert_eq!(from_ob("abéxx"), None);
+        assert_eq!(try_parse_pubkey("abéxx"), None);
+        assert_eq!(try_parse_pubkey("ünïcødé-abéxx"), None);
     }
 }

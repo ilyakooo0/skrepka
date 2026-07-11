@@ -6,6 +6,24 @@ on:
   pull_request:
 
 jobs:
+  core:
+    name: Core (test + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test -p skrepka_core
+
+      - name: Clippy
+        run: cargo clippy -p skrepka_core --all-targets -- -D warnings
+
   build:
     strategy:
       fail-fast: false
@@ -59,7 +77,7 @@ jobs:
           path: server
 
   release:
-    needs: build
+    needs: [core, build]
     if: github.ref == 'refs/heads/master' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -71,9 +89,17 @@ jobs:
         with:
           path: repo
 
+      # Commit timestamp to the second, plus the short SHA. Minute resolution
+      # alone collides when two commits land in the same minute (a rebase-push,
+      # or a merge right after a direct push), and a duplicate tag makes the
+      # release step fail — or worse, silently overwrite the previous release's
+      # assets. The SHA makes the tag unique even at identical timestamps.
       - name: Generate version
         id: version
-        run: echo "tag=$(git -C repo log -1 --format='%cd' --date='format:%Y.%m.%d.%H%M')" >> "$GITHUB_OUTPUT"
+        run: |
+          ts=$(git -C repo log -1 --format='%cd' --date='format:%Y.%m.%d.%H%M%S')
+          sha=$(git -C repo rev-parse --short=7 HEAD)
+          echo "tag=${ts}-${sha}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release assets
         run: |

@@ -45,21 +45,29 @@ echo "Downloading latest release..."
 
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
 
+# Download to a temp file next to the destination, then rename. Writing straight
+# to $INSTALL_BIN fails with ETXTBSY while the service is running; rename(2) is
+# atomic and happily replaces a busy binary (the running process keeps the old
+# inode until it is restarted below).
+TMP_BIN="${INSTALL_BIN}.new.$$"
+trap 'rm -f "$TMP_BIN"' EXIT INT TERM
+
 if command -v curl >/dev/null 2>&1; then
-  curl -fSL "$DOWNLOAD_URL" -o "$INSTALL_BIN"
+  curl -fSL "$DOWNLOAD_URL" -o "$TMP_BIN"
 elif command -v wget >/dev/null 2>&1; then
-  wget -q "$DOWNLOAD_URL" -O "$INSTALL_BIN"
+  wget -q "$DOWNLOAD_URL" -O "$TMP_BIN"
 else
   echo "error: curl or wget required" >&2
   exit 1
 fi
 
-chmod 755 "$INSTALL_BIN"
+chmod 755 "$TMP_BIN"
+mv -f "$TMP_BIN" "$INSTALL_BIN"
 echo "Installed binary to ${INSTALL_BIN}"
 
 case "$PLATFORM" in
   linux-*)
-    cat > "$UNIT_DEST" <<'EOF'
+    cat > "$UNIT_DEST" <<EOF
 [Unit]
 Description=Skrepka relay server
 After=network-online.target
@@ -67,10 +75,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# --serverHost is the federation identity AND the hostname clients bind their
+# auth signature to ("skrepka-auth-v1:<host>:<challenge>"). It defaults to
+# "localhost", which no client ever dials, so /auth/verify would reject every
+# signature. It must be the public name clients use to reach this relay.
 # --http-max-body-bytes must exceed maxBlobLen (40 MiB hex) plus the JSON
 # envelope, otherwise the runtime's default 16 MiB body cap rejects a
 # max-size blob with 413 before the handler's BlobHex check is ever reached.
-ExecStart=/usr/local/bin/skrepka-server --http-max-body-bytes=42M
+ExecStart=/usr/local/bin/skrepka-server --serverHost=${DOMAIN} --http-max-body-bytes=42M
 Restart=on-failure
 RestartSec=5
 

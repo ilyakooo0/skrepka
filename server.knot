@@ -116,10 +116,18 @@ pollTimeoutMs = 25000
 -- share this window; only the per-window request budget varies per endpoint.
 rateLimitWindow : Int<Ms>
 rateLimitWindow = 60000
--- Per-pubkey budget for /auth/challenge and /auth/verify per `rateLimitWindow`.
--- The normal handshake is one challenge + one verify, so a healthy flow uses 2.
+-- Per-client-IP budget for /auth/challenge and /auth/verify per `rateLimitWindow`.
+-- The normal handshake is one challenge + one verify, so a healthy flow uses 2;
+-- the budget leaves room for many clients behind one NAT. (Keyed on IP, not on
+-- the submitted pubkey: keypairs are free to generate, so a pubkey-keyed bucket
+-- hands an attacker a fresh budget with every rotation — a Sybil flood could
+-- then mint sessions until `maxSessions` is hit and evict live ones. A pubkey
+-- key is also abusable in the other direction: flooding a *victim's* pubkey
+-- would exhaust that victim's login budget. Per-pubkey exhaustion of the
+-- challenge/session pools is still bounded, by `maxChallengesPerKey` and
+-- `maxSessionsPerKey` in the handlers.)
 authRateLimit : Int
-authRateLimit = 10
+authRateLimit = 60
 -- Per-client-IP budget for /poll per `rateLimitWindow`. Clients reconnect
 -- after `pollTimeoutMs`, so steady state is ~3/min per client; the budget
 -- leaves room for several clients behind one NAT. (Keyed on IP, not bearer
@@ -275,16 +283,16 @@ type ForwardFailure = {server: Text, failedAt: Timestamp, failures: Int}
 -- ============================================
 -- Rate limiting
 -- ============================================
--- Per-endpoint token-bucket configuration. Auth endpoints key on the submitted
--- pubkey (so one keypair can't drain global capacity); client and federation
--- endpoints key on the client IP (last X-Forwarded-For hop behind a trusted
--- proxy, else the connection address). The bearer token is deliberately not a
--- bucket key: the limiter runs before the handler, so it can't tell valid
--- sessions from invented ones, and an attacker varying the token would mint a
--- fresh bucket per value. Each route has an independent bucket store, so endpoints
--- using the same key strategy don't share budget across routes. Buckets persist
--- in the runtime's `_knot_rate_limits` SQLite table; rejection responds 429
--- before the handler runs.
+-- Per-endpoint token-bucket configuration. Every endpoint keys on the client IP
+-- (last X-Forwarded-For hop behind a trusted proxy, else the connection
+-- address). Nothing the caller can mint for free is a bucket key: the limiter
+-- runs before the handler, so it cannot tell a valid session from an invented
+-- one, and an attacker varying a self-chosen value would get a fresh bucket per
+-- value. That rules out the bearer token (any string) and the submitted pubkey
+-- (any keypair) alike — see `authRateLimit`. Each route has an independent
+-- bucket store, so endpoints using the same key strategy don't share budget
+-- across routes. Buckets persist in the runtime's `_knot_rate_limits` SQLite
+-- table; rejection responds 429 before the handler runs.
 
 -- Suffix of `s` after its last comma, trimmed. X-Forwarded-For is a
 -- comma-separated chain that each proxy appends to; only the final entry —
@@ -304,10 +312,9 @@ pickClientIp = \h connIp -> case h of
   else connIp
   Nothing {} -> connIp
 
-byPubkey = \{pubkey} _ -> Just {value: pubkey}
 byClientIp = \_ ctx -> Just {value: pickClientIp (ctx.header "X-Forwarded-For") ctx.clientIp}
 
-authLimit = {key: byPubkey, limit: {requests: authRateLimit, window: rateLimitWindow}}
+authLimit = {key: byClientIp, limit: {requests: authRateLimit, window: rateLimitWindow}}
 pollLimit = {key: byClientIp, limit: {requests: pollRateLimit, window: rateLimitWindow}}
 sendLimit = {key: byClientIp, limit: {requests: sendRateLimit, window: rateLimitWindow}}
 gossipLimit = {key: byClientIp, limit: {requests: gossipRateLimit, window: rateLimitWindow}}
@@ -483,7 +490,22 @@ anyOctetLeadingZero = \host -> do
   let rest = afterDot host
   (length octet > 1 && take 1 octet == "0") || (rest != "" && anyOctetLeadingZero rest)
 
--- Block private/reserved/internal hostnames (SSRF defense). Skips percent-encoding
+-- Block private/reserved/internal hostnames (SSRF defense).
+--
+-- LIMITATION — this check is purely lexical: it inspects the *string* a peer
+-- gave us, never the address that string resolves to. An attacker who controls
+-- DNS for a name that looks perfectly public (`relay.attacker.example`) can
+-- point it at 127.0.0.1 / 169.254.169.254 / an RFC1918 host and this returns
+-- False, so `fetch` dials the internal target anyway. Nothing here rules that
+-- out, and re-resolving before the request wouldn't either (the resolver is
+-- free to answer differently the second time — a DNS-rebinding TOCTOU). Closing
+-- it needs resolution and connection to be fused: resolve the name, reject the
+-- resulting IP against the same reserved ranges, and connect to *that* IP —
+-- which the `fetch` in use does not expose. Treat the list below as a guard
+-- against accidental and naive-literal SSRF, not against a motivated attacker
+-- with a nameserver. Same class of gap as the percent-encoding one noted next.
+--
+-- Skips percent-encoding
 -- tricks but covers the high-value cases: `localhost`, RFC1918 ranges (10/8,
 -- 172.16/12, 192.168/16) plus link-local
 -- 169.254/16, the IPv4 zero net, CGNAT 100.64/10, benchmarking 198.18/15,
@@ -798,7 +820,7 @@ forwardQueuedToServer = \pubkey server -> atomic (do
 -- revoke/logout.
 
 -- POST /auth/challenge: issue a fresh signed-nonce challenge for `pubkey`.
--- Capped per-key (maxChallengesPerKey); per-pubkey rate limiting is enforced
+-- Capped per-key (maxChallengesPerKey); per-client-IP rate limiting is enforced
 -- by the route's `rateLimit` clause. The IP is recorded so /auth/verify can
 -- require the same client.
 handleChallenge : PubkeyHex -> Text -> IO {rw *challenges, clock, random} (Result HttpError {challenge: Text, expiresAt: Timestamp})
@@ -924,12 +946,18 @@ doPoll = \s t -> do
     -- `race` requires both arms to share a single effect row, so each arm
     -- carries the union {r *messages, clock} — the STM wait gets a `now`,
     -- the timer gets a no-op `*messages` read.
+    -- The wait predicate must match `collectAt`'s exactly, age guard included:
+    -- an expired row that still sits above the cursor (not yet swept by
+    -- `pruneExpired`) would otherwise satisfy the wait, wake the poll, then be
+    -- filtered out by `collectAt` — returning an empty page whose cursor is
+    -- unchanged, so the client immediately re-polls into the same wakeup. That
+    -- is a tight spin for as long as the row survives.
     race
       (do
-        _ <- now
+        tw <- now
         atomic (do
           msgs <- *messages
-          let fresh = filter (\m -> m.toKey == s.pubkey && m.receivedAt > s.clampedCursor) msgs
+          let fresh = filter (\m -> m.toKey == s.pubkey && tw - m.receivedAt < messageMaxAge && m.receivedAt > s.clampedCursor) msgs
           if count fresh > 0 then yield {} else retry))
       (do
         atomic (do _ <- *messages; yield {})

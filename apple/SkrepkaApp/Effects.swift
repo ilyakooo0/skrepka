@@ -91,7 +91,8 @@ final class KvStore {
             return .ok(response: .get(value: read(key)))
         case .set(let key, let value):
             let previous = read(key)
-            try? Data(value).write(to: fileURL(key))
+            // Atomic: a crash mid-write must not leave a truncated messages:<peer>.
+            try? Data(value).write(to: fileURL(key), options: .atomic)
             return .ok(response: .set(previous: previous))
         case .delete(let key):
             let previous = read(key)
@@ -139,20 +140,30 @@ enum Keychain {
         return item as? Data
     }
 
+    /// A failed write is fatal: the in-memory key would work for this session, but the
+    /// next launch would find nothing and silently mint a *new* identity — losing the
+    /// old one, and with it every contact's idea of who we are.
     private static func store(_ data: Data) {
         let delete: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        SecItemDelete(delete as CFDictionary)
+        let deleted = SecItemDelete(delete as CFDictionary)
+        guard deleted == errSecSuccess || deleted == errSecItemNotFound else {
+            fatalError("keychain: could not clear the old identity (OSStatus \(deleted))")
+        }
         let add: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            // ThisDeviceOnly: the identity key must never ride along in a device backup.
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        SecItemAdd(add as CFDictionary, nil)
+        let added = SecItemAdd(add as CFDictionary, nil)
+        guard added == errSecSuccess else {
+            fatalError("keychain: could not store the identity key (OSStatus \(added))")
+        }
     }
 }

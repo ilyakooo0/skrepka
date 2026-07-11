@@ -153,7 +153,7 @@ pub struct MessageVM {
 
 #[derive(Facet, Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ViewModel {
-    /// "setup" | "conversations" | "chat" | "add_contact" | "settings" | "edit_profile"
+    /// "conversations" | "chat" | "add_contact" | "settings" | "edit_profile"
     pub page: String,
     pub has_identity: bool,
     pub my_pubkey_hex: String,

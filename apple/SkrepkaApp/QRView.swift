@@ -50,6 +50,7 @@ struct QRScannerView: UIViewControllerRepresentable {
 final class ScannerVC: UIViewController {
     weak var coordinator: QRScannerView.Coordinator?
     private let session = AVCaptureSession()
+    private var previewLayer: AVCaptureVideoPreviewLayer?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -69,6 +70,12 @@ final class ScannerVC: UIViewController {
         preview.frame = view.layer.bounds
         preview.videoGravity = .resizeAspectFill
         view.layer.addSublayer(preview)
+        previewLayer = preview
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.bounds
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -80,6 +87,9 @@ final class ScannerVC: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        if session.isRunning { session.stopRunning() }
+        // Both start and stop block until the camera pipeline settles — never on main.
+        if session.isRunning {
+            DispatchQueue.global(qos: .userInitiated).async { self.session.stopRunning() }
+        }
     }
 }

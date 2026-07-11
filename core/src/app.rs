@@ -140,9 +140,11 @@ pub enum ConnStatus {
     Online,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Page {
-    Setup,
+    /// The shell renders a spinner until `IdentityLoaded` arrives, so there is
+    /// no distinct pre-identity page — conversations is the landing page.
+    #[default]
     Conversations,
     Chat,
     AddContact,
@@ -162,6 +164,9 @@ pub struct Model {
     token: Option<String>,
     conn: ConnStatus,
     poll_retries: u32,
+    /// A poll request is in flight. Guards against stacking concurrent long-poll
+    /// loops (every extra loop re-polls itself forever and never terminates).
+    polling: bool,
     flushing: bool,
     page: Page,
     active_peer: Option<String>,
@@ -183,8 +188,9 @@ impl Default for Model {
             token: None,
             conn: ConnStatus::Offline,
             poll_retries: 0,
+            polling: false,
             flushing: false,
-            page: Page::Setup,
+            page: Page::default(),
             active_peer: None,
             compose: String::new(),
             error: None,
@@ -218,6 +224,30 @@ fn server_host(url: &str) -> String {
     let host = host_port.split('@').next_back().unwrap_or(host_port);
     let host = host.split(':').next().unwrap_or(host);
     host.trim_end_matches('.').to_lowercase()
+}
+
+/// Validate and canonicalize a user-entered relay URL.
+///
+/// The shell hands us raw text-field contents, and `Http::post` panics on a URL
+/// with no scheme — so a schemeless entry must be rejected here, in the core,
+/// before it can ever reach an effect. Returns the normalized URL (lowercased
+/// scheme, no trailing slash) or `None` if it isn't an absolute http(s) URL.
+fn normalize_server_url(input: &str) -> Option<String> {
+    let (scheme, rest) = input.trim().split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let rest = rest.trim_end_matches('/');
+    if rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    // Require a non-empty authority: reject "http://", "http:///x", "http://:80".
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.split('@').next_back().unwrap_or(authority);
+    if host.split(':').next().unwrap_or("").is_empty() {
+        return None;
+    }
+    Some(format!("{}://{}", scheme.to_lowercase(), rest))
 }
 
 fn json_bytes<T: Serialize>(value: &T) -> Vec<u8> {
@@ -391,6 +421,11 @@ impl App for Skrepka {
                 render()
             }
             Event::SetServerUrl(url) => {
+                let Some(url) = normalize_server_url(&url) else {
+                    model.error = Some("server URL must start with http:// or https://".into());
+                    return render();
+                };
+                model.error = None;
                 model.settings.server_url = url;
                 model.token = None;
                 model.conn = ConnStatus::Offline;
@@ -484,7 +519,11 @@ impl App for Skrepka {
                 };
                 match Http::post(url).body_json(&body) {
                     Ok(req) => req.build().then_send(Event::ChallengeResult).and(render()),
-                    Err(_) => render(),
+                    Err(_) => {
+                        model.conn = ConnStatus::Offline;
+                        model.error = Some("could not build auth request".into());
+                        self.schedule_reconnect(model)
+                    }
                 }
             }
             Event::ChallengeResult(Ok(mut resp)) => {
@@ -505,7 +544,11 @@ impl App for Skrepka {
                         };
                         match Http::post(url).body_json(&body) {
                             Ok(req) => req.build().then_send(Event::VerifyResult),
-                            Err(_) => render(),
+                            Err(_) => {
+                                model.conn = ConnStatus::Offline;
+                                model.error = Some("could not build auth request".into());
+                                self.schedule_reconnect(model)
+                            }
                         }
                     }
                     Err(_) => {
@@ -543,6 +586,11 @@ impl App for Skrepka {
 
             // ---------------- poll ----------------
             Event::Poll => {
+                // Exactly one poll loop at a time: each PollResult re-issues Poll,
+                // so a second concurrent loop would double forever.
+                if model.polling {
+                    return Command::done();
+                }
                 let Some(token) = model.token.clone() else {
                     return Command::event(Event::Authenticate);
                 };
@@ -554,11 +602,18 @@ impl App for Skrepka {
                     .header("authorization", format!("Bearer {token}"))
                     .body_json(&body)
                 {
-                    Ok(req) => req.build().then_send(Event::PollResult),
-                    Err(_) => render(),
+                    Ok(req) => {
+                        model.polling = true;
+                        req.build().then_send(Event::PollResult)
+                    }
+                    Err(_) => {
+                        model.error = Some("could not build poll request".into());
+                        self.backoff_poll(model)
+                    }
                 }
             }
             Event::PollResult(Ok(mut resp)) => {
+                model.polling = false;
                 let status = u16::from(resp.status());
                 if status == 401 {
                     model.token = None;
@@ -576,15 +631,20 @@ impl App for Skrepka {
                     .and(Command::event(Event::Poll))
                     .and(render())
             }
-            Event::PollResult(Err(_)) => self.backoff_poll(model),
+            Event::PollResult(Err(_)) => {
+                model.polling = false;
+                self.backoff_poll(model)
+            }
 
             // ---------------- outbox ----------------
             Event::StartFlush => self.flush_next(model),
             Event::SendResult(Ok(resp)) => {
+                // The in-flight send is over; `flush_next` refuses to run while
+                // this is set, so it must be cleared before *any* branch below.
+                model.flushing = false;
                 let status = u16::from(resp.status());
                 if status == 401 {
                     model.token = None;
-                    model.flushing = false;
                     return Command::event(Event::Authenticate);
                 }
                 if (200..300).contains(&status) || status == 400 {
@@ -593,7 +653,6 @@ impl App for Skrepka {
                     return self.persist_outbox(model).and(self.flush_next(model));
                 }
                 // transient error — stop; will resume on next connect/poll.
-                model.flushing = false;
                 render()
             }
             Event::SendResult(Err(_)) => {
@@ -605,7 +664,6 @@ impl App for Skrepka {
 
     fn view(&self, model: &Model) -> ViewModel {
         let page = match model.page {
-            Page::Setup => "setup",
             Page::Conversations => "conversations",
             Page::Chat => "chat",
             Page::AddContact => "add_contact",
@@ -817,7 +875,10 @@ impl Skrepka {
         {
             Ok(req) => req.build().then_send(Event::SendResult),
             Err(_) => {
+                // Not a dead loop: the next StartFlush (from a poll page or a
+                // fresh send) retries the head of the outbox.
                 model.flushing = false;
+                model.error = Some("could not build send request".into());
                 render()
             }
         }
@@ -950,10 +1011,11 @@ mod tests {
 
     fn with_identity() -> Model {
         let id = Identity::from_seed(&[3u8; 32]);
-        let mut m = Model::default();
-        m.secret_key = Some(id.secret_key.to_vec());
-        m.my_pubkey = id.public_key_hex();
-        m
+        Model {
+            secret_key: Some(id.secret_key.to_vec()),
+            my_pubkey: id.public_key_hex(),
+            ..Default::default()
+        }
     }
 
     fn peer_hex(seed: u8) -> String {
@@ -1056,6 +1118,112 @@ mod tests {
         assert!(m.contacts[&peer].blocked);
         let vm = app.view(&m);
         assert!(vm.contacts.iter().any(|c| c.pubkey == peer && c.blocked));
+    }
+
+    #[test]
+    fn normalize_server_url_requires_an_http_scheme() {
+        assert_eq!(
+            normalize_server_url("  https://Relay.Example.com/  "),
+            Some("https://Relay.Example.com".to_string())
+        );
+        assert_eq!(
+            normalize_server_url("HTTP://localhost:8080///"),
+            Some("http://localhost:8080".to_string())
+        );
+        // The cases that used to panic Http::post or produce a dead URL.
+        assert_eq!(normalize_server_url("relay.example.com"), None);
+        assert_eq!(normalize_server_url("localhost:8080"), None);
+        assert_eq!(normalize_server_url("ftp://relay.example.com"), None);
+        assert_eq!(normalize_server_url("http://"), None);
+        assert_eq!(normalize_server_url("http://:8080"), None);
+        assert_eq!(normalize_server_url("https://relay example.com"), None);
+        assert_eq!(normalize_server_url(""), None);
+    }
+
+    #[test]
+    fn set_server_url_rejects_schemeless_and_keeps_the_old_url() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let original = m.settings.server_url.clone();
+
+        let _ = app.update(Event::SetServerUrl("relay.example.com".into()), &mut m);
+        assert_eq!(m.settings.server_url, original, "bad URL must not persist");
+        assert!(m.error.is_some());
+
+        let _ = app.update(
+            Event::SetServerUrl(" https://relay.example.com/ ".into()),
+            &mut m,
+        );
+        assert_eq!(m.settings.server_url, "https://relay.example.com");
+        assert!(m.error.is_none());
+        assert!(m.token.is_none());
+        assert_eq!(m.conn, ConnStatus::Offline);
+    }
+
+    /// The regression that stalled the outbox: `flushing` stayed `true` forever
+    /// after the first successful send, so nothing was ever sent again.
+    #[test]
+    fn send_result_ok_clears_flushing() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.flushing = true;
+        m.outbox.push_back(OutboxItem {
+            recipient: peer_hex(9),
+            envelope_json: "{}".into(),
+        });
+
+        let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
+        let _ = app.update(Event::SendResult(Ok(resp)), &mut m);
+
+        assert!(!m.flushing, "flushing must be cleared on the success path");
+        assert!(m.outbox.is_empty(), "the sent item is dropped from the outbox");
+    }
+
+    #[test]
+    fn flush_next_resumes_after_a_successful_send() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        for _ in 0..2 {
+            m.outbox.push_back(OutboxItem {
+                recipient: peer_hex(9),
+                envelope_json: "{}".into(),
+            });
+        }
+        // First send goes out and marks the model as flushing.
+        let _ = app.update(Event::StartFlush, &mut m);
+        assert!(m.flushing);
+
+        // Its success must both drop the item and let the *next* one go out.
+        let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
+        let _ = app.update(Event::SendResult(Ok(resp)), &mut m);
+        assert_eq!(m.outbox.len(), 1);
+        assert!(m.flushing, "the second item is now in flight");
+    }
+
+    #[test]
+    fn poll_is_a_noop_while_a_poll_is_already_in_flight() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+
+        let _ = app.update(Event::Poll, &mut m);
+        assert!(m.polling, "the first Poll issues a request");
+
+        // A second Poll (e.g. from a re-auth) must not stack another loop.
+        let _ = app.update(Event::Poll, &mut m);
+        assert!(m.polling);
+
+        // Both success and failure release the guard so the loop can continue.
+        let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
+        let _ = app.update(Event::PollResult(Ok(resp)), &mut m);
+        assert!(!m.polling);
+
+        let _ = app.update(Event::Poll, &mut m);
+        assert!(m.polling);
+        let _ = app.update(Event::PollResult(Err(crux_http::HttpError::Timeout)), &mut m);
+        assert!(!m.polling);
     }
 
     #[test]
