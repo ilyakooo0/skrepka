@@ -1323,4 +1323,6 @@ main = do
   _ <- logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
   _ <- fork backgroundPrune
   _ <- when federationEnabled (fork backgroundRetryForwards)
-  listenOn bindHost listenPort api
+  _ <- listenOn bindHost listenPort api
+  let done : {} = {}
+  done
