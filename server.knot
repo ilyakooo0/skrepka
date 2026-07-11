@@ -1324,3 +1324,4 @@ main = do
   fork backgroundPrune
   when federationEnabled (fork backgroundRetryForwards)
   listenOn bindHost listenPort api
+  yield {}
