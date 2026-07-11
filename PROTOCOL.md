@@ -47,6 +47,23 @@ Identities are shared out-of-band as plain text or QR codes. The client displays
 - **Hex** — 64 lowercase hex characters (the canonical wire form).
 - **@p (phonetic)** — the public key rendered as Urbit-style syllables, hyphen-joined with no leading prefix (e.g. `ridler-binzod-marbud-...`). Easier for humans to read and verify by voice. The client accepts either form when adding a contact.
 
+#### @p Encoding
+
+@p is a display encoding only — it never appears on the wire and carries no information the hex form does not. It is specified here so an independent client renders the *same* syllables, since users compare them aloud to verify keys: a client with a divergent table would show a different name for the same identity and defeat out-of-band verification.
+
+The 32-byte key is encoded **byte-pair by byte-pair, most-significant first**. Each pair `(hi, lo)` becomes one four-letter word `PREFIX[hi] ++ SUFFIX[lo]`, and the 16 words are joined with `-`. Both tables hold 256 three-letter syllables each and are **identical to Urbit's** (`po.hoon`); the reference copies live in [`core/src/phonemic.rs`](core/src/phonemic.rs). Neither table contains duplicates, so decoding is an unambiguous reverse lookup, and a 32-byte key always yields exactly 16 words.
+
+Worked example — the key beginning `0x00 0x00 0x01 0x01 ...`:
+
+| byte pair | prefix | suffix | word     |
+|-----------|--------|--------|----------|
+| `00 00`   | `doz`  | `zod`  | `dozzod` |
+| `01 01`   | `mar`  | `nec`  | `marnec` |
+
+Note the prefix at index **124** is **`nis`** (…`ran`, `nis`, `wol`, `mis`…), matching `po.hoon`; it is not `nic`, which is a common transcription error.
+
+Clients accept either form when adding a contact; hex remains canonical everywhere else.
+
 Servers are addressed separately. A client stores a single server URL (e.g. `https://relay.example.com`) in local settings; this is purely a transport choice and has nothing to do with identity. Two users on different servers can still talk via federation.
 
 ### Trust Model
@@ -147,7 +164,13 @@ signature                 (64 bytes)
 compressed_plaintext      (variable, zstd)
 ```
 
-The sender's pubkey and signature are inside the AEAD ciphertext: the server never sees them, and only the intended recipient can recover the sender's identity. The minimum blob size is `32 + 24 + 32 + 64 + 16 = 168` bytes.
+The sender's pubkey and signature are inside the AEAD ciphertext: the server never sees them, and only the intended recipient can recover the sender's identity. The minimum blob size is `32 + 24 + 32 + 64 + 16 = 168` bytes. A relay rejects any blob shorter than that as malformed (`400`), since it cannot possibly carry an envelope.
+
+> **Compression before encryption leaks plaintext structure.** The payload is zstd-compressed *then* encrypted (steps 4–7), so the ciphertext length is a function of how *compressible* the plaintext was, not just how long it was. XChaCha20-Poly1305 is a stream cipher with no padding: the blob is exactly `72 + len(compressed)` bytes, and that number is visible to every relay and network observer.
+>
+> Two consequences. First, message length is only ever obscured *upward*: a long but repetitive message can produce a smaller blob than a short random-looking one, and blob size still distinguishes a one-word reply from a pasted document. Second — the more serious one — where an attacker can influence part of the plaintext that is compressed together with a secret, the compressed size reveals whether the two share structure. That is the CRIME/BREACH pattern, and it is a real (if narrow) concern for a format that compresses attacker-influenceable text alongside sensitive text in one frame.
+>
+> Skrepka accepts this: payloads are small, each message is compressed independently (no cross-message compression context), and there is no adaptive-guessing oracle in the protocol — an attacker cannot make the client re-encrypt a chosen variant of a secret on demand. Implementations must **not** add one (e.g. by compressing several messages, or attacker-supplied and user-supplied text, into a shared frame). A future revision should add length padding (e.g. bucket blobs to fixed sizes), which is the only real mitigation.
 
 ### Cryptographic Versioning
 
@@ -268,7 +291,7 @@ Skrepka has no central directory. Clients are configured with a single server UR
 ]
 ```
 
-This file is a static suggestion, not a federation directory. Federation between servers is configured server-side, independently of any client-facing list.
+This file is a static suggestion, not a federation directory. Federation between servers is configured server-side, independently of any client-facing list: a relay reaches the mesh by being given **seed peers** (`--seedPeers=host1,host2`), which it gossips to unconditionally until presence gossip teaches it the rest of the mesh. A relay with no seeds and no inbound gossip stays isolated — clients on it can still message each other, but not users on other relays. See §7 for the bootstrap mechanism.
 
 ### Content Type
 
@@ -429,7 +452,21 @@ The following endpoints exist in earlier drafts of this spec but are **not** imp
 
 ### Mesh Formation
 
-Federation is open. A server joins the mesh by being configured (at build/start time) with its own public hostname; peers learn of each other through gossip and through messages flowing across them. There is no central registry.
+Federation is open and **off by default** (`federationEnabled = False`); an operator opts in explicitly. There is no central registry.
+
+A server joins the mesh in two steps:
+
+1. **Identity.** It is configured with its own public hostname (`serverHost`). This is the name it puts in the `fromServer` field of every gossip it sends, and the name peers must be able to resolve to reach it. It must pass the deny-list below, so the default `localhost` cannot federate.
+2. **Bootstrap.** It is configured with one or more **seed peers** (`seedPeers`, a comma-separated host list). These are gossiped to unconditionally, alongside any peers already known from presence.
+
+Seeding is what makes the mesh formable at all. A relay otherwise learns of a peer *only* by receiving gossip from it — presence rows remember the server that announced each key — so two fresh relays that have never heard of each other both begin with an empty gossip target set and neither ever speaks first. Seeding **one** side of a pair is sufficient: the first gossip carries `fromServer`, so the seed learns of the sender and gossips back from then on. Seed peers are gossip *targets* only; they are not written into the presence table (a presence row is keyed by the pubkey it announces, and a seed is just a hostname), so a seed that never answers costs nothing but a periodic failed request under the standard per-peer backoff.
+
+```sh
+# relay A, seeded with relay B — B needs no seed of its own to reach A
+skrepka-server --serverHost=a.example.com --federationEnabled=true --seedPeers=b.example.com
+```
+
+> **Implementation note (reference server).** `serverHost`, `federationEnabled` and `seedPeers` are configuration, and the reference relay exposes them as `--name=value` settings. As of Knot `2026.6.26.1947` the runtime *accepts but silently ignores* these flags at startup — they currently take effect only when passed to `knot build` — so a relay configured purely on the command line will run with the compiled-in defaults (`localhost`, federation off, no seeds) and quietly fail to federate. Verify with the startup log, which prints the federation state and seed list it actually loaded.
 
 Operators may apply an inbound blocklist; outbound federation is filtered through a built-in **SSRF deny-list** that rejects:
 
@@ -585,13 +622,13 @@ Skrepka protects message **content and sender identity** from servers and networ
 | Sender authenticity       | Ed25519 signature on every message                         |
 | Sender anonymity vs. server | Sender pubkey is inside the AEAD ciphertext — servers see the recipient but not the sender |
 | Replay protection (cross-recipient) | Unique nonce per message; signature binds the recipient pubkey, so a captured blob cannot be replayed against a *different* recipient. This does **not** stop re-delivery of the same blob to the *same* recipient — see *Same-recipient replay* below |
-| Partial post-compromise   | Ephemeral X25519 keys per message — once the blob is no longer stored anywhere, even compromising the recipient's long-term key does not recover the message |
+| Deletion-dependent recovery (**not** post-compromise security) | Each message uses a fresh ephemeral X25519 key, so there is no shared long-term session secret to steal. But this buys **nothing cryptographic** against a later key compromise: the recipient's long-term key still opens *any* blob an attacker has kept a copy of. The only thing protecting an old message is that the ciphertext no longer exists — relays delete on ack/TTL, and clients delete on request. That is a *deletion* property, not a *forward secrecy* property, and it fails completely against anyone who recorded the traffic. See *No forward secrecy* below, which is the same fact stated as a risk. |
 
 ### What Is NOT Protected
 
 | Risk                              | Details                                             |
 |-----------------------------------|-----------------------------------------------------|
-| **No forward secrecy**            | If a message blob is captured *and* the recipient's long-term X25519 key is later compromised, that specific message can be decrypted. No ratchet means no post-compromise recovery. |
+| **No forward secrecy**            | A captured blob plus a later compromise of the recipient's long-term key **is enough to decrypt that message** — the per-message ephemeral key is the *sender's*, and the recipient's half of the exchange is their long-term identity key, which never rotates. So an adversary who records ciphertext today (a network observer, or any relay it passed through) and obtains the recipient's key at any point in the future can read everything it recorded. There is no ratchet, so there is also no post-compromise recovery: once the key leaks, future messages are readable too until the user rotates identity. Do not read the per-message ephemeral keys as forward secrecy; they are not. |
 | **Recipient metadata exposure**   | Servers see the recipient pubkey and arrival time of every message, plus the rough size of each blob. They do **not** see the sender. |
 | **Presence gossip leaks location** | Federated peers learn which server a user is currently connected to. A presence row is anchored for up to 90 min (`onlineGossipTtl`), which outlives the 1 h session, so location metadata — and forwards aimed at the user — can linger for up to ~90 min after the user disconnects. |
 | **No durable delivery**           | If the sender's server goes down or all forward retries fail, messages may be lost. |

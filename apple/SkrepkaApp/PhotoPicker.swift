@@ -1,12 +1,15 @@
+import ImageIO
 import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
-/// Presents the system photo picker; returns a downscaled JPEG as base64.
+/// Presents the system photo picker; returns a 256px JPEG as base64.
 struct PhotoPicker: UIViewControllerRepresentable {
     let onPick: (String) -> Void
+    var onCancel: () -> Void = {}
 
-    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
 
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration()
@@ -21,33 +24,45 @@ struct PhotoPicker: UIViewControllerRepresentable {
 
     final class Coordinator: NSObject, PHPickerViewControllerDelegate {
         let onPick: (String) -> Void
-        init(onPick: @escaping (String) -> Void) { self.onPick = onPick }
+        let onCancel: () -> Void
+
+        init(onPick: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+        }
 
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            // Empty results means the user cancelled. Dismissal belongs to the caller's
+            // `isPresented` binding — dismissing the controller behind SwiftUI's back
+            // leaves the binding true, and the sheet never opens again.
             guard let provider = results.first?.itemProvider,
-                  provider.canLoadObject(ofClass: UIImage.self) else {
-                DispatchQueue.main.async { picker.dismiss(animated: true) }
+                  provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) else {
+                DispatchQueue.main.async { self.onCancel() }
                 return
             }
-            provider.loadObject(ofClass: UIImage.self) { object, _ in
-                guard let image = object as? UIImage else { return }
-                // loadObject calls back on a background queue; the redraw below is UIKit.
+            _ = provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { url, _ in
+                // The temp file is deleted the moment this callback returns: decode inline.
+                let base64 = url.flatMap { Self.thumbnailBase64(at: $0) }
                 DispatchQueue.main.async {
-                    guard let base64 = Self.downscaledBase64(image) else { return }
-                    self.onPick(base64)
+                    if let base64 { self.onPick(base64) } else { self.onCancel() }
                 }
             }
         }
 
-        /// Resize to fit 256px and JPEG-encode, to keep the profile payload small.
-        /// Call on the main thread — UIGraphicsImageRenderer and UIImage.draw are UIKit.
-        static func downscaledBase64(_ image: UIImage) -> String? {
-            let maxDim: CGFloat = 256
-            let scale = min(1, maxDim / max(image.size.width, image.size.height))
-            let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-            let renderer = UIGraphicsImageRenderer(size: size)
-            let resized = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
-            return resized.jpegData(compressionQuality: 0.7)?.base64EncodedString()
+        /// Downsample through ImageIO, which decodes straight to the target size. Loading
+        /// a `UIImage` first would materialize the full bitmap — ~190 MB for a 48-megapixel
+        /// shot — to then throw all but 256px of it away.
+        static func thumbnailBase64(at url: URL) -> String? {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true, // honour the EXIF orientation
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: 256, // pixels, not points: no @2x/@3x inflation
+            ]
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+            else { return nil }
+            return UIImage(cgImage: thumb).jpegData(compressionQuality: 0.7)?.base64EncodedString()
         }
     }
 }

@@ -57,18 +57,24 @@ fn suffix_index(s: &str) -> Option<u8> {
     SUFFIXES.iter().position(|p| *p == s).map(|i| i as u8)
 }
 
-/// Encode bytes as a hyphen-joined `@p` string.
-pub fn to_ob(bytes: &[u8]) -> String {
-    bytes
-        .chunks(2)
-        .map(|pair| {
-            let hi = pair[0] as usize;
-            // An odd trailing byte (never happens for 32-byte keys) reuses suffix 0.
-            let lo = pair.get(1).copied().unwrap_or(0) as usize;
-            format!("{}{}", PREFIXES[hi], SUFFIXES[lo])
-        })
-        .collect::<Vec<_>>()
-        .join("-")
+/// Encode bytes as a hyphen-joined `@p` string. `None` for an odd-length input.
+///
+/// A syllable *is* a byte pair, so an odd trailing byte has no spelling. Padding
+/// it with suffix 0 (as this used to) made the encoding non-injective: `[x]` and
+/// `[x, 0]` produced the same @p, and `from_ob` decoded both back to `[x, 0]`.
+/// Keys are always 32 bytes, so no caller is affected — but a display helper
+/// must not quietly invent a byte.
+pub fn to_ob(bytes: &[u8]) -> Option<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| format!("{}{}", PREFIXES[pair[0] as usize], SUFFIXES[pair[1] as usize]))
+            .collect::<Vec<_>>()
+            .join("-"),
+    )
 }
 
 /// Decode a `@p` string back to bytes. Returns `None` if any syllable is invalid.
@@ -135,15 +141,25 @@ mod tests {
     #[test]
     fn round_trip_32_bytes() {
         let key: Vec<u8> = (0u8..32).collect();
-        let ob = to_ob(&key);
+        let ob = to_ob(&key).unwrap();
         assert_eq!(ob.split('-').count(), 16, "16 syllables for 32 bytes");
         assert_eq!(from_ob(&ob), Some(key));
     }
 
     #[test]
     fn zero_key_is_dozzod_repeated() {
-        let ob = to_ob(&[0u8; 32]);
+        let ob = to_ob(&[0u8; 32]).unwrap();
         assert!(ob.starts_with("dozzod-dozzod"));
+    }
+
+    /// A syllable is a byte *pair*. Padding an odd trailing byte with suffix 0
+    /// made `to_ob` non-injective: `[7]` and `[7, 0]` spelled the same, and
+    /// `from_ob` decoded both to `[7, 0]`.
+    #[test]
+    fn odd_length_input_has_no_spelling() {
+        assert_eq!(to_ob(&[7u8]), None);
+        assert_eq!(to_ob(&[7u8, 0]), Some("hidzod".to_string()));
+        assert_eq!(to_ob(&[]), Some(String::new()));
     }
 
     /// A real Ed25519 public key. `try_parse_pubkey` now checks that a key is a
@@ -160,7 +176,7 @@ mod tests {
     fn try_parse_accepts_hex_and_ob() {
         let key = real_key();
         let hex_str = hex::encode(key);
-        let ob = to_ob(&key);
+        let ob = to_ob(&key).unwrap();
         assert_eq!(try_parse_pubkey(&hex_str), Some(hex_str.clone()));
         assert_eq!(try_parse_pubkey(&ob), Some(hex_str.clone()));
         assert_eq!(try_parse_pubkey(&hex_str.to_uppercase()), Some(hex_str));
@@ -180,17 +196,18 @@ mod tests {
             "fixture must really be off-curve"
         );
         // Both spellings of it: raw hex, and the @p it round-trips through.
+        let ob = to_ob(&NOT_A_POINT).unwrap();
         assert_eq!(try_parse_pubkey(&hex::encode(NOT_A_POINT)), None);
-        assert_eq!(try_parse_pubkey(&to_ob(&NOT_A_POINT)), None);
+        assert_eq!(try_parse_pubkey(&ob), None);
         // The syllable encoding itself is still lossless — only the key check fails.
-        assert_eq!(from_ob(&to_ob(&NOT_A_POINT)), Some(NOT_A_POINT.to_vec()));
+        assert_eq!(from_ob(&ob), Some(NOT_A_POINT.to_vec()));
     }
 
     #[test]
     fn ob_parsing_is_case_insensitive() {
         let key = real_key();
         let hex_str = hex::encode(key);
-        let ob = to_ob(&key);
+        let ob = to_ob(&key).unwrap();
         assert_eq!(from_ob(&ob.to_uppercase()), Some(key.to_vec()));
         assert_eq!(try_parse_pubkey(&ob.to_uppercase()), Some(hex_str.clone()));
         // Mixed case, as a QR scan or a paste from a title-cased field might give.

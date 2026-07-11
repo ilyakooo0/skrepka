@@ -18,11 +18,13 @@ use crux_kv::KeyValueOperation;
 use crux_time::TimeRequest;
 use facet::Facet;
 use serde::{Deserialize, Serialize};
+use url::Url;
+use zeroize::Zeroizing;
 
-use crate::crypto::Identity;
+use crate::crypto::{Identity, MAX_BLOB_LEN};
 use crate::model::{
     hex_to_ob, trunc_ob, Contact, ContactVM, MessageVM, OutboxItem, OwnProfile, ProfileVM,
-    Settings, StoredMessage, ViewModel, MAX_MESSAGES_PER_PEER,
+    Settings, StoredMessage, ViewModel, DEFAULT_SERVER_URL, MAX_MESSAGES_PER_PEER,
 };
 use crate::phonemic;
 use crate::protocol::{self, Envelope, Payload};
@@ -37,6 +39,38 @@ type KvData = Result<Option<Vec<u8>>, crux_kv::error::KeyValueError>;
 /// clamped to "now" — enough slack for honest clock skew, not enough to let a
 /// peer park itself at the top of the conversation list.
 const MAX_FUTURE_SKEW_MS: i64 = 60_000;
+
+/// Cap on stored contacts.
+///
+/// Any stranger can create one just by sending us a message, so without a cap a
+/// spammer holding a list of pubkeys can grow `contacts` (and the `contacts` kv
+/// blob, rewritten in full on every change) without bound. Past the cap we drop
+/// mail from unknown keys; contacts the user added by hand are never at risk,
+/// because `AddContact` doesn't go through this path.
+const MAX_CONTACTS: usize = 500;
+
+/// Cap on the total blob bytes we will decrypt out of a single poll page.
+///
+/// A hostile relay can answer `/poll` with as many events as it likes. Each one
+/// costs a hex decode, a scalar mult and an AEAD pass, all before we can tell it
+/// is junk. `MAX_BLOB_LEN` bounds one blob; this bounds the page. Anything past
+/// the budget is dropped exactly like an undecryptable blob would be.
+const MAX_POLL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long a poll may stay in flight before we assume the shell lost it.
+///
+/// `polling` gates the whole long-poll loop, and it is only cleared by a
+/// `PollResult`. If the shell ever drops an HTTP effect (a cancelled task, a
+/// backgrounded app, a bug), `polling` stays `true` and the client goes quiet
+/// forever with no visible error. The watchdog re-arms the loop instead.
+///
+/// This **must** stay above the shell's own HTTP timeout (70 s, see
+/// `Effects.swift`), or the watchdog stops being a watchdog: it would fire on
+/// every poll that is merely slow rather than lost, abandoning a request the
+/// shell is still going to resolve. The generation check in `PollResult` makes
+/// that survivable, but each misfire still costs a redundant request to the
+/// relay, so leave the margin.
+const POLL_WATCHDOG_MS: u64 = 90_000;
 
 // kv keys
 const K_SETTINGS: &str = "settings";
@@ -115,20 +149,44 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     Saved(#[facet(opaque)] KvData),
+    /// The cursor write specifically: the next poll is chained off it, so that a
+    /// message is never acked to the server before it is durable locally.
+    #[serde(skip)]
+    #[facet(skip)]
+    SavedCursor(#[facet(opaque)] KvData),
 
     // ---- internal: auth / poll / send ----
+    // These drive the core's own loops and are never sent by the shell, so they
+    // are kept off the FFI surface entirely.
+    //
+    // The auth and poll results carry the *generation* of the round-trip that
+    // produced them. An in-flight effect is never cancelled — it can only be
+    // superseded — so without a generation a result belonging to an attempt we
+    // already abandoned lands in the handler for the attempt that replaced it.
+    // See `Model::poll_gen`.
+    #[serde(skip)]
+    #[facet(skip)]
     Authenticate,
+    #[serde(skip)]
+    #[facet(skip)]
     Poll,
+    /// Fires `POLL_WATCHDOG_MS` after generation `n`'s poll is issued; a no-op
+    /// unless that exact poll is somehow still in flight.
+    #[serde(skip)]
+    #[facet(skip)]
+    PollWatchdog(u64),
+    #[serde(skip)]
+    #[facet(skip)]
     StartFlush,
     #[serde(skip)]
     #[facet(skip)]
-    ChallengeResult(#[facet(opaque)] HttpResult),
+    ChallengeResult(u64, #[facet(opaque)] HttpResult),
     #[serde(skip)]
     #[facet(skip)]
-    VerifyResult(#[facet(opaque)] HttpResult),
+    VerifyResult(u64, #[facet(opaque)] HttpResult),
     #[serde(skip)]
     #[facet(skip)]
-    PollResult(#[facet(opaque)] HttpResult),
+    PollResult(u64, #[facet(opaque)] HttpResult),
     #[serde(skip)]
     #[facet(skip)]
     SendResult(#[facet(opaque)] HttpResult),
@@ -157,8 +215,14 @@ pub enum Page {
     EditProfile,
 }
 
+/// The five kv keys loaded at startup (`settings`, `profile`, `contacts`,
+/// `cursor`, `outbox`). `Connect` waits for all of them.
+const STARTUP_LOADS: u8 = 5;
+
 pub struct Model {
-    secret_key: Option<Vec<u8>>,
+    /// Zeroized on drop: this is the Ed25519 seed, the one secret whose leak
+    /// costs the user their identity.
+    secret_key: Option<Zeroizing<Vec<u8>>>,
     my_pubkey: String,
     settings: Settings,
     profile: OwnProfile,
@@ -172,7 +236,35 @@ pub struct Model {
     /// A poll request is in flight. Guards against stacking concurrent long-poll
     /// loops (every extra loop re-polls itself forever and never terminates).
     polling: bool,
+    /// Which poll the in-flight `PollResult` is allowed to belong to.
+    ///
+    /// Bumped every time a poll is issued, and every time one is *abandoned* (the
+    /// watchdog gives up on it; a relay switch invalidates it). A `PollResult`
+    /// whose generation no longer matches is dropped on the floor.
+    ///
+    /// A wall-clock "has it been long enough?" test cannot do this job. An HTTP
+    /// effect stays pending across an iOS suspension while `now_ms()` runs on, so
+    /// on resume *every* in-flight poll looks stuck — the watchdog abandons a
+    /// request the shell is still about to resolve, and that resolution then
+    /// clears the guard belonging to its replacement. Two poll loops, each
+    /// re-polling itself forever. The generation is what makes abandoning safe.
+    poll_gen: u64,
+    /// An auth round-trip is in flight. `Connect` is fired from several places
+    /// (startup, a 401, a reconnect timer, a server change); without this guard
+    /// they stack, and each one that lands installs a token and starts its own
+    /// poll loop.
+    authenticating: bool,
+    /// The same idea for the auth round-trip, which spans two legs (challenge →
+    /// verify) and is restarted by `Connect` — which the shell fires on *every*
+    /// return to the foreground (`SkrepkaApp.swift`). The challenge still in
+    /// flight from before the app was backgrounded must not install a token or
+    /// overwrite `conn` on top of the attempt that replaced it.
+    auth_gen: u64,
     flushing: bool,
+    /// Startup kv loads still outstanding. `Connect` only fires at 0, so a poll
+    /// can't land and be persisted against a half-loaded model — which would
+    /// then be clobbered by the loads still in flight.
+    loads_pending: u8,
     page: Page,
     active_peer: Option<String>,
     compose: String,
@@ -194,7 +286,11 @@ impl Default for Model {
             conn: ConnStatus::Offline,
             poll_retries: 0,
             polling: false,
+            poll_gen: 0,
+            authenticating: false,
+            auth_gen: 0,
             flushing: false,
+            loads_pending: 0,
             page: Page::default(),
             active_peer: None,
             compose: String::new(),
@@ -209,12 +305,59 @@ impl Model {
             .as_ref()
             .and_then(|sk| Identity::from_secret_bytes(sk).ok())
     }
+
+    /// Tick off one startup load. Returns `true` exactly once — when the last of
+    /// the five lands — so `Connect` is emitted a single time.
+    fn startup_load_done(&mut self) -> bool {
+        if self.loads_pending == 0 {
+            return false;
+        }
+        self.loads_pending -= 1;
+        self.loads_pending == 0
+    }
+
+    /// Open a new poll generation and return it. Any `PollResult` still in flight
+    /// under the old generation is now dead to us.
+    fn next_poll_gen(&mut self) -> u64 {
+        self.poll_gen = self.poll_gen.wrapping_add(1);
+        self.poll_gen
+    }
+
+    /// Abandon the in-flight poll, if any: release the loop guard and retire the
+    /// generation so a late `PollResult` cannot clear the *replacement* poll's
+    /// guard or fold a stale page (and a stale cursor) into the model.
+    fn abandon_poll(&mut self) {
+        self.polling = false;
+        self.poll_gen = self.poll_gen.wrapping_add(1);
+    }
+
+    /// Open a new auth generation and return it.
+    fn next_auth_gen(&mut self) -> u64 {
+        self.auth_gen = self.auth_gen.wrapping_add(1);
+        self.auth_gen
+    }
+
+    /// Abandon the in-flight auth round-trip (either leg).
+    fn abandon_auth(&mut self) {
+        self.authenticating = false;
+        self.auth_gen = self.auth_gen.wrapping_add(1);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers (pure)
 // ---------------------------------------------------------------------------
 
+/// Wall-clock milliseconds.
+///
+/// This reads the system clock from inside `update()`, which is supposed to be a
+/// pure function of `(Event, Model)`. It isn't, and that has real costs: the
+/// state machine can't be replayed deterministically, and tests can't pin "now".
+/// The clean fix is to take the time as a `crux_time` effect and feed it back in
+/// as an event — but every timestamped path (`SendText`, `SaveProfile`,
+/// `ingest_poll`) would have to become a two-step round-trip through the shell.
+/// That refactor is worth doing; it is not worth folding into a bug-fix pass, so
+/// the impurity is documented rather than hidden.
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -223,36 +366,44 @@ fn now_ms() -> i64 {
 }
 
 /// Bare lowercased hostname of a server URL (no scheme/port/trailing dot).
+///
+/// This feeds the auth signature, which is bound to the host (PROTOCOL.md §6),
+/// so it must agree with what the relay itself computes. Splitting on `:` by hand
+/// mangles an IPv6 literal (`http://[::1]:8080` → `[`), producing a signature the
+/// server rejects; `Url` gets the bracket rules right.
 fn server_host(url: &str) -> String {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let host_port = after_scheme.split('/').next().unwrap_or("");
-    let host = host_port.split('@').next_back().unwrap_or(host_port);
-    let host = host.split(':').next().unwrap_or(host);
-    host.trim_end_matches('.').to_lowercase()
+    Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .map(|h| h.trim_end_matches('.').to_lowercase())
+        .unwrap_or_default()
 }
 
 /// Validate and canonicalize a user-entered relay URL.
 ///
-/// The shell hands us raw text-field contents, and `Http::post` panics on a URL
-/// with no scheme — so a schemeless entry must be rejected here, in the core,
-/// before it can ever reach an effect. Returns the normalized URL (lowercased
-/// scheme, no trailing slash) or `None` if it isn't an absolute http(s) URL.
+/// The shell hands us raw text-field contents and `crux_http` unwraps the parse,
+/// so anything the real parser rejects must be rejected *here* or it panics the
+/// core. That means validating with the same parser rather than a lookalike: the
+/// hand-rolled check this replaces accepted `http://[bad` and `http://ho^st`,
+/// both of which `Url::parse` refuses.
+///
+/// A query or fragment is rejected too. Every request appends a path
+/// (`{url}/poll`), so `http://x?y` would yield `http://x?y/poll` — the path
+/// swallowed into the query string, pointing at nothing.
+///
+/// Returns the normalized URL (no trailing slash) or `None`.
 fn normalize_server_url(input: &str) -> Option<String> {
-    let (scheme, rest) = input.trim().split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+    let url = Url::parse(input.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
-    let rest = rest.trim_end_matches('/');
-    if rest.chars().any(char::is_whitespace) {
+    if url.host_str().is_none_or(str::is_empty) {
         return None;
     }
-    // Require a non-empty authority: reject "http://", "http:///x", "http://:80".
-    let authority = rest.split('/').next().unwrap_or("");
-    let host = authority.split('@').next_back().unwrap_or(authority);
-    if host.split(':').next().unwrap_or("").is_empty() {
+    if url.query().is_some() || url.fragment().is_some() {
         return None;
     }
-    Some(format!("{}://{}", scheme.to_lowercase(), rest))
+    Some(url.as_str().trim_end_matches('/').to_string())
 }
 
 fn json_bytes<T: Serialize>(value: &T) -> Vec<u8> {
@@ -326,10 +477,12 @@ impl App for Skrepka {
                     model.error = Some("invalid identity key".into());
                     return render();
                 };
-                model.secret_key = Some(sk);
+                model.secret_key = Some(Zeroizing::new(sk));
                 model.my_pubkey = id.public_key_hex();
                 model.page = Page::Conversations;
-                // Fan out the startup loads.
+                // Fan out the startup loads. `Connect` waits until the last of
+                // them lands (see `startup_load_done`).
+                model.loads_pending = STARTUP_LOADS;
                 Command::all([
                     KeyValue::get(K_SETTINGS).then_send(Event::LoadedSettings),
                     KeyValue::get(K_PROFILE).then_send(Event::LoadedProfile),
@@ -342,45 +495,47 @@ impl App for Skrepka {
 
             Event::LoadedSettings(res) => {
                 if let Some(s) = parse_kv::<Settings>(res) {
-                    model.settings = s;
+                    // Re-validate on the way in. The URL was normalized when the
+                    // user typed it, but the blob on disk is not trustworthy: an
+                    // older build wrote URLs this parser rejects, and a corrupted
+                    // or hand-edited file would reach `Http::post`, which unwraps
+                    // the parse. That is a panic on every launch — a boot loop
+                    // with no way out from inside the app.
+                    model.settings.server_url = normalize_server_url(&s.server_url)
+                        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
                 }
-                // Server URL known — connect and resume any queued sends.
-                Command::event(Event::Connect)
+                self.startup_done(model).and(render())
             }
             Event::LoadedProfile(res) => {
                 if let Some(p) = parse_kv::<OwnProfile>(res) {
                     model.profile = p;
                 }
-                render()
+                self.startup_done(model).and(render())
             }
             Event::LoadedContacts(res) => {
+                let mut cmds = vec![self.startup_done(model)];
                 if let Some(list) = parse_kv::<Vec<Contact>>(res) {
                     model.contacts = list.into_iter().map(|c| (c.pubkey.clone(), c)).collect();
                     // Lazily load each conversation's messages.
-                    let loads: Vec<_> = model
-                        .contacts
-                        .keys()
-                        .map(|peer| {
-                            let peer = peer.clone();
-                            KeyValue::get(k_messages(&peer))
-                                .then_send(move |r| Event::LoadedMessages(peer.clone(), r))
-                        })
-                        .collect();
-                    return Command::all(loads).and(render());
+                    cmds.extend(model.contacts.keys().map(|peer| {
+                        let peer = peer.clone();
+                        KeyValue::get(k_messages(&peer))
+                            .then_send(move |r| Event::LoadedMessages(peer.clone(), r))
+                    }));
                 }
-                render()
+                Command::all(cmds).and(render())
             }
             Event::LoadedCursor(res) => {
                 if let Some(c) = parse_kv::<i64>(res) {
                     model.cursor = c;
                 }
-                render()
+                self.startup_done(model).and(render())
             }
             Event::LoadedOutbox(res) => {
                 if let Some(list) = parse_kv::<Vec<OutboxItem>>(res) {
                     model.outbox = list.into();
                 }
-                render()
+                self.startup_done(model).and(render())
             }
             Event::LoadedMessages(peer, res) => {
                 if let Some(list) = parse_kv::<Vec<StoredMessage>>(res) {
@@ -397,15 +552,32 @@ impl App for Skrepka {
                 }
                 Command::done()
             }
+            Event::SavedCursor(res) => {
+                // The cursor write is what tells the relay it may delete the mail
+                // we just took (it acks up to `cursor` on the next poll). Only
+                // re-poll once it has actually landed: if we polled in parallel
+                // and the write failed, the messages would be gone from the
+                // server and absent from disk.
+                if let Err(e) = res {
+                    model.error = Some(format!("could not save data: {e}"));
+                    return self.backoff_poll(model);
+                }
+                Command::event(Event::Poll)
+            }
 
             // ---------------- navigation ----------------
+            // `error` is about the thing the user was just doing. Leaving it set
+            // across a page change strands a stale message ("invalid public key")
+            // on an unrelated screen, so every navigation clears it.
             Event::ShowConversations => {
                 model.page = Page::Conversations;
                 model.active_peer = None;
+                model.error = None;
                 render()
             }
             Event::ShowSettings => {
                 model.page = Page::Settings;
+                model.error = None;
                 render()
             }
             Event::ShowAddContact => {
@@ -415,16 +587,19 @@ impl App for Skrepka {
             }
             Event::ShowEditProfile => {
                 model.page = Page::EditProfile;
+                model.error = None;
                 render()
             }
             Event::OpenChat(peer) => {
                 model.active_peer = Some(peer);
                 model.page = Page::Chat;
+                model.error = None;
                 render()
             }
             Event::Back => {
                 model.page = Page::Conversations;
                 model.active_peer = None;
+                model.error = None;
                 render()
             }
 
@@ -435,19 +610,42 @@ impl App for Skrepka {
             }
             Event::SetServerUrl(url) => {
                 let Some(url) = normalize_server_url(&url) else {
-                    model.error = Some("server URL must start with http:// or https://".into());
+                    model.error = Some("server URL must be an http(s) address".into());
                     return render();
                 };
                 model.error = None;
                 model.settings.server_url = url;
                 model.token = None;
                 model.conn = ConnStatus::Offline;
-                KeyValue::set(K_SETTINGS, json_bytes(&model.settings))
-                    .then_send(Event::Saved)
-                    .and(Command::event(Event::Connect))
-                    .and(render())
+                // The cursor is *per relay*: it is that server's own sequence
+                // number, and the next poll acks everything up to it. Carrying
+                // relay A's cursor (roughly `now_ms()`) over to relay B tells B
+                // to delete every message queued for us before it hands any of
+                // them over. Start B from the beginning.
+                model.cursor = 0;
+                // ...and retire the poll that is still in flight *to relay A*, or
+                // resetting the cursor achieves nothing: A's answer is already on
+                // its way, it carries A's cursor, and `ingest_poll` would write it
+                // straight back over the zero we just set. The next poll — to B —
+                // would then ack a sequence number B never issued, and B would
+                // drop every message waiting for us.
+                model.abandon_poll();
+                Command::all([
+                    KeyValue::set(K_SETTINGS, json_bytes(&model.settings)).then_send(Event::Saved),
+                    KeyValue::set(K_CURSOR, json_bytes(&0i64)).then_send(Event::Saved),
+                ])
+                .and(Command::event(Event::Connect))
+                .and(render())
             }
             Event::Connect => {
+                // Connect restarts the auth flow, so whatever challenge/verify was
+                // in flight is now stale and its guard must come off. Retiring the
+                // generation as we do it is what makes that safe: the shell fires
+                // Connect on every return to the foreground, so the round-trip we
+                // are dropping here is usually one that is still very much alive
+                // and about to resolve. Clearing the guard alone would let it land
+                // and install its token on top of the attempt replacing it.
+                model.abandon_auth();
                 if model.secret_key.is_some() && model.conn != ConnStatus::Online {
                     Command::event(Event::Authenticate)
                 } else {
@@ -484,6 +682,18 @@ impl App for Skrepka {
                 if let Some(c) = model.contacts.get_mut(&peer) {
                     c.blocked = blocked;
                 }
+                if blocked {
+                    // Gating *ingest* on the block only stops the acks we have not
+                    // queued yet. Anything already sitting in the outbox for this
+                    // peer — an ack for the very message that made the user block
+                    // them, a profile from the last broadcast — still flushes, and
+                    // an ack is precisely the "we are online and reading you"
+                    // signal the block is supposed to cut off. Drop it all: once
+                    // blocked, nothing more goes to this peer.
+                    model.outbox.retain(|item| item.recipient != peer);
+                    return Command::all([self.persist_contacts(model), self.persist_outbox(model)])
+                        .and(render());
+                }
                 self.persist_contacts(model).and(render())
             }
             Event::SaveProfile {
@@ -503,14 +713,23 @@ impl App for Skrepka {
                     bio: model.profile.bio.clone(),
                     photo: model.profile.photo.clone(),
                 };
-                // Broadcast the new profile to every contact.
+                // Broadcast the new profile to every contact we haven't blocked.
+                // Blocking is meant to cut the peer off in both directions; a
+                // profile broadcast would keep feeding them our display name,
+                // avatar, and a liveness signal.
                 //
                 // Each item carries its own copy of the serialized payload, so a
                 // profile with a photo is duplicated (base64 and all) once per
                 // contact, in memory and in the `outbox` kv blob. Acceptable at
                 // today's contact counts; the fix is to intern the payload and
                 // have `OutboxItem` reference it by id.
-                for peer in model.contacts.keys().cloned().collect::<Vec<_>>() {
+                let recipients: Vec<String> = model
+                    .contacts
+                    .values()
+                    .filter(|c| !c.blocked)
+                    .map(|c| c.pubkey.clone())
+                    .collect();
+                for peer in recipients {
                     model.outbox.push_back(OutboxItem {
                         recipient: peer,
                         envelope_json: protocol::serialize_payload(&payload, ts),
@@ -527,6 +746,15 @@ impl App for Skrepka {
 
             // ---------------- auth ----------------
             Event::Authenticate => {
+                // Exactly one auth round-trip at a time. `Authenticate` is reached
+                // from startup, a 401 on poll, a 401 on send, a reconnect timer
+                // and a server change — all of which can fire at once after a
+                // network blip. Each one that got through would hit
+                // `/auth/challenge`, and each token that came back would install
+                // itself and kick off another poll loop.
+                if model.authenticating {
+                    return Command::done();
+                }
                 let Some(id) = model.identity() else {
                     return render();
                 };
@@ -537,7 +765,13 @@ impl App for Skrepka {
                     pubkey: &id.public_key_hex(),
                 };
                 match Http::post(url).body_json(&body) {
-                    Ok(req) => req.build().then_send(Event::ChallengeResult).and(render()),
+                    Ok(req) => {
+                        model.authenticating = true;
+                        let gen = model.next_auth_gen();
+                        req.build()
+                            .then_send(move |r| Event::ChallengeResult(gen, r))
+                            .and(render())
+                    }
                     Err(_) => {
                         model.conn = ConnStatus::Offline;
                         model.error = Some("could not build auth request".into());
@@ -545,42 +779,67 @@ impl App for Skrepka {
                     }
                 }
             }
-            Event::ChallengeResult(Ok(mut resp)) => {
+            Event::ChallengeResult(gen, res) => {
+                // A challenge from an attempt we already gave up on (a relay
+                // switch, a foreground `Connect`). Its `authenticating` is not
+                // ours to clear and its challenge is not ours to sign.
+                if gen != model.auth_gen {
+                    return Command::done();
+                }
+                // Cleared here and re-set only if the verify leg actually goes
+                // out — every exit from this arm must leave the guard consistent.
+                model.authenticating = false;
+                let Ok(mut resp) = res else {
+                    model.conn = ConnStatus::Offline;
+                    return self.schedule_reconnect(model);
+                };
                 let bytes = resp.take_body().unwrap_or_default();
                 let Some(id) = model.identity() else {
                     return render();
                 };
-                match serde_json::from_slice::<ChallengeResp>(&bytes) {
-                    Ok(c) => {
-                        let host = server_host(&model.settings.server_url);
-                        let signature = id.sign_challenge(&host, &c.challenge);
-                        let url = format!("{}/auth/verify", model.settings.server_url);
-                        let body = VerifyReq {
-                            pubkey: &id.public_key_hex(),
-                            challenge: &c.challenge,
-                            signature: &signature,
-                            revoke_others: false,
-                        };
-                        match Http::post(url).body_json(&body) {
-                            Ok(req) => req.build().then_send(Event::VerifyResult),
-                            Err(_) => {
-                                model.conn = ConnStatus::Offline;
-                                model.error = Some("could not build auth request".into());
-                                self.schedule_reconnect(model)
-                            }
-                        }
+                let Ok(c) = serde_json::from_slice::<ChallengeResp>(&bytes) else {
+                    model.conn = ConnStatus::Offline;
+                    return self.schedule_reconnect(model);
+                };
+                let host = server_host(&model.settings.server_url);
+                let Ok(signature) = id.sign_challenge(&host, &c.challenge) else {
+                    // An over-long challenge: a relay trying to get us to sign
+                    // something of its choosing. Back off rather than comply.
+                    model.conn = ConnStatus::Offline;
+                    model.error = Some("relay sent a malformed auth challenge".into());
+                    return self.schedule_reconnect(model);
+                };
+                let url = format!("{}/auth/verify", model.settings.server_url);
+                let body = VerifyReq {
+                    pubkey: &id.public_key_hex(),
+                    challenge: &c.challenge,
+                    signature: &signature,
+                    revoke_others: false,
+                };
+                match Http::post(url).body_json(&body) {
+                    Ok(req) => {
+                        model.authenticating = true;
+                        // The verify leg belongs to the same attempt as the
+                        // challenge that produced it, so it keeps the generation
+                        // rather than opening a new one.
+                        req.build().then_send(move |r| Event::VerifyResult(gen, r))
                     }
                     Err(_) => {
                         model.conn = ConnStatus::Offline;
+                        model.error = Some("could not build auth request".into());
                         self.schedule_reconnect(model)
                     }
                 }
             }
-            Event::ChallengeResult(Err(_)) => {
-                model.conn = ConnStatus::Offline;
-                self.schedule_reconnect(model)
-            }
-            Event::VerifyResult(Ok(mut resp)) => {
+            Event::VerifyResult(gen, res) => {
+                if gen != model.auth_gen {
+                    return Command::done();
+                }
+                model.authenticating = false;
+                let Ok(mut resp) = res else {
+                    model.conn = ConnStatus::Offline;
+                    return self.schedule_reconnect(model);
+                };
                 let bytes = resp.take_body().unwrap_or_default();
                 match serde_json::from_slice::<VerifyResp>(&bytes) {
                     Ok(v) if !v.token.is_empty() => {
@@ -597,10 +856,6 @@ impl App for Skrepka {
                         self.schedule_reconnect(model)
                     }
                 }
-            }
-            Event::VerifyResult(Err(_)) => {
-                model.conn = ConnStatus::Offline;
-                self.schedule_reconnect(model)
             }
 
             // ---------------- poll ----------------
@@ -623,7 +878,16 @@ impl App for Skrepka {
                 {
                     Ok(req) => {
                         model.polling = true;
-                        req.build().then_send(Event::PollResult)
+                        let gen = model.next_poll_gen();
+                        // Arm the watchdog alongside the request: if this poll
+                        // never resolves, nothing else will ever clear `polling`.
+                        req.build()
+                            .then_send(move |r| Event::PollResult(gen, r))
+                            .and(
+                                Time::notify_after(Duration::from_millis(POLL_WATCHDOG_MS))
+                                    .0
+                                    .then_send(move |_| Event::PollWatchdog(gen)),
+                            )
                     }
                     Err(_) => {
                         model.error = Some("could not build poll request".into());
@@ -631,8 +895,36 @@ impl App for Skrepka {
                     }
                 }
             }
-            Event::PollResult(Ok(mut resp)) => {
+            Event::PollWatchdog(gen) => {
+                // Only the poll this watchdog was armed for, and only while it is
+                // still the current one and still in flight. A watchdog whose poll
+                // already completed (or was superseded) is a stale timer and must
+                // not touch a healthy successor.
+                if gen != model.poll_gen || !model.polling {
+                    return Command::done();
+                }
+                // Retire it as we give up on it. The request itself is not
+                // cancelled — nothing can cancel it — so if it *does* eventually
+                // resolve, the generation check below is what stops it from
+                // clearing the replacement poll's guard and forking the loop.
+                model.abandon_poll();
+                Command::event(Event::Poll)
+            }
+            Event::PollResult(gen, res) => {
+                // A result for a poll we already abandoned. Dropping the page is
+                // safe — and required. We never wrote a cursor for it, so the
+                // relay still holds every message in it and the current poll will
+                // be handed them again; whereas honouring it here would clear a
+                // guard that now belongs to a *different*, live poll, and the
+                // re-poll it chains would be a second loop re-polling itself
+                // forever alongside the first.
+                if gen != model.poll_gen {
+                    return Command::done();
+                }
                 model.polling = false;
+                let Ok(mut resp) = res else {
+                    return self.backoff_poll(model);
+                };
                 let status = u16::from(resp.status());
                 if status == 401 {
                     model.token = None;
@@ -645,14 +937,15 @@ impl App for Skrepka {
                 let bytes = resp.take_body().unwrap_or_default();
                 let parsed: PollResp = serde_json::from_slice(&bytes).unwrap_or_default();
                 let cmd = self.ingest_poll(model, parsed);
-                // Persist cursor and immediately re-poll (the server long-polled 25s).
-                cmd.and(KeyValue::set(K_CURSOR, json_bytes(&model.cursor)).then_send(Event::Saved))
-                    .and(Command::event(Event::Poll))
-                    .and(render())
-            }
-            Event::PollResult(Err(_)) => {
-                model.polling = false;
-                self.backoff_poll(model)
+                // The re-poll hangs off the *cursor write*, not off this event.
+                // Polling again is what acks the batch we just took — the server
+                // deletes everything up to `cursor` — so it must not happen until
+                // the batch is durable on our side. `SavedCursor` re-polls.
+                cmd.and(
+                    KeyValue::set(K_CURSOR, json_bytes(&model.cursor))
+                        .then_send(Event::SavedCursor),
+                )
+                .and(render())
             }
 
             // ---------------- outbox ----------------
@@ -695,17 +988,38 @@ impl App for Skrepka {
             ConnStatus::Online => "online",
         };
 
+        let active_peer = model.active_peer.clone().unwrap_or_default();
+
+        // `view()` runs on every render, and `ComposeChanged` renders on every
+        // keystroke. A contact's `photo` is a base64 avatar — tens of KiB each —
+        // so cloning all of them per keypress meant megabytes of allocation and
+        // bincode-encoding to type one message.
+        //
+        // Only the chat page has a composer (`ComposeChanged` is sent from
+        // `ChatView` and nowhere else), so only the chat page is on that hot path
+        // — and while it is up, the only avatar on screen is the peer we are
+        // talking to. Every *other* page renders from a cold event, and the
+        // conversations list draws an avatar per row, so it gets the real photos.
+        // Withholding them there would not save a single keystroke's work; it
+        // would just replace every contact's picture with their initials.
+        let chat_open = model.page == Page::Chat;
+
         let mut contacts: Vec<ContactVM> = model
             .contacts
             .values()
             .map(|c| {
                 let msgs = model.messages.get(&c.pubkey);
                 let last = msgs.and_then(|m| m.last());
+                let photo = if chat_open && c.pubkey != active_peer {
+                    String::new()
+                } else {
+                    c.photo.clone().unwrap_or_default()
+                };
                 ContactVM {
                     pubkey: c.pubkey.clone(),
                     name: c.label(),
                     ob: hex_to_ob(&c.pubkey),
-                    photo: c.photo.clone().unwrap_or_default(),
+                    photo,
                     blocked: c.blocked,
                     last_message: last.map(|m| m.body.clone()).unwrap_or_default(),
                     last_ts: last.map_or(0, |m| m.ts),
@@ -714,7 +1028,6 @@ impl App for Skrepka {
             .collect();
         contacts.sort_by(|a, b| b.last_ts.cmp(&a.last_ts).then(a.name.cmp(&b.name)));
 
-        let active_peer = model.active_peer.clone().unwrap_or_default();
         let active_contact = model.contacts.get(&active_peer);
         let messages: Vec<MessageVM> = model
             .messages
@@ -760,6 +1073,20 @@ impl App for Skrepka {
 }
 
 impl Skrepka {
+    /// One of the five startup kv loads landed. Fires `Connect` on the last one.
+    ///
+    /// Connecting earlier would let a poll land — and be persisted — against a
+    /// model that is still missing its contacts, cursor, or outbox. The loads
+    /// still in flight would then overwrite what the poll just ingested, and the
+    /// stale `cursor` (0) would make us re-fetch mail we had already acked.
+    fn startup_done(&self, model: &mut Model) -> Command<Effect, Event> {
+        if model.startup_load_done() {
+            Command::event(Event::Connect)
+        } else {
+            Command::done()
+        }
+    }
+
     fn persist_contacts(&self, model: &Model) -> Command<Effect, Event> {
         let list: Vec<Contact> = model.contacts.values().cloned().collect();
         KeyValue::set(K_CONTACTS, json_bytes(&list)).then_send(Event::Saved)
@@ -784,7 +1111,15 @@ impl Skrepka {
             .and(render())
     }
 
+    /// The poll loop stalled — retry after a backoff, and stop claiming to be online.
+    ///
+    /// Every path here (a transport error, a 5xx, a failed cursor write) means the loop
+    /// is not healthy, so leaving `conn` at `Online` both lies to the status dot and —
+    /// worse — makes `Connect` a no-op, because it stands down when it already believes
+    /// it is online. The shell fires `Connect` on every foreground precisely to recover
+    /// the long-poll that backgrounding killed; without this it recovers nothing.
     fn backoff_poll(&self, model: &mut Model) -> Command<Effect, Event> {
+        model.conn = ConnStatus::Offline;
         let delay = backoff_ms(model.poll_retries);
         model.poll_retries = model.poll_retries.saturating_add(1);
         Time::notify_after(Duration::from_millis(delay))
@@ -849,54 +1184,63 @@ impl Skrepka {
         .and(render())
     }
 
+    /// Encrypt and send the head of the outbox, discarding any unsendable items
+    /// ahead of it.
+    ///
+    /// The discards happen in one pass, followed by a single `persist_outbox`.
+    /// The previous shape recursed once per bad item and emitted a full outbox
+    /// rewrite each time, so a contact list holding `n` unusable keys cost
+    /// O(n) kv writes of an O(n) blob — and `n` stack frames — to reach the first
+    /// item that could actually go out.
     fn flush_next(&self, model: &mut Model) -> Command<Effect, Event> {
         if model.flushing {
             return Command::done();
         }
-        let Some(item) = model.outbox.front().cloned() else {
-            return Command::done();
-        };
         let (Some(id), Some(token)) = (model.identity(), model.token.clone()) else {
             return Command::done();
         };
-        // An unusable recipient key can never be encrypted to, so the item has to
-        // be dropped or it blocks the head of the outbox forever — but say so,
-        // rather than letting the message vanish.
-        let drop_item = |model: &mut Model| {
-            model.error = Some(format!(
-                "cannot send to {}: invalid key",
-                trunc_ob(&item.recipient)
-            ));
-            model.outbox.pop_front();
-        };
 
-        let Ok(recipient) = hex::decode(&item.recipient) else {
-            drop_item(model);
-            return self.persist_outbox(model).and(self.flush_next(model));
-        };
-        let mut recip = [0u8; 32];
-        if recipient.len() != 32 {
-            drop_item(model);
-            return self.persist_outbox(model).and(self.flush_next(model));
-        }
-        recip.copy_from_slice(&recipient);
-
-        let mut rng = rand_core::OsRng;
-        let blob = match crate::crypto::encrypt(&mut rng, &id, &recip, item.envelope_json.as_bytes())
-        {
-            // Reachable for a 32-byte key that isn't a curve point: `AddContact`
-            // rejects those now, but an older contact list may still hold one.
-            Ok(b) => b,
-            Err(_) => {
-                drop_item(model);
-                return self.persist_outbox(model).and(self.flush_next(model));
+        let mut dropped = false;
+        let sendable = loop {
+            let Some(item) = model.outbox.front() else {
+                break None;
+            };
+            match encrypt_for(&id, item) {
+                Some(blob) => break Some((item.recipient.clone(), blob)),
+                None => {
+                    // An unusable recipient key can never be encrypted to, so the
+                    // item has to go or it blocks the head of the outbox forever —
+                    // but say so, rather than letting the message vanish.
+                    model.error = Some(format!(
+                        "cannot send to {}: invalid key",
+                        trunc_ob(&item.recipient)
+                    ));
+                    model.outbox.pop_front();
+                    dropped = true;
+                }
             }
+        };
+
+        let persist = if dropped {
+            self.persist_outbox(model)
+        } else {
+            Command::done()
+        };
+
+        let Some((recipient, blob)) = sendable else {
+            // Nothing left to send. Render only if we dropped something, so the
+            // user sees why their message went away.
+            return if dropped {
+                persist.and(render())
+            } else {
+                Command::done()
+            };
         };
 
         model.flushing = true;
         let batch = SendBatch {
             messages: vec![Envelope {
-                to: item.recipient,
+                to: recipient,
                 encrypted_blob: hex::encode(blob),
             }],
         };
@@ -905,13 +1249,13 @@ impl Skrepka {
             .header("authorization", format!("Bearer {token}"))
             .body_json(&batch)
         {
-            Ok(req) => req.build().then_send(Event::SendResult),
+            Ok(req) => persist.and(req.build().then_send(Event::SendResult)),
             Err(_) => {
                 // Not a dead loop: the next StartFlush (from a poll page or a
                 // fresh send) retries the head of the outbox.
                 model.flushing = false;
                 model.error = Some("could not build send request".into());
-                render()
+                persist.and(render())
             }
         }
     }
@@ -931,7 +1275,24 @@ impl Skrepka {
         // sender hex -> message ids needing acks
         let mut ack_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
+        let mut budget = MAX_POLL_TOTAL_BYTES;
         for ev in page.events {
+            // Reject an oversized blob on its hex length, before it costs us a
+            // decode. No conforming sender produces one (the relay caps blobs at
+            // the same size), so this can only be junk.
+            if ev.encrypted_blob.len() > MAX_BLOB_LEN * 2 {
+                continue;
+            }
+            match budget.checked_sub(ev.encrypted_blob.len() / 2) {
+                Some(left) => budget = left,
+                None => {
+                    // A page this large is a misbehaving relay, not real mail.
+                    // Stop here; the rest of the page is discarded exactly as an
+                    // undecryptable blob would be.
+                    model.error = Some("relay sent an oversized poll page".into());
+                    break;
+                }
+            }
             let Ok(blob) = hex::decode(&ev.encrypted_blob) else {
                 continue;
             };
@@ -942,25 +1303,38 @@ impl Skrepka {
                 continue;
             };
             let sender = dec.sender_hex;
+
+            // Blocking cuts the peer off entirely (PROTOCOL.md §4) — not just
+            // their texts. A blocked peer must not be able to rewrite their
+            // display name and avatar in our contact list, mark our messages
+            // delivered, or (via an ack we send back) learn that we are online
+            // and reading. So the gate sits above the payload match, not inside
+            // the `Text` arm.
+            if model.contacts.get(&sender).is_some_and(|c| c.blocked) {
+                continue;
+            }
+
             // `ts` is chosen by the sender and drives conversation ordering,
             // in-chat ordering, and the displayed time. Bound it to the near
             // future so a peer cannot pin itself to the top of the list forever
             // with `ts = i64::MAX`.
             let ts = parsed.ts.min(now.saturating_add(MAX_FUTURE_SKEW_MS));
-            let blocked = model.contacts.get(&sender).is_some_and(|c| c.blocked);
+            let known = model.contacts.contains_key(&sender);
             match parsed.payload {
                 Payload::Text { id: msg_id, body } => {
-                    // A blocked peer's messages are not displayed (PROTOCOL.md
-                    // §4), so don't store them — and don't ack them either: an
-                    // ack would tell them we are online and reading.
-                    if blocked {
-                        continue;
-                    }
-                    // auto-create contact
-                    if !model.contacts.contains_key(&sender) {
-                        model
-                            .contacts
-                            .insert(sender.clone(), Contact::new(sender.clone(), String::new(), ts));
+                    // Auto-create a contact for a stranger who writes to us — but
+                    // only up to `MAX_CONTACTS`. Past that, drop the message
+                    // entirely: storing it would mean a `messages:<peer>` blob for
+                    // a peer with no contact entry, i.e. a conversation nothing
+                    // can open and nothing ever trims.
+                    if !known {
+                        if model.contacts.len() >= MAX_CONTACTS {
+                            continue;
+                        }
+                        model.contacts.insert(
+                            sender.clone(),
+                            Contact::new(sender.clone(), String::new(), ts),
+                        );
                         contacts_dirty = true;
                     }
                     let convo = model.messages.entry(sender.clone()).or_default();
@@ -1000,10 +1374,13 @@ impl Skrepka {
                     bio,
                     photo,
                 } => {
-                    let c = model
-                        .contacts
-                        .entry(sender.clone())
-                        .or_insert_with(|| Contact::new(sender.clone(), String::new(), ts));
+                    // A bare profile from a stranger creates nothing. It is an
+                    // unsolicited push with no message attached, so honouring it
+                    // would let anyone holding our pubkey put an entry (with an
+                    // avatar) in our contact list without ever saying a word.
+                    let Some(c) = model.contacts.get_mut(&sender) else {
+                        continue;
+                    };
                     // Ignore stale profile replays (PROTOCOL.md §4). The clamped
                     // `ts` is what gets recorded, so a peer cannot park
                     // `last_profile_ts` at `i64::MAX` and freeze its own profile.
@@ -1018,14 +1395,26 @@ impl Skrepka {
             }
         }
 
-        // Queue delivery acks (one payload per sender).
+        // Queue delivery acks, in batches the recipient will actually accept.
+        //
+        // `parse_payload` drops a `delivery.ack` carrying more than `MAX_ACK_IDS`
+        // ids, and a peer running this same code applies that cap to *us*. One
+        // payload per sender therefore silently stops working the moment a peer
+        // has more than `MAX_ACK_IDS` messages waiting for us — which is exactly
+        // what a long offline stretch produces — and every one of those messages
+        // stays un-delivered on their side forever, because a poll page is only
+        // ever acked once.
         let ack_ts = now_ms();
         for (sender, ids) in ack_targets {
-            let payload = Payload::DeliveryAck { ack_ids: ids };
-            model.outbox.push_back(OutboxItem {
-                recipient: sender,
-                envelope_json: protocol::serialize_payload(&payload, ack_ts),
-            });
+            for batch in ids.chunks(protocol::MAX_ACK_IDS) {
+                let payload = Payload::DeliveryAck {
+                    ack_ids: batch.to_vec(),
+                };
+                model.outbox.push_back(OutboxItem {
+                    recipient: sender.clone(),
+                    envelope_json: protocol::serialize_payload(&payload, ack_ts),
+                });
+            }
         }
 
         // Persist everything touched.
@@ -1040,6 +1429,16 @@ impl Skrepka {
         cmds.push(Command::event(Event::StartFlush));
         Command::all(cmds)
     }
+}
+
+/// Encrypt one outbox item to its recipient, or `None` if the recipient's key is
+/// unusable — a bad hex string, the wrong length, or 32 bytes that aren't a curve
+/// point. `AddContact` rejects all three now, but an older contact list (or a
+/// profile-broadcast fan-out over one) may still hold such a key.
+fn encrypt_for(sender: &Identity, item: &OutboxItem) -> Option<Vec<u8>> {
+    let recipient: [u8; 32] = hex::decode(&item.recipient).ok()?.try_into().ok()?;
+    let mut rng = rand_core::OsRng;
+    crate::crypto::encrypt(&mut rng, sender, &recipient, item.envelope_json.as_bytes()).ok()
 }
 
 fn backoff_ms(retries: u32) -> u64 {
@@ -1057,6 +1456,18 @@ fn trim_history(convo: &mut Vec<StoredMessage>) {
 }
 
 /// Decode a kv `get` result into a typed value, ignoring errors / absence.
+///
+/// `None` conflates three different things: the key is absent (a fresh install),
+/// the read failed, and the bytes are present but don't deserialize. The caller
+/// keeps its default in all three, and the next mutation writes that default back
+/// — so a blob we merely *failed to read* is destroyed rather than left alone.
+///
+/// The mitigation is upstream: every persisted type is `#[serde(default)]` (see
+/// `model.rs`), so adding a field can't make an old blob unreadable, which is by
+/// far the likeliest way this fires in practice. A genuinely corrupt blob is
+/// still lost. Fixing that properly means distinguishing the three cases here and
+/// refusing to overwrite on the third — a change to every caller and to the error
+/// surface, not a drive-by.
 fn parse_kv<T: for<'de> Deserialize<'de>>(res: KvData) -> Option<T> {
     let bytes = res.ok().flatten()?;
     serde_json::from_slice(&bytes).ok()
@@ -1070,7 +1481,7 @@ mod tests {
     fn with_identity() -> Model {
         let id = Identity::from_seed(&[3u8; 32]);
         Model {
-            secret_key: Some(id.secret_key.to_vec()),
+            secret_key: Some(Zeroizing::new(id.secret_key.to_vec())),
             my_pubkey: id.public_key_hex(),
             ..Default::default()
         }
@@ -1078,6 +1489,24 @@ mod tests {
 
     fn peer_hex(seed: u8) -> String {
         Identity::from_seed(&[seed; 32]).public_key_hex()
+    }
+
+    /// `Command::event` *queues* an event; it does not run it. The runtime drains
+    /// that queue back into `update`, so a test that stops at the first `update`
+    /// only ever sees half of what an event actually does — `Connect` would look
+    /// like it never authenticates, and the poll watchdog like it never re-polls.
+    /// Drain it the way the runtime does.
+    fn drive(app: &Skrepka, cmd: &mut Command<Effect, Event>, model: &mut Model) {
+        for event in cmd.events().collect::<Vec<_>>() {
+            let mut next = app.update(event, model);
+            drive(app, &mut next, model);
+        }
+    }
+
+    /// `update` + drain, i.e. what the shell actually observes.
+    fn dispatch(app: &Skrepka, event: Event, model: &mut Model) {
+        let mut cmd = app.update(event, model);
+        drive(app, &mut cmd, model);
     }
 
     /// A poll page carrying one payload, encrypted from `sender_seed` to `me`.
@@ -1277,7 +1706,24 @@ mod tests {
     fn server_host_strips_scheme_port_and_case() {
         assert_eq!(server_host("https://Relay.Example.com:8443/x"), "relay.example.com");
         assert_eq!(server_host("http://localhost:8080"), "localhost");
-        assert_eq!(server_host("relay.example.com."), "relay.example.com");
+        assert_eq!(server_host("https://relay.example.com./x"), "relay.example.com");
+        // Its only caller passes `settings.server_url`, which is always an
+        // absolute URL (`normalize_server_url` guarantees it). Anything else is a
+        // bug, and an empty host produces a signature the relay rejects — which is
+        // the right failure: loud, not a silently-wrong host binding.
+        assert_eq!(server_host("relay.example.com"), "");
+    }
+
+    /// The auth signature is bound to the host (PROTOCOL.md §6), so `server_host`
+    /// has to agree with what the relay computes. Splitting on `:` by hand cut an
+    /// IPv6 literal at its first colon and produced `[`.
+    #[test]
+    fn server_host_handles_an_ipv6_literal() {
+        assert_eq!(server_host("http://[::1]:8080"), "[::1]");
+        assert_eq!(
+            server_host("https://[2001:DB8::1]/poll"),
+            "[2001:db8::1]"
+        );
     }
 
     #[test]
@@ -1371,15 +1817,62 @@ mod tests {
         assert!(vm.contacts.iter().any(|c| c.pubkey == peer && c.blocked));
     }
 
+    /// Gating ingest stops the acks we have not queued yet — but the ack for the
+    /// message that made the user hit "block" is already in the outbox, and an ack
+    /// is exactly the "we are online and reading you" signal the block exists to
+    /// cut off.
+    #[test]
+    fn blocking_a_peer_drops_what_is_already_queued_for_them() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let enemy = peer_hex(9);
+        let friend = peer_hex(11);
+        m.contacts
+            .insert(enemy.clone(), Contact::new(enemy.clone(), String::new(), 0));
+
+        // An ack to the peer we are about to block, plus unrelated mail.
+        for recipient in [&enemy, &friend] {
+            m.outbox.push_back(OutboxItem {
+                recipient: recipient.clone(),
+                envelope_json: protocol::serialize_payload(
+                    &Payload::DeliveryAck {
+                        ack_ids: vec!["m1".into()],
+                    },
+                    1,
+                ),
+            });
+        }
+
+        let _ = app.update(
+            Event::SetBlocked {
+                peer: enemy.clone(),
+                blocked: true,
+            },
+            &mut m,
+        );
+
+        let recipients: Vec<&str> = m.outbox.iter().map(|o| o.recipient.as_str()).collect();
+        assert_eq!(
+            recipients,
+            vec![friend.as_str()],
+            "nothing more goes to a blocked peer — and everyone else is untouched"
+        );
+    }
+
     #[test]
     fn normalize_server_url_requires_an_http_scheme() {
+        // The real parser canonicalizes: scheme and host are lowercased.
         assert_eq!(
             normalize_server_url("  https://Relay.Example.com/  "),
-            Some("https://Relay.Example.com".to_string())
+            Some("https://relay.example.com".to_string())
         );
         assert_eq!(
             normalize_server_url("HTTP://localhost:8080///"),
             Some("http://localhost:8080".to_string())
+        );
+        assert_eq!(
+            normalize_server_url("http://[::1]:8080"),
+            Some("http://[::1]:8080".to_string())
         );
         // The cases that used to panic Http::post or produce a dead URL.
         assert_eq!(normalize_server_url("relay.example.com"), None);
@@ -1389,6 +1882,24 @@ mod tests {
         assert_eq!(normalize_server_url("http://:8080"), None);
         assert_eq!(normalize_server_url("https://relay example.com"), None);
         assert_eq!(normalize_server_url(""), None);
+    }
+
+    /// The hand-rolled validator this replaces was not the parser it guarded:
+    /// it waved these through, and `crux_http` unwraps the parse.
+    #[test]
+    fn normalize_server_url_rejects_what_the_url_parser_rejects() {
+        assert_eq!(normalize_server_url("http://[bad"), None);
+        assert_eq!(normalize_server_url("http://ho^st"), None);
+        assert_eq!(normalize_server_url("http://a\u{7f}b"), None);
+    }
+
+    /// Every request appends a path, so a query or fragment would silently
+    /// swallow it: `http://x?y` + "/poll" is `http://x?y/poll` — a request to `/`
+    /// with a junk query, not to the poll endpoint.
+    #[test]
+    fn normalize_server_url_rejects_a_query_or_fragment() {
+        assert_eq!(normalize_server_url("http://x?y"), None);
+        assert_eq!(normalize_server_url("https://relay.example.com/#frag"), None);
     }
 
     #[test]
@@ -1461,20 +1972,555 @@ mod tests {
 
         let _ = app.update(Event::Poll, &mut m);
         assert!(m.polling, "the first Poll issues a request");
+        let gen = m.poll_gen;
 
         // A second Poll (e.g. from a re-auth) must not stack another loop.
         let _ = app.update(Event::Poll, &mut m);
         assert!(m.polling);
+        assert_eq!(m.poll_gen, gen, "and does not open a new generation");
 
         // Both success and failure release the guard so the loop can continue.
         let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
-        let _ = app.update(Event::PollResult(Ok(resp)), &mut m);
+        let _ = app.update(Event::PollResult(m.poll_gen, Ok(resp)), &mut m);
         assert!(!m.polling);
 
         let _ = app.update(Event::Poll, &mut m);
         assert!(m.polling);
-        let _ = app.update(Event::PollResult(Err(crux_http::HttpError::Timeout)), &mut m);
+        let _ = app.update(
+            Event::PollResult(m.poll_gen, Err(crux_http::HttpError::Timeout)),
+            &mut m,
+        );
         assert!(!m.polling);
+    }
+
+    /// The cursor is the *relay's* sequence number, and the next poll acks
+    /// everything up to it. Carrying relay A's cursor over to relay B tells B to
+    /// delete every message waiting for us before handing any of them over.
+    #[test]
+    fn switching_relays_resets_the_cursor() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.cursor = now_ms();
+        m.token = Some("t".into());
+        m.conn = ConnStatus::Online;
+
+        let _ = app.update(Event::SetServerUrl("https://other.example.com".into()), &mut m);
+
+        assert_eq!(m.cursor, 0, "the new relay is polled from the beginning");
+        assert!(m.token.is_none(), "the old relay's token is worthless");
+        assert_eq!(m.conn, ConnStatus::Offline);
+    }
+
+    /// Resetting the cursor is not enough on its own: the poll already in flight
+    /// is addressed to the *old* relay and its page carries the old relay's
+    /// sequence number. Letting it land writes that number straight back over the
+    /// reset, and the next poll hands it to the new relay — which reads it as an
+    /// ack and drops every message queued for us before serving any of them.
+    #[test]
+    fn switching_relays_retires_the_poll_still_in_flight_at_the_old_one() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.conn = ConnStatus::Online;
+
+        let _ = app.update(Event::Poll, &mut m);
+        let old_relay_poll = m.poll_gen;
+        assert!(m.polling);
+
+        let _ = app.update(Event::SetServerUrl("https://other.example.com".into()), &mut m);
+        assert!(!m.polling, "the old relay's poll no longer holds the guard");
+
+        // It resolves after the switch, carrying the old relay's cursor.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "events": [],
+            "cursor": 1_700_000_000_000i64,
+        }))
+        .unwrap();
+        let resp = crux_http::testing::ResponseBuilder::ok().body(body).build();
+        let _ = app.update(Event::PollResult(old_relay_poll, Ok(resp)), &mut m);
+
+        assert_eq!(
+            m.cursor, 0,
+            "the new relay must not be handed a cursor from a sequence it never issued"
+        );
+    }
+
+    /// A URL that the parser rejects reaches `Http::post`, which unwraps it. On
+    /// disk it is a panic on every launch — a boot loop with no way out.
+    #[test]
+    fn a_corrupt_persisted_server_url_falls_back_to_the_default() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.loads_pending = STARTUP_LOADS;
+
+        let junk = serde_json::to_vec(&serde_json::json!({"server_url": "http://[bad"})).unwrap();
+        let _ = app.update(Event::LoadedSettings(Ok(Some(junk))), &mut m);
+
+        assert_eq!(m.settings.server_url, DEFAULT_SERVER_URL);
+        assert!(
+            normalize_server_url(&m.settings.server_url).is_some(),
+            "whatever we end up with must survive the parser"
+        );
+    }
+
+    /// A settings blob written before a field existed must still load — otherwise
+    /// `parse_kv` returns None, the default is used, and the next write destroys
+    /// what was there.
+    #[test]
+    fn an_old_settings_blob_still_loads() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.loads_pending = STARTUP_LOADS;
+
+        let empty = serde_json::to_vec(&serde_json::json!({})).unwrap();
+        let _ = app.update(Event::LoadedSettings(Ok(Some(empty))), &mut m);
+        assert_eq!(m.settings.server_url, DEFAULT_SERVER_URL);
+
+        // ...and a Contact missing every optional field still becomes a contact.
+        let peer = peer_hex(9);
+        let old = serde_json::to_vec(&serde_json::json!([{"pubkey": peer}])).unwrap();
+        let _ = app.update(Event::LoadedContacts(Ok(Some(old))), &mut m);
+        assert!(m.contacts.contains_key(&peer));
+    }
+
+    /// Connecting before the startup loads land lets a poll be ingested against a
+    /// half-loaded model — and the loads still in flight then overwrite it.
+    #[test]
+    fn connect_waits_for_every_startup_load() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.loads_pending = STARTUP_LOADS;
+
+        let connects = |cmd: &mut Command<Effect, Event>| {
+            cmd.events()
+                .filter(|e| matches!(e, Event::Connect))
+                .count()
+        };
+
+        for (i, ev) in [
+            Event::LoadedSettings(Ok(None)),
+            Event::LoadedProfile(Ok(None)),
+            Event::LoadedContacts(Ok(None)),
+            Event::LoadedCursor(Ok(None)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut cmd = app.update(ev, &mut m);
+            assert_eq!(
+                m.loads_pending,
+                STARTUP_LOADS - 1 - i as u8,
+                "each load ticks the counter down"
+            );
+            assert_eq!(connects(&mut cmd), 0, "and none of them connects");
+        }
+
+        // The fifth — and only the fifth — emits Connect.
+        let mut cmd = app.update(Event::LoadedOutbox(Ok(None)), &mut m);
+        assert_eq!(m.loads_pending, 0);
+        assert_eq!(connects(&mut cmd), 1, "the last load connects, exactly once");
+
+        // A late duplicate (a re-delivered load) must not connect again.
+        let mut cmd = app.update(Event::LoadedOutbox(Ok(None)), &mut m);
+        assert_eq!(connects(&mut cmd), 0);
+    }
+
+    /// `Authenticate` is reachable from startup, a 401 on poll, a 401 on send and
+    /// a reconnect timer. Without a guard a network blip fires all of them, and
+    /// every token that comes back starts its own poll loop.
+    #[test]
+    fn authentication_does_not_stack() {
+        let app = Skrepka;
+        let mut m = with_identity();
+
+        let _ = app.update(Event::Authenticate, &mut m);
+        assert!(m.authenticating, "the first one goes out");
+        assert_eq!(m.conn, ConnStatus::Connecting);
+
+        // A second Authenticate while the first is in flight is a no-op.
+        m.conn = ConnStatus::Offline;
+        let _ = app.update(Event::Authenticate, &mut m);
+        assert_eq!(m.conn, ConnStatus::Offline, "no second challenge was issued");
+
+        // Any terminal outcome releases the guard.
+        let _ = app.update(
+            Event::ChallengeResult(m.auth_gen, Err(crux_http::HttpError::Timeout)),
+            &mut m,
+        );
+        assert!(!m.authenticating);
+
+        let _ = app.update(Event::Authenticate, &mut m);
+        assert!(m.authenticating);
+        let _ = app.update(
+            Event::VerifyResult(m.auth_gen, Err(crux_http::HttpError::Timeout)),
+            &mut m,
+        );
+        assert!(!m.authenticating);
+    }
+
+    /// The shell fires `Connect` on *every* return to the foreground
+    /// (`SkrepkaApp.swift`), so a challenge issued before the app was backgrounded
+    /// is routinely still in flight when the next attempt starts. It must not come
+    /// back and install a token, or clobber `conn`, on top of the attempt that
+    /// replaced it.
+    #[test]
+    fn an_auth_round_trip_superseded_by_connect_cannot_land() {
+        let app = Skrepka;
+        let mut m = with_identity();
+
+        let _ = app.update(Event::Authenticate, &mut m);
+        let superseded = m.auth_gen;
+        assert!(m.authenticating);
+
+        // Foregrounding restarts the flow.
+        dispatch(&app, Event::Connect, &mut m);
+        let live = m.auth_gen;
+        assert_ne!(live, superseded, "the in-flight attempt was retired");
+        assert!(m.authenticating, "and a fresh one went out");
+
+        // The old challenge finally answers. It is not ours any more.
+        let body = serde_json::to_vec(&serde_json::json!({"challenge": "deadbeef"})).unwrap();
+        let resp = crux_http::testing::ResponseBuilder::ok().body(body).build();
+        let _ = app.update(Event::ChallengeResult(superseded, Ok(resp)), &mut m);
+        assert!(
+            m.authenticating,
+            "the live attempt still holds the guard — a stale leg must not release it"
+        );
+
+        // Nor may a stale *verify* install a token over the live attempt.
+        let body = serde_json::to_vec(&serde_json::json!({"token": "stale"})).unwrap();
+        let resp = crux_http::testing::ResponseBuilder::ok().body(body).build();
+        let _ = app.update(Event::VerifyResult(superseded, Ok(resp)), &mut m);
+        assert!(m.token.is_none(), "no token from a superseded attempt");
+        assert_ne!(m.conn, ConnStatus::Online);
+
+        // The live attempt still completes normally.
+        let body = serde_json::to_vec(&serde_json::json!({"token": "real"})).unwrap();
+        let resp = crux_http::testing::ResponseBuilder::ok().body(body).build();
+        let _ = app.update(Event::VerifyResult(live, Ok(resp)), &mut m);
+        assert_eq!(m.token.as_deref(), Some("real"));
+        assert_eq!(m.conn, ConnStatus::Online);
+    }
+
+    /// Blocking is meant to cut a peer off in *both* directions.
+    #[test]
+    fn a_blocked_peer_cannot_update_their_profile_or_ack_our_messages() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        let mut contact = Contact::new(peer.clone(), "Bob".into(), 0);
+        contact.blocked = true;
+        contact.display_name = "Bob".into();
+        m.contacts.insert(peer.clone(), contact);
+        m.messages.insert(
+            peer.clone(),
+            vec![StoredMessage {
+                id: "mine".into(),
+                body: "hi".into(),
+                ts: 1,
+                outgoing: true,
+                delivered: false,
+            }],
+        );
+
+        let profile = Payload::Profile {
+            display_name: "Mallory".into(),
+            bio: "spam".into(),
+            photo: Some("aGk=".into()),
+        };
+        let page = page_from(9, &m, &profile, now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+        assert_eq!(
+            m.contacts[&peer].display_name, "Bob",
+            "a blocked peer cannot rewrite their entry in our contact list"
+        );
+
+        let ack = Payload::DeliveryAck {
+            ack_ids: vec!["mine".into()],
+        };
+        let page = page_from(9, &m, &ack, now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+        assert!(
+            !m.messages[&peer][0].delivered,
+            "nor tell us they read what we sent before the block"
+        );
+    }
+
+    /// Blocking someone and then updating our profile must not hand them our new
+    /// display name, avatar, and a liveness signal.
+    #[test]
+    fn save_profile_does_not_broadcast_to_blocked_contacts() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let friend = peer_hex(9);
+        let enemy = peer_hex(11);
+        m.contacts
+            .insert(friend.clone(), Contact::new(friend.clone(), "Bob".into(), 0));
+        let mut blocked = Contact::new(enemy.clone(), "Mallory".into(), 0);
+        blocked.blocked = true;
+        m.contacts.insert(enemy.clone(), blocked);
+
+        let _ = app.update(
+            Event::SaveProfile {
+                display_name: "Alice".into(),
+                bio: String::new(),
+                photo: None,
+            },
+            &mut m,
+        );
+
+        let recipients: Vec<&str> = m.outbox.iter().map(|o| o.recipient.as_str()).collect();
+        assert_eq!(recipients, vec![friend.as_str()]);
+    }
+
+    /// Any stranger can create a contact just by writing to us, so the list needs
+    /// a ceiling — and past it, the message goes too: a stored conversation with
+    /// no contact entry is one nothing can open and nothing ever trims.
+    #[test]
+    fn contacts_from_strangers_are_capped() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        for i in 0..MAX_CONTACTS {
+            let k = format!("{i:064x}");
+            m.contacts.insert(k.clone(), Contact::new(k, String::new(), 0));
+        }
+        assert_eq!(m.contacts.len(), MAX_CONTACTS);
+
+        let peer = peer_hex(9);
+        let page = page_from(9, &m, &text("m1", "hi"), now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+
+        assert_eq!(m.contacts.len(), MAX_CONTACTS, "the cap holds");
+        assert!(!m.contacts.contains_key(&peer));
+        assert!(m.messages.get(&peer).is_none_or(Vec::is_empty));
+        assert!(m.outbox.is_empty(), "and nothing is acked back");
+    }
+
+    /// A bare profile is an unsolicited push with no message attached. Honouring
+    /// it would let anyone holding our pubkey install an entry — with an avatar —
+    /// in our contact list without ever saying a word.
+    #[test]
+    fn a_profile_from_a_stranger_does_not_create_a_contact() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+
+        let profile = Payload::Profile {
+            display_name: "Mallory".into(),
+            bio: String::new(),
+            photo: Some("aGk=".into()),
+        };
+        let page = page_from(9, &m, &profile, now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+        assert!(m.contacts.is_empty(), "no contact from a bare profile");
+
+        // But a profile from someone we *do* know still applies.
+        m.contacts
+            .insert(peer.clone(), Contact::new(peer.clone(), String::new(), 0));
+        let page = page_from(9, &m, &profile, now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+        assert_eq!(m.contacts[&peer].display_name, "Mallory");
+    }
+
+    /// `polling` gates the whole long-poll loop and is cleared only by a
+    /// `PollResult`. If the shell ever drops the HTTP effect, the client goes
+    /// silent forever with no visible error.
+    #[test]
+    fn the_watchdog_unwedges_a_poll_that_never_resolved() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+
+        let _ = app.update(Event::Poll, &mut m);
+        assert!(m.polling);
+        let wedged = m.poll_gen;
+
+        // The watchdog armed for *this* poll releases the guard and restarts the
+        // loop — which issues a fresh poll under a new generation.
+        dispatch(&app, Event::PollWatchdog(wedged), &mut m);
+        assert!(m.polling, "the loop restarted");
+        assert_ne!(m.poll_gen, wedged, "under a new generation");
+    }
+
+    /// A watchdog is armed per poll and nothing cancels the earlier ones, so a
+    /// timer for a poll that has already completed keeps firing. It must not
+    /// touch the healthy poll that replaced it.
+    #[test]
+    fn a_stale_watchdog_leaves_the_current_poll_alone() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+
+        let _ = app.update(Event::Poll, &mut m);
+        let first = m.poll_gen;
+        let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
+        let _ = app.update(Event::PollResult(first, Ok(resp)), &mut m);
+        let _ = app.update(Event::Poll, &mut m);
+        let current = m.poll_gen;
+        assert!(m.polling);
+
+        let _ = app.update(Event::PollWatchdog(first), &mut m);
+        assert!(m.polling, "the live poll is untouched");
+        assert_eq!(m.poll_gen, current, "and not superseded");
+    }
+
+    /// The regression the generation exists for.
+    ///
+    /// An HTTP effect cannot be cancelled, only abandoned — and it stays pending
+    /// across an iOS suspension while the wall clock runs on, so on resume the
+    /// watchdog gives up on a poll the shell is still about to resolve. If that
+    /// late `PollResult` were honoured it would clear `polling` — a guard that by
+    /// then belongs to the *replacement* poll — and chain a re-poll of its own.
+    /// Two loops, each re-polling itself forever, doubling on every recurrence.
+    #[test]
+    fn a_poll_abandoned_by_the_watchdog_cannot_fork_the_loop_when_it_lands() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+
+        let _ = app.update(Event::Poll, &mut m);
+        let abandoned = m.poll_gen;
+
+        // The watchdog gives up on it; the loop restarts under a new generation.
+        dispatch(&app, Event::PollWatchdog(abandoned), &mut m);
+        let live = m.poll_gen;
+        assert!(m.polling && live != abandoned);
+
+        // Now the abandoned request finally resolves. It must be ignored outright.
+        let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
+        let mut cmd = app.update(Event::PollResult(abandoned, Ok(resp)), &mut m);
+
+        assert!(m.polling, "the live poll still holds the guard");
+        assert_eq!(m.poll_gen, live);
+        assert_eq!(
+            cmd.events().count(),
+            0,
+            "and the corpse chains nothing — no second loop"
+        );
+    }
+
+    /// Dropping an abandoned page loses nothing: its cursor was never written, so
+    /// the relay still holds every message in it and re-delivers them.
+    #[test]
+    fn an_abandoned_poll_page_is_not_ingested() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+
+        let _ = app.update(Event::Poll, &mut m);
+        let abandoned = m.poll_gen;
+        let page = page_from(9, &m, &text("m1", "hi"), now_ms());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "events": [{"encryptedBlob": page.events[0].encrypted_blob}],
+            "cursor": 12345,
+        }))
+        .unwrap();
+
+        dispatch(&app, Event::PollWatchdog(abandoned), &mut m);
+        let resp = crux_http::testing::ResponseBuilder::ok().body(body).build();
+        let _ = app.update(Event::PollResult(abandoned, Ok(resp)), &mut m);
+
+        assert!(m.messages.get(&peer).is_none_or(Vec::is_empty));
+        assert_eq!(m.cursor, 0, "and the stale cursor is not adopted");
+    }
+
+    /// `view()` runs per keystroke (`ComposeChanged` renders), so cloning every
+    /// contact's base64 avatar each time meant megabytes of allocation to type one
+    /// message. Only the chat page has a composer, and while it is up the only
+    /// avatar on screen is the peer we are talking to — so that is the only page
+    /// that withholds anything.
+    ///
+    /// The conversations list draws an avatar per row (`ConversationsView.row`).
+    /// Blanking photos there buys nothing — no keystroke renders that page — and
+    /// costs every contact their picture.
+    #[test]
+    fn photos_are_withheld_on_the_chat_page_and_nowhere_else() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let a = peer_hex(9);
+        let b = peer_hex(11);
+        for peer in [&a, &b] {
+            let mut c = Contact::new(peer.clone(), String::new(), 0);
+            c.photo = Some("aGVsbG8=".into());
+            m.contacts.insert(peer.clone(), c);
+        }
+        let photo_of = |vm: &ViewModel, k: &str| {
+            vm.contacts
+                .iter()
+                .find(|c| c.pubkey == k)
+                .map(|c| c.photo.clone())
+                .unwrap()
+        };
+
+        // Conversations list: every row keeps its avatar.
+        let vm = app.view(&m);
+        assert_eq!(photo_of(&vm, &a), "aGVsbG8=");
+        assert_eq!(photo_of(&vm, &b), "aGVsbG8=");
+
+        // Open a chat: exactly that peer's photo, and no one else's — this is the
+        // page that re-renders on every keystroke.
+        m.page = Page::Chat;
+        m.active_peer = Some(a.clone());
+        let vm = app.view(&m);
+        assert_eq!(photo_of(&vm, &a), "aGVsbG8=");
+        assert!(photo_of(&vm, &b).is_empty());
+    }
+
+    /// `parse_payload` drops a `delivery.ack` with more than `MAX_ACK_IDS` ids, and
+    /// a peer running this code applies that cap to us. One ack payload per sender
+    /// therefore stops working the moment a peer has more than the cap waiting for
+    /// us — a long offline stretch — and those messages stay un-delivered on their
+    /// side forever, because a page is only ever acked once.
+    #[test]
+    fn acks_are_batched_so_the_peer_can_actually_parse_them() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        m.contacts
+            .insert(peer.clone(), Contact::new(peer.clone(), String::new(), 0));
+
+        // One page holding more messages from one sender than fits in a single ack.
+        let count = protocol::MAX_ACK_IDS + 5;
+        let sender = Identity::from_seed(&[9u8; 32]);
+        let me = Identity::from_secret_bytes(m.secret_key.as_ref().unwrap()).unwrap();
+        let events = (0..count)
+            .map(|i| {
+                let json = protocol::serialize_payload(&text(&format!("m{i}"), "hi"), now_ms());
+                let blob = crate::crypto::encrypt(
+                    &mut rand_core::OsRng,
+                    &sender,
+                    &me.public_key(),
+                    json.as_bytes(),
+                )
+                .unwrap();
+                PollEvent {
+                    encrypted_blob: hex::encode(blob),
+                }
+            })
+            .collect();
+        let _ = app.ingest_poll(&mut m, PollResp { events, cursor: 1 });
+
+        // Local history is capped as always — but every message we *received* is
+        // acked, whether or not we chose to keep it.
+        assert_eq!(m.messages[&peer].len(), MAX_MESSAGES_PER_PEER);
+        assert_eq!(m.outbox.len(), 2, "the acks are split into parseable batches");
+
+        // And every batch really does survive the recipient's parser.
+        let mut acked = 0;
+        for item in &m.outbox {
+            assert_eq!(item.recipient, peer);
+            let parsed = protocol::parse_payload(item.envelope_json.as_bytes())
+                .expect("a peer must be able to parse the ack we send it");
+            match parsed.payload {
+                Payload::DeliveryAck { ack_ids } => {
+                    assert!(ack_ids.len() <= protocol::MAX_ACK_IDS);
+                    acked += ack_ids.len();
+                }
+                _ => panic!("expected a delivery.ack"),
+            }
+        }
+        assert_eq!(acked, count, "and between them they ack the whole page");
     }
 
     #[test]

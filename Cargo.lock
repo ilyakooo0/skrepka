@@ -1816,8 +1816,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "url",
  "uuid",
  "x25519-dalek",
+ "zeroize",
  "zstd",
 ]
 

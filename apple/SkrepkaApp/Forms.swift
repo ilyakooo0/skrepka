@@ -1,10 +1,29 @@
+import ImageIO
 import Skrepka
 import SwiftUI
 import UIKit
 
-func decodeImage(_ base64: String) -> UIImage? {
+/// Decode an avatar, bounded to `maxPixel` on its long edge.
+///
+/// A contact's `photo` is whatever bytes a peer put in a `profile` payload, and nothing
+/// upstream bounds the image's *decoded* size — only the blob's. `UIImage(data:)` would
+/// honour whatever dimensions the header claims, so a few KB of base64 declaring
+/// 30000x30000 costs ~3.6 GB of bitmap and the app is jetsammed. ImageIO decodes straight
+/// to the thumbnail size, so the cost is capped no matter what the source claims to be.
+///
+/// 512 covers the largest avatar we draw (88pt at @3x) with headroom; our own photos come
+/// out of `PhotoPicker` at 256, and a thumbnail is never upscaled past the source.
+func decodeImage(_ base64: String, maxPixel: Int = 512) -> UIImage? {
     guard !base64.isEmpty, let data = Data(base64Encoded: base64) else { return nil }
-    return UIImage(data: data)
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+    ]
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    else { return nil }
+    return UIImage(cgImage: thumb)
 }
 
 struct AddContactView: View {
@@ -44,7 +63,7 @@ struct AddContactView: View {
             }
             .sheet(isPresented: $scanning) {
                 QRScannerView { code in
-                    input = code
+                    input = scannedKeyPayload(code)
                     scanning = false
                 }
             }
@@ -77,8 +96,14 @@ struct SettingsView: View {
                     Text(core.view.myPubkeyOb).font(.system(.footnote, design: .monospaced))
                         .textSelection(.enabled)
                     Button {
-                        UIPasteboard.general.string = core.view.myPubkeyHex
+                        // Expire the pasteboard item: a public key is not a secret, but it
+                        // is an identifier, and every app on the device can read the board.
+                        UIPasteboard.general.setItems(
+                            [[UIPasteboard.typeAutomatic: core.view.myPubkeyHex]],
+                            options: [.expirationDate: Date().addingTimeInterval(60)]
+                        )
                         copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
                     } label: {
                         Label(copied ? "Copied!" : "Copy key", systemImage: "doc.on.doc")
                     }
@@ -92,6 +117,11 @@ struct SettingsView: View {
                     Button("Save & reconnect") {
                         core.update(.setServerUrl(serverUrl))
                     }.disabled(serverUrl.isEmpty || serverUrl == core.view.serverUrl)
+                    // A rejected URL sets `error` in the core and leaves the page open;
+                    // without this the Save button just does nothing, forever.
+                    if !core.view.error.isEmpty {
+                        Text(core.view.error).foregroundColor(.red)
+                    }
                 }
             }
             .navigationTitle("Settings")
@@ -141,10 +171,13 @@ struct EditProfileView: View {
                 }
             }
             .sheet(isPresented: $picking) {
-                PhotoPicker { base64 in
-                    photo = base64
-                    picking = false
-                }
+                PhotoPicker(
+                    onPick: { base64 in
+                        photo = base64
+                        picking = false
+                    },
+                    onCancel: { picking = false }
+                )
             }
             .onAppear {
                 name = core.view.profile.displayName

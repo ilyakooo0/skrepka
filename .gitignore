@@ -15,3 +15,6 @@ apple/SkrepkaApp.xcodeproj
 apple/build
 apple/generated
 apple/DerivedData
+# xcodegen writes both of these from project.yml — edit that, not these.
+apple/SkrepkaApp/Info-iOS.plist
+apple/SkrepkaApp/SkrepkaApp.entitlements

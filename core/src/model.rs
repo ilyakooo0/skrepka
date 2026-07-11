@@ -17,7 +17,15 @@ pub const DEFAULT_SERVER_URL: &str = "http://localhost:8080";
 /// `messages:<peer>` kv blob are trimmed to this many most-recent messages.
 pub const MAX_MESSAGES_PER_PEER: usize = 1000;
 
+/// Every persisted struct is `#[serde(default)]`.
+///
+/// A kv blob that fails to deserialize is indistinguishable from an absent key
+/// (see `app::parse_kv`), and the next mutation overwrites it — so a field added
+/// in a later release would silently wipe the user's contacts, outbox, or
+/// history on first launch. Defaulting the missing fields keeps old blobs
+/// loadable across schema evolution instead.
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct Settings {
     pub server_url: String,
 }
@@ -31,6 +39,7 @@ impl Default for Settings {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct OwnProfile {
     pub display_name: String,
     pub bio: String,
@@ -38,7 +47,8 @@ pub struct OwnProfile {
     pub photo: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct Contact {
     pub pubkey: String,
     pub nickname: String,
@@ -77,7 +87,8 @@ impl Contact {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct StoredMessage {
     pub id: String,
     pub body: String,
@@ -88,7 +99,8 @@ pub struct StoredMessage {
 }
 
 /// A queued outbound payload awaiting encryption + send.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct OutboxItem {
     pub recipient: String,
     /// The serialized plaintext payload JSON (encrypted only at send time).
@@ -99,12 +111,14 @@ pub struct OutboxItem {
 // @p helpers
 // ---------------------------------------------------------------------------
 
-/// Full @p rendering of a hex pubkey.
+/// Full @p rendering of a hex pubkey. Falls back to the input for anything that
+/// isn't an even-length hex string — the @p encoding is only defined on byte
+/// *pairs*, so an odd-length input has no syllable spelling at all.
 pub fn hex_to_ob(hex_key: &str) -> String {
-    match hex::decode(hex_key) {
-        Ok(bytes) => phonemic::to_ob(&bytes),
-        Err(_) => hex_key.to_string(),
-    }
+    hex::decode(hex_key)
+        .ok()
+        .and_then(|bytes| phonemic::to_ob(&bytes))
+        .unwrap_or_else(|| hex_key.to_string())
 }
 
 /// Truncated @p: first two and last two syllables (`a-b-…-y-z`).

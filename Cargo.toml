@@ -2,6 +2,19 @@
 members = ["core"]
 resolver = "2"
 
+# The curve arithmetic is ~100x slower unoptimized, and the tests do real
+# signing and real X25519 — a poll page of a thousand messages is minutes of
+# debug-mode scalar mults. Optimizing just these crates keeps `cargo test` in
+# seconds while everything we actually debug stays at opt-level 0.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.x25519-dalek]
+opt-level = 3
+[profile.dev.package.zstd-sys]
+opt-level = 3
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.90"
@@ -30,6 +43,8 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 rand_chacha = "0.3"
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+url = "2"
 
 # codegen bin
 anyhow = "1.0"

@@ -45,6 +45,8 @@ zstd.workspace = true
 rand_core.workspace = true
 uuid.workspace = true
 hex.workspace = true
+zeroize.workspace = true
+url.workspace = true
 
 # optional, only for the codegen bin
 anyhow = { workspace = true, optional = true }

@@ -20,6 +20,20 @@ targets:
       - path: SkrepkaApp
         excludes:
           - "Info-*.plist"
+          - "*.entitlements"
+    settings:
+      base:
+        # iPhone only: the app declares portrait-only, which iPadOS rejects for an iPad
+        # build (it requires landscape too). Rather than pretend to support a form factor
+        # the layout was never designed for, don't claim it.
+        TARGETED_DEVICE_FAMILY: "1"
+    entitlements:
+      path: SkrepkaApp/SkrepkaApp.entitlements
+      properties:
+        # Plaintext message history sits in Application Support. Default every file the
+        # app creates to Complete protection, so it is unreadable while the device is
+        # locked — the KV store then opts into UnlessOpen for the files it holds open.
+        com.apple.developer.default-data-protection: NSFileProtectionComplete
     info:
       path: SkrepkaApp/Info-iOS.plist
       properties:
@@ -29,6 +43,8 @@ targets:
           - UIInterfaceOrientationPortrait
         NSCameraUsageDescription: Scan a contact's QR code to add them.
         NSPhotoLibraryUsageDescription: Choose a photo for your profile.
+        # Declared so App Store Connect stops asking on every upload.
+        ITSAppUsesNonExemptEncryption: false
         # Relays must be reachable over TLS. The only cleartext exception is a
         # locally-run `just server`, for development.
         NSAppTransportSecurity:

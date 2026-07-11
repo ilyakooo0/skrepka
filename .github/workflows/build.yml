@@ -76,7 +76,10 @@ jobs:
           - runner: ubuntu-24.04-arm
             name: linux-arm64
             knot-platform: linux-aarch64
-          - runner: macos-26
+          # macos-14 is the oldest GA arm64 image; the iOS job above already runs on
+          # it. (`macos-26` is not a provisioned runner label — a job requesting it
+          # queues until it times out rather than failing fast.)
+          - runner: macos-14
             name: macos-arm64
             knot-platform: macos-aarch64
     runs-on: ${{ matrix.runner }}
@@ -110,6 +113,99 @@ jobs:
 
       - name: Verify binary
         run: file server
+
+      # The Linux release binary is what install.sh drops onto a bare host, so it
+      # has to carry its own libc. A dynamically-linked build would still pass every
+      # other step here and only fail on the operator's machine, at startup.
+      - name: Verify static linking (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          file server | grep -q "statically linked" || {
+            echo "::error::release binary is not statically linked"
+            file server
+            exit 1
+          }
+
+      # End-to-end smoke test: the compile steps above only prove the server
+      # typechecks, never that it serves. This boots the real binary and asserts the
+      # status code of every route, so a regression that breaks auth, validation, or
+      # the federation gate fails CI instead of shipping.
+      #
+      # The server binds 0.0.0.0:8080 and cannot be moved: the Knot runtime accepts
+      # but ignores --<name>=<value> constant overrides at startup (they only apply
+      # at `knot build` time), so --listenPort/--bindHost would be silently inert.
+      # Everything below therefore runs against the compiled-in default port, and
+      # against the compiled-in default federationEnabled=False.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          ./server > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          # Wait for the listener rather than sleeping a fixed amount.
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null "http://127.0.0.1:8080/" 2>/dev/null \
+               || curl -s -o /dev/null "http://127.0.0.1:8080/"; then
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "::error::server exited during startup"; cat /tmp/server.log; exit 1
+            fi
+            sleep 1
+          done
+
+          PK=$(printf '0%.0s' $(seq 1 64))          # 64 hex chars: a well-formed pubkey
+          SIG=$(printf '0%.0s' $(seq 1 128))        # 128 hex chars: a well-formed signature
+          BLOB=$(printf 'ab%.0s' $(seq 1 200))      # 400 hex chars: over the 336-char floor
+
+          # $1 = expected status, $2 = label, rest = curl args
+          expect() {
+            want="$1"; label="$2"; shift 2
+            got=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 10 "$@")
+            if [ "$got" != "$want" ]; then
+              echo "::error::${label}: expected HTTP ${want}, got ${got}"
+              cat /tmp/body; echo; cat /tmp/server.log
+              exit 1
+            fi
+            echo "ok  ${label} -> ${got}"
+          }
+          J='Content-Type: application/json'
+
+          expect 200 "auth/challenge (valid pubkey)" \
+            -X POST http://127.0.0.1:8080/auth/challenge -H "$J" -d "{\"pubkey\":\"$PK\"}"
+          grep -q '"challenge"' /tmp/body || { echo "::error::no challenge in body"; exit 1; }
+
+          expect 400 "auth/challenge (malformed pubkey rejected)" \
+            -X POST http://127.0.0.1:8080/auth/challenge -H "$J" -d '{"pubkey":"zz"}'
+
+          expect 401 "auth/verify (bad signature)" \
+            -X POST http://127.0.0.1:8080/auth/verify -H "$J" \
+            -d "{\"pubkey\":\"$PK\",\"challenge\":\"x\",\"signature\":\"$SIG\",\"revokeOthers\":false}"
+
+          expect 401 "poll (unauthenticated)" \
+            -X POST http://127.0.0.1:8080/poll -H "$J" -H 'Authorization: Bearer nope' -d '{"cursor":0}'
+
+          expect 401 "messages (unauthenticated)" \
+            -X POST http://127.0.0.1:8080/messages -H "$J" -H 'Authorization: Bearer nope' \
+            -d "{\"messages\":[{\"to\":\"$PK\",\"encryptedBlob\":\"$BLOB\"}]}"
+
+          # federationEnabled defaults to False, so both peer endpoints must refuse.
+          expect 403 "federation/gossip (federation disabled by default)" \
+            -X POST http://127.0.0.1:8080/federation/gossip -H "$J" \
+            -d '{"events":[],"fromServer":"relay.example.com"}'
+
+          expect 403 "federation/forward (federation disabled by default)" \
+            -X POST http://127.0.0.1:8080/federation/forward -H "$J" \
+            -d "{\"toKey\":\"$PK\",\"encryptedBlob\":\"$BLOB\"}"
+
+          # Below the 336-hex-char (168-byte) minimum envelope: rejected by BlobHex
+          # at the route boundary, before the federation gate.
+          expect 400 "federation/forward (undersized blob rejected)" \
+            -X POST http://127.0.0.1:8080/federation/forward -H "$J" \
+            -d "{\"toKey\":\"$PK\",\"encryptedBlob\":\"abcd\"}"
+
+          echo "smoke test passed"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -150,6 +246,20 @@ jobs:
             mv "${name}.tmp" "$name"
           done
           chmod +x server-*
+
+          # Publish a SHA-256 beside each binary. install.sh downloads
+          # "<asset>.sha256" and refuses to install a binary that does not match it,
+          # so this is the integrity link between what CI built and what lands on an
+          # operator's host as root. Hashing the *final* asset names (rather than the
+          # in-artifact "server") means a downloaded pair also verifies with a plain
+          # `sha256sum -c server-linux-x86_64.sha256`.
+          #
+          # The glob is expanded before the loop body runs, so `bin` only ever
+          # iterates the binaries, never the .sha256 files being created.
+          for bin in server-*; do
+            sha256sum "$bin" > "${bin}.sha256"
+          done
+          ls -l server-*
 
       - uses: softprops/action-gh-release@v2
         with:

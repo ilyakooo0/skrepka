@@ -32,12 +32,13 @@ generate: typegen pack project
 
 # Build the iOS app for a booted simulator (set SIM_ID, or pass a destination).
 build sim=sim_id:
+    @test -n "{{sim}}" || ( echo "error: no simulator. Set SIM_ID=<udid> or run: just build <udid>"; echo "  list booted devices with: xcrun simctl list devices booted"; exit 1 )
     cd apple && xcodebuild -project SkrepkaApp.xcodeproj -scheme SkrepkaApp-iOS \
         -destination 'platform=iOS Simulator,id={{sim}}' \
         -derivedDataPath build -skipPackagePluginValidation build
 
-# Install + launch on a booted simulator.
-run sim=sim_id:
+# Build, then install + launch on a booted simulator.
+run sim=sim_id: (build sim)
     cd apple && xcrun simctl install {{sim}} \
         build/Build/Products/Debug-iphonesimulator/SkrepkaApp-iOS.app
     xcrun simctl launch {{sim}} {{bundle}}

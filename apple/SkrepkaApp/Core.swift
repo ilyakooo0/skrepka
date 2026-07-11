@@ -8,6 +8,11 @@ import SkrepkaShared
 final class Core: ObservableObject {
     @Published var view: ViewModel
 
+    /// A Keychain failure never reaches the core — without an identity there is no
+    /// `IdentityLoaded` event to carry it — so the shell holds it. `RootView` shows this
+    /// instead of spinning on a progress view forever.
+    @Published private(set) var identityError: String?
+
     private let core = CoreFFI()
     private let store = KvStore()
 
@@ -53,9 +58,13 @@ final class Core: ObservableObject {
             }
 
         case .keyValue(let op):
-            let result = store.handle(op)
-            // swiftlint:disable:next force_try
-            resolve(id, try! result.bincodeSerialize())
+            // The file I/O runs on the store's own serial queue; hop the result back to
+            // the main actor, because the core is single-threaded and `.render` publishes.
+            store.handle(op) { [weak self] result in
+                // swiftlint:disable:next force_try
+                let output = try! result.bincodeSerialize()
+                Task { @MainActor in self?.resolve(id, output) }
+            }
 
         case .time(let req):
             Time.handle(req) { [weak self] response in
@@ -67,8 +76,16 @@ final class Core: ObservableObject {
 
     // MARK: - Identity
 
-    private func bootIdentity() {
-        let key = Keychain.loadOrCreateIdentity()
-        update(.identityLoaded([UInt8](key)))
+    /// Loads the identity key, or reports why it could not. Safe to call again — that is
+    /// what the retry affordance on the error screen does, and the common failure (the
+    /// device has not been unlocked since boot) resolves on its own.
+    func bootIdentity() {
+        switch Keychain.loadOrCreateIdentity() {
+        case .success(let key):
+            identityError = nil
+            update(.identityLoaded([UInt8](key)))
+        case .failure(let error):
+            identityError = error.message
+        }
     }
 }
