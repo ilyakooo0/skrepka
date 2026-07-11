@@ -565,6 +565,14 @@ else afterComma (drop 1 s)
 -- is the usual beforeX/afterX recursion. Empty fields survive the split (",,a"
 -- yields "" twice — relations dedupe, so once) and are dropped by the caller;
 -- see `seedPeerList`.
+--
+-- The `beforeComma`/`afterComma`/`beforeDot`/`afterDot`/`beforeColon` family
+-- looks ripe to fold into one generic `beforeChar sep s` / `afterChar sep s`.
+-- Do NOT: routing *this* function's tail recursion through a partially-applied
+-- `afterChar ","` hangs the Knot compiler indefinitely (confirmed 2026-07-11 —
+-- a 9-line repro of `splitOnComma = ... splitOnComma (afterChar "," s)` never
+-- finishes compiling, while the bespoke single-argument `afterComma` compiles
+-- in ~1 s). The per-separator helpers stay bespoke on purpose.
 splitOnComma : Text -> [Text]
 splitOnComma = \s -> if s == ""
 then ([] : [Text])
