@@ -2,8 +2,11 @@
 name = "skrepka_core"
 crate = "skrepka_core"
 version = "0.1.0"
-repository = "https://github.com/iko/skrepka"
+repository = "https://github.com/ilyakooo0/skrepka"
 license = "MIT"
+
+[cargo]
+command_args = { "build" = ["--features", "facet_typegen"] }
 
 [targets.apple]
 output = "../apple/generated/Shared"
