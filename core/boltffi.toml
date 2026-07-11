@@ -6,7 +6,10 @@ repository = "https://github.com/ilyakooo0/skrepka"
 license = "MIT"
 
 [cargo]
-command_args = { "build" = ["--features", "facet_typegen"] }
+global_args = []
+
+[cargo.command_args]
+build = ["--features", "facet_typegen"]
 
 [targets.apple]
 output = "../apple/generated/Shared"
