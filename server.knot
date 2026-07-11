@@ -239,9 +239,9 @@ type ServerName = Text where isValidServerName
 type Timestamp = Int<Ms>
 
 -- Outstanding nonce issued by /auth/challenge; consumed by /auth/verify.
-type Challenge = {pubkey: Text, challenge: Text, expiresAt: Timestamp, ip: Text}
+type Challenge = {pubkey: PubkeyHex, challenge: Text, expiresAt: Timestamp, ip: Text}
 -- An issued bearer token bound to (pubkey, ip, expiry).
-type Session = {token: Text, pubkey: Text, expiresAt: Timestamp, ip: Text}
+type Session = {token: Text, pubkey: PubkeyHex, expiresAt: Timestamp, ip: Text}
 -- Mailbox row: a stored message awaiting recipient pickup or federation forward.
 -- Storage TTL is fixed at `messageMaxAge`, so expiry is derived from
 -- `receivedAt`. Any send time the sender wants to convey lives inside
@@ -250,14 +250,18 @@ type Session = {token: Text, pubkey: Text, expiresAt: Timestamp, ip: Text}
 -- presence re-announce of `toKey` doesn't trigger a duplicate delivery.
 -- (Single-field record rows, not bare names: the Knot runtime cannot persist
 -- a nested relation of scalars.)
-type Message = {toKey: Text, encryptedBlob: BlobHex, receivedAt: Timestamp, deliveredTo: [{server: Text}]}
+-- Server names are plain `Text`, not `ServerName`: they are sourced from
+-- `serverHost`, which is a startup-overridable scalar the predicate cannot be
+-- checked on at declaration time (see `localServerName`). Pubkeys are refined —
+-- every write site can prove the predicate.
+type Message = {toKey: PubkeyHex, encryptedBlob: BlobHex, receivedAt: Timestamp, deliveredTo: [{server: Text}]}
 -- Last-known location of a pubkey, either local (`server == serverHost`) or
 -- learned from a peer via gossip. Multiple entries per pubkey are allowed.
-type PresenceEntry = {pubkey: Text, server: Text, expiresAt: Timestamp}
+type PresenceEntry = {pubkey: PubkeyHex, server: Text, expiresAt: Timestamp}
 -- A message queued for cross-server delivery to `toServer`. `retries` is
 -- incremented by `retryPendingForwards` until `maxForwardRetries` is hit.
 -- Identity is derived from `encryptedBlob` (see `Message`).
-type ForwardEntry = {toServer: Text, toKey: Text, encryptedBlob: BlobHex, retries: Int}
+type ForwardEntry = {toServer: Text, toKey: PubkeyHex, encryptedBlob: BlobHex, retries: Int}
 -- Running failure counter for a peer; keyed by `server`. Drives `shouldRetryServer`.
 -- `failedAt` is the start time of the last recorded attempt; `failures: 0` is
 -- the post-success tombstone (no backoff, kept so the timestamp can outrank
@@ -688,14 +692,12 @@ hasLocalPresence = \pres pk t -> any (\p -> p.pubkey == pk && isLocalServer p.se
 -- Project items through `getServer`, drop our own hostname, and dedupe.
 -- Used to derive peer recipient lists from forwards/presence/etc.
 --
--- Returns `[ServerName]`, not `[Text]`: every caller projects a field that is
--- already a `ServerName` (`PresenceEntry.server`, `ForwardEntry.toServer`), so
--- Returns `[Text]` — the base type of `ServerName`. Internal helpers use `Text`
--- (the base type); the refined `ServerName` is enforced at route boundaries
--- (`fromServer: ServerName` on `/federation/gossip`) and in relation schemas.
--- Downstream functions that build records with `ServerName` fields (e.g.
--- `forwardMatches`, `forwardQueuedToServer`) accept `Text` and the runtime
--- validates the refined type on relation write.
+-- Returns `[Text]`, the base type of `ServerName`. Server names stay unrefined
+-- internally: they originate in `serverHost`, a startup-overridable scalar whose
+-- predicate can only be checked at runtime (`localServerName`). The refined
+-- `ServerName` is enforced where it can be — at the `/federation/gossip` route
+-- boundary (`fromServer: ServerName`) and at federation egress, where
+-- `isBadServerName` applies the SSRF deny-list the predicate deliberately omits.
 collectPeers : [a] -> (a -> Text) -> [Text]
 collectPeers = \items getServer -> filter (\s -> not isLocalServer s) (map getServer items)
 
@@ -725,7 +727,7 @@ forwardMatches = \blob server f -> f.encryptedBlob == blob && f.toServer == serv
 -- Replace any local presence rows for `pubkey` with one fresh row at
 -- `expiry`, and return the post-update peer broadcast set. Caller wraps in
 -- `atomic`.
-refreshLocalPresence : Text -> Timestamp -> IO {rw *presence} [Text]
+refreshLocalPresence : PubkeyHex -> Timestamp -> IO {rw *presence} [Text]
 refreshLocalPresence = \pubkey expiry -> do
   pres <- *presence
   *presence = union (filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres) [
@@ -743,7 +745,7 @@ refreshLocalPresence = \pubkey expiry -> do
 -- One sweep over every state ref: drops expired rows in a single atomic block.
 -- Returns the locally-expired presence rows whose pubkey has no other live
 -- local session, so the caller can broadcast offline gossip for them.
-pruneExpired : Int<Ms> -> IO {rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions} [Text]
+pruneExpired : Int<Ms> -> IO {rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions} [PubkeyHex]
 pruneExpired = \t -> atomic do
   ch <- *challenges
   *challenges = filter (\x -> x.expiresAt > t) ch
@@ -851,7 +853,7 @@ retryPendingForwards = do
 -- and why it is an accepted v0.1 limitation. Do not add a caller that widens
 -- what this forwards (e.g. dropping the `deliveredTo` filter) without revisiting
 -- that note.
-forwardQueuedToServer : Text -> ServerName -> IO {rw *forwards, r *messages} {}
+forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages} {}
 forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
   fwds <- *forwards
@@ -984,7 +986,7 @@ handlePoll = \cursor authorization clientIp -> do
 -- the wait transaction reads `*messages` and `retry`s until a row matching
 -- this pubkey/cursor is committed; the timer wins on idle. Either way we
 -- re-collect at the new wall time, so a timeout returns an empty page.
-doPoll : {clampedCursor: Timestamp, pubkey: Text | a} -> Timestamp -> IO {r *messages, clock} {cursor: Timestamp, events: [{encryptedBlob: BlobHex}]}
+doPoll : {clampedCursor: Timestamp, pubkey: PubkeyHex | a} -> Timestamp -> IO {r *messages, clock} {cursor: Timestamp, events: [{encryptedBlob: BlobHex}]}
 doPoll = \s t -> do
   let collectAt = \tnow -> atomic (do
     msgs <- *messages
@@ -1182,21 +1184,24 @@ handleRecvGossip = \events fromServer -> do
       pres <- *presence
       let collected = fold (\acc e -> case e.pubkey of
         -- `pubkey` is nested inside the `events` list, so the route-boundary
-        -- refinement never validates it (same nested-list gap that `/messages`
-        -- works around with an explicit `isValidExactHex 64` check). Reject a
-        -- malformed key here so a peer can't poison `*presence` with non-hex
-        -- rows that then spawn bogus-`toKey` forward entries.
-        Just {value: pk} -> if not isValidExactHex 64 pk
-        then acc
-        else if e.eventType == "online"
-        then {
-          touched: union acc.touched [pk],
-          added: union acc.added [{pubkey: pk, server: fromServer, expiresAt: t + onlineGossipTtl}]
-        }
-        else if e.eventType == "offline"
-        then {acc.added, touched: union acc.touched [pk]}
-        else acc
-        Nothing {} -> acc) {touched: ([] : [Text]), added: ([] : [PresenceEntry])} events
+        -- refinement never validates it (the same nested-list gap that
+        -- `/messages` works around by hand). `refine` re-checks the `PubkeyHex`
+        -- predicate here, dropping a malformed key so a peer can't poison
+        -- `*presence` with non-hex rows that then spawn bogus-`toKey` forward
+        -- entries. It also yields the `PubkeyHex` the `PresenceEntry` row below
+        -- requires — an explicit `isValidExactHex 64` guard would check the same
+        -- predicate but leave the key typed `Text`.
+        Just {value: raw} -> case ((refine raw) : Result RefinementError PubkeyHex) of
+          Err _ -> acc
+          Ok {value: pk} -> if e.eventType == "online"
+          then {
+            touched: union acc.touched [pk],
+            added: union acc.added [{pubkey: pk, server: fromServer, expiresAt: t + onlineGossipTtl}]
+          }
+          else if e.eventType == "offline"
+          then {acc.added, touched: union acc.touched [pk]}
+          else acc
+        Nothing {} -> acc) {touched: ([] : [PubkeyHex]), added: ([] : [PresenceEntry])} events
       let kept = filter (\p -> p.server != fromServer || not elem p.pubkey collected.touched) pres
       *presence = union kept collected.added
       yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == fromServer && p.expiresAt > t) pres) (map (\p -> p.pubkey) collected.added)))
