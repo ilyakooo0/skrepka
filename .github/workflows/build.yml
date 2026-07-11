@@ -85,8 +85,7 @@ jobs:
 
       - name: Download knot compiler
         run: |
-          version=$(basename "$(curl -sI -o /dev/null -w '%{redirect_url}' \
-            https://github.com/ilyakooo0/knot/releases/latest)")
+          version="2026.6.26.1947"
           tarball="knot-${version}-${{ matrix.knot-platform }}.tar.gz"
           curl -fsSL "https://github.com/ilyakooo0/knot/releases/download/${version}/${tarball}" \
             | tar xz
