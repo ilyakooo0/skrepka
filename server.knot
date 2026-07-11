@@ -690,11 +690,13 @@ hasLocalPresence = \pres pk t -> any (\p -> p.pubkey == pk && isLocalServer p.se
 --
 -- Returns `[ServerName]`, not `[Text]`: every caller projects a field that is
 -- already a `ServerName` (`PresenceEntry.server`, `ForwardEntry.toServer`), so
--- carrying the refinement through costs nothing and keeps the peer names usable
--- where a `ServerName` is required (`forwardMatches`, the `*forwards` /
--- `deliveredTo` writes, the gossip body). Erasing to `Text` here is what forces
--- an unchecked re-`refine` at every downstream use.
-collectPeers : [a] -> (a -> ServerName) -> [ServerName]
+-- Returns `[Text]` — the base type of `ServerName`. Internal helpers use `Text`
+-- (the base type); the refined `ServerName` is enforced at route boundaries
+-- (`fromServer: ServerName` on `/federation/gossip`) and in relation schemas.
+-- Downstream functions that build records with `ServerName` fields (e.g.
+-- `forwardMatches`, `forwardQueuedToServer`) accept `Text` and the runtime
+-- validates the refined type on relation write.
+collectPeers : [a] -> (a -> Text) -> [Text]
 collectPeers = \items getServer -> filter (\s -> not isLocalServer s) (map getServer items)
 
 -- Current sequence value, or 0 before the first message seeds it. Reads the
@@ -717,13 +719,13 @@ appendMessage = \toKey encryptedBlob t -> do
 
 -- True when `f` is the queued forward of `blob` to `server`. Used to dedupe
 -- per-(blob, server) entries on the forwards outbox.
-forwardMatches : BlobHex -> ServerName -> ForwardEntry -> Bool
+forwardMatches : BlobHex -> Text -> ForwardEntry -> Bool
 forwardMatches = \blob server f -> f.encryptedBlob == blob && f.toServer == server
 
 -- Replace any local presence rows for `pubkey` with one fresh row at
 -- `expiry`, and return the post-update peer broadcast set. Caller wraps in
 -- `atomic`.
-refreshLocalPresence : PubkeyHex -> Timestamp -> IO {rw *presence} [ServerName]
+refreshLocalPresence : PubkeyHex -> Timestamp -> IO {rw *presence} [Text]
 refreshLocalPresence = \pubkey expiry -> do
   pres <- *presence
   *presence = union (filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres) [
@@ -771,7 +773,7 @@ pruneExpired = \t -> atomic do
 -- Also a no-op when `serverHost` fails the `ServerName` predicate: the gossip
 -- body must carry a valid `fromServer`, and a peer would reject (400) a name we
 -- could not have refined anyway. `main` warns about this at startup.
-sendBatchedGossip : [ServerName] -> [GossipEvent] -> IO {rw *forwardFailures, network, clock} {}
+sendBatchedGossip : [Text] -> [GossipEvent] -> IO {rw *forwardFailures, network, clock} {}
 sendBatchedGossip = \peers events -> case localServerName of
   Nothing {} -> yield {}
   Just {value: me} -> when (count events > 0) (do
@@ -849,7 +851,7 @@ retryPendingForwards = do
 -- and why it is an accepted v0.1 limitation. Do not add a caller that widens
 -- what this forwards (e.g. dropping the `deliveredTo` filter) without revisiting
 -- that note.
-forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages} {}
+forwardQueuedToServer : Text -> ServerName -> IO {rw *forwards, r *messages} {}
 forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
   fwds <- *forwards
@@ -1109,7 +1111,7 @@ handleSendMessages = \messages authorization clientIp -> do
 -- the message), and `deliveredTo` prevents re-forwards to peers that already
 -- have the message. On failure the forwards row stays so
 -- `retryPendingForwards` can re-attempt with backoff.
-forkForwardsTo : PubkeyHex -> BlobHex -> [ServerName] -> IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
+forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> when (not isBadServerName server) (do
   t <- now
   result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
@@ -1300,6 +1302,7 @@ backgroundRetryForwards = do
 -- Fork the background prune loop (which runs an immediate sweep on its
 -- first tick) and start the HTTP listener. The forward-retry loop only
 -- runs when federation is enabled.
+main : IO {network, console, clock, random} {}
 main = do
   logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
