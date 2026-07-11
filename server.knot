@@ -28,8 +28,28 @@
 -- and other private/reserved names), so two default-built servers cannot
 -- federate with each other. The default is only suitable for a single-node,
 -- non-federated deployment.
-serverHost : ServerName
+--
+-- Typed `Text`, not `ServerName`: a refined type cannot be given a bare literal
+-- default (the compiler requires an explicit `refine`), and this constant is
+-- overridable at startup. `localServerName` below is where the `ServerName`
+-- predicate is actually checked — an operator who overrides this with a name
+-- that fails `isValidServerName` (too long, not lowercase, or trailing-dotted)
+-- gets federation egress disabled and a loud startup warning, rather than an
+-- invalid name on the wire.
+serverHost : Text
 serverHost = "localhost"
+
+-- `serverHost` refined to a `ServerName`, or `Nothing` when it fails
+-- `isValidServerName`. This is the only place the predicate is checked for our
+-- own hostname; peer-supplied names are validated by the runtime at the
+-- `/federation/gossip` route boundary (`fromServer: ServerName`). Federation
+-- egress (`sendBatchedGossip`) needs a `ServerName` to put in the gossip body,
+-- so a misconfigured host simply stops gossiping — see `main`, which warns at
+-- startup.
+localServerName : Maybe ServerName
+localServerName = case refine serverHost of
+  Ok {value: sn} -> Just {value: sn}
+  Err _ -> Nothing {}
 -- Network interface the HTTP listener binds to. "0.0.0.0" accepts connections
 -- on every IPv4 interface (the typical default behind a reverse proxy);
 -- "127.0.0.1" restricts the listener to localhost-only; "::" / "::1" do the
@@ -381,8 +401,8 @@ else do
 -- `chars` yields the *distinct* character set (relations dedupe), which is
 -- fine for the membership check; the length checks must use `length`.
 isValidHex : Text -> Bool
-isValidHex = \s -> do
-  let n = length s
+isValidHex = \s ->
+  let n = length s in
   n > 0 && n / 2 * 2 == n && all (\c -> contains c "0123456789abcdef") (chars s)
 
 -- Recursively strip every trailing "." from `s` (DNS root form).
@@ -423,8 +443,8 @@ else take 1 s ++ beforeColon (drop 1 s)
 -- carry no dotted octets, so the prefix list below never matches them, yet
 -- they resolve to the same internal addresses.
 isNumericHost : Text -> Bool
-isNumericHost = \sn -> do
-  let host = beforeColon sn
+isNumericHost = \sn ->
+  let host = beforeColon sn in
   host != "" && all (\c -> contains c "0123456789") (chars host)
 
 -- Decimal value of a single hex/ascii digit character.
@@ -468,9 +488,9 @@ isDottedNumeric = \host -> host != "" && contains "." host && all (\c -> contain
 -- literals (`isDottedNumeric`) so hostnames are never caught. Shorthand forms
 -- like "100.64" still match — only the first two octets are inspected.
 isReservedIPv4 : Text -> Bool
-isReservedIPv4 = \host -> do
-  let o1 = decimalValue (beforeDot host)
-  let o2 = decimalValue (beforeDot (afterDot host))
+isReservedIPv4 = \host ->
+  let o1 = decimalValue (beforeDot host) in
+  let o2 = decimalValue (beforeDot (afterDot host)) in
   isDottedNumeric host && (o1 >= 224 || (o1 == 100 && o2 >= 64 && o2 <= 127) || (o1 == 198 && (o2 == 18 || o2 == 19)))
 
 -- True when a dotted-numeric host carries an octet with a redundant leading
@@ -485,9 +505,9 @@ isReservedIPv4 = \host -> do
 hasLeadingZeroOctet : Text -> Bool
 hasLeadingZeroOctet = \host -> isDottedNumeric host && anyOctetLeadingZero host
 anyOctetLeadingZero : Text -> Bool
-anyOctetLeadingZero = \host -> do
-  let octet = beforeDot host
-  let rest = afterDot host
+anyOctetLeadingZero = \host ->
+  let octet = beforeDot host in
+  let rest = afterDot host in
   (length octet > 1 && take 1 octet == "0") || (rest != "" && anyOctetLeadingZero rest)
 
 -- Block private/reserved/internal hostnames (SSRF defense).
@@ -667,7 +687,14 @@ hasLocalPresence = \pres pk t -> any (\p -> p.pubkey == pk && isLocalServer p.se
 
 -- Project items through `getServer`, drop our own hostname, and dedupe.
 -- Used to derive peer recipient lists from forwards/presence/etc.
-collectPeers : [a] -> (a -> Text) -> [Text]
+--
+-- Returns `[ServerName]`, not `[Text]`: every caller projects a field that is
+-- already a `ServerName` (`PresenceEntry.server`, `ForwardEntry.toServer`), so
+-- carrying the refinement through costs nothing and keeps the peer names usable
+-- where a `ServerName` is required (`forwardMatches`, the `*forwards` /
+-- `deliveredTo` writes, the gossip body). Erasing to `Text` here is what forces
+-- an unchecked re-`refine` at every downstream use.
+collectPeers : [a] -> (a -> ServerName) -> [ServerName]
 collectPeers = \items getServer -> filter (\s -> not isLocalServer s) (map getServer items)
 
 -- Current sequence value, or 0 before the first message seeds it. Reads the
@@ -696,7 +723,7 @@ forwardMatches = \blob server f -> f.encryptedBlob == blob && f.toServer == serv
 -- Replace any local presence rows for `pubkey` with one fresh row at
 -- `expiry`, and return the post-update peer broadcast set. Caller wraps in
 -- `atomic`.
-refreshLocalPresence : PubkeyHex -> Timestamp -> IO {rw *presence} [Text]
+refreshLocalPresence : PubkeyHex -> Timestamp -> IO {rw *presence} [ServerName]
 refreshLocalPresence = \pubkey expiry -> do
   pres <- *presence
   *presence = union (filter (\p -> not (p.pubkey == pubkey && isLocalServer p.server)) pres) [
@@ -740,15 +767,21 @@ pruneExpired = \t -> atomic do
 -- Fan out one bundle of gossip events to each peer, skipping denylisted
 -- peers and peers in backoff. No-op when `events` is empty so callers don't
 -- need to guard. Records or clears federation-failure counters per call.
-sendBatchedGossip : [Text] -> [GossipEvent] -> IO {rw *forwardFailures, network, clock} {}
-sendBatchedGossip = \peers events -> when (count events > 0) (do
-  t <- now
-  failures <- *forwardFailures
-  forEach peers (\server -> when (not (isBadServerName server) && shouldRetryServer server t failures) (do
-    result <- fetch (federationUrl server) (RecvGossip {events, fromServer: serverHost})
-    case result of
-      Err _ -> recordFailure server t
-      Ok _ -> clearFailure server t)))
+--
+-- Also a no-op when `serverHost` fails the `ServerName` predicate: the gossip
+-- body must carry a valid `fromServer`, and a peer would reject (400) a name we
+-- could not have refined anyway. `main` warns about this at startup.
+sendBatchedGossip : [ServerName] -> [GossipEvent] -> IO {rw *forwardFailures, network, clock} {}
+sendBatchedGossip = \peers events -> case localServerName of
+  Nothing {} -> yield {}
+  Just {value: me} -> when (count events > 0) (do
+    t <- now
+    failures <- *forwardFailures
+    forEach peers (\server -> when (not (isBadServerName server) && shouldRetryServer server t failures) (do
+      result <- fetch (federationUrl server) (RecvGossip {events, fromServer: me})
+      case result of
+        Err _ -> recordFailure server t
+        Ok _ -> clearFailure server t)))
 
 -- ============================================
 -- Forward retries
@@ -1076,7 +1109,7 @@ handleSendMessages = \messages authorization clientIp -> do
 -- the message), and `deliveredTo` prevents re-forwards to peers that already
 -- have the message. On failure the forwards row stays so
 -- `retryPendingForwards` can re-attempt with backoff.
-forkForwardsTo : PubkeyHex -> BlobHex -> [Text] -> IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
+forkForwardsTo : PubkeyHex -> BlobHex -> [ServerName] -> IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> when (not isBadServerName server) (do
   t <- now
   result <- fetch (federationUrl server) (ForwardMessage {toKey: to, encryptedBlob})
@@ -1135,7 +1168,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> when (
 -- cannot inject presence at all. Deferred past v0.1 because it needs a
 -- key-to-home-server binding the protocol does not yet define.
 -- PROTOCOL.md §10 enumerates what open federation does and does not protect.
-handleRecvGossip : [GossipEvent] -> Text -> IO {r *messages, rw *forwards, rw *presence, clock} (Result HttpError {})
+handleRecvGossip : [GossipEvent] -> ServerName -> IO {r *messages, rw *forwards, rw *presence, clock} (Result HttpError {})
 handleRecvGossip = \events fromServer -> do
   t <- now
   if not federationEnabled
@@ -1267,7 +1300,6 @@ backgroundRetryForwards = do
 -- Fork the background prune loop (which runs an immediate sweep on its
 -- first tick) and start the HTTP listener. The forward-retry loop only
 -- runs when federation is enabled.
-main : IO _ {}
 main = do
   logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
   logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
