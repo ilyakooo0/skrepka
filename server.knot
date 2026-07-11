@@ -1319,7 +1319,7 @@ backgroundRetryForwards = do
 -- runs when federation is enabled.
 main = do
   _ <- logInfo ("Skrepka relay server starting on " ++ bindHost ++ ":" ++ show listenPort ++ " ...")
-  logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
-  fork backgroundPrune
-  when federationEnabled (fork backgroundRetryForwards)
+  _ <- logInfo ("  federation: " ++ (if federationEnabled then "enabled" else "disabled"))
+  _ <- fork backgroundPrune
+  _ <- when federationEnabled (fork backgroundRetryForwards)
   listenOn bindHost listenPort api
