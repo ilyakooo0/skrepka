@@ -564,6 +564,18 @@ isBadServerName = \sn -> sn == "" || sn == "localhost" || hasPrefix "localhost:"
 -- The `no_presence` check bounds federated forwards to currently-online keys.
 
 -- Plain ip match (sessions with empty ip skip the check).
+--
+-- Mobile tradeoff: binding a session to an IP means a client that moves between
+-- networks (Wi-Fi <-> cellular, or a carrier NAT re-assignment mid-session) no
+-- longer matches its session row, gets a 401, and must re-run the full
+-- challenge/verify handshake. That is the correct security posture — it is what
+-- stops a stolen Bearer token from being replayed from anywhere — but it is
+-- chatty for exactly the clients this protocol targets: phones change networks
+-- constantly, so re-auth is a routine event, not an exceptional one. Clients are
+-- expected to treat a 401 as "re-authenticate and retry", not as a fatal error.
+-- Operators who front the relay with a proxy that does not set a stable
+-- X-Forwarded-For (or who run with `--trustForwardedFor=False`) get an empty
+-- bound IP, which disables the check entirely — see `clientIpOf`.
 matchIp : Text -> Text -> Bool
 matchIp = \clientIp sessionIp -> sessionIp == "" || clientIp == sessionIp
 
@@ -796,6 +808,14 @@ retryPendingForwards = do
 -- Forward queued messages to a server when a remote key comes online.
 -- Skips messages already delivered to `server` (tracked via Message.deliveredTo)
 -- so a presence re-announce after a TTL lapse doesn't duplicate delivery.
+--
+-- SECURITY: this function trusts `*presence`, and `*presence` is writable by any
+-- unauthenticated host via `/federation/gossip`. A forged `online` announcement
+-- therefore redirects a victim's queued ciphertext to the attacker's server —
+-- see the gossip-redirect note on `handleRecvGossip` for the full threat model
+-- and why it is an accepted v0.1 limitation. Do not add a caller that widens
+-- what this forwards (e.g. dropping the `deliveredTo` filter) without revisiting
+-- that note.
 forwardQueuedToServer : PubkeyHex -> ServerName -> IO {rw *forwards, r *messages} {}
 forwardQueuedToServer = \pubkey server -> atomic (do
   msgs <- *messages
@@ -1089,6 +1109,32 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> when (
 -- that transition offline → online, flushes any locally-buffered messages via
 -- `forwardQueuedToServer`. Events with an unrecognized `eventType` or no
 -- `pubkey` are skipped (forward-compat) rather than rejecting the batch.
+--
+-- SECURITY (accepted v0.1 limitation — gossip redirect / ciphertext theft):
+-- this endpoint is unauthenticated, and nothing ties a gossip event to the key
+-- it claims to speak for. Any host that can reach us may announce an arbitrary
+-- victim pubkey as `online` at itself; we write that presence row, and the very
+-- next `forwardQueuedToServer` hands the victim's queued ciphertext to the
+-- attacker's host. The attacker cannot *read* those messages — the payload is
+-- sealed to the victim's key, and the sender's identity and signature live
+-- inside the AEAD (PROTOCOL.md §5) — but it does harvest metadata a relay is
+-- otherwise never supposed to concentrate: which keys are receiving traffic,
+-- how much, and when. Worse, because our copy is pruned once it is marked
+-- `deliveredTo` the attacker's host, a forged announcement can also *withhold*
+-- delivery: the ciphertext goes to a host that will never serve it to the
+-- victim's client. So this is a confidentiality-preserving but availability-
+-- and metadata-affecting attack.
+--
+-- Bounded, not prevented, by: the SSRF deny-list (`isBadServerName`), the
+-- `no_presence` gate on the inbound side, per-IP rate limits, and the gossip
+-- TTL (`onlineGossipTtl`) capping how long one forged row survives.
+--
+-- The fix is peer authentication: require a gossip event to carry a signature
+-- from the pubkey it announces (proving the key really did authenticate at
+-- `fromServer`), and/or authenticate the peer relay itself so an unknown host
+-- cannot inject presence at all. Deferred past v0.1 because it needs a
+-- key-to-home-server binding the protocol does not yet define.
+-- PROTOCOL.md §10 enumerates what open federation does and does not protect.
 handleRecvGossip : [GossipEvent] -> Text -> IO {r *messages, rw *forwards, rw *presence, clock} (Result HttpError {})
 handleRecvGossip = \events fromServer -> do
   t <- now
@@ -1131,6 +1177,27 @@ handleRecvGossip = \events fromServer -> do
 -- Re-delivery of an already-stored (toKey, blob) pair is treated as success
 -- without a second append, so a sender whose success response was lost can
 -- retry without duplicating the message in the recipient's mailbox.
+--
+-- SECURITY (accepted v0.1 limitation — unauthenticated mailbox injection):
+-- this endpoint authenticates nobody. Any host that can reach us may append an
+-- arbitrary blob to any currently-online local key's mailbox, and the recipient
+-- will poll it down like any other message. This is a spam/flood surface, not a
+-- forgery one: the sender's identity and signature live *inside* the AEAD
+-- (PROTOCOL.md §5), so an injected blob that the recipient's key cannot open —
+-- or that opens but carries no valid inner signature — is dropped by the client
+-- and can never impersonate a contact. What an attacker gets is unsolicited
+-- rows in the recipient's mailbox and in `*messages` (storage + bandwidth), not
+-- a message the recipient will attribute to someone else.
+--
+-- Bounded, not prevented, by: the `no_presence` gate (only currently-online
+-- local keys are injectable, so an attacker must first observe or force
+-- presence), per-IP rate limits on the route, `maxBlobLen`, the dedupe below
+-- (the same blob cannot be appended twice), and `messageMaxAge` pruning.
+--
+-- The fix is the same one the gossip-redirect note calls for: authenticate the
+-- peer relay, so an unknown host cannot write to `*messages` at all. Deferred
+-- past v0.1. PROTOCOL.md §10 enumerates what open federation does and does not
+-- protect.
 handleForwardMessage : PubkeyHex -> BlobHex -> IO {rw *messages, r *presence, rw *seqCounter, clock} (Result HttpError {})
 handleForwardMessage = \toKey encryptedBlob -> do
   t <- now

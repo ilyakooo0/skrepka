@@ -45,9 +45,10 @@ install.sh                  Linux deploy: downloads the release binary, writes a
 skrepka.service             Reference systemd unit (install.sh writes its own, with --http-max-body-bytes=42M).
 Justfile                    All build/run recipes.
 .cargo/config.toml          Pins IPHONEOS/MACOSX deployment targets (see Gotchas).
-.github/workflows/build.yml CI: compiles server.knot on linux-x86_64 / linux-arm64 / macos-arm64, cuts a release.
+.github/workflows/build.yml CI: tests + clippy on the core, builds the iOS shell, compiles server.knot on
+                            linux-x86_64 / linux-arm64 / macos-arm64, cuts a release.
 PROTOCOL.md                 Wire protocol specification.
-PROTOCOL-REVIEW.md          Audit of spec-vs-implementation gaps (written against the old F# client — see Gotchas).
+PROTOCOL-REVIEW.md          Audit of spec-vs-implementation gaps, cross-checked against the Rust core.
 ```
 
 ## Build & Run
@@ -115,6 +116,4 @@ When reading diffs, pass `--git` to `jj diff` / `jj show` — the configured for
 - **`.cargo/config.toml` is load-bearing.** It pins `IPHONEOS_DEPLOYMENT_TARGET=17.0` / `MACOSX_DEPLOYMENT_TARGET=11.0` so `zstd-sys` (a C dep) and rustc agree on the minimum OS version. Without it the linker fails on a version mismatch.
 - **Body-size cap on the relay.** `--http-max-body-bytes` must exceed `maxBlobLen` (40 MiB hex) plus the JSON envelope, or the runtime's default 16 MiB cap rejects a max-size blob with a bare `413` before the handler's `400 invalid_message` check runs. `install.sh` sets `42M`.
 - **Refined types don't validate inside lists.** Knot's route-boundary checks only fire on top-level scalar body fields, so `handleSendMessages` and `handleRecvGossip` re-validate nested `to` / `pubkey` / `encryptedBlob` by hand. Preserve those checks.
-- **Stale artifacts from the deleted F# client.** `README.md` (describes an F#/Avalonia app and links a nonexistent logo), `dotnet-tools.json` (Fantomas), parts of `.gitignore` (`client/bin`, `client/obj`, `.fake`), and `PROTOCOL-REVIEW.md` (cites `client/ApiClient.fs`) all predate the Rust rewrite. Don't treat them as descriptions of the current code.
-- **PROTOCOL.md is behind the core in one place.** §4 and §10 claim "the reference client does not yet enforce" stale-`profile` rejection. The Rust core *does* enforce it — `ingest_poll` in `app.rs` drops any `profile` whose `ts` predates `Contact::last_profile_ts`.
 - **Federation is unauthenticated by design.** `/federation/*` endpoints accept any caller; abuse is bounded by the SSRF deny-list, the `no_presence` gate, and per-IP rate limits — not by peer authentication. `PROTOCOL.md` §10 enumerates what that does and doesn't protect.

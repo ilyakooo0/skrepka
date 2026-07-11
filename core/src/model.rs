@@ -12,6 +12,11 @@ use crate::phonemic;
 
 pub const DEFAULT_SERVER_URL: &str = "http://localhost:8080";
 
+/// Cap on locally retained messages per conversation (PROTOCOL.md §9: clients
+/// SHOULD age out local message history). Both the in-memory `Vec` and the
+/// `messages:<peer>` kv blob are trimmed to this many most-recent messages.
+pub const MAX_MESSAGES_PER_PEER: usize = 1000;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     pub server_url: String,

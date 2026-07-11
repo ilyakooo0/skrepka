@@ -34,7 +34,44 @@ detect_platform() {
     *) echo "error: unsupported architecture: $arch" >&2; exit 1 ;;
   esac
 
+  # CI only publishes server-macos-arm64; there is no Intel macOS asset, so bail
+  # out here rather than 404ing on the download.
+  if [ "$os_name" = "macos" ] && [ "$arch_name" != "arm64" ]; then
+    echo "error: only arm64 (Apple silicon) macOS is supported; no release asset is built for Intel macOS" >&2
+    exit 1
+  fi
+
   echo "${os_name}-${arch_name}"
+}
+
+# Install Caddy with whichever package manager the host actually has. The
+# upstream Debian repo recipe is apt-only; on RHEL-family hosts (which this
+# script otherwise supports — see the firewalld branch below) `apt-get` does not
+# exist and `set -e` would abort the whole install. Caddy ships an official COPR
+# repo there instead.
+install_caddy() {
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update
+    apt-get install -y caddy
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y 'dnf-command(copr)'
+    dnf copr enable -y @caddy/caddy
+    dnf install -y caddy
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y yum-plugin-copr
+    yum copr enable -y @caddy/caddy
+    yum install -y caddy
+  elif command -v brew >/dev/null 2>&1; then
+    brew install caddy
+  else
+    echo "error: no supported package manager found (apt-get, dnf, yum, brew)" >&2
+    echo "install Caddy manually (https://caddyserver.com/docs/install), then re-run" >&2
+    exit 1
+  fi
 }
 
 PLATFORM=$(detect_platform)
@@ -101,11 +138,7 @@ EOF
 
     if ! command -v caddy >/dev/null 2>&1; then
       echo "Installing Caddy..."
-      apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
-      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
-      apt-get update
-      apt-get install -y caddy
+      install_caddy
     fi
 
     mkdir -p /etc/caddy

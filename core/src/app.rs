@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::Identity;
 use crate::model::{
     hex_to_ob, trunc_ob, Contact, ContactVM, MessageVM, OutboxItem, OwnProfile, ProfileVM,
-    Settings, StoredMessage, ViewModel,
+    Settings, StoredMessage, ViewModel, MAX_MESSAGES_PER_PEER,
 };
 use crate::phonemic;
 use crate::protocol::{self, Envelope, Payload};
@@ -32,6 +32,11 @@ type KeyValue = crux_kv::KeyValue<Effect, Event>;
 type Time = crux_time::Time<Effect, Event>;
 type HttpResult = crux_http::Result<crux_http::Response<Vec<u8>>>;
 type KvData = Result<Option<Vec<u8>>, crux_kv::error::KeyValueError>;
+
+/// How far into the future an incoming, sender-chosen `ts` may sit before it is
+/// clamped to "now" — enough slack for honest clock skew, not enough to let a
+/// peer park itself at the top of the conversation list.
+const MAX_FUTURE_SKEW_MS: i64 = 60_000;
 
 // kv keys
 const K_SETTINGS: &str = "settings";
@@ -383,7 +388,15 @@ impl App for Skrepka {
                 }
                 render()
             }
-            Event::Saved(_) => Command::done(),
+            Event::Saved(res) => {
+                // A dropped write silently loses data (a message, a contact, the
+                // cursor), so surface it rather than swallowing the result.
+                if let Err(e) = res {
+                    model.error = Some(format!("could not save data: {e}"));
+                    return render();
+                }
+                Command::done()
+            }
 
             // ---------------- navigation ----------------
             Event::ShowConversations => {
@@ -491,6 +504,12 @@ impl App for Skrepka {
                     photo: model.profile.photo.clone(),
                 };
                 // Broadcast the new profile to every contact.
+                //
+                // Each item carries its own copy of the serialized payload, so a
+                // profile with a photo is duplicated (base64 and all) once per
+                // contact, in memory and in the `outbox` kv blob. Acceptable at
+                // today's contact counts; the fix is to intern the payload and
+                // have `OutboxItem` reference it by id.
                 for peer in model.contacts.keys().cloned().collect::<Vec<_>>() {
                     model.outbox.push_back(OutboxItem {
                         recipient: peer,
@@ -795,6 +814,7 @@ impl Skrepka {
             outgoing: true,
             delivered: false,
         });
+        trim_history(convo);
 
         // Auto-create a bare contact if messaging a brand-new key.
         model
@@ -839,14 +859,24 @@ impl Skrepka {
         let (Some(id), Some(token)) = (model.identity(), model.token.clone()) else {
             return Command::done();
         };
-        let Ok(recipient) = hex::decode(&item.recipient) else {
-            // Bad recipient — drop it.
+        // An unusable recipient key can never be encrypted to, so the item has to
+        // be dropped or it blocks the head of the outbox forever — but say so,
+        // rather than letting the message vanish.
+        let drop_item = |model: &mut Model| {
+            model.error = Some(format!(
+                "cannot send to {}: invalid key",
+                trunc_ob(&item.recipient)
+            ));
             model.outbox.pop_front();
+        };
+
+        let Ok(recipient) = hex::decode(&item.recipient) else {
+            drop_item(model);
             return self.persist_outbox(model).and(self.flush_next(model));
         };
         let mut recip = [0u8; 32];
         if recipient.len() != 32 {
-            model.outbox.pop_front();
+            drop_item(model);
             return self.persist_outbox(model).and(self.flush_next(model));
         }
         recip.copy_from_slice(&recipient);
@@ -854,9 +884,11 @@ impl Skrepka {
         let mut rng = rand_core::OsRng;
         let blob = match crate::crypto::encrypt(&mut rng, &id, &recip, item.envelope_json.as_bytes())
         {
+            // Reachable for a 32-byte key that isn't a curve point: `AddContact`
+            // rejects those now, but an older contact list may still hold one.
             Ok(b) => b,
             Err(_) => {
-                model.outbox.pop_front();
+                drop_item(model);
                 return self.persist_outbox(model).and(self.flush_next(model));
             }
         };
@@ -893,6 +925,7 @@ impl Skrepka {
             return Command::done();
         };
 
+        let now = now_ms();
         let mut touched_convos: Vec<String> = Vec::new();
         let mut contacts_dirty = false;
         // sender hex -> message ids needing acks
@@ -909,13 +942,25 @@ impl Skrepka {
                 continue;
             };
             let sender = dec.sender_hex;
+            // `ts` is chosen by the sender and drives conversation ordering,
+            // in-chat ordering, and the displayed time. Bound it to the near
+            // future so a peer cannot pin itself to the top of the list forever
+            // with `ts = i64::MAX`.
+            let ts = parsed.ts.min(now.saturating_add(MAX_FUTURE_SKEW_MS));
+            let blocked = model.contacts.get(&sender).is_some_and(|c| c.blocked);
             match parsed.payload {
                 Payload::Text { id: msg_id, body } => {
+                    // A blocked peer's messages are not displayed (PROTOCOL.md
+                    // §4), so don't store them — and don't ack them either: an
+                    // ack would tell them we are online and reading.
+                    if blocked {
+                        continue;
+                    }
                     // auto-create contact
                     if !model.contacts.contains_key(&sender) {
                         model
                             .contacts
-                            .insert(sender.clone(), Contact::new(sender.clone(), String::new(), parsed.ts));
+                            .insert(sender.clone(), Contact::new(sender.clone(), String::new(), ts));
                         contacts_dirty = true;
                     }
                     let convo = model.messages.entry(sender.clone()).or_default();
@@ -924,11 +969,12 @@ impl Skrepka {
                         convo.push(StoredMessage {
                             id: msg_id.clone(),
                             body,
-                            ts: parsed.ts,
+                            ts,
                             outgoing: false,
                             delivered: false,
                         });
                         convo.sort_by_key(|m| m.ts);
+                        trim_history(convo);
                         if !touched_convos.contains(&sender) {
                             touched_convos.push(sender.clone());
                         }
@@ -957,13 +1003,15 @@ impl Skrepka {
                     let c = model
                         .contacts
                         .entry(sender.clone())
-                        .or_insert_with(|| Contact::new(sender.clone(), String::new(), parsed.ts));
-                    // Ignore stale profile replays (PROTOCOL.md §4).
-                    if parsed.ts >= c.last_profile_ts {
+                        .or_insert_with(|| Contact::new(sender.clone(), String::new(), ts));
+                    // Ignore stale profile replays (PROTOCOL.md §4). The clamped
+                    // `ts` is what gets recorded, so a peer cannot park
+                    // `last_profile_ts` at `i64::MAX` and freeze its own profile.
+                    if ts >= c.last_profile_ts {
                         c.display_name = display_name;
                         c.bio = bio;
                         c.photo = photo;
-                        c.last_profile_ts = parsed.ts;
+                        c.last_profile_ts = ts;
                         contacts_dirty = true;
                     }
                 }
@@ -998,6 +1046,16 @@ fn backoff_ms(retries: u32) -> u64 {
     (3000u64.saturating_mul(1u64 << retries.min(4))).min(30_000)
 }
 
+/// Age out local history: keep only the most recent `MAX_MESSAGES_PER_PEER`
+/// messages of a conversation (PROTOCOL.md §9). Callers keep `convo` sorted by
+/// `ts`, so the oldest messages are at the front. The subsequent kv write
+/// persists the trimmed list, bounding the `messages:<peer>` blob too.
+fn trim_history(convo: &mut Vec<StoredMessage>) {
+    if let Some(excess) = convo.len().checked_sub(MAX_MESSAGES_PER_PEER) {
+        convo.drain(..excess);
+    }
+}
+
 /// Decode a kv `get` result into a typed value, ignoring errors / absence.
 fn parse_kv<T: for<'de> Deserialize<'de>>(res: KvData) -> Option<T> {
     let bytes = res.ok().flatten()?;
@@ -1020,6 +1078,199 @@ mod tests {
 
     fn peer_hex(seed: u8) -> String {
         Identity::from_seed(&[seed; 32]).public_key_hex()
+    }
+
+    /// A poll page carrying one payload, encrypted from `sender_seed` to `me`.
+    fn page_from(sender_seed: u8, me: &Model, payload: &Payload, ts: i64) -> PollResp {
+        let sender = Identity::from_seed(&[sender_seed; 32]);
+        let recipient = Identity::from_secret_bytes(me.secret_key.as_ref().unwrap()).unwrap();
+        let json = protocol::serialize_payload(payload, ts);
+        let blob = crate::crypto::encrypt(
+            &mut rand_core::OsRng,
+            &sender,
+            &recipient.public_key(),
+            json.as_bytes(),
+        )
+        .unwrap();
+        PollResp {
+            events: vec![PollEvent {
+                encrypted_blob: hex::encode(blob),
+            }],
+            cursor: 1,
+        }
+    }
+
+    fn text(id: &str, body: &str) -> Payload {
+        Payload::Text {
+            id: id.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    /// PROTOCOL.md §4: a blocked peer's messages are not shown — and acking them
+    /// would tell the blocked peer we are online and reading.
+    #[test]
+    fn a_blocked_senders_message_is_neither_stored_nor_acked() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        let mut contact = Contact::new(peer.clone(), "Bob".into(), 0);
+        contact.blocked = true;
+        m.contacts.insert(peer.clone(), contact);
+
+        let page = page_from(9, &m, &text("m1", "hi"), now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+
+        assert!(
+            m.messages.get(&peer).is_none_or(Vec::is_empty),
+            "a blocked peer's message must not be stored"
+        );
+        assert!(m.outbox.is_empty(), "no delivery.ack goes back to a blocked peer");
+        // ...and nothing to render in the chat, even if it is opened.
+        m.active_peer = Some(peer);
+        m.page = Page::Chat;
+        assert!(app.view(&m).messages.is_empty());
+    }
+
+    /// The same page, unblocked: the control that proves the gate is the block
+    /// flag and not something else in the ingest path.
+    fn ingest_one_text_from_an_unblocked_peer() -> (Model, String) {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        let page = page_from(9, &m, &text("m1", "hi"), now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+        (m, peer)
+    }
+
+    #[test]
+    fn an_unblocked_senders_message_is_stored_and_acked() {
+        let (m, peer) = ingest_one_text_from_an_unblocked_peer();
+        assert_eq!(m.messages[&peer].len(), 1);
+        assert_eq!(m.messages[&peer][0].body, "hi");
+        assert_eq!(m.outbox.len(), 1, "one delivery.ack is queued");
+        assert_eq!(m.outbox[0].recipient, peer);
+    }
+
+    /// A peer sending `ts = i64::MAX` used to pin itself to the top of the
+    /// conversation list forever, and render with an absurd timestamp.
+    #[test]
+    fn a_far_future_timestamp_is_clamped_to_now() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+
+        let page = page_from(9, &m, &text("m1", "hi"), i64::MAX);
+        let before = now_ms();
+        let _ = app.ingest_poll(&mut m, page);
+
+        let ts = m.messages[&peer][0].ts;
+        assert!(
+            ts <= now_ms() + MAX_FUTURE_SKEW_MS,
+            "ts {ts} must be clamped into the skew window"
+        );
+        assert!(ts >= before, "and clamped to now, not to some past value");
+        // The clamped value is what the shell sorts and renders by.
+        assert_eq!(app.view(&m).contacts[0].last_ts, ts);
+    }
+
+    /// Honest clock skew inside the tolerance is preserved as-is.
+    #[test]
+    fn a_slightly_future_timestamp_is_kept() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        let ts = now_ms() + 5_000;
+
+        let page = page_from(9, &m, &text("m1", "hi"), ts);
+        let _ = app.ingest_poll(&mut m, page);
+
+        assert_eq!(m.messages[&peer][0].ts, ts);
+    }
+
+    #[test]
+    fn message_history_is_capped_at_the_cutoff() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+
+        let convo = m.messages.entry(peer.clone()).or_default();
+        for i in 0..MAX_MESSAGES_PER_PEER {
+            convo.push(StoredMessage {
+                id: format!("old-{i}"),
+                body: "x".into(),
+                ts: i as i64,
+                outgoing: false,
+                delivered: false,
+            });
+        }
+
+        let page = page_from(9, &m, &text("new", "newest"), now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+
+        let convo = &m.messages[&peer];
+        assert_eq!(convo.len(), MAX_MESSAGES_PER_PEER, "the cap holds");
+        assert_eq!(convo.last().unwrap().id, "new", "the newest is kept");
+        assert_eq!(convo.first().unwrap().id, "old-1", "the oldest is aged out");
+    }
+
+    /// An off-curve key can't be encrypted to, so the send is dropped — but the
+    /// user has to be told, rather than watching the message vanish.
+    #[test]
+    fn a_send_to_an_unusable_key_reports_an_error() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let bad = hex::encode([0xabu8; 32]); // 32 bytes, not a curve point
+        m.outbox.push_back(OutboxItem {
+            recipient: bad,
+            envelope_json: "{}".into(),
+        });
+
+        let _ = app.update(Event::StartFlush, &mut m);
+
+        assert!(m.outbox.is_empty(), "the unsendable item does not wedge the outbox");
+        assert!(!m.flushing);
+        let err = m.error.expect("the failure is surfaced");
+        assert!(err.contains("invalid key"), "got: {err}");
+    }
+
+    #[test]
+    fn add_contact_rejects_a_key_that_is_not_a_curve_point() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let bad = hex::encode([0xabu8; 32]);
+
+        let _ = app.update(
+            Event::AddContact {
+                input: bad.clone(),
+                nickname: "Mallory".into(),
+            },
+            &mut m,
+        );
+
+        assert!(!m.contacts.contains_key(&bad), "an unsendable contact is not stored");
+        assert!(m.error.is_some());
+    }
+
+    /// A dropped kv write silently loses data; it must not be swallowed.
+    #[test]
+    fn a_failed_save_surfaces_an_error() {
+        let app = Skrepka;
+        let mut m = with_identity();
+
+        let _ = app.update(
+            Event::Saved(Err(crux_kv::error::KeyValueError::Io {
+                message: "no space left on device".into(),
+            })),
+            &mut m,
+        );
+        assert!(m.error.is_some(), "a failed write is reported");
+
+        // A successful write stays quiet.
+        m.error = None;
+        let _ = app.update(Event::Saved(Ok(None)), &mut m);
+        assert!(m.error.is_none());
     }
 
     #[test]

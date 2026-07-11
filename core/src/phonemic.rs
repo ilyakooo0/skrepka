@@ -94,20 +94,28 @@ pub fn from_ob(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Check that `bytes` is a 32-byte, well-formed Ed25519 public key, and return
+/// its lowercase hex.
+///
+/// Length alone is not enough: `crypto::encrypt` decompresses the recipient key
+/// to its Montgomery form, so 32 bytes that aren't a curve point would be
+/// accepted as a contact and then fail on *every* send to them.
+fn valid_pubkey_hex(bytes: &[u8]) -> Option<String> {
+    let key: [u8; 32] = bytes.try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key).ok()?;
+    Some(hex::encode(key))
+}
+
 /// Parse a contact identifier given as either a `@p` string or 64-char hex.
 /// Returns the lowercase hex of a valid 32-byte Ed25519 public key.
 pub fn try_parse_pubkey(input: &str) -> Option<String> {
     let trimmed = input.trim();
     // Try @p first (contains hyphens or non-hex syllables), then hex.
-    if let Some(bytes) = from_ob(trimmed) {
-        if bytes.len() == 32 {
-            return Some(hex::encode(bytes));
-        }
+    if let Some(hex) = from_ob(trimmed).as_deref().and_then(valid_pubkey_hex) {
+        return Some(hex);
     }
     if let Ok(bytes) = hex::decode(trimmed.to_lowercase()) {
-        if bytes.len() == 32 {
-            return Some(hex::encode(bytes));
-        }
+        return valid_pubkey_hex(&bytes);
     }
     None
 }
@@ -138,9 +146,19 @@ mod tests {
         assert!(ob.starts_with("dozzod-dozzod"));
     }
 
+    /// A real Ed25519 public key. `try_parse_pubkey` now checks that a key is a
+    /// curve point, so tests can't use an arbitrary byte pattern.
+    fn real_key() -> [u8; 32] {
+        crate::crypto::Identity::from_seed(&[7u8; 32]).public_key()
+    }
+
+    /// 32 bytes that decode fine but are *not* on the curve — the case that used
+    /// to be accepted as a contact and then failed on every send to it.
+    const NOT_A_POINT: [u8; 32] = [0xab; 32];
+
     #[test]
     fn try_parse_accepts_hex_and_ob() {
-        let key = [0xabu8; 32];
+        let key = real_key();
         let hex_str = hex::encode(key);
         let ob = to_ob(&key);
         assert_eq!(try_parse_pubkey(&hex_str), Some(hex_str.clone()));
@@ -156,14 +174,32 @@ mod tests {
     }
 
     #[test]
+    fn try_parse_rejects_a_32_byte_key_that_is_not_a_curve_point() {
+        assert!(
+            ed25519_dalek::VerifyingKey::from_bytes(&NOT_A_POINT).is_err(),
+            "fixture must really be off-curve"
+        );
+        // Both spellings of it: raw hex, and the @p it round-trips through.
+        assert_eq!(try_parse_pubkey(&hex::encode(NOT_A_POINT)), None);
+        assert_eq!(try_parse_pubkey(&to_ob(&NOT_A_POINT)), None);
+        // The syllable encoding itself is still lossless — only the key check fails.
+        assert_eq!(from_ob(&to_ob(&NOT_A_POINT)), Some(NOT_A_POINT.to_vec()));
+    }
+
+    #[test]
     fn ob_parsing_is_case_insensitive() {
-        let key = [0xabu8; 32];
+        let key = real_key();
         let hex_str = hex::encode(key);
         let ob = to_ob(&key);
         assert_eq!(from_ob(&ob.to_uppercase()), Some(key.to_vec()));
         assert_eq!(try_parse_pubkey(&ob.to_uppercase()), Some(hex_str.clone()));
         // Mixed case, as a QR scan or a paste from a title-cased field might give.
-        assert_eq!(try_parse_pubkey(&ob.replace("ler", "Ler")), Some(hex_str));
+        let mixed: String = ob
+            .chars()
+            .enumerate()
+            .map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c })
+            .collect();
+        assert_eq!(try_parse_pubkey(&mixed), Some(hex_str));
     }
 
     /// `part.len()` is a *byte* count, so a 6-byte syllable holding a multi-byte

