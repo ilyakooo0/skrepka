@@ -885,9 +885,6 @@ refreshLocalPresence = \pubkey expiry -> do
 -- ============================================
 -- Pruning
 -- ============================================
--- Single sweep that drops expired entries from every state ref in one atomic
--- block. Returns the locally-expired presence rows whose pubkey has no other
--- live local session, so the caller can broadcast offline gossip for them.
 
 -- One sweep over every state ref: drops expired rows in a single atomic block.
 -- Returns the locally-expired presence rows whose pubkey has no other live
