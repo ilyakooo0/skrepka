@@ -3,6 +3,9 @@
 //! Each byte pair `[hi, lo]` encodes as `prefixes[hi] ++ suffixes[lo]` (6 chars);
 //! pairs are joined with `-`. A 32-byte key -> 16 six-char syllables.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 const PREFIXES: [&str; 256] = [
     "doz", "mar", "bin", "wan", "sam", "lit", "sig", "hid", "fid", "lis", "sog", "dir", "wac",
     "sab", "wis", "sib", "rig", "sol", "dop", "mod", "fog", "lid", "hop", "dar", "dor", "lor",
@@ -49,12 +52,40 @@ const SUFFIXES: [&str; 256] = [
     "fyr", "mur", "tel", "rep", "teg", "pec", "nel", "nev", "fes",
 ];
 
+/// Reverse tables for decoding. Built once, on first `from_ob`.
+///
+/// Correctness rests on both tables being duplicate-free: a `HashMap` keeps the
+/// *last* of any repeated syllable, where the linear scan this replaced returned
+/// the *first*. `tables_are_full_and_distinct` pins that invariant down.
+static PREFIX_MAP: OnceLock<HashMap<&'static str, u8>> = OnceLock::new();
+static SUFFIX_MAP: OnceLock<HashMap<&'static str, u8>> = OnceLock::new();
+
+fn prefix_map() -> &'static HashMap<&'static str, u8> {
+    PREFIX_MAP.get_or_init(|| {
+        PREFIXES
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (s, i as u8))
+            .collect()
+    })
+}
+
+fn suffix_map() -> &'static HashMap<&'static str, u8> {
+    SUFFIX_MAP.get_or_init(|| {
+        SUFFIXES
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (s, i as u8))
+            .collect()
+    })
+}
+
 fn prefix_index(s: &str) -> Option<u8> {
-    PREFIXES.iter().position(|p| *p == s).map(|i| i as u8)
+    prefix_map().get(s).copied()
 }
 
 fn suffix_index(s: &str) -> Option<u8> {
-    SUFFIXES.iter().position(|p| *p == s).map(|i| i as u8)
+    suffix_map().get(s).copied()
 }
 
 /// Encode bytes as a hyphen-joined `@p` string. `None` for an odd-length input.
@@ -130,12 +161,29 @@ pub fn try_parse_pubkey(input: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The name always claimed distinctness; now the decode path depends on it.
+    /// A duplicate syllable would collapse a map entry, so a table of 256 that
+    /// maps to fewer than 256 keys is the exact failure this must catch.
     #[test]
     fn tables_are_full_and_distinct() {
         assert_eq!(PREFIXES.len(), 256);
         assert_eq!(SUFFIXES.len(), 256);
         assert_eq!(PREFIXES[0], "doz");
         assert_eq!(SUFFIXES[0], "zod");
+        assert_eq!(prefix_map().len(), 256, "prefix table has a duplicate");
+        assert_eq!(suffix_map().len(), 256, "suffix table has a duplicate");
+    }
+
+    /// Every index must survive encode -> decode. Guards the map against being
+    /// built off-by-one or with a truncated cast.
+    #[test]
+    fn every_syllable_index_round_trips() {
+        for i in 0..=255u8 {
+            assert_eq!(prefix_index(PREFIXES[i as usize]), Some(i));
+            assert_eq!(suffix_index(SUFFIXES[i as usize]), Some(i));
+        }
+        assert_eq!(prefix_index("zod"), None, "suffix must not decode as prefix");
+        assert_eq!(suffix_index("doz"), None, "prefix must not decode as suffix");
     }
 
     #[test]
@@ -214,7 +262,13 @@ mod tests {
         let mixed: String = ob
             .chars()
             .enumerate()
-            .map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c })
+            .map(|(i, c)| {
+                if i.is_multiple_of(2) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
             .collect();
         assert_eq!(try_parse_pubkey(&mixed), Some(hex_str));
     }
