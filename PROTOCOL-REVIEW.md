@@ -181,6 +181,36 @@ protection without the proxy caveat. Recommend documenting it.
 
 ---
 
+## 🟡 9. Federation retry loop can starve the prune sweep
+
+**Severity: low — design tradeoff, not a code bug.**
+
+`backgroundRetryForwards` runs `retryPendingForwards` inline (not via `fork`),
+so a sweep that hits many slow or timing-out peers blocks until every
+`fetch` in the batch resolves. Each `fetch` has no explicit timeout — the
+runtime's HTTP client holds the connection — so a sweep over N unreachable
+peers can take N × (TCP connect timeout) before returning. During that time
+`backgroundPrune` (on its own `fork`) is free to run, but its writes to
+`*messages` and `*forwardFailures` conflict with `retryPendingForwards`'s
+`atomic` blocks, so `pruneExpired`'s atomic retries lose to the retry loop
+and are effectively starved: expired messages, sessions, and challenges
+pile up until the retry sweep finishes.
+
+In practice this only matters under federation with many dead peers and a
+low `retryBackoffMax` — the `shouldRetryServer` gate skips peers in backoff,
+so after one failed sweep most peers are gated out of the next one. The
+first sweep after a network partition is the worst case.
+
+**No fix applied.** The deliberate design (inline, not forked) prevents two
+concurrent `retryPendingForwards` from seeing the same `*forwards` snapshot
+and double-counting `recordFailure`. Forking it would reintroduce that race.
+A real fix would either (a) give `fetch` a deadline and bound the sweep
+time, or (b) run `retryPendingForwards` in a transaction that yields
+`*messages`/`*forwardFailures` to `pruneExpired` between per-peer batches.
+Both need runtime support the current `fetch` does not expose.
+
+---
+
 ## Suggested follow-ups
 
 1. **Spec edits (safe, no behavior change):** fold #2, #4, #6, #8 caveats into
@@ -190,3 +220,5 @@ protection without the proxy caveat. Recommend documenting it.
    guard) are **done**.
 3. #2 and #4 are inherent to open, unauthenticated federation — decide whether to
    document-as-accepted or add peer authentication.
+4. **#9** is a design tradeoff; document as accepted until `fetch` supports a
+   deadline.
