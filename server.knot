@@ -734,6 +734,23 @@ clientIpOf = \h -> case h of
 
 -- Resolve a Bearer token to its session pubkey if the session is unexpired and
 -- the client IP matches. Returns Nothing on missing/invalid token.
+--
+-- TIMING SIDE-CHANNEL (known gap, not fixable in Knot today). `s.token == token`
+-- is ordinary string equality, which almost certainly short-circuits on the first
+-- differing byte. An attacker who can time the response therefore learns how many
+-- leading characters of a guess were correct, and can in principle extend a guessed
+-- prefix one hex char at a time instead of searching the whole space. Two things
+-- bound that today, neither of which is a fix:
+--   * the token is 48 random hex chars (192 bits, `genToken`), so a blind guess is
+--     hopeless and the attacker is forced onto the timing channel to make progress;
+--   * `/poll` and `/messages` are per-IP rate limited, and the linear scan over
+--     `*sessions` adds noise on the order of the comparison itself, so the number
+--     of samples needed to resolve a per-byte difference over a network is large.
+-- Neither argument is a security guarantee — they raise the cost of the attack, they
+-- do not remove it. The correct fix is a `constantTimeEquals : Text -> Text -> Bool`
+-- primitive in the Knot runtime (a byte-wise XOR-and-accumulate compare that always
+-- reads both strings in full); swap the `s.token == token` conjunct for it as soon as
+-- one exists. See PROTOCOL.md §6, *Error Responses*.
 authedPubkey : Text -> Int<Ms> -> Text -> IO {r *sessions} (Maybe PubkeyHex)
 authedPubkey = \authorization t clientIp -> do
   ses <- *sessions

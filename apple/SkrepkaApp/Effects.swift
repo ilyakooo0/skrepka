@@ -5,11 +5,40 @@ import Skrepka
 
 // MARK: - HTTP
 
+/// Cancels every HTTP redirect instead of following it.
+///
+/// URLSession replays the original request's headers onto a redirect target, including
+/// `Authorization: Bearer <session_token>`. A relay is untrusted infrastructure: a hostile
+/// (or compromised) one could answer `/poll` or `/messages` with a 302 to a host it chooses
+/// and harvest the bearer token from the request we would dutifully re-send there. Sessions
+/// are bound to a single relay by design (§6), so a cross-host redirect is never legitimate
+/// — refusing it costs nothing and closes the token-exfiltration path.
+///
+/// Returning `nil` from the completion handler does not error the task: it stops the
+/// redirect and hands the 3xx response itself back to the caller, which the core sees as a
+/// non-2xx status and treats as a failed request.
+private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 enum Http {
+    /// Strongly held by `session` for the app's lifetime — the session is never invalidated,
+    /// so the delegate is never released. That is the intended shape here, not a leak.
+    private static let redirectDelegate = NoRedirectDelegate()
+
     /// A private, ephemeral session. `URLSession.shared` would hand every relay a
     /// persistent cookie jar and an on-disk response cache — a relay is untrusted
     /// infrastructure and must not be able to pin a stable identifier on the client
-    /// or leave polled ciphertext lying around on disk.
+    /// or leave polled ciphertext lying around on disk. It would also follow redirects,
+    /// which is what `NoRedirectDelegate` is here to prevent.
     private static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieAcceptPolicy = .never
@@ -19,7 +48,7 @@ enum Http {
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.timeoutIntervalForRequest = 70 // server long-polls for ~25s
         config.tlsMinimumSupportedProtocolVersion = .TLSv12
-        return URLSession(configuration: config)
+        return URLSession(configuration: config, delegate: redirectDelegate, delegateQueue: nil)
     }()
 
     static func perform(_ req: HttpRequest) async -> HttpResult {

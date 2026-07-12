@@ -400,6 +400,8 @@ Errors return a non-2xx HTTP status with a body of:
 | 429         | (HTTP only)           | Per-route rate limit exceeded        |
 | 503         | `capacity`            | Server-side resource cap reached     |
 
+> **Timing side-channel on token comparison (known gap).** The reference server compares the presented bearer token against each stored session token with plain string equality, which short-circuits on the first differing byte and so leaks, through response timing, how long a correct prefix an attacker guessed. The 192-bit token and the per-IP rate limit on `/poll` and `/messages` bound the attack — a blind guess is infeasible, and the sample count needed to resolve a per-byte timing difference across a network is large — but they do not eliminate it. A constant-time comparison is the correct fix; the reference implementation is blocked on the absence of such a primitive in its runtime. Implementations on platforms that offer one (`crypto_verify`, `subtle`, `hmac.compare_digest`, …) SHOULD use it.
+
 ### `POST /poll` — Long poll for new events
 
 The client makes a blocking POST. The server holds the connection open until new events are available or the long-poll timeout (25 s) elapses.
@@ -680,3 +682,33 @@ to every relay it can reach. Each relay holding mail for the victim now forwards
 - Consider pinning server TLS certificates for additional transport security.
 - Federate only with peers operated by trusted operators if presence metadata is sensitive.
 - Servers SHOULD delete message blobs as soon as the implicit ack (cursor advance) lands.
+
+---
+
+## 11. Future Extensions
+
+Nothing in this section is implemented or normative in v0.1. It records the shape the extension is expected to take, so that clients avoid design choices that would foreclose it.
+
+### Key Rotation
+
+Identity in Skrepka *is* the Ed25519 keypair (§2), so today a user who loses or wants to retire a key has no in-protocol way to say so: they have to re-share a new key out-of-band, and every contact must re-add them by hand. Worse, because contacts are TOFU (§2, *Trust Model*), a contact who simply receives a message from an unfamiliar key cannot distinguish "my peer rotated" from "someone is impersonating my peer".
+
+A future revision may add a `key_rotation` message type (§4) that lets a user signal the change in-band:
+
+```json
+{
+  "type": "key_rotation",
+  "new_pubkey": "<hex(new_ed25519_pubkey)>",
+  "ts": 1679000000000
+}
+```
+
+The message is a normal plaintext payload: encrypted to each contact and, per §4, signed by the **old** key — which is exactly the point. Only the holder of the retiring key can announce its successor, so the announcement carries the same authority as any other message from that identity, and a recipient who already trusts the old key can extend that trust to the new one without a fresh out-of-band fingerprint check. Recipients would update the contact entry in place: replace the stored pubkey with `new_pubkey`, keep the existing display name, avatar, and message history, and retain the old key only as a *former identity* so that already-received messages still verify.
+
+Open questions a full specification must settle:
+
+- **Proof of possession of the new key.** A signature by the old key alone proves the *announcement* is authentic, not that the announcer holds the new secret. A cross-signature (the payload additionally signed by the new key, over both pubkeys) closes that gap and should be considered mandatory.
+- **Ordering and replay.** Rotations must be totally ordered per identity, or a replayed old `key_rotation` could roll a contact back to a superseded key. The per-contact `ts` staleness rule of §4 is the obvious mechanism, and it inherits that rule's weakness (§10, *Same-recipient replay*) — a monotonic rotation counter is likely the safer construction.
+- **Contacts who miss the announcement.** A contact offline past the 30-day TTL (§9) never receives the rotation and is left holding a dead key. Re-announcing on reconnect, or letting a client ask a peer to re-send its current identity, would need to be specified.
+- **Revocation vs. rotation.** These are different operations. Rotation says "use this key from now on" and assumes the old key is still under the owner's control; revocation says "the old key is compromised — distrust it", and an attacker holding the compromised key can forge exactly the rotation message that would hijack the identity. A rotation announcement therefore MUST NOT be treated as a compromise recovery mechanism. Recovering from a stolen key needs a separate design (an offline recovery key, or out-of-band re-verification) and is out of scope here.
+- **No retroactive protection.** Rotating does not protect past traffic. Messages already sent to the old key remain decryptable by whoever holds it, exactly as §10, *No forward secrecy* describes.
