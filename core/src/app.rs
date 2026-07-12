@@ -73,6 +73,24 @@ const MAX_POLL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// relay, so leave the margin.
 const POLL_WATCHDOG_MS: u64 = 90_000;
 
+/// Messages per `/messages` request.
+///
+/// The relay rejects a longer batch outright (`413 batch_too_large`,
+/// PROTOCOL.md §7), so this is a hard ceiling, not a tuning knob.
+const MAX_SEND_BATCH: usize = 100;
+
+/// ...and a byte ceiling on the same batch, counted in hex characters — i.e. in
+/// the units the request body is actually built from.
+///
+/// The count limit alone is not enough: a hundred profile broadcasts each
+/// carrying a 64 KiB photo would build a request far past the 16 MiB body cap a
+/// relay has by default (`--http-max-body-bytes`, PROTOCOL.md §7), and the whole
+/// batch would come back `413` — which we read as a transient failure and retry,
+/// forever. Bounding the body here keeps the batch inside what any conforming
+/// relay accepts. A single item over the budget still goes out alone: it is the
+/// relay's job to reject it, and its rejection is per-message and permanent.
+const MAX_SEND_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 // kv keys
 const K_SETTINGS: &str = "settings";
 const K_PROFILE: &str = "profile";
@@ -120,6 +138,10 @@ pub enum Event {
     SendText,
     AddContact { input: String, nickname: String },
     SetBlocked { peer: String, blocked: bool },
+    /// Forget a peer entirely: the contact, the conversation, and anything still
+    /// queued for them. Blocking only silences a peer; the entry stays in the
+    /// list forever, and there was no way to be rid of it.
+    DeleteContact { peer: String },
     SaveProfile {
         display_name: String,
         bio: String,
@@ -220,6 +242,18 @@ pub enum Page {
 /// `cursor`, `outbox`). `Connect` waits for all of them.
 const STARTUP_LOADS: u8 = 5;
 
+/// The batch a live `/messages` request is carrying: the first `count` items of
+/// the outbox, all bound for `recipient`.
+///
+/// `SendResult` needs both. The count is what it pops on success and what it
+/// charges a retry against on a transient failure; the recipient is what tells
+/// `SetBlocked` and `DeleteContact` whether the items they are about to remove
+/// are the very ones this send is going to pop.
+struct InFlight {
+    recipient: String,
+    count: usize,
+}
+
 pub struct Model {
     /// Zeroized on drop: this is the Ed25519 seed, the one secret whose leak
     /// costs the user their identity.
@@ -261,7 +295,16 @@ pub struct Model {
     /// flight from before the app was backgrounded must not install a token or
     /// overwrite `conn` on top of the attempt that replaced it.
     auth_gen: u64,
+    /// A `/messages` request is in flight. One at a time: `SendResult` pops the
+    /// items it sent off the head of the outbox, so two overlapping sends would
+    /// pop each other's messages.
     flushing: bool,
+    /// What the in-flight send will pop off the head of the outbox when it
+    /// succeeds — see `InFlight`. `None` while nothing is in flight, and also
+    /// while a send is in flight whose items have since been removed from under
+    /// it (`SetBlocked`, `DeleteContact`): there is then nothing left to pop, and
+    /// popping by count anyway would eat whichever messages slid into their place.
+    in_flight: Option<InFlight>,
     /// Startup kv loads still outstanding. `Connect` only fires at 0, so a poll
     /// can't land and be persisted against a half-loaded model — which would
     /// then be clobbered by the loads still in flight.
@@ -291,6 +334,7 @@ impl Default for Model {
             authenticating: false,
             auth_gen: 0,
             flushing: false,
+            in_flight: None,
             loads_pending: 0,
             page: Page::default(),
             active_peer: None,
@@ -342,6 +386,26 @@ impl Model {
     fn abandon_auth(&mut self) {
         self.authenticating = false;
         self.auth_gen = self.auth_gen.wrapping_add(1);
+    }
+
+    /// Every item bound for `peer` is about to be removed from the outbox. If the
+    /// send in flight is the one carrying them, forget what it was going to pop:
+    /// those items will not be there when it lands, and popping by count anyway
+    /// would take whatever slid into their place — another peer's mail.
+    ///
+    /// The `flushing` guard stays up. Nothing can cancel the request; it is still
+    /// out there, and a second send started underneath it would have its own items
+    /// popped by the first one's result.
+    fn detach_in_flight(&mut self, peer: &str) {
+        if self.in_flight.as_ref().is_some_and(|f| f.recipient == peer) {
+            self.in_flight = None;
+        }
+    }
+
+    /// How many items at the head of the outbox are already on the wire, and so
+    /// must not be rewritten in place (their ciphertext is built and gone).
+    fn in_flight_count(&self) -> usize {
+        self.in_flight.as_ref().map_or(0, |f| f.count)
     }
 }
 
@@ -693,10 +757,33 @@ impl App for Skrepka {
                     // signal the block is supposed to cut off. Drop it all: once
                     // blocked, nothing more goes to this peer.
                     model.outbox.retain(|item| item.recipient != peer);
+                    model.detach_in_flight(&peer);
                     return Command::all([self.persist_contacts(model), self.persist_outbox(model)])
                         .and(render());
                 }
                 self.persist_contacts(model).and(render())
+            }
+            Event::DeleteContact { peer } => {
+                model.contacts.remove(&peer);
+                model.messages.remove(&peer);
+                model.outbox.retain(|item| item.recipient != peer);
+                // The send in flight may be carrying the very items we just
+                // dropped; if so its result must pop nothing.
+                model.detach_in_flight(&peer);
+                if model.active_peer.as_deref() == Some(peer.as_str()) {
+                    model.active_peer = None;
+                    model.page = Page::Conversations;
+                }
+                model.error = None;
+                Command::all([
+                    self.persist_contacts(model),
+                    // The conversation is gone from the model, but `persist_messages`
+                    // would leave a `messages:<peer>` blob behind holding every
+                    // message the user just asked us to forget. Delete the key.
+                    KeyValue::delete(k_messages(&peer)).then_send(Event::Saved),
+                    self.persist_outbox(model),
+                ])
+                .and(render())
             }
             Event::SaveProfile {
                 display_name,
@@ -720,11 +807,12 @@ impl App for Skrepka {
                 // profile broadcast would keep feeding them our display name,
                 // avatar, and a liveness signal.
                 //
-                // Each item carries its own copy of the serialized payload, so a
-                // profile with a photo is duplicated (base64 and all) once per
-                // contact, in memory and in the `outbox` kv blob. Acceptable at
-                // today's contact counts; the fix is to intern the payload and
-                // have `OutboxItem` reference it by id.
+                // One `Arc<String>` for the whole fan-out: the payload carries a
+                // base64 photo, and a copy per contact would be megabytes in memory
+                // for a list of any size. (The `outbox` kv blob still serializes the
+                // string once per item — serde has no idea the `Arc`s are shared —
+                // but the supersede-in-place below caps that at one pending profile
+                // per contact, which is the bound that actually matters.)
                 let recipients: Vec<String> = model
                     .contacts
                     .values()
@@ -732,11 +820,28 @@ impl App for Skrepka {
                     .map(|c| c.pubkey.clone())
                     .collect();
                 let payload_json = Arc::new(protocol::serialize_payload(&payload, ts));
+                // Items already on the wire cannot be rewritten: their ciphertext is
+                // built and gone, and `SendResult` will pop them on success — so a
+                // payload swapped into one now would be dropped having never been
+                // sent. Supersede only what is still behind them.
+                let live = model.in_flight_count();
                 for peer in recipients {
-                    model.outbox.push_back(OutboxItem {
-                        recipient: peer,
-                        envelope_json: Arc::clone(&payload_json),
-                    });
+                    // A profile is state, not an event: only the newest one means
+                    // anything. Overwrite the pending one for this peer instead of
+                    // queueing a second — five quick edits to a profile with a photo
+                    // would otherwise be five payloads per contact, each of which we
+                    // then encrypt and send.
+                    match model
+                        .outbox
+                        .iter_mut()
+                        .skip(live)
+                        .find(|i| i.is_profile() && i.recipient == peer)
+                    {
+                        Some(pending) => pending.envelope_json = Arc::clone(&payload_json),
+                        None => model
+                            .outbox
+                            .push_back(OutboxItem::profile(peer, Arc::clone(&payload_json))),
+                    }
                 }
                 Command::all([
                     KeyValue::set(K_PROFILE, json_bytes(&model.profile)).then_send(Event::Saved),
@@ -957,22 +1062,30 @@ impl App for Skrepka {
                 // The in-flight send is over; `flush_next` refuses to run while
                 // this is set, so it must be cleared before *any* branch below.
                 model.flushing = false;
+                let batch = model.in_flight.take();
                 let status = u16::from(resp.status());
                 if status == 401 {
                     model.token = None;
+                    // The batch stays exactly as it is — re-auth, then re-send it.
                     return Command::event(Event::Authenticate);
                 }
                 if (200..300).contains(&status) || status == 400 {
-                    // success, or a permanent rejection (self_send/invalid) — drop it.
-                    model.outbox.pop_front();
+                    // The batch was accepted, or rejected outright (`self_send` /
+                    // `invalid_message` — both permanent, and the relay takes a
+                    // batch all-or-nothing). Either way it is finished with.
+                    for _ in 0..batch.map_or(0, |b| b.count) {
+                        model.outbox.pop_front();
+                    }
                     return self.persist_outbox(model).and(self.flush_next(model));
                 }
-                // transient error — stop; will resume on next connect/poll.
-                render()
+                // A transient failure: a 5xx, a rate limit, a relay restarting.
+                self.retry_batch(model, batch)
             }
             Event::SendResult(Err(_)) => {
+                // A transport error is the same transient failure as a 5xx.
                 model.flushing = false;
-                render()
+                let batch = model.in_flight.take();
+                self.retry_batch(model, batch)
             }
         }
     }
@@ -1145,13 +1258,19 @@ impl Skrepka {
 
         let convo = model.messages.entry(peer.clone()).or_default();
         let first_to_peer = !convo.iter().any(|m| m.outgoing);
-        convo.push(StoredMessage {
-            id: id.clone(),
-            body: body.clone(),
-            ts,
-            outgoing: true,
-            delivered: false,
-        });
+        // Insert in order rather than appending: an incoming message may hold a
+        // `ts` up to `MAX_FUTURE_SKEW_MS` ahead of ours, so appending would leave
+        // the conversation unsorted — and `trim_history` ages out the *front*.
+        insert_sorted(
+            convo,
+            StoredMessage {
+                id: id.clone(),
+                body: body.clone(),
+                ts,
+                outgoing: true,
+                delivered: false,
+            },
+        );
         trim_history(convo);
 
         // Auto-create a bare contact if messaging a brand-new key.
@@ -1161,21 +1280,23 @@ impl Skrepka {
             .or_insert_with(|| Contact::new(peer.clone(), String::new(), ts));
 
         let text = Payload::Text { id, body };
-        model.outbox.push_back(OutboxItem {
-            recipient: peer.clone(),
-            envelope_json: Arc::new(protocol::serialize_payload(&text, ts)),
-        });
-        // On first contact, also share our profile.
+        model.outbox.push_back(OutboxItem::new(
+            peer.clone(),
+            Arc::new(protocol::serialize_payload(&text, ts)),
+        ));
+        // On first contact, also share our profile. Marked as a profile like any
+        // other, so a `SaveProfile` before this ever goes out supersedes it rather
+        // than queueing a second one behind it.
         if first_to_peer {
             let profile = Payload::Profile {
                 display_name: model.profile.display_name.clone(),
                 bio: model.profile.bio.clone(),
                 photo: model.profile.photo.clone(),
             };
-            model.outbox.push_back(OutboxItem {
-                recipient: peer.clone(),
-                envelope_json: Arc::new(protocol::serialize_payload(&profile, ts)),
-            });
+            model.outbox.push_back(OutboxItem::profile(
+                peer.clone(),
+                Arc::new(protocol::serialize_payload(&profile, ts)),
+            ));
         }
 
         Command::all([
@@ -1187,8 +1308,23 @@ impl Skrepka {
         .and(render())
     }
 
-    /// Encrypt and send the head of the outbox, discarding any unsendable items
-    /// ahead of it.
+    /// Encrypt and send a batch from the head of the outbox, discarding any
+    /// unsendable items in the way.
+    ///
+    /// The batch is the longest run of items at the head that share a recipient,
+    /// bounded by `MAX_SEND_BATCH` and `MAX_SEND_BATCH_BYTES`. Sending them one
+    /// at a time meant an HTTP round-trip per message — and per *ack*, which
+    /// `ingest_poll` queues one of per sender per page, so catching up after a
+    /// long offline stretch was one request per message received. The relay takes
+    /// up to a hundred per request (PROTOCOL.md §7); take it up on that.
+    ///
+    /// Stopping at the first recipient change keeps the outbox's FIFO ordering
+    /// intact — a batch is delivered as a unit, so hoisting a later item for the
+    /// same peer over an earlier one for a different peer could only reorder
+    /// *across* conversations, but it would also let one busy peer starve the
+    /// rest of the queue. Consecutive-only is the cheap, obviously-fair rule, and
+    /// it already collapses the two cases that matter: a burst of texts to the
+    /// open chat, and a page's worth of acks back to one sender.
     ///
     /// The discards happen in one pass, followed by a single `persist_outbox`.
     /// The previous shape recursed once per bad item and emitted a full outbox
@@ -1203,64 +1339,143 @@ impl Skrepka {
             return Command::done();
         };
 
-        let mut dropped = false;
-        let sendable = loop {
-            let Some(item) = model.outbox.front() else {
-                break None;
+        let now = now_ms();
+        let mut dirty = false;
+        let mut recipient: Option<String> = None;
+        let mut messages: Vec<Envelope> = Vec::new();
+        let mut bytes = 0usize;
+
+        while messages.len() < MAX_SEND_BATCH {
+            let Some(item) = model.outbox.get(messages.len()) else {
+                break;
             };
-            match encrypt_for(&id, item) {
-                Some(blob) => break Some((item.recipient.clone(), blob)),
-                None => {
-                    // An unusable recipient key can never be encrypted to, so the
-                    // item has to go or it blocks the head of the outbox forever —
-                    // but say so, rather than letting the message vanish.
-                    model.error = Some(format!(
-                        "cannot send to {}: invalid key",
-                        trunc_ob(&item.recipient)
-                    ));
-                    model.outbox.pop_front();
-                    dropped = true;
-                }
+            if recipient.as_ref().is_some_and(|r| r != &item.recipient) {
+                break;
             }
-        };
+            let Some(blob) = encrypt_for(&id, item) else {
+                // An unusable recipient key can never be encrypted to, so the item
+                // has to go or it blocks the head of the outbox forever — but say
+                // so, rather than letting the message vanish. (Only reachable at
+                // the head: an item deeper in the batch shares the recipient of one
+                // we have already encrypted to, so its key is good by construction.)
+                model.error = Some(format!(
+                    "cannot send to {}: invalid key",
+                    trunc_ob(&item.recipient)
+                ));
+                model.outbox.remove(messages.len());
+                dirty = true;
+                continue;
+            };
+            let hex_blob = hex::encode(blob);
+            // Always take the first item, whatever it weighs — a lone oversized
+            // payload must still reach the relay, which rejects it permanently
+            // (`400`) and so gets it out of the queue for good. Past the first,
+            // stop before the body outgrows what a relay will accept.
+            if !messages.is_empty() && bytes + hex_blob.len() > MAX_SEND_BATCH_BYTES {
+                break;
+            }
+            bytes += hex_blob.len();
+            recipient = Some(item.recipient.clone());
+            messages.push(Envelope {
+                to: item.recipient.clone(),
+                encrypted_blob: hex_blob,
+            });
+        }
 
-        let persist = if dropped {
-            self.persist_outbox(model)
-        } else {
-            Command::done()
-        };
-
-        let Some((recipient, blob)) = sendable else {
+        let Some(recipient) = recipient else {
             // Nothing left to send. Render only if we dropped something, so the
             // user sees why their message went away.
-            return if dropped {
-                persist.and(render())
+            return if dirty {
+                self.persist_outbox(model).and(render())
             } else {
                 Command::done()
             };
         };
 
-        model.flushing = true;
-        let batch = SendBatch {
-            messages: vec![Envelope {
-                to: recipient,
-                encrypted_blob: hex::encode(blob),
-            }],
+        // Stamp the items now going out for the first time. This is what the TTL
+        // in `OutboxItem::is_expired` measures from, so it has to be durable —
+        // otherwise a relaunch resets the clock and a permanently-stuck item is
+        // immortal again.
+        for item in model.outbox.iter_mut().take(messages.len()) {
+            if item.first_attempt == 0 {
+                item.first_attempt = now;
+                dirty = true;
+            }
+        }
+        let persist = if dirty {
+            self.persist_outbox(model)
+        } else {
+            Command::done()
         };
+
+        model.flushing = true;
+        model.in_flight = Some(InFlight {
+            recipient,
+            count: messages.len(),
+        });
         let url = format!("{}/messages", model.settings.server_url);
         match Http::post(url)
             .header("authorization", format!("Bearer {token}"))
-            .body_json(&batch)
+            .body_json(&SendBatch { messages })
         {
             Ok(req) => persist.and(req.build().then_send(Event::SendResult)),
             Err(_) => {
                 // Not a dead loop: the next StartFlush (from a poll page or a
                 // fresh send) retries the head of the outbox.
                 model.flushing = false;
+                model.in_flight = None;
                 model.error = Some("could not build send request".into());
                 persist.and(render())
             }
         }
+    }
+
+    /// A send failed transiently (a 5xx, a rate limit, a dropped connection). The
+    /// batch stays queued and goes out again on the next `StartFlush` — but not
+    /// forever.
+    ///
+    /// The outbox is a strict FIFO, so an item that can never be delivered blocks
+    /// every message queued behind it, permanently: a single unreachable recipient
+    /// relay used to be enough to silence the client for good. Charge every item in
+    /// the failed batch a retry and drop the ones that have exhausted their budget
+    /// (`OutboxItem::is_expired`) — with an error, rather than letting them vanish.
+    fn retry_batch(&self, model: &mut Model, batch: Option<InFlight>) -> Command<Effect, Event> {
+        // `None` means the items were removed out from under the send (the peer was
+        // blocked, or deleted). There is nothing left to charge or to drop.
+        let Some(batch) = batch else {
+            return render();
+        };
+
+        let now = now_ms();
+        let mut expired = 0usize;
+        let mut kept: VecDeque<OutboxItem> = VecDeque::with_capacity(model.outbox.len());
+        for (i, mut item) in std::mem::take(&mut model.outbox).into_iter().enumerate() {
+            if i < batch.count {
+                item.retries = item.retries.saturating_add(1);
+                if item.is_expired(now) {
+                    expired += 1;
+                    continue;
+                }
+            }
+            kept.push_back(item);
+        }
+        model.outbox = kept;
+
+        if expired == 0 {
+            // Nothing dropped, but the retry counters still have to be durable: a
+            // relaunch that handed every stuck item a fresh budget would wedge the
+            // outbox across restarts exactly as it did before there was a budget.
+            return self.persist_outbox(model).and(render());
+        }
+        model.error = Some(format!(
+            "gave up sending {expired} message(s) to {}",
+            trunc_ob(&batch.recipient)
+        ));
+        // The head of the outbox has moved, so whatever was stuck behind the items
+        // we just dropped can finally go out.
+        self.persist_outbox(model)
+            .and(self.flush_next(model))
+            .and(render())
     }
 
     /// Decrypt and fold a poll page into the model; queue delivery acks.
@@ -1349,15 +1564,21 @@ impl Skrepka {
                     });
                     // dedup by id — O(1) via HashSet
                     if !id_set.contains(&msg_id) {
-                        convo.push(StoredMessage {
-                            id: msg_id.clone(),
-                            body,
-                            ts,
-                            outgoing: false,
-                            delivered: false,
-                        });
+                        // The conversation is *kept* sorted rather than re-sorted:
+                        // a `sort_by_key` per arrival is O(n log n) on a list of up
+                        // to `MAX_MESSAGES_PER_PEER`, every time, and a poll page
+                        // can carry hundreds of messages.
+                        insert_sorted(
+                            convo,
+                            StoredMessage {
+                                id: msg_id.clone(),
+                                body,
+                                ts,
+                                outgoing: false,
+                                delivered: false,
+                            },
+                        );
                         id_set.insert(msg_id.clone());
-                        convo.sort_by_key(|m| m.ts);
                         trim_history(convo);
                         touched_convos.insert(sender.clone());
                     }
@@ -1373,9 +1594,15 @@ impl Skrepka {
                     if stale {
                         continue;
                     }
-                    // Update last_ack_ts to the clamped ts.
+                    // The watermark is clamped to *now*, not merely into the skew
+                    // window: `ts` is the peer's to choose, and `last_ack_ts` is
+                    // what every later ack is measured against. A single ack at
+                    // `ts = i64::MAX` would otherwise park the watermark a minute
+                    // into the future, and every honest ack that followed — the
+                    // ones that actually mark our messages delivered — would read
+                    // as stale and be dropped.
                     if let Some(c) = model.contacts.get_mut(&sender) {
-                        c.last_ack_ts = ts;
+                        c.last_ack_ts = ts.min(now);
                         contacts_dirty = true;
                     }
                     let ack_set: HashSet<String> = ack_ids.iter().cloned().collect();
@@ -1404,14 +1631,16 @@ impl Skrepka {
                     let Some(c) = model.contacts.get_mut(&sender) else {
                         continue;
                     };
-                    // Ignore stale profile replays (PROTOCOL.md §4). The clamped
-                    // `ts` is what gets recorded, so a peer cannot park
-                    // `last_profile_ts` at `i64::MAX` and freeze its own profile.
+                    // Ignore stale profile replays (PROTOCOL.md §4). The watermark
+                    // is clamped to *now* for the same reason `last_ack_ts` is: a
+                    // peer that parked it in the future would freeze its own
+                    // profile, since every honest update it sent afterwards would
+                    // read as a stale replay of itself.
                     if ts >= c.last_profile_ts {
                         c.display_name = display_name;
                         c.bio = bio;
                         c.photo = photo;
-                        c.last_profile_ts = ts;
+                        c.last_profile_ts = ts.min(now);
                         contacts_dirty = true;
                     }
                 }
@@ -1433,10 +1662,12 @@ impl Skrepka {
                 let payload = Payload::DeliveryAck {
                     ack_ids: batch.to_vec(),
                 };
-                model.outbox.push_back(OutboxItem {
-                    recipient: sender.clone(),
-                    envelope_json: Arc::new(protocol::serialize_payload(&payload, ack_ts)),
-                });
+                // Consecutive and same-recipient, so `flush_next` puts every one of
+                // a sender's ack batches into a single `/messages` request.
+                model.outbox.push_back(OutboxItem::new(
+                    sender.clone(),
+                    Arc::new(protocol::serialize_payload(&payload, ack_ts)),
+                ));
             }
         }
 
@@ -1466,6 +1697,20 @@ fn encrypt_for(sender: &Identity, item: &OutboxItem) -> Option<Vec<u8>> {
 
 fn backoff_ms(retries: u32) -> u64 {
     (3000u64.saturating_mul(1u64 << retries.min(4))).min(30_000)
+}
+
+/// Insert a message into a conversation held in `ts` order.
+///
+/// `partition_point` lands *after* every message sharing the new one's `ts`, so
+/// ties keep arrival order — exactly what the stable `sort_by_key` this replaces
+/// produced, at O(log n) + a shift instead of O(n log n) on every message.
+///
+/// This is what makes "sorted by `ts`" an invariant rather than something
+/// `ingest_poll` restored after the fact, which is what `trim_history` has always
+/// assumed (it ages out the *front*) and what `view()` renders in order.
+fn insert_sorted(convo: &mut Vec<StoredMessage>, msg: StoredMessage) {
+    let pos = convo.partition_point(|m| m.ts <= msg.ts);
+    convo.insert(pos, msg);
 }
 
 /// Age out local history: keep only the most recent `MAX_MESSAGES_PER_PEER`
@@ -1500,6 +1745,7 @@ fn parse_kv<T: for<'de> Deserialize<'de>>(res: KvData) -> Option<T> {
 mod tests {
     use super::*;
     use crate::crypto::Identity;
+    use crate::model::{MAX_OUTBOX_RETRIES, OUTBOX_TTL_MS};
 
     fn with_identity() -> Model {
         let id = Identity::from_seed(&[3u8; 32]);
@@ -1557,6 +1803,627 @@ mod tests {
             id: id.to_string(),
             body: body.to_string(),
         }
+    }
+
+    fn queued(recipient: &str, body: &str) -> OutboxItem {
+        OutboxItem::new(
+            recipient.to_string(),
+            Arc::new(protocol::serialize_payload(&text(body, body), 1)),
+        )
+    }
+
+    /// The `/messages` batches a command actually puts on the wire. Reading them
+    /// off the effect is the only way to see what was *sent*, as opposed to what
+    /// the model thinks it sent.
+    fn sent_batches(cmd: &mut Command<Effect, Event>) -> Vec<Vec<Envelope>> {
+        #[derive(Deserialize)]
+        struct Sent {
+            messages: Vec<Envelope>,
+        }
+        cmd.effects()
+            .filter_map(|e| match e {
+                Effect::Http(req) if req.operation.url.ends_with("/messages") => {
+                    serde_json::from_slice::<Sent>(&req.operation.body)
+                        .ok()
+                        .map(|b| b.messages)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ok_response(status: u16) -> crux_http::Response<Vec<u8>> {
+        let status = crux_http::http::StatusCode::try_from(status).unwrap();
+        crux_http::testing::ResponseBuilder::with_status(status)
+            .body(Vec::new())
+            .build()
+    }
+
+    /// One full send round-trip: flush the outbox, then answer with `status`.
+    fn send_and_answer(app: &Skrepka, m: &mut Model, status: u16) {
+        let _ = app.update(Event::StartFlush, m);
+        let _ = app.update(Event::SendResult(Ok(ok_response(status))), m);
+    }
+
+    // -----------------------------------------------------------------------
+    // outbox: retry budget and TTL
+    // -----------------------------------------------------------------------
+
+    /// The outbox is a strict FIFO, so an item that can never be delivered used to
+    /// block every message queued behind it — forever.
+    #[test]
+    fn an_undeliverable_item_is_dropped_once_it_runs_out_of_retries() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let stuck = peer_hex(9);
+        let behind = peer_hex(11);
+        m.outbox.push_back(queued(&stuck, "wedged"));
+        m.outbox.push_back(queued(&behind, "stranded"));
+
+        // The relay keeps 500-ing on the head of the queue.
+        for i in 1..MAX_OUTBOX_RETRIES {
+            send_and_answer(&app, &mut m, 503);
+            assert_eq!(m.outbox.len(), 2, "still queued after {i} failure(s)");
+            assert_eq!(m.outbox[0].retries, i, "and its budget is being spent");
+        }
+
+        // The last one exhausts the budget: the head goes, and what was stuck
+        // behind it goes out.
+        let _ = app.update(Event::StartFlush, &mut m);
+        let mut cmd = app.update(Event::SendResult(Ok(ok_response(503))), &mut m);
+
+        assert_eq!(m.outbox.len(), 1, "the undeliverable item is dropped");
+        assert_eq!(m.outbox[0].recipient, behind, "and the queue moves on");
+        assert_eq!(
+            sent_batches(&mut cmd).len(),
+            1,
+            "the message behind it is sent immediately, not left for the next flush"
+        );
+        let err = m.error.expect("the user is told the message was given up on");
+        assert!(err.contains("gave up sending 1"), "got: {err}");
+    }
+
+    /// The counter alone is not enough: retries only accrue when a send is
+    /// attempted, so a client that goes online once a day would take a fortnight to
+    /// spend a ten-retry budget. The TTL bounds it in wall-clock time instead.
+    #[test]
+    fn an_item_older_than_the_ttl_is_dropped_on_its_next_failure() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+
+        let mut old = queued(&peer, "ancient");
+        old.first_attempt = now_ms() - OUTBOX_TTL_MS - 1;
+        old.retries = 1; // nowhere near the retry cap
+        m.outbox.push_back(old);
+
+        send_and_answer(&app, &mut m, 503);
+
+        assert!(m.outbox.is_empty(), "the TTL alone is enough to drop it");
+        assert!(m.error.is_some_and(|e| e.contains("gave up sending")));
+    }
+
+    /// An item queued during a week offline must not be dropped the moment the
+    /// network returns: the TTL runs from the first *attempt*, not from when the
+    /// message was written. An outbox blob from a build with no `first_attempt`
+    /// field deserializes to 0, which must mean "never attempted", not "epoch".
+    #[test]
+    fn an_item_that_was_never_attempted_has_no_ttl_to_outlive() {
+        let item = OutboxItem::new(peer_hex(9), Arc::new("{}".into()));
+        assert_eq!(item.first_attempt, 0);
+        assert!(
+            !item.is_expired(now_ms()),
+            "an unsent item must not age out against the epoch"
+        );
+    }
+
+    /// The TTL clock has to survive a relaunch, or a permanently-stuck item is
+    /// handed a fresh 24 hours on every launch and the outbox wedges forever again.
+    #[test]
+    fn the_first_attempt_stamp_is_persisted_when_the_item_goes_out() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+        let before = now_ms();
+
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+
+        assert!(m.outbox[0].first_attempt >= before, "the item is stamped");
+        // ...and the stamp is written to the `outbox` key, not just to memory.
+        let wrote_outbox = cmd.effects().any(|e| {
+            matches!(e, Effect::KeyValue(req)
+                if matches!(&req.operation, crux_kv::KeyValueOperation::Set { key, .. } if key == K_OUTBOX))
+        });
+        assert!(wrote_outbox, "the stamped outbox is persisted");
+    }
+
+    /// A transient failure below the budget changes nothing but the counter — the
+    /// message stays queued and goes out on the next flush.
+    #[test]
+    fn a_transient_failure_within_budget_keeps_the_message() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+
+        send_and_answer(&app, &mut m, 503);
+        assert_eq!(m.outbox.len(), 1);
+        assert_eq!(m.outbox[0].retries, 1);
+        assert!(m.error.is_none(), "a single 5xx is not worth shouting about");
+        assert!(!m.flushing, "and the guard is released so the next flush can run");
+
+        // The relay recovers; the message goes out and the item is gone.
+        send_and_answer(&app, &mut m, 200);
+        assert!(m.outbox.is_empty());
+    }
+
+    /// A 401 is not a delivery failure — it means our token expired. The batch must
+    /// not be charged a retry for it, or a long-lived client burns its whole budget
+    /// on routine re-auths.
+    #[test]
+    fn a_401_does_not_spend_the_retry_budget() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+
+        send_and_answer(&app, &mut m, 401);
+
+        assert_eq!(m.outbox.len(), 1, "the message is still queued");
+        assert_eq!(m.outbox[0].retries, 0, "and unpunished");
+        assert!(m.token.is_none(), "but the token is thrown away");
+    }
+
+    // -----------------------------------------------------------------------
+    // outbox: batching
+    // -----------------------------------------------------------------------
+
+    /// Sending one message per request meant a round-trip per *ack* too, so
+    /// catching up on a hundred messages cost a hundred requests.
+    #[test]
+    fn consecutive_items_for_one_recipient_go_out_in_a_single_request() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+        for i in 0..5 {
+            m.outbox.push_back(queued(&peer, &format!("m{i}")));
+        }
+
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+
+        let batches = sent_batches(&mut cmd);
+        assert_eq!(batches.len(), 1, "one request, not five");
+        assert_eq!(batches[0].len(), 5, "carrying every message");
+        assert!(batches[0].iter().all(|e| e.to == peer));
+
+        // ...and its success clears the whole batch, not just the head.
+        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        assert!(m.outbox.is_empty());
+    }
+
+    /// The batch stops at the first recipient change: a batch is delivered as a
+    /// unit, and hoisting a later item for the same peer over an earlier one for a
+    /// different peer would let one busy conversation starve the rest of the queue.
+    #[test]
+    fn a_batch_stops_at_the_first_recipient_change() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let a = peer_hex(9);
+        let b = peer_hex(11);
+        m.outbox.push_back(queued(&a, "a1"));
+        m.outbox.push_back(queued(&a, "a2"));
+        m.outbox.push_back(queued(&b, "b1"));
+        m.outbox.push_back(queued(&a, "a3"));
+
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+        let batches = sent_batches(&mut cmd);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2, "only the run at the head");
+        assert!(batches[0].iter().all(|e| e.to == a));
+
+        let mut cmd = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        assert_eq!(m.outbox.len(), 2);
+        let batches = sent_batches(&mut cmd);
+        assert_eq!(batches[0].len(), 1, "then b's single message");
+        assert_eq!(batches[0][0].to, b);
+    }
+
+    /// The relay answers `413 batch_too_large` past a hundred (PROTOCOL.md §7) —
+    /// which we would read as a transient failure and retry forever.
+    #[test]
+    fn a_batch_is_capped_at_the_relays_limit() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+        for i in 0..(MAX_SEND_BATCH + 20) {
+            m.outbox.push_back(queued(&peer, &format!("m{i}")));
+        }
+
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+        let batches = sent_batches(&mut cmd);
+        assert_eq!(batches[0].len(), MAX_SEND_BATCH);
+
+        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        assert_eq!(m.outbox.len(), 20, "the rest stays queued for the next batch");
+    }
+
+    /// A hundred profile broadcasts each carrying a 64 KiB photo would build a
+    /// request far past the body-size cap a relay has by default — and the `413`
+    /// that came back would look transient, so we would retry it forever.
+    #[test]
+    fn a_batch_is_capped_by_body_size_as_well_as_count() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+        // A body at the cap, and incompressible — `crypto::encrypt` deflates the
+        // plaintext, so a run of one character would ride out to nearly nothing and
+        // prove no cap at all.
+        let mut seed = 1u64;
+        let big: String = std::iter::repeat_with(|| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            char::from(b'a' + (seed >> 33) as u8 % 26)
+        })
+        .take(protocol::MAX_BODY_LEN)
+        .collect();
+        for i in 0..MAX_SEND_BATCH {
+            m.outbox.push_back(OutboxItem::new(
+                peer.clone(),
+                Arc::new(protocol::serialize_payload(&text(&format!("m{i}"), &big), 1)),
+            ));
+        }
+
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+        let batches = sent_batches(&mut cmd);
+        let body: usize = batches[0].iter().map(|e| e.encrypted_blob.len()).sum();
+
+        assert!(batches[0].len() < MAX_SEND_BATCH, "the count cap is not the binding one");
+        assert!(!batches[0].is_empty(), "but something still goes out");
+        assert!(body <= MAX_SEND_BATCH_BYTES, "the body stays inside the budget");
+    }
+
+    /// An unusable key at the head still has to be discarded, batching or not —
+    /// and the discard must not take the rest of the queue with it.
+    #[test]
+    fn an_unsendable_head_is_dropped_and_the_batch_behind_it_still_goes_out() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let good = peer_hex(9);
+        m.outbox.push_back(queued(&hex::encode([0xabu8; 32]), "doomed"));
+        m.outbox.push_back(queued(&good, "fine"));
+        m.outbox.push_back(queued(&good, "also fine"));
+
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+
+        assert_eq!(m.outbox.len(), 2, "only the unsendable item is dropped");
+        let batches = sent_batches(&mut cmd);
+        assert_eq!(batches[0].len(), 2, "and the batch behind it goes out whole");
+        assert!(m.error.is_some_and(|e| e.contains("invalid key")));
+    }
+
+    // -----------------------------------------------------------------------
+    // outbox: profile supersede
+    // -----------------------------------------------------------------------
+
+    /// A profile is state, not an event: only the newest one means anything. Five
+    /// quick edits used to queue five payloads per contact — each with the photo.
+    #[test]
+    fn repeated_profile_edits_supersede_rather_than_pile_up() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let a = peer_hex(9);
+        let b = peer_hex(11);
+        for peer in [&a, &b] {
+            m.contacts
+                .insert(peer.clone(), Contact::new(peer.clone(), String::new(), 0));
+        }
+
+        for name in ["One", "Two", "Three"] {
+            let _ = app.update(
+                Event::SaveProfile {
+                    display_name: name.into(),
+                    bio: String::new(),
+                    photo: None,
+                },
+                &mut m,
+            );
+        }
+
+        assert_eq!(m.outbox.len(), 2, "one pending profile per contact, not three");
+        for item in &m.outbox {
+            assert!(item.is_profile());
+            let parsed = protocol::parse_payload(item.envelope_json.as_bytes()).unwrap();
+            match parsed.payload {
+                Payload::Profile { display_name, .. } => {
+                    assert_eq!(display_name, "Three", "and it is the latest one");
+                }
+                _ => panic!("expected a profile"),
+            }
+        }
+    }
+
+    /// Superseding must not reach into a payload that is already on the wire: its
+    /// ciphertext is built and gone, and `SendResult` pops it on success — so a
+    /// profile swapped in now would be dropped having never been sent.
+    #[test]
+    fn a_profile_already_in_flight_is_not_rewritten_under_the_send() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+        m.contacts
+            .insert(peer.clone(), Contact::new(peer.clone(), String::new(), 0));
+
+        let _ = app.update(
+            Event::SaveProfile {
+                display_name: "Old".into(),
+                bio: String::new(),
+                photo: None,
+            },
+            &mut m,
+        );
+        // It goes out and is still in flight.
+        let _ = app.update(Event::StartFlush, &mut m);
+        assert!(m.flushing);
+
+        // A second edit lands mid-send. It must queue a *new* item rather than
+        // rewrite the one whose ciphertext is already gone.
+        let _ = app.update(
+            Event::SaveProfile {
+                display_name: "New".into(),
+                bio: String::new(),
+                photo: None,
+            },
+            &mut m,
+        );
+        assert_eq!(m.outbox.len(), 2, "the in-flight item is left alone");
+
+        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        assert_eq!(m.outbox.len(), 1, "the sent one is popped");
+        let parsed = protocol::parse_payload(m.outbox[0].envelope_json.as_bytes()).unwrap();
+        match parsed.payload {
+            Payload::Profile { display_name, .. } => assert_eq!(
+                display_name, "New",
+                "and the newer profile survives to be sent"
+            ),
+            _ => panic!("expected a profile"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // in-flight bookkeeping
+    // -----------------------------------------------------------------------
+
+    /// `SendResult` pops by count off the head of the outbox. If the items it sent
+    /// were removed from under it — the user blocked the peer mid-send — popping by
+    /// count anyway takes whatever slid into their place: another peer's mail.
+    #[test]
+    fn blocking_the_peer_mid_send_does_not_pop_someone_elses_messages() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let enemy = peer_hex(9);
+        let friend = peer_hex(11);
+        m.contacts
+            .insert(enemy.clone(), Contact::new(enemy.clone(), String::new(), 0));
+        m.outbox.push_back(queued(&enemy, "e1"));
+        m.outbox.push_back(queued(&enemy, "e2"));
+        m.outbox.push_back(queued(&friend, "f1"));
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        assert_eq!(m.in_flight.as_ref().unwrap().count, 2);
+
+        // Blocked mid-flight: the two items in the air are dropped from the queue.
+        let _ = app.update(
+            Event::SetBlocked {
+                peer: enemy.clone(),
+                blocked: true,
+            },
+            &mut m,
+        );
+        assert_eq!(m.outbox.len(), 1);
+
+        // The send lands. It must pop nothing.
+        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        assert_eq!(m.outbox.len(), 1, "the friend's message is untouched");
+        assert_eq!(m.outbox[0].recipient, friend);
+    }
+
+    // -----------------------------------------------------------------------
+    // delete contact
+    // -----------------------------------------------------------------------
+
+    /// Blocking only silences a peer; the entry stayed in the list forever.
+    #[test]
+    fn deleting_a_contact_forgets_the_contact_the_history_and_the_queue() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        let other = peer_hex(11);
+        for p in [&peer, &other] {
+            m.contacts
+                .insert(p.clone(), Contact::new(p.clone(), String::new(), 0));
+            m.messages.insert(
+                p.clone(),
+                vec![StoredMessage {
+                    id: "m1".into(),
+                    body: "hi".into(),
+                    ts: 1,
+                    outgoing: false,
+                    delivered: false,
+                }],
+            );
+            m.outbox.push_back(queued(p, "queued"));
+        }
+        m.active_peer = Some(peer.clone());
+        m.page = Page::Chat;
+
+        let mut cmd = app.update(Event::DeleteContact { peer: peer.clone() }, &mut m);
+
+        assert!(!m.contacts.contains_key(&peer));
+        assert!(!m.messages.contains_key(&peer));
+        assert!(
+            m.outbox.iter().all(|i| i.recipient != peer),
+            "nothing more goes to a peer we have forgotten"
+        );
+        assert_eq!(m.page, Page::Conversations, "the open chat is closed");
+        assert!(m.active_peer.is_none());
+
+        // Everyone else is untouched.
+        assert!(m.contacts.contains_key(&other));
+        assert_eq!(m.messages[&other].len(), 1);
+        assert_eq!(m.outbox.len(), 1);
+
+        // The history blob is *deleted*, not left behind holding what the user just
+        // asked us to forget.
+        let deleted = cmd.effects().any(|e| {
+            matches!(e, Effect::KeyValue(req)
+                if matches!(&req.operation, crux_kv::KeyValueOperation::Delete { key } if key == &k_messages(&peer)))
+        });
+        assert!(deleted, "the messages:<peer> key is removed");
+    }
+
+    /// Deleting a peer we are not looking at must not throw the user out of the
+    /// chat they *are* looking at.
+    #[test]
+    fn deleting_another_contact_leaves_the_open_chat_alone() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let open = peer_hex(9);
+        let doomed = peer_hex(11);
+        for p in [&open, &doomed] {
+            m.contacts
+                .insert(p.clone(), Contact::new(p.clone(), String::new(), 0));
+        }
+        m.active_peer = Some(open.clone());
+        m.page = Page::Chat;
+
+        let _ = app.update(Event::DeleteContact { peer: doomed }, &mut m);
+
+        assert_eq!(m.page, Page::Chat);
+        assert_eq!(m.active_peer.as_deref(), Some(open.as_str()));
+    }
+
+    // -----------------------------------------------------------------------
+    // watermark clamping
+    // -----------------------------------------------------------------------
+
+    /// An ack at `ts = i64::MAX` used to park `last_ack_ts` a minute into the
+    /// future — and every honest ack that followed, the ones that actually mark our
+    /// messages delivered, read as stale and was dropped. A peer could silence its
+    /// own delivery receipts forever with one payload.
+    #[test]
+    fn a_far_future_ack_cannot_suppress_the_acks_that_follow_it() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        m.contacts
+            .insert(peer.clone(), Contact::new(peer.clone(), String::new(), 0));
+        m.messages.insert(
+            peer.clone(),
+            vec![StoredMessage {
+                id: "m1".into(),
+                body: "hi".into(),
+                ts: 1,
+                outgoing: true,
+                delivered: false,
+            }],
+        );
+
+        // The poisoned ack: acks nothing we sent, but sets the watermark.
+        let ack = Payload::DeliveryAck {
+            ack_ids: vec!["nothing".into()],
+        };
+        let page = page_from(9, &m, &ack, i64::MAX);
+        let _ = app.ingest_poll(&mut m, page);
+        assert!(
+            m.contacts[&peer].last_ack_ts <= now_ms(),
+            "the watermark cannot be pushed into the future"
+        );
+
+        // A perfectly ordinary ack, sent now. It must still land.
+        let ack = Payload::DeliveryAck {
+            ack_ids: vec!["m1".into()],
+        };
+        let page = page_from(9, &m, &ack, now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+        assert!(
+            m.messages[&peer][0].delivered,
+            "an honest ack after a far-future one must still be honoured"
+        );
+    }
+
+    /// The same trick against `last_profile_ts`: a profile at `ts = i64::MAX` would
+    /// freeze the peer's own entry, since every honest update they sent afterwards
+    /// would read as a stale replay of itself.
+    #[test]
+    fn a_far_future_profile_cannot_freeze_the_peers_own_profile() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        m.contacts
+            .insert(peer.clone(), Contact::new(peer.clone(), String::new(), 0));
+
+        let profile = |name: &str| Payload::Profile {
+            display_name: name.into(),
+            bio: String::new(),
+            photo: None,
+        };
+        let page = page_from(9, &m, &profile("Far"), i64::MAX);
+        let _ = app.ingest_poll(&mut m, page);
+        assert!(m.contacts[&peer].last_profile_ts <= now_ms());
+
+        let page = page_from(9, &m, &profile("Now"), now_ms());
+        let _ = app.ingest_poll(&mut m, page);
+        assert_eq!(
+            m.contacts[&peer].display_name, "Now",
+            "a later, honest profile must still apply"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // conversation ordering
+    // -----------------------------------------------------------------------
+
+    /// The conversation is held in `ts` order rather than re-sorted per arrival.
+    /// `trim_history` ages out the *front*, so an out-of-order insert does not just
+    /// render wrong — it throws away the wrong message.
+    #[test]
+    fn messages_are_inserted_in_timestamp_order() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+
+        // Arrive out of order, including a tie.
+        for (i, ts) in [300i64, 100, 200, 200].into_iter().enumerate() {
+            let page = page_from(9, &m, &text(&format!("m{i}"), "x"), ts);
+            let _ = app.ingest_poll(&mut m, page);
+        }
+        // ...and an outgoing message, which used to be appended blindly.
+        m.active_peer = Some(peer.clone());
+        m.compose = "mine".into();
+        let _ = app.update(Event::SendText, &mut m);
+
+        let convo = &m.messages[&peer];
+        assert!(
+            convo.windows(2).all(|w| w[0].ts <= w[1].ts),
+            "the conversation is sorted: {:?}",
+            convo.iter().map(|s| s.ts).collect::<Vec<_>>()
+        );
+        // Ties keep arrival order, exactly as the stable sort used to give.
+        let tied: Vec<&str> = convo
+            .iter()
+            .filter(|s| s.ts == 200)
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(tied, vec!["m2", "m3"]);
     }
 
     /// PROTOCOL.md §4: a blocked peer's messages are not shown — and acking them
@@ -1674,10 +2541,8 @@ mod tests {
         let mut m = with_identity();
         m.token = Some("t".into());
         let bad = hex::encode([0xabu8; 32]); // 32 bytes, not a curve point
-        m.outbox.push_back(OutboxItem {
-            recipient: bad,
-            envelope_json: Arc::new("{}".into()),
-        });
+        m.outbox
+            .push_back(OutboxItem::new(bad, Arc::new("{}".into())));
 
         let _ = app.update(Event::StartFlush, &mut m);
 
@@ -1855,15 +2720,15 @@ mod tests {
 
         // An ack to the peer we are about to block, plus unrelated mail.
         for recipient in [&enemy, &friend] {
-            m.outbox.push_back(OutboxItem {
-                recipient: recipient.clone(),
-                envelope_json: Arc::new(protocol::serialize_payload(
+            m.outbox.push_back(OutboxItem::new(
+                recipient.clone(),
+                Arc::new(protocol::serialize_payload(
                     &Payload::DeliveryAck {
                         ack_ids: vec!["m1".into()],
                     },
                     1,
                 )),
-            });
+            ));
         }
 
         let _ = app.update(
@@ -1952,11 +2817,11 @@ mod tests {
         let app = Skrepka;
         let mut m = with_identity();
         m.token = Some("t".into());
-        m.flushing = true;
-        m.outbox.push_back(OutboxItem {
-            recipient: peer_hex(9),
-            envelope_json: Arc::new("{}".into()),
-        });
+        m.outbox
+            .push_back(OutboxItem::new(peer_hex(9), Arc::new("{}".into())));
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        assert!(m.flushing);
 
         let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
         let _ = app.update(Event::SendResult(Ok(resp)), &mut m);
@@ -1970,11 +2835,10 @@ mod tests {
         let app = Skrepka;
         let mut m = with_identity();
         m.token = Some("t".into());
-        for _ in 0..2 {
-            m.outbox.push_back(OutboxItem {
-                recipient: peer_hex(9),
-                envelope_json: Arc::new("{}".into()),
-            });
+        // Two different peers, or the batching would send both at once.
+        for seed in [9u8, 11] {
+            m.outbox
+                .push_back(OutboxItem::new(peer_hex(seed), Arc::new("{}".into())));
         }
         // First send goes out and marks the model as flushing.
         let _ = app.update(Event::StartFlush, &mut m);

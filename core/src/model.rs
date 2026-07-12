@@ -103,6 +103,17 @@ pub struct StoredMessage {
     pub delivered: bool,
 }
 
+/// Transient send failures one outbox item may absorb before it is given up on.
+///
+/// Without a ceiling the head of the outbox is retried forever, and because the
+/// outbox is a strict FIFO an item that can never be delivered blocks every
+/// message queued behind it — permanently.
+pub const MAX_OUTBOX_RETRIES: u32 = 10;
+
+/// ...and a wall-clock bound on the same thing, for the case where the retries
+/// come in slowly enough that the counter alone would take days to run out. 24h.
+pub const OUTBOX_TTL_MS: i64 = 86_400_000;
+
 /// A queued outbound payload awaiting encryption + send.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
@@ -110,6 +121,54 @@ pub struct OutboxItem {
     pub recipient: String,
     /// The serialized plaintext payload JSON (encrypted only at send time).
     pub envelope_json: Arc<String>,
+    /// `Some("profile")` for a profile broadcast, `None` for everything else.
+    ///
+    /// A profile is *state*, not an event: only the latest one matters, so
+    /// `SaveProfile` overwrites the pending item for a recipient rather than
+    /// queueing another. Without the marker there is nothing to overwrite by, and
+    /// five quick profile edits mean five payloads (photo and all) per contact.
+    pub kind: Option<String>,
+    /// Transient send failures this item has absorbed so far.
+    pub retries: u32,
+    /// `now_ms()` when this item was first put on the wire, or `0` if it never
+    /// has been. The TTL runs from here, so an item queued during a week offline
+    /// still gets its full retry budget once the network comes back.
+    pub first_attempt: i64,
+}
+
+impl OutboxItem {
+    pub fn new(recipient: String, envelope_json: Arc<String>) -> Self {
+        OutboxItem {
+            recipient,
+            envelope_json,
+            kind: None,
+            retries: 0,
+            first_attempt: 0,
+        }
+    }
+
+    /// A profile broadcast — the one payload kind that supersedes rather than
+    /// accumulates (see `kind`).
+    pub fn profile(recipient: String, envelope_json: Arc<String>) -> Self {
+        OutboxItem {
+            kind: Some("profile".to_string()),
+            ..OutboxItem::new(recipient, envelope_json)
+        }
+    }
+
+    pub fn is_profile(&self) -> bool {
+        self.kind.as_deref() == Some("profile")
+    }
+
+    /// Has this item exhausted its retry budget or outlived the TTL?
+    ///
+    /// `first_attempt == 0` means it has never been sent (or was queued by a build
+    /// that predates the field), so the TTL has nothing to measure from and only
+    /// the counter applies.
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.retries >= MAX_OUTBOX_RETRIES
+            || (self.first_attempt > 0 && now.saturating_sub(self.first_attempt) > OUTBOX_TTL_MS)
+    }
 }
 
 // ---------------------------------------------------------------------------
