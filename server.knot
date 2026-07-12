@@ -539,6 +539,17 @@ digitValue = \c -> if c == "0" then 0 else if c == "1" then 1 else if c == "2" t
 -- Value of an all-digits string (e.g. "172" -> 172); -1 when empty or
 -- non-numeric. `chars` is fine for the membership guard (set semantics don't
 -- matter there); the actual parse walks the string in order via take/drop.
+--
+-- The accumulator saturates at 2^32 so an overlong all-digits octet cannot
+-- overflow i64 and panic the handler. `isBadServerName` reaches this via
+-- `isReservedIPv4` on a peer-supplied name (`/federation/gossip`'s `fromServer`
+-- only passes a length/lowercase check at the route boundary), so a 19+-digit
+-- octet like "9999999999999999999.0.0.1" would otherwise abort the request with
+-- an unhandled `integer overflow in ... * 10`. A real IPv4 octet is 0-255 and
+-- every `isReservedIPv4` comparison is against a constant <= 255, so saturating
+-- above that range preserves the result for valid octets while an oversized
+-- first octet still reads as `>= 224` (reserved → fail-closed). The `* 10`
+-- stays safe because `acc` is capped at 2^32 before each step.
 decimalValue : Text -> Int
 decimalValue = \s -> if s == "" || not all (\c -> contains c "0123456789") (chars s)
 then -1
@@ -546,7 +557,7 @@ else decimalValueGo 0 s
 decimalValueGo : Int -> Text -> Int
 decimalValueGo = \acc s -> if s == ""
 then acc
-else decimalValueGo (acc * 10 + digitValue (take 1 s)) (drop 1 s)
+else decimalValueGo (min 4294967296 (acc * 10 + digitValue (take 1 s))) (drop 1 s)
 
 -- Substring of `s` before / after its first ",". Same shape as `beforeDot` /
 -- `afterDot`, on a different separator.
