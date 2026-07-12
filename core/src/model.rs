@@ -1,6 +1,8 @@
 //! Domain types: persisted state (stored in the kv capability as JSON) and the
 //! `ViewModel` types the Swift shell renders.
 
+use std::sync::Arc;
+
 use facet::Facet;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +60,8 @@ pub struct Contact {
     pub blocked: bool,
     /// `ts` of the last applied profile message (drop older replays).
     pub last_profile_ts: i64,
+    /// `ts` of the last applied delivery.ack (drop older replays).
+    pub last_ack_ts: i64,
     pub added_at: i64,
 }
 
@@ -71,6 +75,7 @@ impl Contact {
             photo: None,
             blocked: false,
             last_profile_ts: 0,
+            last_ack_ts: 0,
             added_at,
         }
     }
@@ -104,7 +109,7 @@ pub struct StoredMessage {
 pub struct OutboxItem {
     pub recipient: String,
     /// The serialized plaintext payload JSON (encrypted only at send time).
-    pub envelope_json: String,
+    pub envelope_json: Arc<String>,
 }
 
 // ---------------------------------------------------------------------------

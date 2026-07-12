@@ -139,15 +139,11 @@ So a batch can carry one max-size blob or many small ones, but total ≤ 42 MiB.
 
 ---
 
-## ❌ 7. No crypto / wire-format version negotiation
+## ✅ 7. No crypto / wire-format version negotiation — fixed
 
-**Severity: low — open.**
+**Severity: low — fixed.**
 
-`HKDF_INFO = "skrepka-v1"` is hardcoded (`core/src/crypto.rs`), and neither the
-envelope nor the plaintext payload carries a version field. "Ignore unknown
-`type`" (`protocol::parse_payload`) gives payload-type agility but no path to
-rotate the AEAD/KDF/curve. Recommend a stated version field or an explicit "no
-crypto agility in v0.1" note.
+`HKDF_INFO = "skrepka-v1"` is hardcoded (`core/src/crypto.rs`), and the plaintext payload carries no version field. The wire format now carries a leading version byte (`WIRE_VERSION = 0x01`, `core/src/crypto.rs`): `encrypt` prepends it, and `decrypt` reads and checks it before any other processing, returning `CryptoError::Decrypt` on mismatch. `MIN_BLOB_LEN` includes the extra byte (169 bytes). "Ignore unknown `type`" (`protocol::parse_payload`) gives payload-type agility; the version byte gives the same for the wire format, AEAD, KDF, and curve choices. A future revision that changes crypto primitives should bump both the version byte and the HKDF `info` string.
 
 ---
 

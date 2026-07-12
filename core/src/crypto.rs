@@ -29,11 +29,40 @@ const HKDF_INFO: &[u8] = b"skrepka-v1";
 /// Domain-separation tag for the auth challenge signature (PROTOCOL.md §6).
 const AUTH_TAG: &str = "skrepka-auth-v1:";
 
+/// Wire-format version byte prepended to every encrypted blob (PROTOCOL.md §3).
+const WIRE_VERSION: u8 = 1;
+
 pub const ED25519_SECRET_LEN: usize = 64;
 pub const ED25519_PUBLIC_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
-/// 32 (eph) + 24 (nonce) + 32 (sender pub) + 64 (sig) + 16 (AEAD tag).
-pub const MIN_BLOB_LEN: usize = 32 + NONCE_LEN + 32 + 64 + 16;
+/// 1 (version) + 32 (eph) + 24 (nonce) + 32 (sender pub) + 64 (sig) + 4 (compressed_len)
+/// + 16 (AEAD tag). The 4-byte compressed_len field sits inside the AEAD ciphertext.
+pub const MIN_BLOB_LEN: usize = 1 + 32 + NONCE_LEN + 32 + 64 + 4 + 16;
+
+/// Blob sizes are padded up to these boundaries so the on-wire length does not
+/// reveal the exact plaintext (compressed) size to relays and network observers.
+/// Below 65536 we round up to the nearest bucket; above it we round to the next
+/// multiple of 65536 (MAX_BLOB_LEN is exactly 672 × 65536, so we never exceed it).
+const PADDING_BUCKETS: [usize; 9] = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+/// Round `actual` up to the nearest padding boundary.
+fn padded_len(actual: usize) -> usize {
+    if actual == 0 {
+        return PADDING_BUCKETS[0];
+    }
+    for &bucket in &PADDING_BUCKETS {
+        if actual <= bucket {
+            return bucket;
+        }
+    }
+    // Above 65536: round to the next multiple of 65536.
+    let remainder = actual % 65536;
+    if remainder == 0 {
+        actual
+    } else {
+        actual + 65536 - remainder
+    }
+}
 /// Upper bound on a blob we will even attempt to decrypt, in *decoded* bytes —
 /// rejected on length before it costs us a scalar mult or an AEAD pass.
 ///
@@ -274,17 +303,36 @@ pub fn encrypt(
 
     let compressed = compress(plaintext);
 
-    // Sign recipient_pub || compressed (binds the blob to the recipient).
-    let mut signed = Vec::with_capacity(32 + compressed.len());
+    // Compute padding: round the full on-wire blob size up to a bucket boundary
+    // so relays and network observers cannot tell the exact (compressed) length.
+    // unpadded = 1 (version) + 32 (eph_pub) + 24 (nonce) + inner + 16 (AEAD tag)
+    //          = 1 + 32 + 24 + (32 + 64 + 4 + compressed.len()) + 16
+    //          = 173 + compressed.len()
+    let unpadded_blob_len = 1 + 32 + NONCE_LEN + 32 + 64 + 4 + compressed.len() + 16;
+    let target = padded_len(unpadded_blob_len);
+    let pad_len = target - unpadded_blob_len;
+
+    let mut padding = vec![0u8; pad_len];
+    rng.fill_bytes(&mut padding);
+
+    let compressed_len_bytes = (compressed.len() as u32).to_be_bytes();
+
+    // Sign recipient_pub || compressed_len_bytes || compressed || padding
+    // (i.e. recipient_pub || everything after the 96-byte header in inner).
+    let mut signed = Vec::with_capacity(32 + 4 + compressed.len() + padding.len());
     signed.extend_from_slice(recipient_ed_pub);
+    signed.extend_from_slice(&compressed_len_bytes);
     signed.extend_from_slice(&compressed);
+    signed.extend_from_slice(&padding);
     let signature = sender.signing_key().sign(&signed);
 
-    // inner = sender_pub(32) || sig(64) || compressed
-    let mut inner = Vec::with_capacity(32 + 64 + compressed.len());
+    // inner = sender_pub(32) || sig(64) || compressed_len(4) || compressed || padding
+    let mut inner = Vec::with_capacity(32 + 64 + 4 + compressed.len() + padding.len());
     inner.extend_from_slice(&sender_pub);
     inner.extend_from_slice(&signature.to_bytes());
+    inner.extend_from_slice(&compressed_len_bytes);
     inner.extend_from_slice(&compressed);
+    inner.extend_from_slice(&padding);
 
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut nonce);
@@ -294,7 +342,8 @@ pub fn encrypt(
         .map_err(|_| CryptoError::Encrypt)?;
     inner.zeroize();
 
-    let mut blob = Vec::with_capacity(32 + NONCE_LEN + ciphertext.len());
+    let mut blob = Vec::with_capacity(1 + 32 + NONCE_LEN + ciphertext.len());
+    blob.push(WIRE_VERSION);
     blob.extend_from_slice(&eph_pub);
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ciphertext);
@@ -316,11 +365,15 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     if blob.len() > MAX_BLOB_LEN {
         return Err(CryptoError::BlobTooLong);
     }
+    // Version byte — reject any blob we don't know how to handle.
+    if blob[0] != WIRE_VERSION {
+        return Err(CryptoError::Decrypt);
+    }
     let mut eph_pub = [0u8; 32];
-    eph_pub.copy_from_slice(&blob[..32]);
+    eph_pub.copy_from_slice(&blob[1..33]);
     let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&blob[32..32 + NONCE_LEN]);
-    let ciphertext = &blob[32 + NONCE_LEN..];
+    nonce.copy_from_slice(&blob[33..33 + NONCE_LEN]);
+    let ciphertext = &blob[33 + NONCE_LEN..];
 
     let recip_x_priv = ed25519_sk_to_x25519(&recipient.secret_key);
     let raw_secret = x25519(&recip_x_priv, &eph_pub)?;
@@ -332,7 +385,7 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
         .decrypt(XNonce::from_slice(&nonce), ciphertext)
         .map_err(|_| CryptoError::Decrypt)?;
 
-    if inner.len() < 32 + 64 {
+    if inner.len() < 32 + 64 + 4 {
         inner.zeroize();
         return Err(CryptoError::BlobTooShort);
     }
@@ -340,14 +393,26 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     sender_pub.copy_from_slice(&inner[..32]);
     let mut sig_bytes = [0u8; 64];
     sig_bytes.copy_from_slice(&inner[32..96]);
-    let compressed = &inner[96..];
 
-    // Verify signature over recipient_pub || compressed.
+    let compressed_len = u32::from_be_bytes([
+        inner[96],
+        inner[97],
+        inner[98],
+        inner[99],
+    ]) as usize;
+    if 100 + compressed_len > inner.len() {
+        inner.zeroize();
+        return Err(CryptoError::Decrypt);
+    }
+    let compressed = &inner[100..100 + compressed_len];
+
+    // Verify signature over recipient_pub || inner[96..]
+    // (covers compressed_len_bytes || compressed || padding).
     let verifying = VerifyingKey::from_bytes(&sender_pub).map_err(|_| CryptoError::BadSignature)?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    let mut signed = Vec::with_capacity(32 + compressed.len());
+    let mut signed = Vec::with_capacity(32 + (inner.len() - 96));
     signed.extend_from_slice(&recipient.public_key());
-    signed.extend_from_slice(compressed);
+    signed.extend_from_slice(&inner[96..]);
     verifying
         .verify(&signed, &signature)
         .map_err(|_| CryptoError::BadSignature)?;
@@ -433,13 +498,15 @@ mod tests {
         let alice = Identity::generate(&mut rng(1));
         let bob = Identity::generate(&mut rng(2));
         let blob = encrypt(&mut rng(7), &alice, &bob.public_key(), b"x").unwrap();
-        // eph_pub occupies the first 32 bytes and equals x25519 basepoint * eph_priv;
+        // Version byte at offset 0.
+        assert_eq!(blob[0], WIRE_VERSION);
+        // eph_pub occupies bytes 1..33 and equals x25519 basepoint * eph_priv;
         // we can't recompute eph_priv, but the nonce region must differ run-to-run.
         let blob2 = encrypt(&mut rng(8), &alice, &bob.public_key(), b"x").unwrap();
-        assert_ne!(&blob[..32], &blob2[..32], "ephemeral pubkey must be random");
+        assert_ne!(&blob[1..33], &blob2[1..33], "ephemeral pubkey must be random");
         assert_ne!(
-            &blob[32..32 + NONCE_LEN],
-            &blob2[32..32 + NONCE_LEN],
+            &blob[33..33 + NONCE_LEN],
+            &blob2[33..33 + NONCE_LEN],
             "nonce must be random"
         );
     }
@@ -506,11 +573,82 @@ mod tests {
         // eph_pub = 0 is the canonical low-order point; x25519 with it yields
         // an all-zero shared secret for any scalar.
         let mut blob = vec![0u8; MIN_BLOB_LEN + 1];
-        blob[..32].fill(0);
+        blob[0] = WIRE_VERSION;
+        blob[1..33].fill(0);
         assert_eq!(
             decrypt(&bob, &blob).unwrap_err(),
             CryptoError::InvalidEphemeralKey
         );
+    }
+
+    /// A short message must be padded so the blob size lands on a bucket boundary.
+    #[test]
+    fn blob_is_padded_to_bucket_size() {
+        let alice = Identity::generate(&mut rng(1));
+        let bob = Identity::generate(&mut rng(2));
+
+        // Short message → should round up to the smallest bucket (256).
+        let blob_small = encrypt(&mut rng(7), &alice, &bob.public_key(), b"x").unwrap();
+        assert!(
+            PADDING_BUCKETS.contains(&blob_small.len()),
+            "blob len {} is not a bucket boundary",
+            blob_small.len()
+        );
+        assert_eq!(blob_small.len(), 256);
+
+        // A larger message should also land on a bucket boundary.
+        let large_msg = vec![0u8; 300];
+        let blob_large = encrypt(&mut rng(8), &alice, &bob.public_key(), &large_msg).unwrap();
+        assert!(
+            PADDING_BUCKETS.contains(&blob_large.len()) || blob_large.len() % 65536 == 0,
+            "blob len {} is not a bucket boundary",
+            blob_large.len()
+        );
+    }
+
+    /// The same plaintext encrypted with different RNG seeds must produce the
+    /// same blob size (same bucket) but different blob contents (random padding).
+    #[test]
+    fn padding_is_random_per_message() {
+        let alice = Identity::generate(&mut rng(1));
+        let bob = Identity::generate(&mut rng(2));
+        let msg = b"hello bob, this is a test message";
+
+        let blob1 = encrypt(&mut rng(100), &alice, &bob.public_key(), msg).unwrap();
+        let blob2 = encrypt(&mut rng(200), &alice, &bob.public_key(), msg).unwrap();
+
+        // Same bucket → same size.
+        assert_eq!(blob1.len(), blob2.len(), "same plaintext must have same blob size");
+
+        // Different RNG → different ephemeral key, nonce, and padding → different bytes.
+        assert_ne!(&blob1[..], &blob2[..], "different RNG must produce different blobs");
+
+        // Both must decrypt correctly.
+        assert_eq!(decrypt(&bob, &blob1).unwrap().plaintext, msg);
+        assert_eq!(decrypt(&bob, &blob2).unwrap().plaintext, msg);
+    }
+
+    /// The compressed_len field must be parsed correctly so the decompressor
+    /// never sees trailing padding bytes.
+    #[test]
+    fn compressed_len_field_is_parsed_correctly() {
+        let alice = Identity::generate(&mut rng(1));
+        let bob = Identity::generate(&mut rng(2));
+
+        // Normal round-trip.
+        let msg = b"round trip test with some content";
+        let blob = encrypt(&mut rng(7), &alice, &bob.public_key(), msg).unwrap();
+        assert_eq!(decrypt(&bob, &blob).unwrap().plaintext, msg);
+
+        // A message whose compressed size happens to produce a blob that lands
+        // exactly on a bucket boundary (zero padding). We can't easily engineer
+        // this, but we can verify the decrypt path works with the actual data.
+        // Just verify that every bucket-sized blob round-trips.
+        for size in [1usize, 10, 100, 200, 500, 1000, 5000] {
+            let m = vec![0xABu8; size];
+            let b = encrypt(&mut rng(42), &alice, &bob.public_key(), &m).unwrap();
+            assert_eq!(decrypt(&bob, &b).unwrap().plaintext, m.to_vec());
+        }
     }
 
     /// A recipient key that isn't a curve point can't be encrypted to, and the

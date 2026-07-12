@@ -118,14 +118,16 @@ The wire-visible "envelope" carries only the recipient and the opaque blob. The 
    ```
    compressed = zstd(plaintext_bytes)   // standard zstd frame (embeds content size)
    ```
-5. Sign the recipient pubkey concatenated with the compressed plaintext. Binding the signature to the recipient prevents the same blob from being replayed against another recipient:
+5. Sign the recipient pubkey concatenated with the compressed plaintext and padding. Binding the signature to the recipient prevents the same blob from being replayed against another recipient:
    ```
+   compressed_len = uint32_be(len(compressed))
+   padding        = random_bytes(target_blob_size - unpadded_blob_size)
    signature = ed25519_sign(sender_ed25519_private,
-                            recipient_ed25519_public || compressed)
+                            recipient_ed25519_public || compressed_len || compressed || padding)
    ```
 6. Build the inner buffer that will be encrypted:
    ```
-   inner = sender_ed25519_public || signature || compressed
+   inner = sender_ed25519_public || signature || compressed_len || compressed || padding
    ```
 7. Generate a random 24-byte nonce and AEAD-encrypt the inner buffer:
    ```
@@ -142,15 +144,16 @@ The wire-visible "envelope" carries only the recipient and the opaque blob. The 
 1. Split the blob: 32-byte `ephemeral_public`, 24-byte `nonce`, remainder is `ciphertext`.
 2. Derive the recipient's X25519 private key from the recipient's Ed25519 private key, compute the raw shared secret with `ephemeral_public`, and HKDF-derive the same `key`.
 3. AEAD-decrypt the ciphertext to recover the inner buffer.
-4. Split: 32-byte `sender_ed25519_public`, 64-byte `signature`, remainder is `compressed`.
-5. Verify the signature over `recipient_ed25519_public || compressed` using `sender_ed25519_public`. Reject the message on failure.
-6. zstd-decompress to recover the plaintext payload.
+4. Split: 32-byte `sender_ed25519_public`, 64-byte `signature`, 4-byte `compressed_len` (big-endian u32), then `compressed_len` bytes of `compressed` (the remainder is padding).
+5. Verify the signature over `recipient_ed25519_public || inner[96..]` (i.e. `compressed_len || compressed || padding`) using `sender_ed25519_public`. Reject the message on failure.
+6. zstd-decompress the `compressed` bytes (only the `compressed_len`-length slice, not the trailing padding) to recover the plaintext payload.
 
 ### Encrypted Blob Format
 
 On the wire (cleartext, server-visible):
 
 ```
+version                   (1 byte, currently 0x01)
 ephemeral_x25519_pubkey   (32 bytes)
 nonce                     (24 bytes)
 ciphertext                (variable, includes 16-byte AEAD tag)
@@ -161,20 +164,34 @@ After AEAD decryption, the inner buffer is:
 ```
 sender_ed25519_pubkey     (32 bytes)
 signature                 (64 bytes)
-compressed_plaintext      (variable, zstd)
+compressed_len            (4 bytes, big-endian u32)
+compressed_plaintext      (variable, zstd; exactly compressed_len bytes)
+padding                   (variable, random)
 ```
 
-The sender's pubkey and signature are inside the AEAD ciphertext: the server never sees them, and only the intended recipient can recover the sender's identity. The minimum blob size is `32 + 24 + 32 + 64 + 16 = 168` bytes. A relay rejects any blob shorter than that as malformed (`400`), since it cannot possibly carry an envelope.
+The sender's pubkey and signature are inside the AEAD ciphertext: the server never sees them, and only the intended recipient can recover the sender's identity. The `compressed_len` field tells the recipient exactly where the zstd frame ends, so trailing padding bytes are never fed to the decompressor. The minimum blob size is `1 + 32 + 24 + 32 + 64 + 4 + 16 = 173` bytes. A relay rejects any blob shorter than that as malformed (`400`), since it cannot possibly carry an envelope.
 
-> **Compression before encryption leaks plaintext structure.** The payload is zstd-compressed *then* encrypted (steps 4–7), so the ciphertext length is a function of how *compressible* the plaintext was, not just how long it was. XChaCha20-Poly1305 is a stream cipher with no padding: the blob is exactly `72 + len(compressed)` bytes, and that number is visible to every relay and network observer.
+### Length Padding
+
+Blob sizes are padded to fixed boundaries so the on-wire length does not reveal the exact compressed (and thus plaintext) size to relays and network observers. The padding is added *inside* the AEAD ciphertext (after the compressed data, before encryption), so the server only sees the padded size.
+
+The bucket boundaries are:
+
+```
+256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
+```
+
+A blob is rounded up to the smallest bucket ≥ its unpadded size. Above 65536 bytes, the blob is rounded up to the next multiple of 65536. The padding bytes are randomly generated per message, so two encryptions of the same plaintext produce the same blob size (same bucket) but different blob contents. The on-wire blob is therefore `173 + len(compressed) + len(padding)` bytes, and that padded size is all a relay or network observer sees.
+
+> **Compression before encryption leaks plaintext structure.** The payload is zstd-compressed *then* encrypted (steps 4–7), so the ciphertext length is a function of how *compressible* the plaintext was, not just how long it was. XChaCha20-Poly1305 is a stream cipher with no padding: without length padding the blob would be exactly `173 + len(compressed)` bytes, and that number would be visible to every relay and network observer. Version 0x01 adds length padding (see *Length Padding* above), which buckets blob sizes to fixed boundaries so the exact compressed size is hidden.
 >
 > Two consequences. First, message length is only ever obscured *upward*: a long but repetitive message can produce a smaller blob than a short random-looking one, and blob size still distinguishes a one-word reply from a pasted document. Second — the more serious one — where an attacker can influence part of the plaintext that is compressed together with a secret, the compressed size reveals whether the two share structure. That is the CRIME/BREACH pattern, and it is a real (if narrow) concern for a format that compresses attacker-influenceable text alongside sensitive text in one frame.
 >
-> Skrepka accepts this: payloads are small, each message is compressed independently (no cross-message compression context), and there is no adaptive-guessing oracle in the protocol — an attacker cannot make the client re-encrypt a chosen variant of a secret on demand. Implementations must **not** add one (e.g. by compressing several messages, or attacker-supplied and user-supplied text, into a shared frame). A future revision should add length padding (e.g. bucket blobs to fixed sizes), which is the only real mitigation.
+> Skrepka accepts the remaining risk: payloads are small, each message is compressed independently (no cross-message compression context), and there is no adaptive-guessing oracle in the protocol — an attacker cannot make the client re-encrypt a chosen variant of a secret on demand. Implementations must **not** add one (e.g. by compressing several messages, or attacker-supplied and user-supplied text, into a shared frame). Length padding (version 0x01) obscures the exact compressed size by bucketing blob lengths, but does not eliminate the CRIME/BREACH side channel within a single bucket — it only makes the granularity coarser.
 
 ### Cryptographic Versioning
 
-There is currently **no version field** on the wire or in the plaintext payload, and the HKDF `info` string is the fixed constant `"skrepka-v1"`. The unknown-`type` rule (§4) gives forward compatibility for *payload* types, but the wire format, AEAD, KDF, and curve choices have no negotiated version, so there is no in-band path to migrate them without a flag day. A future revision should introduce an explicit protocol version (e.g. a leading version byte on the blob, or a `v` field) to allow cryptographic agility.
+The wire format carries a leading **version byte** (currently `0x01`) on every encrypted blob. A recipient that sees a version it does not recognise rejects the blob (`CryptoError::Decrypt`) without attempting further processing, so a future revision can introduce a new AEAD, KDF, or curve by bumping this byte. Version 0x01 includes length padding (see *Length Padding* above): blobs are padded to fixed-size bucket boundaries, and the inner buffer carries a 4-byte `compressed_len` field so the recipient can separate the zstd frame from trailing padding. The HKDF `info` string remains the fixed constant `"skrepka-v1"` for version 0x01. The unknown-`type` rule (§4) gives forward compatibility for *payload* types; the version byte gives the same for the wire format, AEAD, KDF, and curve choices. A future revision that changes the crypto primitives should bump both the version byte and the HKDF `info` string together.
 
 ---
 

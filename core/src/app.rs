@@ -5,7 +5,8 @@
 //! key-value storage, a timer, and (natively, fed back as events) the Keychain,
 //! QR scanning, photo picking, and clipboard.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crux_core::{
@@ -358,6 +359,7 @@ impl Model {
 /// `ingest_poll`) would have to become a two-step round-trip through the shell.
 /// That refactor is worth doing; it is not worth folding into a bug-fix pass, so
 /// the impurity is documented rather than hidden.
+// TODO: replace with crux_time effect for deterministic timestamps
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -729,10 +731,11 @@ impl App for Skrepka {
                     .filter(|c| !c.blocked)
                     .map(|c| c.pubkey.clone())
                     .collect();
+                let payload_json = Arc::new(protocol::serialize_payload(&payload, ts));
                 for peer in recipients {
                     model.outbox.push_back(OutboxItem {
                         recipient: peer,
-                        envelope_json: protocol::serialize_payload(&payload, ts),
+                        envelope_json: Arc::clone(&payload_json),
                     });
                 }
                 Command::all([
@@ -1160,7 +1163,7 @@ impl Skrepka {
         let text = Payload::Text { id, body };
         model.outbox.push_back(OutboxItem {
             recipient: peer.clone(),
-            envelope_json: protocol::serialize_payload(&text, ts),
+            envelope_json: Arc::new(protocol::serialize_payload(&text, ts)),
         });
         // On first contact, also share our profile.
         if first_to_peer {
@@ -1171,7 +1174,7 @@ impl Skrepka {
             };
             model.outbox.push_back(OutboxItem {
                 recipient: peer.clone(),
-                envelope_json: protocol::serialize_payload(&profile, ts),
+                envelope_json: Arc::new(protocol::serialize_payload(&profile, ts)),
             });
         }
 
@@ -1270,10 +1273,12 @@ impl Skrepka {
         };
 
         let now = now_ms();
-        let mut touched_convos: Vec<String> = Vec::new();
+        let mut touched_convos: HashSet<String> = HashSet::new();
         let mut contacts_dirty = false;
         // sender hex -> message ids needing acks
         let mut ack_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // Lazily-built per-sender sets of known message IDs for O(1) text dedup.
+        let mut seen_ids: HashMap<String, HashSet<String>> = HashMap::new();
 
         let mut budget = MAX_POLL_TOTAL_BYTES;
         for ev in page.events {
@@ -1338,8 +1343,12 @@ impl Skrepka {
                         contacts_dirty = true;
                     }
                     let convo = model.messages.entry(sender.clone()).or_default();
-                    // dedup by id
-                    if !convo.iter().any(|m| m.id == msg_id) {
+                    // Lazily build the per-sender ID set on first touch.
+                    let id_set = seen_ids.entry(sender.clone()).or_insert_with(|| {
+                        convo.iter().map(|m| m.id.clone()).collect()
+                    });
+                    // dedup by id — O(1) via HashSet
+                    if !id_set.contains(&msg_id) {
                         convo.push(StoredMessage {
                             id: msg_id.clone(),
                             body,
@@ -1347,25 +1356,39 @@ impl Skrepka {
                             outgoing: false,
                             delivered: false,
                         });
+                        id_set.insert(msg_id.clone());
                         convo.sort_by_key(|m| m.ts);
                         trim_history(convo);
-                        if !touched_convos.contains(&sender) {
-                            touched_convos.push(sender.clone());
-                        }
+                        touched_convos.insert(sender.clone());
                     }
                     ack_targets.entry(sender).or_default().push(msg_id);
                 }
                 Payload::DeliveryAck { ack_ids } => {
+                    // Staleness check: drop a replayed ack whose ts predates the
+                    // last one we processed for this contact.
+                    let stale = model
+                        .contacts
+                        .get(&sender)
+                        .is_some_and(|c| ts < c.last_ack_ts);
+                    if stale {
+                        continue;
+                    }
+                    // Update last_ack_ts to the clamped ts.
+                    if let Some(c) = model.contacts.get_mut(&sender) {
+                        c.last_ack_ts = ts;
+                        contacts_dirty = true;
+                    }
+                    let ack_set: HashSet<String> = ack_ids.iter().cloned().collect();
                     if let Some(convo) = model.messages.get_mut(&sender) {
                         let mut changed = false;
                         for m in convo.iter_mut() {
-                            if m.outgoing && ack_ids.contains(&m.id) && !m.delivered {
+                            if m.outgoing && ack_set.contains(&m.id) && !m.delivered {
                                 m.delivered = true;
                                 changed = true;
                             }
                         }
-                        if changed && !touched_convos.contains(&sender) {
-                            touched_convos.push(sender);
+                        if changed {
+                            touched_convos.insert(sender);
                         }
                     }
                 }
@@ -1412,7 +1435,7 @@ impl Skrepka {
                 };
                 model.outbox.push_back(OutboxItem {
                     recipient: sender.clone(),
-                    envelope_json: protocol::serialize_payload(&payload, ack_ts),
+                    envelope_json: Arc::new(protocol::serialize_payload(&payload, ack_ts)),
                 });
             }
         }
@@ -1653,7 +1676,7 @@ mod tests {
         let bad = hex::encode([0xabu8; 32]); // 32 bytes, not a curve point
         m.outbox.push_back(OutboxItem {
             recipient: bad,
-            envelope_json: "{}".into(),
+            envelope_json: Arc::new("{}".into()),
         });
 
         let _ = app.update(Event::StartFlush, &mut m);
@@ -1834,12 +1857,12 @@ mod tests {
         for recipient in [&enemy, &friend] {
             m.outbox.push_back(OutboxItem {
                 recipient: recipient.clone(),
-                envelope_json: protocol::serialize_payload(
+                envelope_json: Arc::new(protocol::serialize_payload(
                     &Payload::DeliveryAck {
                         ack_ids: vec!["m1".into()],
                     },
                     1,
-                ),
+                )),
             });
         }
 
@@ -1932,7 +1955,7 @@ mod tests {
         m.flushing = true;
         m.outbox.push_back(OutboxItem {
             recipient: peer_hex(9),
-            envelope_json: "{}".into(),
+            envelope_json: Arc::new("{}".into()),
         });
 
         let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
@@ -1950,7 +1973,7 @@ mod tests {
         for _ in 0..2 {
             m.outbox.push_back(OutboxItem {
                 recipient: peer_hex(9),
-                envelope_json: "{}".into(),
+                envelope_json: Arc::new("{}".into()),
             });
         }
         // First send goes out and marks the model as flushing.
@@ -2531,5 +2554,58 @@ mod tests {
         assert!(vm.has_identity);
         assert_eq!(vm.my_pubkey_hex, m.my_pubkey);
         assert_eq!(vm.my_pubkey_ob.split('-').count(), 16);
+    }
+
+    /// A replayed delivery.ack with an older `ts` must be dropped, and
+    /// `last_ack_ts` must not regress — otherwise a relay re-delivering an old
+    /// page could flip messages back to "not delivered" or keep a stale ack live.
+    #[test]
+    fn a_replayed_delivery_ack_is_ignored() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        let mut contact = Contact::new(peer.clone(), "Bob".into(), 0);
+        contact.last_ack_ts = 100;
+        m.contacts.insert(peer.clone(), contact);
+        m.messages.insert(
+            peer.clone(),
+            vec![StoredMessage {
+                id: "m1".into(),
+                body: "hi".into(),
+                ts: 50,
+                outgoing: true,
+                delivered: false,
+            }],
+        );
+
+        // An ack with ts = 50 (< 100) is stale → ignored.
+        let ack = Payload::DeliveryAck {
+            ack_ids: vec!["m1".into()],
+        };
+        let page = page_from(9, &m, &ack, 50);
+        let _ = app.ingest_poll(&mut m, page);
+        assert!(
+            !m.messages[&peer][0].delivered,
+            "a stale ack must not mark the message delivered"
+        );
+        assert_eq!(
+            m.contacts[&peer].last_ack_ts, 100,
+            "last_ack_ts must not regress"
+        );
+
+        // An ack with ts = 200 (> 100) passes → message is marked delivered.
+        let ack = Payload::DeliveryAck {
+            ack_ids: vec!["m1".into()],
+        };
+        let page = page_from(9, &m, &ack, 200);
+        let _ = app.ingest_poll(&mut m, page);
+        assert!(
+            m.messages[&peer][0].delivered,
+            "a fresh ack must mark the message delivered"
+        );
+        assert_eq!(
+            m.contacts[&peer].last_ack_ts, 200,
+            "last_ack_ts advances to the fresh ack's ts"
+        );
     }
 }

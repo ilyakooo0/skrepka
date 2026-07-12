@@ -72,15 +72,15 @@ messageMaxAge = 2592000000
 -- Max length of a hex-encoded message body / opaque blob (40 MiB hex ≈ 20 MiB bytes).
 maxBlobLen : Int
 maxBlobLen = 41943040
--- Min length of a hex-encoded blob: 336 chars = 168 bytes. A well-formed blob is
--- `ephemeral_x25519_pubkey (32) || nonce (24) || ciphertext`, and the ciphertext
--- seals at minimum `sender_pubkey (32) || signature (64)` plus the 16-byte
--- Poly1305 tag — so 32 + 24 + 32 + 64 + 16 = 168 bytes is the floor for a blob
--- any client could possibly decrypt (PROTOCOL.md §3). Anything shorter is
--- garbage by construction: it cannot carry a sender identity, and storing it only
+-- Min length of a hex-encoded blob: 346 chars = 173 bytes. A well-formed blob is
+-- `version (1) || ephemeral_x25519_pubkey (32) || nonce (24) || ciphertext`, and the
+-- ciphertext seals at minimum `sender_pubkey (32) || signature (64) || compressed_len (4)`
+-- plus the 16-byte Poly1305 tag — so 1 + 32 + 24 + 32 + 64 + 4 + 16 = 173 bytes is the
+-- floor for a blob any client could possibly decrypt (PROTOCOL.md §3). Anything shorter
+-- is garbage by construction: it cannot carry a sender identity, and storing it only
 -- burns mailbox rows and the recipient's poll bandwidth. Reject at the boundary.
 minBlobLen : Int
-minBlobLen = 336
+minBlobLen = 346
 -- Cap on items in a batched send request.
 maxBatchSize : Int
 maxBatchSize = 100
@@ -474,13 +474,16 @@ capPerServer = \items server maxN -> union (filter (\x -> not (x.server == serve
 -- desired length in characters (so n=48 yields 24 random bytes of entropy).
 -- Session bearers, /auth challenges, and federation auth nonces all use n=48
 -- (192 bits of entropy, well beyond birthday bound).
-genToken : Int -> IO {random} Text
-genToken = \n -> if n <= 0
-then yield ""
+-- Tail-recursive: builds the string left-to-right via an accumulator (`acc`),
+-- appending one hex char per call. Each `acc ++ ...` still copies the accumulator,
+-- but the total work is O(n) rather than O(n²) because characters are appended
+-- in forward order instead of prepended at every return.
+genToken : Int -> Text -> IO {random} Text
+genToken = \n acc -> if n <= 0
+then yield acc
 else do
   d <- randomInt 16
-  rest <- genToken (n - 1)
-  yield (take 1 (drop d "0123456789abcdef") ++ rest)
+  genToken (n - 1) (acc ++ take 1 (drop d "0123456789abcdef"))
 
 -- True when `s` is non-empty, even-length, and only lowercase hex digits.
 -- `chars` yields the *distinct* character set (relations dedupe), which is
@@ -1095,7 +1098,7 @@ forwardQueuedToServer = \pubkey serverName -> atomic (do
 handleChallenge : PubkeyHex -> Text -> IO {rw *challenges, clock, random} (Result HttpError {challenge: Text, expiresAt: Timestamp})
 handleChallenge = \pubkey clientIp -> do
   t <- now
-  challenge <- genToken 48
+  challenge <- genToken 48 ""
   let expiresAt = t + challengeExpiry
   atomic (do
     ch <- *challenges
@@ -1111,7 +1114,7 @@ handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *challeng
 handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
   let expiry = t + sessionExpiry
-  token <- genToken 48
+  token <- genToken 48 ""
   -- The client signs (target host, challenge) under a domain-separation tag so a
   -- relay server cannot replay the signature to a different server. We verify
   -- against our own configured hostname (port stripped), which a relay cannot forge.
