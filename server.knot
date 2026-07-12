@@ -103,21 +103,10 @@ maxChallenges = 10000
 -- `handleVerifyAuth`, which LRU-evicts the soonest-to-expire sessions once the
 -- pool is full.
 --
--- LIMITATION — that global LRU eviction is Sybil-floodable. `capList` does not
--- care whose sessions it drops: an attacker minting fresh keypairs (free) from
--- enough IPs to stay under `authRateLimit` can push `maxSessions` worth of
--- throwaway sessions through and evict *live* users' sessions, which shows up
--- client-side as a 401 and a forced re-handshake.
---
--- `maxSessionsPerKey` bounds any single key's share, and the per-IP
--- `authRateLimit` bounds the rate from any single source, so the flood needs real
--- distributed resources. Deliberately not fixed with a per-IP session cap:
--- `clientIp` is empty for every session whenever there is no trusted proxy
--- (`clientIpOf`), so such a cap would collapse to a single global bucket in
--- exactly the deployments that have no XFF — and even with a proxy it would
--- punish carrier-NAT users, where thousands of legitimate clients genuinely do
--- share one address. A real fix prices session creation (proof of work, or a
--- per-key deposit) rather than counting IPs.
+-- LIMITATION — global LRU eviction is Sybil-floodable: an attacker with enough
+-- IPs can evict live users' sessions. Bounded by `maxSessionsPerKey` and per-IP
+-- `authRateLimit`; a per-IP session cap was rejected (collapses without XFF,
+-- punishes carrier-NAT). A real fix prices session creation, not IPs. See PROTOCOL.md §10.
 maxSessions : Int
 maxSessions = 10000
 -- Per-pubkey ceiling on outstanding challenges (prevents one key from exhausting the pool).
@@ -125,35 +114,22 @@ maxChallengesPerKey : Int
 maxChallengesPerKey = 5
 -- Per-pubkey ceiling on concurrent sessions.
 --
--- LIMITATION — concurrent sessions for the *same* keypair are not supported, and
--- this cap does not make them safe; it only bounds how many can exist. The mailbox
--- is keyed by pubkey, not by session, and /poll treats a cursor advance as an ack
--- that *deletes* rows (`ackPolledMessages`), so two devices sharing one keypair
--- poll the same mailbox and each one's ack destroys messages the other has not
--- read yet — whichever polls first wins, and the loser silently never sees them.
--- The expected model is one keypair per device (PROTOCOL.md §2: "Each device
--- generates its own independent keypair and is treated as a separate identity").
--- The cap exists so a key cannot exhaust the global `maxSessions` pool, not to
--- make key-sharing work. Fixing key-sharing needs per-session delivery cursors
--- instead of destructive acks — out of scope for v0.1.
+-- LIMITATION — concurrent sessions for the same keypair are not supported: the
+-- mailbox is keyed by pubkey, so two devices sharing a key poll one mailbox and
+-- each ack destroys messages the other hasn't read. The model is one keypair per
+-- device (PROTOCOL.md §2). This cap only bounds pool exhaustion, not key-sharing.
+-- A fix needs per-session delivery cursors — out of scope for v0.1.
 maxSessionsPerKey : Int
 maxSessionsPerKey = 10
 -- Ceiling on gossip-learned (remote) presence rows.
 --
 -- `/federation/gossip` is unauthenticated and pubkeys are free to invent, so
--- without a cap one peer can grow `*presence` without bound — and every hot path
--- that reads it is an O(n) scan (`hasLocalPresence` on every inbound federated
--- forward, `refreshLocalPresence` on every /poll). `handleRecvGossip` LRU-evicts
--- (`capList`) down to this ceiling.
+-- without a cap one peer can grow `*presence` without bound. `handleRecvGossip`
+-- LRU-evicts (`capList`) down to this ceiling.
 --
--- Local rows (`server == serverHost`) are deliberately *exempt* from this cap and
--- from `maxPresencePerServer`. They are already bounded by `maxSessions` — one row
--- per authenticated session — and a shared ceiling would let a gossip flood evict
--- them: gossiped rows expire at `onlineGossipTtl` (90 min) while local rows expire
--- at `sessionExpiry` (60 min), so `capList`'s soonest-to-expire eviction would drop
--- *our own online users* first, and every inbound federated forward addressed to
--- them would then answer `no_presence` (404). Capping only remote rows bounds the
--- table without handing an attacker a way to knock local users off the mesh.
+-- Local rows are exempt: they're bounded by `maxSessions` and a shared ceiling
+-- would let gossip floods evict our own online users (local TTL 60 min < gossip
+-- TTL 90 min, so `capList` drops local rows first). See PROTOCOL.md §10.
 maxPresence : Int
 maxPresence = 100000
 -- Per-peer-server ceiling on gossip-learned presence rows, so a single peer cannot
@@ -258,13 +234,14 @@ federationEnabled = False {}
 seedPeers : Text
 seedPeers = ""
 
--- `seedPeers` split on commas, trimmed, with blanks dropped. Deliberately *not*
--- filtered through `isBadServerName` here: every federation egress site applies
--- the deny-list itself, so a denylisted seed is refused at exactly the same choke
--- point as a denylisted gossip-learned peer, and the parse stays purely
--- syntactic.
+-- `seedPeers` split on commas, trimmed, with blanks and our own hostname dropped.
+-- Deliberately *not* filtered through `isBadServerName` here: every federation
+-- egress site applies the deny-list itself, so a denylisted seed is refused at
+-- exactly the same choke point as a denylisted gossip-learned peer.
+-- Filtering `serverHost` out at parse time lets `gossipTargets` drop its
+-- `isLocalServer` guard (the only other source, `collectPeers`, already filters it).
 seedPeerList : [Text]
-seedPeerList = filter (\s -> s != "") (splitOnComma seedPeers)
+seedPeerList = filter (\s -> s != "" && not isLocalServer s) (splitOnComma seedPeers)
 
 federationUrl : Text -> Text
 federationUrl = \server -> federationScheme ++ server
@@ -672,12 +649,11 @@ isReservedIPv4 = \host ->
 -- outright. Gated by `isDottedNumeric` so a digit-led hostname label like
 -- "0foo.example.com" is never caught (it isn't all-digits-and-dots).
 hasLeadingZeroOctet : Text -> Bool
-hasLeadingZeroOctet = \host -> isDottedNumeric host && anyOctetLeadingZero host
-anyOctetLeadingZero : Text -> Bool
-anyOctetLeadingZero = \host ->
-  let octet = beforeDot host in
-  let rest = afterDot host in
-  (length octet > 1 && take 1 octet == "0") || (rest != "" && anyOctetLeadingZero rest)
+hasLeadingZeroOctet = \host ->
+  isDottedNumeric host &&
+  (let octet = beforeDot host in
+   let rest = afterDot host in
+   (length octet > 1 && take 1 octet == "0") || (rest != "" && hasLeadingZeroOctet rest))
 
 -- True when the host's first two labels name a reserved IPv4 range: the zero net
 -- (0/8), loopback (127/8), and the RFC1918 blocks 10/8, 172.16/12, 192.168/16,
@@ -696,42 +672,25 @@ isReservedOctetPrefix = \host ->
 
 -- Block private/reserved/internal hostnames (SSRF defense).
 --
--- LIMITATION — this check is purely lexical: it inspects the *string* a peer
--- gave us, never the address that string resolves to. An attacker who controls
--- DNS for a name that looks perfectly public (`relay.attacker.example`) can
--- point it at 127.0.0.1 / 169.254.169.254 / an RFC1918 host and this returns
--- False, so `fetch` dials the internal target anyway. Nothing here rules that
--- out, and re-resolving before the request wouldn't either (the resolver is
--- free to answer differently the second time — a DNS-rebinding TOCTOU). Closing
--- it needs resolution and connection to be fused: resolve the name, reject the
--- resulting IP against the same reserved ranges, and connect to *that* IP —
--- which the `fetch` in use does not expose. Treat the checks below as a guard
--- against accidental and naive-literal SSRF, not against a motivated attacker
--- with a nameserver. Percent-encoding tricks are likewise not covered.
+-- LIMITATION — purely lexical: inspects the string, never the resolved address.
+-- DNS-rebinding TOCTOU and percent-encoding tricks bypass it. A real fix needs
+-- resolve-then-pin (fuse resolution with connection), which `fetch` doesn't
+-- expose. See PROTOCOL.md §10. Treat as a guard against naive-literal SSRF, not
+-- a motivated attacker with a nameserver.
 --
--- Enforced on inbound requests (`handleRecvGossip`, so a peer can't claim a bogus
--- `fromServer`) and again at every federation egress site (`sendBatchedGossip`,
--- `retryPendingForwards`, `forkForwardsTo`) as defense-in-depth — state persisted
--- before a denylist tightening, or any future ingress gap, must not steer a
--- `fetch` at an internal host.
+-- Enforced on inbound (`handleRecvGossip`) and at every egress site
+-- (`sendBatchedGossip`, `retryPendingForwards`, `forkForwardsTo`) as
+-- defense-in-depth — persisted state from before a denylist tightening must
+-- not steer a `fetch` at an internal host.
 --
--- A legitimate `host:port` server name has exactly one `:`, so the multi-colon
--- check rejects bare IPv6 literals (loopback `::`/`::1`, link-local `fe80::/10`,
--- ULA `fc00::/7`, globals like `2001:db8::1`) while leaving `host:port` intact.
---
--- The name is trailing-dot-stripped (`stripTrailingDot`) before every check.
--- The system resolver treats `localhost.` / `foo.internal.` (DNS root form) the
--- same as the dotless name, but the bare `== "localhost"` and `.internal`-suffix
--- tests would miss the dotted form. Peer-supplied names already arrive stripped
--- (`isValidServerName` rejects a trailing dot at the `/federation/gossip`
--- boundary), so the only unstripped ingress is `seedPeers`; normalizing here
--- keeps the deny-list sound independently of that upstream check — the same
--- "don't trust prior validation" posture the rest of this note describes.
+-- A legitimate `host:port` has exactly one `:`, so the multi-colon check
+-- rejects bare IPv6 literals. The name is trailing-dot-stripped before every
+-- check so `localhost.` / `foo.internal.` (DNS root form) are caught.
 isBadServerName : Text -> Bool
 isBadServerName = \raw ->
   let sn = stripTrailingDot raw in
   let host = beforeColon sn in
-  sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || isNumericHost host || isReservedOctetPrefix host || isReservedIPv4 host || hasLeadingZeroOctet host || hasPrefix "0x" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [".", ":", "[", "192.0.2.", "203.0.113."] || any (\s -> hasSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
+  sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || isNumericHost host || isReservedOctetPrefix host || isReservedIPv4 host || hasLeadingZeroOctet host || hasPrefix "0x" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [".", ":", "192.0.2.", "203.0.113."] || any (\s -> hasSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
 
 -- ============================================
 -- Auth helpers
@@ -932,7 +891,10 @@ refreshLocalPresence = \pubkey expiry -> do
 -- One sweep over every state ref: drops expired rows in a single atomic block.
 -- Returns the locally-expired presence rows whose pubkey has no other live
 -- local session, so the caller can broadcast offline gossip for them.
-pruneExpired : Int<Ms> -> IO {rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions} [PubkeyHex]
+-- Also prunes orphaned *forwards entries whose message has been removed by
+-- the TTL sweep — a 404-deferred forward (recipient never online at the peer)
+-- would otherwise stay forever with retries=0, retried every sweep indefinitely.
+pruneExpired : Int<Ms> -> IO {rw *challenges, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions} [PubkeyHex]
 pruneExpired = \t -> atomic do
   ch <- *challenges
   *challenges = filter (\x -> x.expiresAt > t) ch
@@ -940,6 +902,10 @@ pruneExpired = \t -> atomic do
   *sessions = filter (\x -> x.expiresAt > t) ses
   msgs <- *messages
   *messages = filter (\m -> t - m.receivedAt < messageMaxAge) msgs
+  -- Prune forwards whose message was removed by the TTL sweep above.
+  -- ForwardEntry carries no timestamp, so match against the surviving messages.
+  fw <- *forwards
+  *forwards = filter (\f -> any (\m -> m.toKey == f.toKey && m.encryptedBlob == f.encryptedBlob) msgs) fw
   ff <- *forwardFailures
   *forwardFailures = filter (\f -> t - f.failedAt < forwardFailureMaxAge) ff
   -- presence: remember locally-expired keys for offline gossip
@@ -969,7 +935,7 @@ pruneExpired = \t -> atomic do
 -- rows, and from then on it is reachable through the `peers` half of this union
 -- like any other peer.
 gossipTargets : [Text] -> [Text]
-gossipTargets = \peers -> filter (\s -> not isLocalServer s) (union peers seedPeerList)
+gossipTargets = \peers -> union peers seedPeerList
 
 -- Fan out one bundle of gossip events to each peer (presence-learned peers and
 -- bootstrap seeds alike), skipping denylisted peers and peers in backoff. No-op
@@ -1094,7 +1060,9 @@ forwardQueuedToServer = \pubkey serverName -> atomic (do
   fwds <- *forwards
   let existing = countWhere (\f -> f.toServer == server) fwds
   let budget = max 0 (maxForwardsPerServer - existing)
-  let candidates = filter (\m -> m.toKey == pubkey && not any (forwardMatches m.toKey m.encryptedBlob server) fwds && not any (\d -> d.server == server) m.deliveredTo) msgs
+  let notYetForwarded = \m -> not any (forwardMatches m.toKey m.encryptedBlob server) fwds
+  let notYetDelivered = \m -> not any (\d -> d.server == server) m.deliveredTo
+  let candidates = filter (\m -> m.toKey == pubkey && notYetForwarded m && notYetDelivered m) msgs
   let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget (sortBy (\m -> m.receivedAt) candidates))
   *forwards = union fwds newFwds)
 
@@ -1147,6 +1115,8 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   -- The client signs (target host, challenge) under a domain-separation tag so a
   -- relay server cannot replay the signature to a different server. We verify
   -- against our own configured hostname (port stripped), which a relay cannot forge.
+  -- Computed outside the atomic block: `verify` is not a DB effect, and computing
+  -- it here avoids re-running crypto on every STM retry.
   let signedText = "skrepka-auth-v1:" ++ authHost serverHost ++ ":" ++ challenge
   let sigValid = case bytesFromHex pubkey of
     Just {value: pk} -> case bytesFromHex signature of
@@ -1210,6 +1180,8 @@ handlePoll = \cursor authorization clientIp -> do
         let clampedCursor = max 0 (min (max t curSeq) cursor)
         when (clampedCursor > 0) (ackPolledMessages pubkey clampedCursor)
         pres <- *presence
+        -- Refresh local presence when less than half the session TTL remains,
+        -- so peers don't time us out mid-session.
         let stale = not any (\p -> p.pubkey == pubkey && isLocalServer p.server && p.expiresAt - t >= sessionExpiry / 2) pres
         refreshPeers <- if stale then refreshLocalPresence pubkey (t + sessionExpiry) else yield []
         yield (Just {value: {pubkey, clampedCursor, refreshPeers}}))
@@ -1272,15 +1244,17 @@ doPoll = \s t -> do
 -- The ack is destructive and keyed on `pubkey` alone — no session identity enters
 -- into it, so two sessions sharing one keypair race over one mailbox. Accepted
 -- limitation; see `maxSessionsPerKey`.
+-- Self-atomic: touches two refs (*messages and *forwards), so wraps its own
+-- transaction rather than relying on the caller's.
 ackPolledMessages : PubkeyHex -> Timestamp -> IO {rw *forwards, rw *messages} {}
-ackPolledMessages = \pubkey cursor -> do
+ackPolledMessages = \pubkey cursor -> atomic (do
   msgs <- *messages
   let matches = \m -> m.toKey == pubkey && m.receivedAt <= cursor
   let toAck = filter matches msgs
   let blobs = map (\m -> m.encryptedBlob) toAck
   *messages = filter (\m -> not matches m) msgs
   fwds <- *forwards
-  *forwards = filter (\f -> not (f.toKey == pubkey && elem f.encryptedBlob blobs)) fwds
+  *forwards = filter (\f -> not (f.toKey == pubkey && elem f.encryptedBlob blobs)) fwds)
 
 -- ============================================
 -- Handler: send
@@ -1295,6 +1269,21 @@ ackPolledMessages = \pubkey cursor -> do
 -- The sender's UI treats every success the same and learns "they got it" only via
 -- the recipient's E2E ack.
 
+-- Batch validation: checks batch size, per-message field validity, and self-send.
+-- Refined-type validation at the route boundary only fires for top-level scalar
+-- body fields; `to`/`encryptedBlob` are nested inside the `messages` list, so the
+-- runtime does not check them. `isValidBlobHex` is the same predicate `BlobHex`
+-- refines on, so this check and the route boundary cannot drift apart.
+validateBatch : [{to: PubkeyHex, encryptedBlob: BlobHex | a}] -> PubkeyHex -> Maybe HttpError
+validateBatch = \messages senderKey ->
+  if count messages > maxBatchSize
+  then Just {value: {status: 413, message: "batch_too_large"}}
+  else if any (\m -> not (isValidExactHex 64 m.to && isValidBlobHex m.encryptedBlob)) messages
+  then Just {value: {status: 400, message: "invalid_message"}}
+  else if any (\m -> m.to == senderKey) messages
+  then Just {value: {status: 400, message: "self_send"}}
+  else Nothing {}
+
 -- POST /messages: send a list of ciphertexts atomically. Self-send is
 -- rejected up-front; the remaining batch is committed inside one atomic
 -- block (all-or-nothing) which reads presence to pre-stage federation
@@ -1305,21 +1294,9 @@ handleSendMessages = \messages authorization clientIp -> do
   auth <- authedPubkey authorization t clientIp
   case auth of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
-    Just {value: senderKey} -> do
-      if count messages > maxBatchSize
-      then yield (Err {error: {status: 413, message: "batch_too_large"}})
-      -- Refined-type validation at the route boundary only fires for top-level
-      -- scalar body fields; `to`/`encryptedBlob` are nested inside the `messages`
-      -- list, so the runtime does not check them. Enforce the `PubkeyHex` /
-      -- `BlobHex` contracts here so a malformed key, or a non-hex / under-
-      -- `minBlobLen` / over-`maxBlobLen` blob, is rejected instead of stored.
-      -- `isValidBlobHex` is the same predicate `BlobHex` refines on, so this
-      -- check and the route boundary cannot drift apart.
-      else if any (\m -> not (isValidExactHex 64 m.to && isValidBlobHex m.encryptedBlob)) messages
-      then yield (Err {error: {status: 400, message: "invalid_message"}})
-      else if any (\m -> m.to == senderKey) messages
-      then yield (Err {error: {status: 400, message: "self_send"}})
-      else do
+    Just {value: senderKey} -> case validateBatch messages senderKey of
+      Just {value: err} -> yield (Err {error: err})
+      Nothing {} -> do
         committed <- atomic (do
           pres <- *presence
           let staged = map (\m -> {
@@ -1339,7 +1316,9 @@ handleSendMessages = \messages authorization clientIp -> do
             -- is `[]` on the normal path; on a client resend it carries the real
             -- set. Mirrors `forwardQueuedToServer`'s guard so we don't re-stage a
             -- forward to a peer that already accepted this blob.
-            let delivered = fold (\acc m -> if m.toKey == c.to && m.encryptedBlob == c.encryptedBlob then union acc (map (\d -> d.server) m.deliveredTo) else acc) [] existingMsgs
+            let delivered = case findFirst existingMsgs (\m -> m.toKey == c.to && m.encryptedBlob == c.encryptedBlob) of
+              Just {value: m} -> map (\d -> d.server) m.deliveredTo
+              Nothing {} -> ([] : [Text])
             -- Stage outbox rows for peers under their `maxForwardsPerServer`
             -- ceiling. Peers at the cap still get the immediate post-commit
             -- delivery attempt (`forkForwardsTo`) — only the retry-queue row
@@ -1538,7 +1517,7 @@ api = serve Api where
 -- Endless tick: prune expired state and gossip offline for locally-expired
 -- keys. First sweep happens immediately so stale rows persisted by the
 -- previous process clear before the next interval elapses.
-backgroundPrune : IO {rw *challenges, rw *forwardFailures, rw *messages, rw *presence, rw *sessions, network, clock} a
+backgroundPrune : IO {rw *challenges, rw *forwardFailures, rw *forwards, rw *messages, rw *presence, rw *sessions, network, clock} a
 backgroundPrune = do
   t <- now
   -- Snapshot the peer set *before* the sweep. `pruneExpired` drops every expired
