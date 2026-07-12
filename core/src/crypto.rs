@@ -600,7 +600,7 @@ mod tests {
         let large_msg = vec![0u8; 300];
         let blob_large = encrypt(&mut rng(8), &alice, &bob.public_key(), &large_msg).unwrap();
         assert!(
-            PADDING_BUCKETS.contains(&blob_large.len()) || blob_large.len() % 65536 == 0,
+            PADDING_BUCKETS.contains(&blob_large.len()) || blob_large.len().is_multiple_of(65536),
             "blob len {} is not a bucket boundary",
             blob_large.len()
         );
