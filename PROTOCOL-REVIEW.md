@@ -280,3 +280,60 @@ blocks until every `fetch` resolves. The prune sweep's writes conflict with the
 retry loop's atomic blocks. A fix needs either a `fetch` deadline or a
 transaction that yields between per-peer batches, neither of which the current
 `fetch` supports. Documented in PROTOCOL-REVIEW.md #9.
+
+---
+
+## Fixed in third-pass audit (2026-07-13)
+
+### ✅ F. Cursor advanced before budget check — message loss on oversized poll page
+
+**Severity: high — fixed.**
+
+`ingest_poll` advanced `model.cursor` to `page.cursor` before the event loop.
+If the `MAX_POLL_TOTAL_BYTES` budget was exhausted mid-page, the loop broke
+but the cursor stayed at `page.cursor`. The next poll acked the whole page to
+the relay, which deleted every event the client never processed — permanent
+message loss. A relay serving 4+ large blobs (each up to 20 MiB) in a single
+50-event page was enough to trigger this.
+
+**Fix:** Save the pre-page cursor and restore it when the budget is exhausted.
+
+### ✅ G. `send_text` did not check if peer is blocked
+
+**Severity: medium — fixed.**
+
+Blocking was documented as cutting a peer off in both directions, and the
+ingest side correctly dropped blocked peers' messages. But `send_text` had no
+block check, so a user could keep sending messages to a blocked contact. The
+Swift `ChatView` composer was also not disabled for blocked peers.
+
+**Fix:** `send_text` now refuses with an error when the active peer is blocked.
+The Swift composer disables both the text field and the send button when
+`activePeerBlocked` is true.
+
+### ✅ H. `compressed` and `signed` intermediates not zeroized in `crypto::encrypt`
+
+**Severity: low — fixed.**
+
+The `inner` buffer was correctly `Zeroize`d after encryption, but the
+`compressed` (compressed plaintext) and `signed` (signature input containing
+recipient_pub + compressed + padding) intermediates were plain `Vec<u8>`s
+that retained sensitive data in freed memory. Both are now `Zeroizing<Vec<u8>>`.
+
+### ✅ I. PROTOCOL.md §10 "No cryptographic agility" contradicted §3
+
+**Severity: spec only — fixed.**
+
+The §10 risk table said "The wire format has no version field" but §3 had
+been updated to describe a version byte (`0x01`) and a "Cryptographic
+Versioning" section. The table entry now accurately reflects the version
+byte's existence and its limitations.
+
+### ✅ J. PROTOCOL.md §4 "Blocking" didn't match implementation
+
+**Severity: spec only — fixed.**
+
+The spec said blocked senders' messages "are still received and decrypted but
+are not displayed." The implementation drops them before decryption. The spec
+now accurately describes the implementation: messages are dropped without
+decryption or storage, and blocking is bidirectional.

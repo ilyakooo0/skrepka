@@ -301,7 +301,7 @@ pub fn encrypt(
     let raw_secret = x25519(&eph_priv, &recip_x)?;
     let key = derive_key(&raw_secret, &eph_pub, &recip_x);
 
-    let compressed = compress(plaintext);
+    let compressed = Zeroizing::new(compress(plaintext));
 
     // Compute padding: round the full on-wire blob size up to a bucket boundary
     // so relays and network observers cannot tell the exact (compressed) length.
@@ -319,7 +319,7 @@ pub fn encrypt(
 
     // Sign recipient_pub || compressed_len_bytes || compressed || padding
     // (i.e. recipient_pub || everything after the 96-byte header in inner).
-    let mut signed = Vec::with_capacity(32 + 4 + compressed.len() + padding.len());
+    let mut signed = Zeroizing::new(Vec::with_capacity(32 + 4 + compressed.len() + padding.len()));
     signed.extend_from_slice(recipient_ed_pub);
     signed.extend_from_slice(&compressed_len_bytes);
     signed.extend_from_slice(&compressed);

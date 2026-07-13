@@ -1511,6 +1511,14 @@ impl Skrepka {
         let Some(peer) = model.active_peer.clone() else {
             return render();
         };
+        // Blocking cuts the peer off in both directions (PROTOCOL.md §4). The
+        // ingest side drops their messages; the send side must refuse too, or
+        // a blocked peer still receives our texts, acks, and the liveness
+        // signal that blocking is supposed to cut off.
+        if model.contacts.get(&peer).is_some_and(|c| c.blocked) {
+            model.error = Some("cannot send to a blocked contact".into());
+            return render();
+        }
         let body = model.compose.trim().to_string();
         if body.is_empty() {
             return render();
@@ -1768,6 +1776,7 @@ impl Skrepka {
         if model.kv_load_failed {
             return Command::done();
         }
+        let prev_cursor = model.cursor;
         if page.cursor > model.cursor {
             model.cursor = page.cursor;
         }
@@ -1797,6 +1806,13 @@ impl Skrepka {
                     // A page this large is a misbehaving relay, not real mail.
                     // Stop here; the rest of the page is discarded exactly as an
                     // undecryptable blob would be.
+                    //
+                    // Restore the cursor: it was advanced to `page.cursor` above,
+                    // but we have not processed the remaining events. If we keep
+                    // the advanced cursor, the next poll acks the whole page to
+                    // the relay — including every event we skipped — and the
+                    // relay deletes them. Those messages are permanently lost.
+                    model.cursor = prev_cursor;
                     model.error = Some("relay sent an oversized poll page".into());
                     break;
                 }
@@ -4175,5 +4191,87 @@ mod tests {
             m.contacts[&peer].last_ack_ts, 200,
             "last_ack_ts advances to the fresh ack's ts"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // cursor restoration on budget exhaustion
+    // -----------------------------------------------------------------------
+
+    /// The cursor is advanced to `page.cursor` before the event loop runs. If the
+    /// poll-byte budget is exhausted mid-page, the loop breaks — but the cursor
+    /// must be restored to its pre-page value. Otherwise the next poll acks the
+    /// whole page to the relay, which deletes every event we skipped: permanent
+    /// message loss.
+    #[test]
+    fn a_budget_exhausted_mid_page_restores_the_cursor() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        m.contacts
+            .insert(peer.clone(), Contact::new(peer.clone(), String::new(), 0));
+        m.cursor = 100;
+
+        // Two blobs, each at the per-blob ceiling (MAX_BLOB_LEN hex chars =
+        // MAX_BLOB_LEN/2 decoded bytes = 21 MiB). Individually they pass the
+        // per-blob size gate; together they exceed the 64 MiB page budget.
+        // The first passes the budget check (21 < 64) and fails decrypt (it's
+        // not a real blob); the second fails the budget check (21 + 21 + 21 > 64).
+        // Three blobs to be sure: 3 × 21 = 63 MiB (just under 64), so use four.
+        let big_hex = "ab".repeat(MAX_BLOB_LEN); // MAX_BLOB_LEN hex chars = MAX_BLOB_LEN/2 bytes
+        let page = PollResp {
+            events: (0..4)
+                .map(|_| PollEvent {
+                    encrypted_blob: big_hex.clone(),
+                })
+                .collect(),
+            cursor: 200,
+        };
+        let _ = app.ingest_poll(&mut m, page);
+
+        assert_eq!(
+            m.cursor, 100,
+            "the cursor must be restored — the page was not fully processed"
+        );
+        assert!(
+            m.error.as_ref().is_some_and(|e| e.contains("oversized")),
+            "the user is told"
+        );
+        assert!(
+            m.messages.get(&peer).is_none_or(Vec::is_empty),
+            "nothing was stored from the oversized page"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // send_text block check
+    // -----------------------------------------------------------------------
+
+    /// Blocking cuts a peer off in both directions. `send_text` must refuse to
+    /// enqueue a message to a blocked contact — otherwise the block only stops
+    /// their incoming mail while we keep sending them ours.
+    #[test]
+    fn send_text_to_a_blocked_peer_is_refused() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        let mut contact = Contact::new(peer.clone(), "Enemy".into(), 0);
+        contact.blocked = true;
+        m.contacts.insert(peer.clone(), contact);
+        m.active_peer = Some(peer.clone());
+        m.compose = "hello?".into();
+
+        let _ = app.update(Event::SendText, &mut m);
+
+        assert!(
+            m.outbox.is_empty(),
+            "no message is queued for a blocked peer"
+        );
+        assert!(
+            m.error.as_ref().is_some_and(|e| e.contains("blocked")),
+            "the user is told why"
+        );
+        // The compose buffer is not cleared — the user might want to unblock
+        // and resend, and losing their draft would be surprising.
+        assert_eq!(m.compose, "hello?");
     }
 }

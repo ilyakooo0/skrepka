@@ -293,6 +293,7 @@ struct ChatView: View {
             TextField("Message", text: $draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
+                .disabled(core.view.activePeerBlocked)
             Button {
                 let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !text.isEmpty else { return }
@@ -302,7 +303,8 @@ struct ChatView: View {
             } label: {
                 Image(systemName: "arrow.up.circle.fill").font(.title)
             }
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      || core.view.activePeerBlocked)
         }
         .padding(.horizontal).padding(.vertical, 8)
         .background(.bar)

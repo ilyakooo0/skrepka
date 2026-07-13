@@ -292,7 +292,7 @@ This is the only delivery-confirmation channel in the protocol: the server itsel
 
 ### Blocking
 
-Blocking is client-side only. A blocked sender's messages are still received and decrypted but are not displayed to the user. The protocol does not provide a mechanism to tell a server to reject messages from a specific pubkey.
+Blocking is client-side only. A blocked sender's messages are dropped without decryption or storage — the reference client does not decrypt, store, display, or ack them. The protocol does not provide a mechanism to tell a server to reject messages from a specific pubkey. Blocking also cuts the peer off in the other direction: the reference client refuses to send new messages to a blocked contact and drops any queued outgoing messages (including delivery acks) for them when the block is applied.
 
 ---
 
@@ -411,7 +411,7 @@ Errors return a non-2xx HTTP status with a body of:
 | 401         | `unauthorized`        | `/poll` or `/messages` with a missing, invalid, or expired token, or a request from a different IP |
 | 403         | `federation_disabled` | A `/federation/*` endpoint was called while federation is disabled |
 | 404         | `no_presence`         | Federated forward arrived for a recipient with no live local session |
-| 413         | `batch_too_large`     | A `/messages` batch exceeds the 100-message cap |
+| 413         | `batch_too_large`     | A `/messages` batch exceeds the 100-message cap. A bare `413` with no JSON body (the runtime's HTTP body-size cap, `--http-max-body-bytes`) is also possible when the total request body exceeds the operator-configured limit; clients MUST treat a bodyless `413` the same as `batch_too_large` for retry purposes. Operators **must** set `--http-max-body-bytes` above `maxBlobLen` plus the JSON envelope (the reference deployment uses `42M`), otherwise the runtime's default 16 MiB cap rejects a maximum-size blob before the per-blob `400` check is reached. |
 | 429         | (HTTP only)           | Per-route rate limit exceeded        |
 | 503         | `capacity`            | Server-side resource cap reached     |
 
@@ -670,7 +670,7 @@ Skrepka protects message **content and sender identity** from servers and networ
 | **Same-recipient replay**         | Nothing stops a captured blob from being re-delivered to its original recipient. The damage is bounded per payload type: `text` is deduplicated by `id`, `delivery.ack` is idempotent, and `profile` — which carries no `id` — is guarded by the per-contact `ts` staleness check of §4, which the reference client enforces, so a replayed stale `profile` is dropped rather than rolling a contact's cached profile back. A client that omits that check is open to profile rollback. |
 | **Open federation — gossip redirect** | `/federation/gossip` is unauthenticated, and the harm is *active*, not merely passive observation: an attacker announces the victim online at a host it controls and origin relays forward the victim's queued ciphertext there. See *Open federation* below. |
 | **Open federation — forward injection** | `/federation/forward` is unauthenticated, so any host can inject arbitrary blobs into a currently-online recipient's mailbox. See *Open federation* below. |
-| **No cryptographic agility**      | The wire format has no version field and a fixed HKDF `info` (§3); the AEAD/KDF/curve cannot be migrated in-band. |
+| **No crypto rotation performed**  | The wire format carries a version byte (§3, *Cryptographic Versioning*) and a fixed HKDF `info` (`"skrepka-v1"`), so a future revision *can* introduce new AEAD/KDF/curve choices by bumping both. No such rotation has been performed, and a client that does not recognize the version byte rejects the blob outright — but there is no negotiation, so an old client cannot discover that a new one exists. |
 | **TOFU only**                     | A first-time public key is trusted on encounter; users must compare fingerprints out-of-band to detect MITM at first contact. |
 
 ### Open Federation (accepted limitation of v0.1)
