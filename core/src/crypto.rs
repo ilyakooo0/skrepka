@@ -351,9 +351,14 @@ pub fn encrypt(
 }
 
 /// Result of decrypting a blob: the plaintext and the sender's Ed25519 pubkey (hex).
+///
+/// `plaintext` is `Zeroizing<Vec<u8>>` so the decrypted message content is wiped
+/// from memory when the value is dropped, not left in freed memory for a heap
+/// inspection or a jetsam snapshot. `Deref` makes `&dec.plaintext` work as `&[u8]`
+/// via auto-deref, so callers that only read the bytes need no change.
 #[derive(Debug, Clone)]
 pub struct Decrypted {
-    pub plaintext: Vec<u8>,
+    pub plaintext: Zeroizing<Vec<u8>>,
     pub sender_hex: String,
 }
 
@@ -427,7 +432,7 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     inner.zeroize();
     signed.zeroize();
     Ok(Decrypted {
-        plaintext,
+        plaintext: Zeroizing::new(plaintext),
         sender_hex: hex::encode(sender_pub),
     })
 }
@@ -478,7 +483,7 @@ mod tests {
         assert!(blob.len() >= MIN_BLOB_LEN);
 
         let out = decrypt(&bob, &blob).unwrap();
-        assert_eq!(out.plaintext, msg);
+        assert_eq!(out.plaintext.as_slice(), msg);
         assert_eq!(out.sender_hex, alice.public_key_hex());
     }
 
@@ -570,7 +575,7 @@ mod tests {
         let bob = Identity::generate(&mut rng(2));
         let msg = vec![7u8; MAX_PLAINTEXT_LEN];
         let blob = encrypt(&mut rng(3), &alice, &bob.public_key(), &msg).unwrap();
-        assert_eq!(decrypt(&bob, &blob).unwrap().plaintext, msg);
+        assert_eq!(decrypt(&bob, &blob).unwrap().plaintext.as_slice(), msg.as_slice());
     }
 
     /// A low-order ephemeral point makes every recipient derive the same shared
@@ -632,8 +637,8 @@ mod tests {
         assert_ne!(&blob1[..], &blob2[..], "different RNG must produce different blobs");
 
         // Both must decrypt correctly.
-        assert_eq!(decrypt(&bob, &blob1).unwrap().plaintext, msg);
-        assert_eq!(decrypt(&bob, &blob2).unwrap().plaintext, msg);
+        assert_eq!(decrypt(&bob, &blob1).unwrap().plaintext.as_slice(), msg);
+        assert_eq!(decrypt(&bob, &blob2).unwrap().plaintext.as_slice(), msg);
     }
 
     /// The compressed_len field must be parsed correctly so the decompressor
@@ -646,7 +651,7 @@ mod tests {
         // Normal round-trip.
         let msg = b"round trip test with some content";
         let blob = encrypt(&mut rng(7), &alice, &bob.public_key(), msg).unwrap();
-        assert_eq!(decrypt(&bob, &blob).unwrap().plaintext, msg);
+        assert_eq!(decrypt(&bob, &blob).unwrap().plaintext.as_slice(), msg);
 
         // A message whose compressed size happens to produce a blob that lands
         // exactly on a bucket boundary (zero padding). We can't easily engineer
@@ -655,7 +660,7 @@ mod tests {
         for size in [1usize, 10, 100, 200, 500, 1000, 5000] {
             let m = vec![0xABu8; size];
             let b = encrypt(&mut rng(42), &alice, &bob.public_key(), &m).unwrap();
-            assert_eq!(decrypt(&bob, &b).unwrap().plaintext, m.to_vec());
+            assert_eq!(decrypt(&bob, &b).unwrap().plaintext.as_slice(), m.as_slice());
         }
     }
 

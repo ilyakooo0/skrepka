@@ -339,3 +339,59 @@ identity is inside the AEAD ciphertext, so decryption is necessary to learn who
 the message is from). The spec now accurately describes the implementation:
 messages are decrypted to recover the sender identity, then dropped without
 storage, display, or ack, and blocking is bidirectional.
+
+---
+
+## Fixed in sixth-pass audit (2026-07-13)
+
+### ✅ K. No send-side body length check — silent message loss
+
+**Severity: medium — fixed.**
+
+`send_text` did not check `body.len()` against `protocol::MAX_BODY_LEN`. The
+recipient's `parse_payload` enforces the cap and silently drops oversized text,
+so a user who pastes a very long message would see it stored locally, sent to
+the relay, and marked "sent" — but it would never arrive, never get acked, and
+the sender would see it stuck as "sent" forever with no error.
+
+**Fix:** `send_text` now refuses with `"message too long"` before queueing.
+
+### ✅ L. No profile field length checks in SaveProfile — silent broadcast failure
+
+**Severity: medium — fixed.**
+
+`SaveProfile` broadcast `display_name`, `bio`, and `photo` without checking
+against `MAX_DISPLAY_NAME_LEN` (128 chars), `MAX_BIO_LEN` (1024 chars), or
+`MAX_PHOTO_LEN` (64 KiB). Every recipient's `parse_payload` would silently drop
+the oversized profile, creating a divergence between what the sender sees and
+what contacts see.
+
+**Fix:** All three fields are validated before the profile is saved or broadcast.
+
+### ✅ M. `Decrypted` plaintext not zeroized
+
+**Severity: low — fixed.**
+
+The `inner` buffer and `signed` intermediate were carefully `Zeroizing<Vec<u8>>`,
+but the output `Decrypted { plaintext: Vec<u8> }` escaped the zeroization
+boundary. The decrypted message content sat in freed memory until the allocator
+reused that page. `plaintext` is now `Zeroizing<Vec<u8>>`.
+
+### ✅ N. No send watchdog — stuck `flushing` guard
+
+**Severity: low — fixed.**
+
+The poll loop had a watchdog (`POLL_WATCHDOG_MS`) that recovered from a dropped
+HTTP effect, but the send loop had no equivalent. If `SendResult` never came
+back (a cancelled task, a backgrounded app, a bug), `flushing` stayed `true`
+forever and the outbox was permanently stuck. A `FlushWatchdog` event (armed
+alongside the send, same pattern as the poll watchdog) now releases the guard
+and retries the flush after `FLUSH_WATCHDOG_MS` (90 s).
+
+### ✅ O. No nickname length check in AddContact
+
+**Severity: very low — fixed.**
+
+The `nickname` in `AddContact` was stored without any length bound. A user could
+set a megabyte-long nickname, bloating the contacts kv blob (rewritten in full on
+every change). `nickname.len()` is now checked against `MAX_DISPLAY_NAME_LEN`.

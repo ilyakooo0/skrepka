@@ -73,6 +73,20 @@ const MAX_POLL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// relay, so leave the margin.
 const POLL_WATCHDOG_MS: u64 = 90_000;
 
+/// How long a send may stay in flight before we assume the shell lost it.
+///
+/// `flushing` gates the whole send loop, and it is only cleared by a
+/// `SendResult`. If the shell ever drops the HTTP effect (a cancelled task, a
+/// backgrounded app, a bug), `flushing` stays `true` and the outbox is
+/// permanently stuck — new messages queue up but never send. The watchdog
+/// releases the guard so the next `StartFlush` can retry.
+///
+/// Kept above the shell's 70 s HTTP timeout for the same reason as
+/// `POLL_WATCHDOG_MS`: a misfire on a merely slow send is survivable (the late
+/// `SendResult` finds `in_flight` already cleared and pops nothing), but each
+/// one costs a redundant request.
+const FLUSH_WATCHDOG_MS: u64 = 90_000;
+
 /// Messages per `/messages` request.
 ///
 /// The relay rejects a longer batch outright (`413 batch_too_large`,
@@ -210,6 +224,11 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     StartFlush,
+    /// Fires `FLUSH_WATCHDOG_MS` after a flush is issued; a no-op unless the
+    /// send is somehow still in flight — same pattern as `PollWatchdog`.
+    #[serde(skip)]
+    #[facet(skip)]
+    FlushWatchdog,
     #[serde(skip)]
     #[facet(skip)]
     ChallengeResult(u64, #[facet(opaque)] HttpResult),
@@ -862,6 +881,13 @@ impl App for Skrepka {
                 }
             }
             Event::AddContact { input, nickname } => {
+                // A nickname is stored in the contacts kv blob, which is
+                // rewritten in full on every change. An unbounded nickname
+                // bloats the blob and every subsequent write.
+                if nickname.len() > protocol::MAX_DISPLAY_NAME_LEN {
+                    model.error = Some("nickname too long".into());
+                    return render();
+                }
                 match phonemic::try_parse_pubkey(&input) {
                     Some(hex) if hex != model.my_pubkey => {
                         model
@@ -933,6 +959,23 @@ impl App for Skrepka {
                 bio,
                 photo,
             } => {
+                // The recipient's `parse_payload` enforces these caps and
+                // silently drops oversized profiles. Without these checks the
+                // sender's local profile would be saved, broadcast to every
+                // contact, and silently dropped by every recipient — a silent
+                // divergence between what the sender sees and what contacts see.
+                if display_name.chars().count() > protocol::MAX_DISPLAY_NAME_LEN {
+                    model.error = Some("display name too long".into());
+                    return render();
+                }
+                if bio.chars().count() > protocol::MAX_BIO_LEN {
+                    model.error = Some("bio too long".into());
+                    return render();
+                }
+                if photo.as_ref().is_some_and(|p| p.len() > protocol::MAX_PHOTO_LEN) {
+                    model.error = Some("photo too large".into());
+                    return render();
+                }
                 model.profile = OwnProfile {
                     display_name,
                     bio,
@@ -1214,6 +1257,19 @@ impl App for Skrepka {
 
             // ---------------- outbox ----------------
             Event::StartFlush => self.flush_next(model),
+            Event::FlushWatchdog => {
+                // The send request never came back — the shell dropped the HTTP
+                // effect (backgrounded app, bug), and `flushing` has been stuck
+                // ever since. Release the guard and retry the flush. The late
+                // `SendResult`, if it ever arrives, finds `in_flight` already
+                // cleared and pops nothing.
+                if !model.flushing {
+                    return Command::done();
+                }
+                model.flushing = false;
+                model.in_flight = None;
+                self.flush_next(model)
+            }
             Event::SendResult(Ok(resp)) => {
                 // The in-flight send is over; `flush_next` refuses to run while
                 // this is set, so it must be cleared before *any* branch below.
@@ -1530,6 +1586,15 @@ impl Skrepka {
         if body.is_empty() {
             return render();
         }
+        // The recipient's `parse_payload` enforces `MAX_BODY_LEN` and silently
+        // drops oversized text. Without this check the message would be stored
+        // locally, sent to the relay, and marked "sent" — but never arrive, never
+        // get acked, and the sender would see it stuck as "sent" forever with no
+        // error.
+        if body.len() > protocol::MAX_BODY_LEN {
+            model.error = Some("message too long".into());
+            return render();
+        }
 
         // Check the contact cap *before* mutating anything. The old order
         // cleared `compose` and inserted the message into `model.messages`
@@ -1733,7 +1798,12 @@ impl Skrepka {
             .header("authorization", format!("Bearer {token}"))
             .body_json(&SendBatch { messages })
         {
-            Ok(req) => persist.and(req.build().then_send(Event::SendResult)),
+            Ok(req) => persist.and(req.build().then_send(Event::SendResult))
+                .and(
+                    Time::notify_after(Duration::from_millis(FLUSH_WATCHDOG_MS))
+                        .0
+                        .then_send(|_| Event::FlushWatchdog),
+                ),
             Err(_) => {
                 // Not a dead loop: the next StartFlush (from a poll page or a
                 // fresh send) retries the head of the outbox.
@@ -4313,6 +4383,10 @@ mod tests {
     // send_text block check
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // send_text body length check
+    // -----------------------------------------------------------------------
+
     /// Blocking cuts a peer off in both directions. `send_text` must refuse to
     /// enqueue a message to a blocked contact — otherwise the block only stops
     /// their incoming mail while we keep sending them ours.
@@ -4340,5 +4414,168 @@ mod tests {
         // The compose buffer is not cleared — the user might want to unblock
         // and resend, and losing their draft would be surprising.
         assert_eq!(m.compose, "hello?");
+    }
+
+    /// A text body over `MAX_BODY_LEN` would be stored locally and sent to the
+    /// relay, but the recipient's `parse_payload` silently drops oversized text.
+    /// The sender would see it stuck as "sent" forever with no error.
+    #[test]
+    fn send_text_refuses_an_oversized_body() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        m.active_peer = Some(peer.clone());
+        m.compose = "x".repeat(protocol::MAX_BODY_LEN + 1);
+
+        let _ = app.update(Event::SendText, &mut m);
+
+        assert!(m.outbox.is_empty(), "nothing is queued");
+        assert!(m.messages.get(&peer).is_none_or(Vec::is_empty), "nothing stored");
+        assert!(!m.compose.is_empty(), "compose is preserved");
+        assert!(m.error.as_ref().is_some_and(|e| e.contains("too long")));
+    }
+
+    // -----------------------------------------------------------------------
+    // SaveProfile field length checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_profile_rejects_an_oversized_display_name() {
+        let app = Skrepka;
+        let mut m = with_identity();
+
+        let _ = app.update(Event::SaveProfile {
+            display_name: "x".repeat(protocol::MAX_DISPLAY_NAME_LEN + 1),
+            bio: String::new(),
+            photo: None,
+        }, &mut m);
+
+        assert!(m.outbox.is_empty(), "no broadcast queued");
+        assert!(m.profile.display_name.is_empty(), "local profile not updated");
+        assert!(m.error.as_ref().is_some_and(|e| e.contains("display name")));
+    }
+
+    #[test]
+    fn save_profile_rejects_an_oversized_bio() {
+        let app = Skrepka;
+        let mut m = with_identity();
+
+        let _ = app.update(Event::SaveProfile {
+            display_name: "Alice".into(),
+            bio: "x".repeat(protocol::MAX_BIO_LEN + 1),
+            photo: None,
+        }, &mut m);
+
+        assert!(m.outbox.is_empty(), "no broadcast queued");
+        assert!(m.profile.bio.is_empty(), "local profile not updated");
+        assert!(m.error.as_ref().is_some_and(|e| e.contains("bio")));
+    }
+
+    #[test]
+    fn save_profile_rejects_an_oversized_photo() {
+        let app = Skrepka;
+        let mut m = with_identity();
+
+        let _ = app.update(Event::SaveProfile {
+            display_name: "Alice".into(),
+            bio: String::new(),
+            photo: Some("x".repeat(protocol::MAX_PHOTO_LEN + 1)),
+        }, &mut m);
+
+        assert!(m.outbox.is_empty(), "no broadcast queued");
+        assert!(m.profile.photo.is_none(), "local profile not updated");
+        assert!(m.error.as_ref().is_some_and(|e| e.contains("photo")));
+    }
+
+    // -----------------------------------------------------------------------
+    // AddContact nickname length check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn add_contact_rejects_an_oversized_nickname() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+
+        let _ = app.update(Event::AddContact {
+            input: peer.clone(),
+            nickname: "x".repeat(protocol::MAX_DISPLAY_NAME_LEN + 1),
+        }, &mut m);
+
+        assert!(!m.contacts.contains_key(&peer), "no contact created");
+        assert!(m.error.as_ref().is_some_and(|e| e.contains("nickname")));
+    }
+
+    // -----------------------------------------------------------------------
+    // FlushWatchdog unsticks a wedged send loop
+    // -----------------------------------------------------------------------
+
+    /// `flushing` is only cleared by `SendResult`. If the shell drops the HTTP
+    /// effect, the outbox is permanently stuck. The watchdog releases the guard
+    /// so the flush retries.
+    #[test]
+    fn the_flush_watchdog_unwedges_a_send_that_never_resolved() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+        m.outbox.push_back(queued(&peer, "stuck"));
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        assert!(m.flushing, "the send is in flight");
+        assert!(m.in_flight.is_some());
+
+        // The send never comes back. The watchdog fires, clears the stuck guard,
+        // and retries the flush — the message goes out again.
+        let mut cmd = app.update(Event::FlushWatchdog, &mut m);
+
+        assert!(m.flushing, "a fresh send is in flight (the retry)");
+        assert!(m.in_flight.is_some(), "in_flight is set for the retry");
+        let batches = sent_batches(&mut cmd);
+        assert_eq!(batches.len(), 1, "the message is re-sent");
+    }
+
+    /// A watchdog that fires after the send already completed is a no-op.
+    #[test]
+    fn a_stale_flush_watchdog_leaves_a_completed_send_alone() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        assert!(!m.flushing);
+        assert!(m.outbox.is_empty());
+
+        // The watchdog for the completed send fires late.
+        let _ = app.update(Event::FlushWatchdog, &mut m);
+        assert!(!m.flushing, "a completed send is not re-armed");
+        assert!(m.outbox.is_empty());
+    }
+
+    /// A late `SendResult` after the watchdog has already retried sees the
+    /// retry's `in_flight` and pops its items. This is correct: the retry sent
+    /// the same items, and a 200 means they were accepted — whether by the
+    /// original request or the retry is irrelevant. The items are delivered.
+    #[test]
+    fn a_late_send_result_after_the_watchdog_pops_the_retrys_items() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+        m.outbox.push_back(queued(&peer, "stuck"));
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        // The watchdog fires and retries the flush.
+        let _ = app.update(Event::FlushWatchdog, &mut m);
+        assert_eq!(m.outbox.len(), 1, "the item is still queued (re-sent)");
+
+        // Now the original send's result arrives late. The retry's in_flight is
+        // set, so a 200 pops the item — which is correct, the message was
+        // accepted by one of the two sends.
+        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        assert!(m.outbox.is_empty(), "the late 200 pops the retry's items — the message was accepted");
+        assert!(!m.flushing, "and the guard is released");
     }
 }
