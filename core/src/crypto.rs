@@ -312,7 +312,7 @@ pub fn encrypt(
     let target = padded_len(unpadded_blob_len);
     let pad_len = target - unpadded_blob_len;
 
-    let mut padding = vec![0u8; pad_len];
+    let mut padding = Zeroizing::new(vec![0u8; pad_len]);
     rng.fill_bytes(&mut padding);
 
     let compressed_len_bytes = (compressed.len() as u32).to_be_bytes();
@@ -381,9 +381,11 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     let key = derive_key(&raw_secret, &eph_pub, &recip_x_pub);
 
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*key));
-    let mut inner = cipher
-        .decrypt(XNonce::from_slice(&nonce), ciphertext)
-        .map_err(|_| CryptoError::Decrypt)?;
+    let mut inner = Zeroizing::new(
+        cipher
+            .decrypt(XNonce::from_slice(&nonce), ciphertext)
+            .map_err(|_| CryptoError::Decrypt)?,
+    );
 
     if inner.len() < 32 + 64 + 4 {
         inner.zeroize();
@@ -410,7 +412,7 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     // (covers compressed_len_bytes || compressed || padding).
     let verifying = VerifyingKey::from_bytes(&sender_pub).map_err(|_| CryptoError::BadSignature)?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    let mut signed = Vec::with_capacity(32 + (inner.len() - 96));
+    let mut signed = Zeroizing::new(Vec::with_capacity(32 + (inner.len() - 96)));
     signed.extend_from_slice(&recipient.public_key());
     signed.extend_from_slice(&inner[96..]);
     verifying
@@ -418,6 +420,12 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
         .map_err(|_| CryptoError::BadSignature)?;
 
     let plaintext = decompress(compressed)?;
+    // `inner` and `signed` hold the decrypted sender identity and message
+    // content; zeroize them explicitly on the success path too, not just on
+    // errors (the `Zeroizing` wrapper handles drop, but being explicit here
+    // keeps the success and error paths symmetric).
+    inner.zeroize();
+    signed.zeroize();
     Ok(Decrypted {
         plaintext,
         sender_hex: hex::encode(sender_pub),

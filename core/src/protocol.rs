@@ -115,7 +115,11 @@ pub fn parse_payload(bytes: &[u8]) -> Option<ParsedPayload> {
                 .iter()
                 .filter_map(|x| x.as_str().map(str::to_string))
                 .collect();
-            if ack_ids.iter().any(|id| id.len() > MAX_ID_LEN) {
+            // Re-check after filtering: a peer could pack the array with
+            // non-string junk that passes the raw count but leaves more
+            // real ids than the cap allows after filtering. The raw check
+            // above is an early out; this is the authoritative one.
+            if ack_ids.len() > MAX_ACK_IDS || ack_ids.iter().any(|id| id.len() > MAX_ID_LEN) {
                 return None;
             }
             Payload::DeliveryAck { ack_ids }

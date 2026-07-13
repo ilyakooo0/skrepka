@@ -334,6 +334,8 @@ byte's existence and its limitations.
 **Severity: spec only — fixed.**
 
 The spec said blocked senders' messages "are still received and decrypted but
-are not displayed." The implementation drops them before decryption. The spec
-now accurately describes the implementation: messages are dropped without
-decryption or storage, and blocking is bidirectional.
+are not displayed." The implementation drops them after decryption (the sender
+identity is inside the AEAD ciphertext, so decryption is necessary to learn who
+the message is from). The spec now accurately describes the implementation:
+messages are decrypted to recover the sender identity, then dropped without
+storage, display, or ack, and blocking is bidirectional.

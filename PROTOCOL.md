@@ -292,7 +292,7 @@ This is the only delivery-confirmation channel in the protocol: the server itsel
 
 ### Blocking
 
-Blocking is client-side only. A blocked sender's messages are dropped without decryption or storage — the reference client does not decrypt, store, display, or ack them. The protocol does not provide a mechanism to tell a server to reject messages from a specific pubkey. Blocking also cuts the peer off in the other direction: the reference client refuses to send new messages to a blocked contact and drops any queued outgoing messages (including delivery acks) for them when the block is applied.
+Blocking is client-side only. A blocked sender's messages are decrypted to recover the sender identity (which lives inside the AEAD ciphertext, §3), then dropped without storage, display, or ack — the reference client does not store, display, or ack them. Decryption is necessary because the sender identity is inside the AEAD ciphertext; the decrypted content is never persisted or shown. The protocol does not provide a mechanism to tell a server to reject messages from a specific pubkey. Blocking also cuts the peer off in the other direction: the reference client refuses to send new messages to a blocked contact and drops any queued outgoing messages (including delivery acks) for them when the block is applied.
 
 ---
 

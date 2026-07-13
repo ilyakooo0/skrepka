@@ -845,6 +845,18 @@ impl App for Skrepka {
                 }
                 if model.secret_key.is_some() && model.conn != ConnStatus::Online {
                     Command::event(Event::Authenticate)
+                } else if model.secret_key.is_some()
+                    && model.conn == ConnStatus::Online
+                    && !model.polling
+                {
+                    // The poll loop can die without `conn` going offline: after
+                    // `PollResult` clears `polling`, the re-poll is chained off
+                    // `SavedCursor`. If the shell drops that effect (backgrounded
+                    // app, bug), `polling` stays `false` with no pending re-poll
+                    // and the watchdog sees `!polling` and does nothing. The
+                    // status shows "online" but no polling ever happens. Restart
+                    // the loop here — `Connect` is fired on every foreground return.
+                    Command::event(Event::Poll)
                 } else {
                     render()
                 }
@@ -1528,7 +1540,6 @@ impl Skrepka {
         let id = uuid::Uuid::new_v4().to_string();
 
         let convo = model.messages.entry(peer.clone()).or_default();
-        let first_to_peer = !convo.iter().any(|m| m.outgoing);
         // Insert in order rather than appending: an incoming message may hold a
         // `ts` up to `MAX_FUTURE_SKEW_MS` ahead of ours, so appending would leave
         // the conversation unsorted — and `trim_history` ages out the *front*.
@@ -1544,21 +1555,26 @@ impl Skrepka {
         );
         trim_history(convo);
 
-        // Auto-create a bare contact if messaging a brand-new key.
-        model
-            .contacts
-            .entry(peer.clone())
-            .or_insert_with(|| Contact::new(peer.clone(), String::new(), ts));
+        // Auto-create a bare contact if messaging a brand-new key, respecting
+        // the same `MAX_CONTACTS` cap `ingest_poll` enforces. This is
+        // user-driven (not an attack vector), but the cap exists to bound the
+        // `contacts` kv blob, which is rewritten in full on every change.
+        let was_new = !model.contacts.contains_key(&peer);
+        if was_new && model.contacts.len() >= MAX_CONTACTS {
+            model.error = Some("contact list is full".into());
+            return render();
+        }
+        if was_new {
+            model
+                .contacts
+                .insert(peer.clone(), Contact::new(peer.clone(), String::new(), ts));
+        }
 
-        let text = Payload::Text { id, body };
-        model.outbox.push_back(OutboxItem::new(
-            peer.clone(),
-            Arc::new(protocol::serialize_payload(&text, ts)),
-        ));
-        // On first contact, also share our profile. Marked as a profile like any
-        // other, so a `SaveProfile` before this ever goes out supersedes it rather
-        // than queueing a second one behind it.
-        if first_to_peer {
+        // On first contact, share our profile *before* the text so the
+        // recipient's first impression is a name and avatar, not a truncated
+        // @p that gets replaced a moment later. Both are queued behind any
+        // in-flight items, so the ordering is preserved through the outbox.
+        if was_new {
             let profile = Payload::Profile {
                 display_name: model.profile.display_name.clone(),
                 bio: model.profile.bio.clone(),
@@ -1569,6 +1585,12 @@ impl Skrepka {
                 Arc::new(protocol::serialize_payload(&profile, ts)),
             ));
         }
+
+        let text = Payload::Text { id, body };
+        model.outbox.push_back(OutboxItem::new(
+            peer.clone(),
+            Arc::new(protocol::serialize_payload(&text, ts)),
+        ));
 
         Command::all([
             self.persist_messages(model, &peer),
@@ -1852,8 +1874,14 @@ impl Skrepka {
             // `ts` is chosen by the sender and drives conversation ordering,
             // in-chat ordering, and the displayed time. Bound it to the near
             // future so a peer cannot pin itself to the top of the list forever
-            // with `ts = i64::MAX`.
-            let ts = parsed.ts.min(now.saturating_add(MAX_FUTURE_SKEW_MS));
+            // with `ts = i64::MAX`, and bound it to the non-negative past so a
+            // malicious peer cannot make their own message invisible by dating
+            // it at `i64::MIN` — `insert_sorted` would put it at position 0 and
+            // `trim_history` would age it out first.
+            let ts = parsed
+                .ts
+                .max(0)
+                .min(now.saturating_add(MAX_FUTURE_SKEW_MS));
             let known = model.contacts.contains_key(&sender);
             match parsed.payload {
                 Payload::Text { id: msg_id, body } => {
