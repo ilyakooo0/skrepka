@@ -43,6 +43,14 @@ targets:
           - UIInterfaceOrientationPortrait
         NSCameraUsageDescription: Scan a contact's QR code to add them.
         NSPhotoLibraryUsageDescription: Choose a photo for your profile.
+        # Opportunistic catch-up polls while backgrounded (BGAppRefreshTask). `fetch` is the
+        # mode BGAppRefreshTask runs under; `processing` is for long deferrable work and is
+        # not what this is. The scheduler refuses — silently — any identifier not listed in
+        # BGTaskSchedulerPermittedIdentifiers, so it must match `SkrepkaApp.refreshTaskId`.
+        UIBackgroundModes:
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - lol.skrepka.SkrepkaApp.fetch
         # Declared so App Store Connect stops asking on every upload.
         ITSAppUsesNonExemptEncryption: false
         # Relays must be reachable over TLS. The only cleartext exception is a

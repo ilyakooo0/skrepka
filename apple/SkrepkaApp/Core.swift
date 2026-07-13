@@ -6,6 +6,15 @@ import SkrepkaShared
 /// each effect (HTTP, key-value, timer, render) and resolves it back into the core.
 @MainActor
 final class Core: ObservableObject {
+    /// One core per process, reachable outside the view tree.
+    ///
+    /// `SkrepkaApp` holds this in a `@StateObject`, but the background-refresh handler runs
+    /// with no view installed — and a `@StateObject` read from there hands back a *fresh*
+    /// instance every time. That would mean a second `CoreFFI` with its own identity, its own
+    /// kv state and its own poll loop, writing over the real one's files and rendering into
+    /// nothing. The state machine is a singleton in fact; make it one in the type.
+    static let shared = Core()
+
     @Published var view: ViewModel
 
     /// A Keychain failure never reaches the core — without an identity there is no
@@ -16,7 +25,7 @@ final class Core: ObservableObject {
     private let core = CoreFFI()
     private let store = KvStore()
 
-    init() {
+    private init() {
         // swiftlint:disable:next force_try
         self.view = try! .bincodeDeserialize(input: [UInt8](core.view()))
         bootIdentity()

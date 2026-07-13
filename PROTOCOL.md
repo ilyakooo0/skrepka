@@ -191,7 +191,7 @@ A blob is rounded up to the smallest bucket ≥ its unpadded size. Above 65536 b
 
 ### Cryptographic Versioning
 
-The wire format carries a leading **version byte** (currently `0x01`) on every encrypted blob. A recipient that sees a version it does not recognise rejects the blob (`CryptoError::Decrypt`) without attempting further processing, so a future revision can introduce a new AEAD, KDF, or curve by bumping this byte. Version 0x01 includes length padding (see *Length Padding* above): blobs are padded to fixed-size bucket boundaries, and the inner buffer carries a 4-byte `compressed_len` field so the recipient can separate the zstd frame from trailing padding. The HKDF `info` string remains the fixed constant `"skrepka-v1"` for version 0x01. The unknown-`type` rule (§4) gives forward compatibility for *payload* types; the version byte gives the same for the wire format, AEAD, KDF, and curve choices. A future revision that changes the crypto primitives should bump both the version byte and the HKDF `info` string together.
+The wire format carries a leading **version byte** (currently `0x01`) on every encrypted blob. A recipient that sees a version it does not recognise MUST reject the blob without attempting further processing (no AEAD decrypt, no key derivation, no decompression) — the reference client returns a decryption error and drops the blob. This ensures a future revision can introduce a new AEAD, KDF, or curve by bumping this byte without risk of misinterpreting an unknown format. Version 0x01 includes length padding (see *Length Padding* above): blobs are padded to fixed-size bucket boundaries, and the inner buffer carries a 4-byte `compressed_len` field so the recipient can separate the zstd frame from trailing padding. The HKDF `info` string remains the fixed constant `"skrepka-v1"` for version 0x01. The unknown-`type` rule (§4) gives forward compatibility for *payload* types; the version byte gives the same for the wire format, AEAD, KDF, and curve choices. A future revision that changes the crypto primitives should bump both the version byte and the HKDF `info` string together.
 
 ---
 
@@ -229,7 +229,7 @@ After decryption (and zstd decompression), the plaintext is a UTF-8 JSON object 
 
 - `type` and `ts` are present on every payload. `ts` is the sender's wall-clock at send time, in **milliseconds** since the Unix epoch.
 - `id` is a client-generated unique ID (e.g. UUID v4) carried by `text` messages only. Clients deduplicate incoming `text` messages by `id`. `delivery.ack` and `profile` payloads do not carry an `id`.
-- Clients MUST silently ignore message types they do not recognize. This allows newer clients to introduce new types without breaking older ones.
+- Clients MUST silently drop message types they do not recognize — no error is surfaced to the sender, and the blob is treated as if it were not there. This allows newer clients to introduce new types without breaking older ones.
 
 ### Message Types
 
@@ -242,6 +242,21 @@ The current implementation defines three plaintext message types:
 | `profile`       | Share display name, bio, and/or photo    | `display_name`, `bio` (strings), `photo` (base64-encoded image, optional) |
 
 Future message types (media attachments, read receipts, group messages) are not part of this revision.
+
+### Payload Size Limits
+
+A decrypted payload is attacker-controlled: a peer can put any value in any field. The reference client enforces the following caps and silently drops a payload that exceeds any of them (treated identically to an unknown type). An independent client SHOULD enforce the same caps, or it risks storing, rendering, and re-transmitting unbounded attacker-supplied data.
+
+| Field             | Cap         | Rationale                                              |
+|-------------------|-------------|--------------------------------------------------------|
+| `text.body`       | 64 KiB      | A text body is never legitimately this long.           |
+| `text.id`         | 128 chars   | IDs are UUIDs; 128 chars is generous.                  |
+| `profile.display_name` | 128 chars (Unicode) | A display name is not a bio.                   |
+| `profile.bio`     | 1024 chars (Unicode) | Enough for a paragraph.                          |
+| `profile.photo`   | 64 KiB (base64) | A 256px JPEG is ~10-30 KiB; 64 KiB is headroom.    |
+| `delivery.ack.ack_ids` | 1024 entries | Bounds the O(n·m) scan a peer can dictate.       |
+
+The caps on `display_name` and `bio` are measured in Unicode characters (not bytes), so a multi-byte emoji costs the same as an ASCII letter. A payload sitting exactly at the cap is accepted; the bound is inclusive.
 
 ### Profiles
 

@@ -91,6 +91,15 @@ const MAX_SEND_BATCH: usize = 100;
 /// relay's job to reject it, and its rejection is per-message and permanent.
 const MAX_SEND_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
+/// Ceiling on a `Retry-After` we will honour from a relay.
+///
+/// The header is a number the relay chooses and we obey, so without a cap a
+/// single `Retry-After: 999999999` — from a hostile relay, or a merely broken
+/// one — parks the outbox for thirty years with nothing on screen to say why.
+/// Five minutes is longer than any real rate-limit window and still recovers on
+/// its own.
+const MAX_RETRY_AFTER_MS: u64 = 5 * 60 * 1000;
+
 // kv keys
 const K_SETTINGS: &str = "settings";
 const K_PROFILE: &str = "profile";
@@ -245,13 +254,16 @@ const STARTUP_LOADS: u8 = 5;
 /// The batch a live `/messages` request is carrying: the first `count` items of
 /// the outbox, all bound for `recipient`.
 ///
-/// `SendResult` needs both. The count is what it pops on success and what it
+/// `SendResult` needs all three. The count is what it pops on success and what it
 /// charges a retry against on a transient failure; the recipient is what tells
 /// `SetBlocked` and `DeleteContact` whether the items they are about to remove
-/// are the very ones this send is going to pop.
+/// are the very ones this send is going to pop; and `bytes` — the size of the
+/// body we actually built — is what a `413` halves to find a batch this relay
+/// will accept (see `Model::send_batch_budget`).
 struct InFlight {
     recipient: String,
     count: usize,
+    bytes: usize,
 }
 
 pub struct Model {
@@ -305,6 +317,20 @@ pub struct Model {
     /// it (`SetBlocked`, `DeleteContact`): there is then nothing left to pop, and
     /// popping by count anyway would eat whichever messages slid into their place.
     in_flight: Option<InFlight>,
+    /// What this relay will actually accept as a request body, in hex characters,
+    /// once it has told us. `None` until then — meaning "assume
+    /// `MAX_SEND_BATCH_BYTES`", which is a guess at a cap the protocol never
+    /// publishes.
+    ///
+    /// A relay configured below our guess answers `413`, and a `413` read as a
+    /// transient failure is a batch that is rebuilt identically, rejected
+    /// identically, and retried until every item in it has burned its retry budget
+    /// and been dropped — the outbox drains into the void without a single message
+    /// leaving. So a `413` *measures* the cap instead: halve what we just tried and
+    /// rebuild smaller. It is deliberately not reset on success — the batch that
+    /// worked is evidence about the relay, and the relay's cap does not grow — only
+    /// on a server change, where the evidence no longer applies.
+    send_batch_budget: Option<usize>,
     /// Startup kv loads still outstanding. `Connect` only fires at 0, so a poll
     /// can't land and be persisted against a half-loaded model — which would
     /// then be clobbered by the loads still in flight.
@@ -335,6 +361,7 @@ impl Default for Model {
             auth_gen: 0,
             flushing: false,
             in_flight: None,
+            send_batch_budget: None,
             loads_pending: 0,
             page: Page::default(),
             active_peer: None,
@@ -560,52 +587,76 @@ impl App for Skrepka {
             }
 
             Event::LoadedSettings(res) => {
-                if let Some(s) = parse_kv::<Settings>(res) {
-                    // Re-validate on the way in. The URL was normalized when the
-                    // user typed it, but the blob on disk is not trustworthy: an
-                    // older build wrote URLs this parser rejects, and a corrupted
-                    // or hand-edited file would reach `Http::post`, which unwraps
-                    // the parse. That is a panic on every launch — a boot loop
-                    // with no way out from inside the app.
-                    model.settings.server_url = normalize_server_url(&s.server_url)
-                        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+                match parse_kv::<Settings>(res) {
+                    Ok(Some(s)) => {
+                        // Re-validate on the way in. The URL was normalized when the
+                        // user typed it, but the blob on disk is not trustworthy: an
+                        // older build wrote URLs this parser rejects, and a corrupted
+                        // or hand-edited file would reach `Http::post`, which unwraps
+                        // the parse. That is a panic on every launch — a boot loop
+                        // with no way out from inside the app.
+                        model.settings.server_url = normalize_server_url(&s.server_url)
+                            .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        model.error = Some("could not read settings from storage".into());
+                    }
                 }
                 self.startup_done(model).and(render())
             }
             Event::LoadedProfile(res) => {
-                if let Some(p) = parse_kv::<OwnProfile>(res) {
-                    model.profile = p;
+                match parse_kv::<OwnProfile>(res) {
+                    Ok(Some(p)) => model.profile = p,
+                    Ok(None) => {}
+                    Err(()) => model.error = Some("could not read profile from storage".into()),
                 }
                 self.startup_done(model).and(render())
             }
             Event::LoadedContacts(res) => {
                 let mut cmds = vec![self.startup_done(model)];
-                if let Some(list) = parse_kv::<Vec<Contact>>(res) {
-                    model.contacts = list.into_iter().map(|c| (c.pubkey.clone(), c)).collect();
-                    // Lazily load each conversation's messages.
-                    cmds.extend(model.contacts.keys().map(|peer| {
-                        let peer = peer.clone();
-                        KeyValue::get(k_messages(&peer))
-                            .then_send(move |r| Event::LoadedMessages(peer.clone(), r))
-                    }));
+                match parse_kv::<Vec<Contact>>(res) {
+                    Ok(Some(list)) => {
+                        model.contacts = list.into_iter().map(|c| (c.pubkey.clone(), c)).collect();
+                        // Lazily load each conversation's messages.
+                        cmds.extend(model.contacts.keys().map(|peer| {
+                            let peer = peer.clone();
+                            KeyValue::get(k_messages(&peer))
+                                .then_send(move |r| Event::LoadedMessages(peer.clone(), r))
+                        }));
+                    }
+                    Ok(None) => {}
+                    Err(()) => model.error = Some("could not read contacts from storage".into()),
                 }
                 Command::all(cmds).and(render())
             }
             Event::LoadedCursor(res) => {
-                if let Some(c) = parse_kv::<i64>(res) {
-                    model.cursor = c;
+                match parse_kv::<i64>(res) {
+                    Ok(Some(c)) => model.cursor = c,
+                    Ok(None) => {}
+                    Err(()) => model.error = Some("could not read cursor from storage".into()),
                 }
                 self.startup_done(model).and(render())
             }
             Event::LoadedOutbox(res) => {
-                if let Some(list) = parse_kv::<Vec<OutboxItem>>(res) {
-                    model.outbox = list.into();
+                match parse_kv::<Vec<OutboxItem>>(res) {
+                    Ok(Some(list)) => model.outbox = list.into(),
+                    Ok(None) => {}
+                    Err(()) => model.error = Some("could not read outbox from storage".into()),
                 }
                 self.startup_done(model).and(render())
             }
             Event::LoadedMessages(peer, res) => {
-                if let Some(list) = parse_kv::<Vec<StoredMessage>>(res) {
-                    model.messages.insert(peer, list);
+                match parse_kv::<Vec<StoredMessage>>(res) {
+                    Ok(Some(list)) => {
+                        model.messages.insert(peer, list);
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        // Don't overwrite a potentially-loaded conversation with
+                        // an empty default — the read failed, the data is still
+                        // on disk.
+                    }
                 }
                 render()
             }
@@ -683,6 +734,12 @@ impl App for Skrepka {
                 model.settings.server_url = url;
                 model.token = None;
                 model.conn = ConnStatus::Offline;
+                // Whatever we learned about the old relay's body cap was about *it*.
+                // A new relay is entitled to a bigger one, and carrying a shrunken
+                // budget over would cap our batches against a limit that no longer
+                // exists — with no `413` left to correct it, since the new relay has
+                // no reason to send one.
+                model.send_batch_budget = None;
                 // The cursor is *per relay*: it is that server's own sequence
                 // number, and the next poll acks everything up to it. Carrying
                 // relay A's cursor (roughly `now_ms()`) over to relay B tells B
@@ -1069,6 +1126,56 @@ impl App for Skrepka {
                     // The batch stays exactly as it is — re-auth, then re-send it.
                     return Command::event(Event::Authenticate);
                 }
+                if status == 429 {
+                    // Rate-limited. Not a delivery failure and not the items'
+                    // fault, so they are not charged a retry — a client that spent
+                    // its delivery budget on the relay's load would drop perfectly
+                    // good messages for being sent too enthusiastically. They stay
+                    // queued untouched; we just wait.
+                    //
+                    // `Retry-After` is the relay saying how long. Only the
+                    // delta-seconds form is read — the HTTP-date form falls back to
+                    // our own backoff — and it is clamped either way, because
+                    // obeying an unbounded number from a relay is how the outbox
+                    // gets parked forever.
+                    let delay = resp
+                        .header("retry-after")
+                        .map(|v| v.last().as_str())
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map_or_else(
+                            || Duration::from_millis(backoff_ms(model.poll_retries)),
+                            |secs| {
+                                Duration::from_millis(
+                                    secs.saturating_mul(1000).min(MAX_RETRY_AFTER_MS),
+                                )
+                            },
+                        );
+                    return Time::notify_after(delay)
+                        .0
+                        .then_send(|_| Event::StartFlush)
+                        .and(render());
+                }
+                if status == 413 {
+                    // The body outgrew what this relay accepts. `MAX_SEND_BATCH_BYTES`
+                    // is only a guess at that cap, and this relay's is smaller — so
+                    // treating the `413` as transient rebuilds the very same batch,
+                    // which is rejected the very same way, forever.
+                    //
+                    // Measure the cap instead: halve what this batch actually
+                    // weighed and rebuild under that. The items are untouched (we
+                    // only pop on 200/400), so there is nothing to re-queue.
+                    //
+                    // Only a *splittable* batch takes this path. A lone item over
+                    // the cap cannot be made any smaller, and halving the budget
+                    // around it would spin — `flush_next` always takes the first
+                    // item whatever it weighs. It falls through to `retry_batch`,
+                    // whose budget is what eventually drops it, with an error the
+                    // user can see.
+                    if let Some(b) = batch.as_ref().filter(|b| b.count > 1) {
+                        model.send_batch_budget = Some(b.bytes / 2);
+                        return self.flush_next(model);
+                    }
+                }
                 if (200..300).contains(&status) || status == 400 {
                     // The batch was accepted, or rejected outright (`self_send` /
                     // `invalid_message` — both permanent, and the relay takes a
@@ -1182,7 +1289,6 @@ impl App for Skrepka {
             active_peer_ob: hex_to_ob(&active_peer),
             active_peer_blocked: active_contact.is_some_and(|c| c.blocked),
             messages,
-            compose: model.compose.clone(),
             error: model.error.clone().unwrap_or_default(),
         }
     }
@@ -1344,6 +1450,9 @@ impl Skrepka {
         let mut recipient: Option<String> = None;
         let mut messages: Vec<Envelope> = Vec::new();
         let mut bytes = 0usize;
+        // What we believe this relay's body cap to be — `MAX_SEND_BATCH_BYTES`
+        // until a `413` tells us otherwise.
+        let batch_budget = model.send_batch_budget.unwrap_or(MAX_SEND_BATCH_BYTES);
 
         while messages.len() < MAX_SEND_BATCH {
             let Some(item) = model.outbox.get(messages.len()) else {
@@ -1371,7 +1480,7 @@ impl Skrepka {
             // payload must still reach the relay, which rejects it permanently
             // (`400`) and so gets it out of the queue for good. Past the first,
             // stop before the body outgrows what a relay will accept.
-            if !messages.is_empty() && bytes + hex_blob.len() > MAX_SEND_BATCH_BYTES {
+            if !messages.is_empty() && bytes + hex_blob.len() > batch_budget {
                 break;
             }
             bytes += hex_blob.len();
@@ -1412,6 +1521,7 @@ impl Skrepka {
         model.in_flight = Some(InFlight {
             recipient,
             count: messages.len(),
+            bytes,
         });
         let url = format!("{}/messages", model.settings.server_url);
         match Http::post(url)
@@ -1524,6 +1634,17 @@ impl Skrepka {
             };
             let sender = dec.sender_hex;
 
+            // Mail from ourselves. A relay cannot forge this — the sender identity
+            // is signed inside the AEAD — but it can *echo back* a blob we sent
+            // through it, and one addressed to ourselves decrypts perfectly well.
+            // Nothing downstream would notice: it would auto-create a contact for
+            // our own key (which `AddContact` explicitly refuses to do), file our
+            // own words as an incoming message, and queue a delivery ack addressed
+            // to us — which flushes, comes back, and is acked again.
+            if sender == model.my_pubkey {
+                continue;
+            }
+
             // Blocking cuts the peer off entirely (PROTOCOL.md §4) — not just
             // their texts. A blocked peer must not be able to rewrite their
             // display name and avatar in our contact list, mark our messages
@@ -1581,8 +1702,10 @@ impl Skrepka {
                         id_set.insert(msg_id.clone());
                         trim_history(convo);
                         touched_convos.insert(sender.clone());
+                        // Only ack a message we actually stored — a duplicate id
+                        // was already acked when its first copy was ingested.
+                        ack_targets.entry(sender.clone()).or_default().push(msg_id);
                     }
-                    ack_targets.entry(sender).or_default().push(msg_id);
                 }
                 Payload::DeliveryAck { ack_ids } => {
                     // Staleness check: drop a replayed ack whose ts predates the
@@ -1636,7 +1759,15 @@ impl Skrepka {
                     // peer that parked it in the future would freeze its own
                     // profile, since every honest update it sent afterwards would
                     // read as a stale replay of itself.
-                    if ts >= c.last_profile_ts {
+                    //
+                    // Strict `>` (not `>=`): a replayed profile at the *same* `ts`
+                    // as the one we already stored is a re-delivery, not an update.
+                    // `>=` would let a captured blob overwrite the cached profile
+                    // with an identical one — harmless in the normal case, but it
+                    // also means a peer who sends `ts = 0` (the default when the
+                    // field is missing) can overwrite another `ts = 0` profile
+                    // indefinitely.
+                    if ts > c.last_profile_ts {
                         c.display_name = display_name;
                         c.bio = bio;
                         c.photo = photo;
@@ -1723,22 +1854,26 @@ fn trim_history(convo: &mut Vec<StoredMessage>) {
     }
 }
 
-/// Decode a kv `get` result into a typed value, ignoring errors / absence.
+/// Decode a kv `get` result into a typed value.
 ///
-/// `None` conflates three different things: the key is absent (a fresh install),
-/// the read failed, and the bytes are present but don't deserialize. The caller
-/// keeps its default in all three, and the next mutation writes that default back
-/// — so a blob we merely *failed to read* is destroyed rather than left alone.
+/// Returns `Ok(Some(value))` when the key exists and deserializes, `Ok(None)`
+/// when the key is absent (a fresh install), and `Err` when the read itself
+/// failed (e.g. the file is locked or corrupt). The caller MUST NOT overwrite
+/// a key with a default when the read failed — the data is still on disk, and
+/// writing the default back destroys it. An absent key is safe to default.
 ///
-/// The mitigation is upstream: every persisted type is `#[serde(default)]` (see
-/// `model.rs`), so adding a field can't make an old blob unreadable, which is by
-/// far the likeliest way this fires in practice. A genuinely corrupt blob is
-/// still lost. Fixing that properly means distinguishing the three cases here and
-/// refusing to overwrite on the third — a change to every caller and to the error
-/// surface, not a drive-by.
-fn parse_kv<T: for<'de> Deserialize<'de>>(res: KvData) -> Option<T> {
-    let bytes = res.ok().flatten()?;
-    serde_json::from_slice(&bytes).ok()
+/// The old `parse_kv` conflated read errors with absence, which meant a
+/// background wake while the device was locked (where `completeUnlessOpen`
+/// refuses to open existing files) would load an empty model, and the next
+/// `persist_*` would write that emptiness back over the real data.
+fn parse_kv<T: for<'de> Deserialize<'de>>(res: KvData) -> Result<Option<T>, ()> {
+    match res {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| ()),
+        Ok(None) => Ok(None),
+        Err(_) => Err(()),
+    }
 }
 
 #[cfg(test)]
@@ -1837,6 +1972,33 @@ mod tests {
         crux_http::testing::ResponseBuilder::with_status(status)
             .body(Vec::new())
             .build()
+    }
+
+    /// The same, plus one header — the only thing a relay can say to us beyond a
+    /// status code, and `Retry-After` is the one we act on.
+    fn response_with_header(status: u16, name: &str, value: &str) -> crux_http::Response<Vec<u8>> {
+        let status = crux_http::http::StatusCode::try_from(status).unwrap();
+        crux_http::testing::ResponseBuilder::with_status(status)
+            .header(name, value)
+            .body(Vec::new())
+            .build()
+    }
+
+    /// The delays a command actually asks the shell to wait, in milliseconds.
+    /// Asserting on the model alone cannot see these — a backoff lives entirely in
+    /// the effect.
+    fn scheduled_delays(cmd: &mut Command<Effect, Event>) -> Vec<u64> {
+        cmd.effects()
+            .filter_map(|e| match e {
+                Effect::Time(req) => match req.operation {
+                    crux_time::TimeRequest::NotifyAfter { duration, .. } => {
+                        Some(Duration::from(duration).as_millis() as u64)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
     }
 
     /// One full send round-trip: flush the outbox, then answer with `status`.
@@ -1977,6 +2139,71 @@ mod tests {
         assert!(m.token.is_none(), "but the token is thrown away");
     }
 
+    /// A 429 is the relay's load, not the message's fault. Charging the batch a
+    /// retry for it would let a busy relay drive perfectly good messages out of the
+    /// outbox — and the relay usually says exactly how long to wait, so wait that
+    /// long rather than guessing.
+    #[test]
+    fn a_429_waits_out_retry_after_without_spending_the_retry_budget() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        let mut cmd = app.update(
+            Event::SendResult(Ok(response_with_header(429, "retry-after", "2"))),
+            &mut m,
+        );
+
+        assert_eq!(m.outbox.len(), 1, "the message is still queued");
+        assert_eq!(m.outbox[0].retries, 0, "and unpunished — it did nothing wrong");
+        assert!(!m.flushing, "the guard is released so the retry can run");
+        assert_eq!(
+            scheduled_delays(&mut cmd),
+            vec![2_000],
+            "and we wait exactly as long as the relay asked"
+        );
+    }
+
+    /// Without the header there is nothing to honour, so fall back to our own
+    /// backoff rather than hammering the relay that just asked us to slow down.
+    #[test]
+    fn a_429_without_retry_after_falls_back_to_the_usual_backoff() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        let mut cmd = app.update(Event::SendResult(Ok(ok_response(429))), &mut m);
+
+        assert_eq!(m.outbox[0].retries, 0, "still not the message's fault");
+        assert_eq!(scheduled_delays(&mut cmd), vec![backoff_ms(m.poll_retries)]);
+    }
+
+    /// `Retry-After` is a number a relay chooses and we obey. Unbounded, one of
+    /// them parks the outbox for thirty years — with nothing on screen to say why.
+    #[test]
+    fn an_absurd_retry_after_is_clamped() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        let mut cmd = app.update(
+            Event::SendResult(Ok(response_with_header(429, "retry-after", "999999999"))),
+            &mut m,
+        );
+
+        assert_eq!(
+            scheduled_delays(&mut cmd),
+            vec![MAX_RETRY_AFTER_MS],
+            "we wait, but only as long as we are willing to"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // outbox: batching
     // -----------------------------------------------------------------------
@@ -2086,6 +2313,101 @@ mod tests {
         assert!(batches[0].len() < MAX_SEND_BATCH, "the count cap is not the binding one");
         assert!(!batches[0].is_empty(), "but something still goes out");
         assert!(body <= MAX_SEND_BATCH_BYTES, "the body stays inside the budget");
+    }
+
+    /// `MAX_SEND_BATCH_BYTES` is a *guess* at a cap the protocol never publishes, and
+    /// a relay configured below it answers `413`. Read as a transient failure, that
+    /// `413` rebuilds the identical batch, is rejected identically, and repeats until
+    /// every item has burned its retry budget — the outbox drains without a single
+    /// message being delivered. So a `413` measures the cap instead of fighting it.
+    #[test]
+    fn a_413_halves_the_batch_budget_and_retries_smaller() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        let peer = peer_hex(9);
+        for i in 0..5 {
+            m.outbox.push_back(queued(&peer, &format!("m{i}")));
+        }
+
+        // Nothing is known about this relay yet, so all five go out at once.
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+        let first = sent_batches(&mut cmd);
+        assert_eq!(first[0].len(), 5, "the whole run goes out on the first attempt");
+        assert!(m.send_batch_budget.is_none(), "and we have assumed nothing");
+        let sent_bytes: usize = first[0].iter().map(|e| e.encrypted_blob.len()).sum();
+
+        // ...and the relay says that was too big.
+        let mut cmd = app.update(Event::SendResult(Ok(ok_response(413))), &mut m);
+
+        assert_eq!(
+            m.send_batch_budget,
+            Some(sent_bytes / 2),
+            "the budget is halved against what actually failed, not against the constant"
+        );
+        assert_eq!(m.outbox.len(), 5, "a 413 delivered nothing, so nothing is popped");
+        assert!(
+            m.outbox.iter().all(|i| i.retries == 0),
+            "and the items are not charged for the relay being smaller than we guessed"
+        );
+
+        // The retry goes out at once, and it is smaller.
+        let second = sent_batches(&mut cmd);
+        assert_eq!(second.len(), 1, "retried immediately, not left for the next flush");
+        let shrunk = second[0].len();
+        assert!(shrunk < 5, "with a smaller batch, got {shrunk} items");
+        assert!(shrunk > 0, "but not an empty one");
+
+        // The relay takes the smaller batch, and exactly it is popped.
+        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        assert_eq!(m.outbox.len(), 5 - shrunk, "exactly the batch that landed is gone");
+        assert_eq!(
+            m.send_batch_budget,
+            Some(sent_bytes / 2),
+            "and what we learned about the relay survives the success — its cap did not grow"
+        );
+    }
+
+    /// A batch of one cannot be split, and `flush_next` takes the first item whatever
+    /// it weighs — so halving the budget around a lone oversized item would rebuild
+    /// the same one-item batch forever, at full speed, with no retry ever charged.
+    /// It has to fall through to the retry budget, which is what eventually drops it.
+    #[test]
+    fn a_413_on_a_single_item_ages_out_instead_of_spinning() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "bigger than this relay allows"));
+
+        for i in 1..MAX_OUTBOX_RETRIES {
+            send_and_answer(&app, &mut m, 413);
+            assert_eq!(m.outbox.len(), 1, "still queued after {i} rejection(s)");
+            assert_eq!(m.outbox[0].retries, i, "and charged for each of them");
+        }
+        assert!(
+            m.send_batch_budget.is_none(),
+            "an unsplittable batch teaches us nothing about the cap"
+        );
+
+        send_and_answer(&app, &mut m, 413);
+        assert!(m.outbox.is_empty(), "the item that can never be sent is dropped");
+        assert!(
+            m.error.is_some_and(|e| e.contains("gave up sending")),
+            "and the user is told, rather than the message quietly vanishing"
+        );
+    }
+
+    /// What we learned is about *that relay*. A new one is entitled to a bigger cap,
+    /// and it will never send the `413` that would correct a budget carried over.
+    #[test]
+    fn changing_relay_forgets_the_learned_batch_budget() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.send_batch_budget = Some(1024);
+
+        let _ = app.update(Event::SetServerUrl("https://other.example".into()), &mut m);
+
+        assert!(m.send_batch_budget.is_none());
     }
 
     /// An unusable key at the head still has to be discarded, batching or not —
@@ -2378,9 +2700,12 @@ mod tests {
         };
         let page = page_from(9, &m, &profile("Far"), i64::MAX);
         let _ = app.ingest_poll(&mut m, page);
-        assert!(m.contacts[&peer].last_profile_ts <= now_ms());
+        let first_ts = m.contacts[&peer].last_profile_ts;
+        assert!(first_ts <= now_ms());
 
-        let page = page_from(9, &m, &profile("Now"), now_ms());
+        // A later profile at a strictly greater ts must still apply (the
+        // staleness check is strict `>`, not `>=`).
+        let page = page_from(9, &m, &profile("Now"), first_ts + 1);
         let _ = app.ingest_poll(&mut m, page);
         assert_eq!(
             m.contacts[&peer].display_name, "Now",
@@ -3207,6 +3532,43 @@ mod tests {
         let page = page_from(9, &m, &profile, now_ms());
         let _ = app.ingest_poll(&mut m, page);
         assert_eq!(m.contacts[&peer].display_name, "Mallory");
+    }
+
+    /// A relay cannot forge mail from us — the sender identity is signed inside the
+    /// AEAD — but it can *echo back* a blob we sent through it, and one addressed to
+    /// ourselves decrypts perfectly well. Nothing downstream would notice: it would
+    /// file our own words as incoming, put our own key in our contact list (which
+    /// `AddContact` explicitly refuses), and queue a delivery ack addressed to us —
+    /// which flushes, comes back, and is acked again.
+    #[test]
+    fn a_message_from_ourselves_is_dropped() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let me = Identity::from_secret_bytes(m.secret_key.as_ref().unwrap()).unwrap();
+
+        let json = protocol::serialize_payload(&text("m1", "echo"), now_ms());
+        let blob = crate::crypto::encrypt(
+            &mut rand_core::OsRng,
+            &me,
+            &me.public_key(),
+            json.as_bytes(),
+        )
+        .unwrap();
+        let page = PollResp {
+            events: vec![PollEvent {
+                encrypted_blob: hex::encode(blob),
+            }],
+            cursor: 1,
+        };
+
+        let _ = app.ingest_poll(&mut m, page);
+
+        assert!(
+            !m.contacts.contains_key(&m.my_pubkey),
+            "we are not our own contact"
+        );
+        assert!(m.messages.is_empty(), "and our own words are not incoming mail");
+        assert!(m.outbox.is_empty(), "and we do not ack ourselves");
     }
 
     /// `polling` gates the whole long-poll loop and is cleared only by a

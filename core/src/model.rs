@@ -251,6 +251,5 @@ pub struct ViewModel {
     pub active_peer_ob: String,
     pub active_peer_blocked: bool,
     pub messages: Vec<MessageVM>,
-    pub compose: String,
     pub error: String,
 }

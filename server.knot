@@ -93,6 +93,21 @@ maxPollEvents = 50
 -- Per-peer ceiling on outstanding forward attempts.
 maxForwardsPerServer : Int
 maxForwardsPerServer = 2000
+-- Global ceiling on the `*forwards` outbox. `maxForwardsPerServer` bounds any one
+-- peer, but a recipient gossiped as present on many servers fans one blob out to
+-- all of them, so the total is bounded only by (peers x per-peer cap). This caps
+-- the whole outbox.
+--
+-- Evicts the *highest*-retry entries first: those are the ones closest to
+-- `maxForwardRetries` (about to be abandoned anyway), so pressure is shed onto
+-- failing peers rather than healthy ones. Freshly-staged rows carry `retries: 0`
+-- and so always survive their own capping.
+--
+-- Dropping a forward is not message loss: the `*messages` row it points at stays
+-- put, so the recipient still gets the blob by polling here, and a later presence
+-- announce re-stages the forward via `forwardQueuedToServer`.
+maxForwardsTotal : Int
+maxForwardsTotal = 50000
 -- Max accepted length of a server hostname.
 maxServerNameLen : Int
 maxServerNameLen = 128
@@ -138,6 +153,33 @@ maxPresence = 100000
 -- each pass `isBadServerName`.
 maxPresencePerServer : Int
 maxPresencePerServer = 5000
+-- Per-recipient ceiling on stored mailbox rows. Without a cap a single
+-- authenticated sender can queue unbounded data for one recipient
+-- (`maxBatchSize` 100 messages/request x `sendRateLimit` 60 requests/min =
+-- 6000/min, each blob up to 20 MiB) and only the 30-day `messageMaxAge` TTL
+-- ever reclaims it. Past the cap `appendMessage` drops the oldest rows (lowest
+-- `receivedAt`) — the same rows the TTL would eventually drop, just sooner.
+--
+-- The recipient's client bounds what it *processes* per poll (MAX_POLL_TOTAL_BYTES
+-- in core/src/app.rs), but nothing bounded what the server *stores* before this.
+--
+-- Dropping a row orphans any `*forwards` entry for it; `pruneExpired` collects
+-- those (it drops forwards whose message no longer exists). Its `deliveredTo`
+-- set is lost with it, which is harmless — the blob is gone, so there is
+-- nothing left to re-forward.
+--
+-- LIMITATION — evicting on overflow means a flood can now *destroy* mail, not
+-- just pile it up: an attacker who fills a recipient's mailbox pushes that
+-- recipient's genuine undelivered messages out of the window. Pubkeys are free
+-- to mint, so "authenticated sender" is no barrier. This is a trade, not a fix
+-- — the alternative (reject once full) hands the same attacker a permanent
+-- block on *all* new mail to that recipient, which is strictly worse: here at
+-- least the newest messages always land. It only bites a recipient who is
+-- offline long enough to accumulate `maxMessagesPerRecipient`, since polling
+-- drains the mailbox (`ackPolledMessages`). A real fix prices sending — see
+-- the same argument for sessions on `maxSessions`, and PROTOCOL.md §10.
+maxMessagesPerRecipient : Int
+maxMessagesPerRecipient = 10000
 -- Validity window for an auth challenge before it must be re-issued (1 min).
 challengeExpiry : Int<Ms>
 challengeExpiry = 60000
@@ -469,6 +511,15 @@ capPerKey = \items pubkey maxN -> union (filter (\x -> not (x.pubkey == pubkey))
 -- peer from crowding every other peer out of the `maxPresence` pool.
 capPerServer : [{server: Text, expiresAt: Timestamp | r}] -> Text -> Int -> [{server: Text, expiresAt: Timestamp | r}]
 capPerServer = \items server maxN -> union (filter (\x -> not (x.server == server)) items) (capList (filter (\x -> x.server == server) items) maxN)
+
+-- Cap the whole forwards outbox to `maxForwardsTotal`, evicting the highest-retry
+-- entries first — see `maxForwardsTotal` for why those and not the oldest.
+-- Deliberately not `capList`: that keys on `expiresAt`, and `ForwardEntry` carries
+-- no timestamp (the same reason `retryPendingForwards` has to sort on the blob).
+-- Applied by both writers that grow `*forwards` (`forwardQueuedToServer` and
+-- `handleSendMessages`); the retry sweep only ever shrinks it.
+capForwards : [ForwardEntry] -> [ForwardEntry]
+capForwards = \fwds -> take maxForwardsTotal (sortBy (\f -> f.retries) fwds)
 
 -- Random hex token: one random hex char per recursive call. `n` is the
 -- desired length in characters (so n=48 yields 24 random bytes of entropy).
@@ -872,7 +923,18 @@ appendMessage = \toKey encryptedBlob t -> do
     seqRows <- *seqCounter
     let seqTs = max t (currentSeq seqRows + 1)
     *seqCounter = [{value: seqTs}]
-    *messages = union msgs [{toKey, encryptedBlob, receivedAt: seqTs, deliveredTo: []}])
+    -- Enforce `maxMessagesPerRecipient` before the append: evict the oldest rows
+    -- for this recipient so the post-append count lands exactly on the ceiling.
+    -- `- 1` reserves the slot the new row is about to take.
+    --
+    -- Eviction keys on `encryptedBlob` rather than the row itself because
+    -- (toKey, encryptedBlob) is unique by this function's own dedup invariant
+    -- (the `when` guard above), so a blob identifies at most one row per key.
+    let forRecipient = filter (\m -> m.toKey == toKey) msgs
+    let excess = max 0 (count forRecipient - (maxMessagesPerRecipient - 1))
+    let evicted = map (\m -> m.encryptedBlob) (take excess (sortBy (\m -> m.receivedAt) forRecipient))
+    let kept = filter (\m -> not (m.toKey == toKey && elem m.encryptedBlob evicted)) msgs
+    *messages = union kept [{toKey, encryptedBlob, receivedAt: seqTs, deliveredTo: []}])
 
 -- Record that `server` has accepted a federated forward of this message, so a
 -- later presence re-announce of `toKey` doesn't re-forward the same blob to a peer
@@ -1084,7 +1146,7 @@ forwardQueuedToServer = \pubkey serverName -> atomic (do
   let notYetDelivered = \m -> not any (\d -> d.server == server) m.deliveredTo
   let candidates = filter (\m -> m.toKey == pubkey && notYetForwarded m && notYetDelivered m) msgs
   let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget (sortBy (\m -> m.receivedAt) candidates))
-  *forwards = union fwds newFwds)
+  *forwards = capForwards (union fwds newFwds))
 
 -- ============================================
 -- Handler: challenge / verify
@@ -1127,7 +1189,7 @@ handleChallenge = \pubkey clientIp -> do
 -- On success, mints a session token, records local presence (`pubkey` is now
 -- live on this server), and gossips an `online` event to known peers. If
 -- `revokeOthers` is set, all other sessions for the same pubkey are dropped.
-handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *challenges, rw *forwardFailures, rw *presence, rw *sessions, network, clock, random} (Result HttpError {expiresAt: Timestamp, token: Text})
+handleVerifyAuth : PubkeyHex -> Text -> Text -> Bool -> Text -> IO {rw *challenges, rw *forwardFailures, rw *presence, rw *sessions, network, clock, random, console} (Result HttpError {expiresAt: Timestamp, token: Text})
 handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   t <- now
   let expiry = t + sessionExpiry
@@ -1158,13 +1220,23 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
       let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
       -- LRU-evicts the soonest-to-expire session when the pool is full; this global
       -- eviction is Sybil-floodable, see the LIMITATION note on `maxSessions`.
-      *sessions = capList (union pruned [newSession]) maxSessions
+      let pooled = union pruned [newSession]
+      -- Count what `capList` is about to shed, so the handler can warn about it
+      -- below. That flood has no other observable signature: evicted users just
+      -- start seeing 401s and silently re-authenticate, which looks like normal
+      -- traffic in the access log. A sustained nonzero rate here is the alert.
+      let evicted = max 0 (count pooled - maxSessions)
+      *sessions = capList pooled maxSessions
       peers <- refreshLocalPresence pubkey expiry
-      yield (Just {value: peers}))
+      yield (Just {value: {peers, evicted}}))
   case result of
     Nothing {} -> yield (Err {error: {status: 401, message: "invalid"}})
-    Just {value: peers} -> do
-      when federationEnabled (fork (sendBatchedGossip peers [{eventType: "online", pubkey: Just {value: pubkey}}]))
+    Just {value: r} -> do
+      -- Warn outside the `atomic` block, never inside: an STM transaction can
+      -- retry, and a console write is not rolled back with it — logging inside
+      -- would emit one line per retry attempt rather than one per eviction.
+      when (r.evicted > 0) (logWarn ("session pool full: evicted " ++ show r.evicted ++ " session(s) to seat a new login (maxSessions=" ++ show maxSessions ++ ")"))
+      when federationEnabled (fork (sendBatchedGossip r.peers [{eventType: "online", pubkey: Just {value: pubkey}}]))
       yield (Ok {value: {token, expiresAt: expiry}})
 
 -- ============================================
@@ -1346,7 +1418,7 @@ handleSendMessages = \messages authorization clientIp -> do
             when federationEnabled (do
               fwds <- *forwards
               let newFwds = map (\s -> {toServer: s, toKey: c.to, c.encryptedBlob, retries: 0}) (filter (\s -> not (any (forwardMatches c.to c.encryptedBlob s) fwds) && not elem s delivered && countWhere (\f -> f.toServer == s) fwds < maxForwardsPerServer) c.remoteServers)
-              *forwards = union fwds newFwds))
+              *forwards = capForwards (union fwds newFwds)))
           yield staged)
         when federationEnabled (forEach committed (\c -> fork (forkForwardsTo c.to c.encryptedBlob c.remoteServers)))
         yield (Ok {value: {}})

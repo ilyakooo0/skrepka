@@ -218,3 +218,65 @@ Both need runtime support the current `fetch` does not expose.
    document-as-accepted or add peer authentication.
 4. **#9** is a design tradeoff; document as accepted until `fetch` supports a
    deadline.
+
+---
+
+## Findings blocked on runtime/protocol support (2026-07-13 audit)
+
+These findings are documented here for tracking. Each is blocked on a capability
+the current runtime or protocol does not expose, so no code fix is possible
+today.
+
+### ❌ A. `now_ms()` impurity breaks MVU replayability
+
+**Severity: medium — blocked on `crux_time` refactor.**
+
+`now_ms()` reads the system clock from inside `update()` (app.rs:427), which is
+supposed to be a pure function of `(Event, Model)`. This affects `SendText`,
+`SaveProfile`, `ingest_poll`, `flush_next` (first_attempt stamping), and ack
+timestamping. The state machine cannot be replayed deterministically, and tests
+cannot pin "now".
+
+The fix is to take the time as a `crux_time` effect and feed it back as an
+event — but every timestamped path would become a two-step round-trip through
+the shell. A TODO comment is in place at the call site. This refactor is worth
+doing but is not a drive-by fix.
+
+### ❌ B. Token comparison timing side-channel
+
+**Severity: medium — blocked on Knot runtime.**
+
+`s.token == token` is plain string equality, which short-circuits on the first
+differing byte (server.knot:761). An attacker who can time the response learns
+how many leading characters of a guess were correct. Bounded by the 192-bit
+token and per-IP rate limit. The correct fix is a `constantTimeEquals` primitive
+in the Knot runtime. Documented in PROTOCOL.md §6 and in-code comments.
+
+### ❌ C. Open federation — gossip redirect & forward injection
+
+**Severity: high — accepted v0.1 limitation, blocked on peer authentication.**
+
+Both `/federation/*` endpoints are unauthenticated. An attacker can redirect a
+victim's queued ciphertext or inject blobs into an online recipient's mailbox.
+Fully documented in PROTOCOL-REVIEW.md #2, #4 and PROTOCOL.md §10. The fix
+requires signed presence gossip and authenticated forward requests, which needs
+a key-to-home-server binding the protocol does not yet define.
+
+### ❌ D. SSRF deny-list is lexical only
+
+**Severity: medium — blocked on `fetch` exposing DNS resolution.**
+
+`isBadServerName` inspects the hostname string, never the resolved address.
+DNS-rebinding TOCTOU bypasses it. The fix needs resolve-then-pin (fuse DNS
+resolution with connection), which `fetch` does not expose. Documented in
+PROTOCOL-REVIEW.md and in-code comments at `isBadServerName`.
+
+### ❌ E. Federation retry sweep can starve the prune sweep
+
+**Severity: low — design tradeoff, blocked on `fetch` deadline support.**
+
+`backgroundRetryForwards` runs inline, so a sweep over many unreachable peers
+blocks until every `fetch` resolves. The prune sweep's writes conflict with the
+retry loop's atomic blocks. A fix needs either a `fetch` deadline or a
+transaction that yields between per-peer batches, neither of which the current
+`fetch` supports. Documented in PROTOCOL-REVIEW.md #9.
