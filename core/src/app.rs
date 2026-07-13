@@ -1337,18 +1337,13 @@ impl App for Skrepka {
 
         let active_peer = model.active_peer.clone().unwrap_or_default();
 
-        // `view()` runs on every render, and `ComposeChanged` renders on every
-        // keystroke. A contact's `photo` is a base64 avatar — tens of KiB each —
-        // so cloning all of them per keypress meant megabytes of allocation and
-        // bincode-encoding to type one message.
-        //
-        // Only the chat page has a composer (`ComposeChanged` is sent from
-        // `ChatView` and nowhere else), so only the chat page is on that hot path
-        // — and while it is up, the only avatar on screen is the peer we are
-        // talking to. Every *other* page renders from a cold event, and the
-        // conversations list draws an avatar per row, so it gets the real photos.
-        // Withholding them there would not save a single keystroke's work; it
-        // would just replace every contact's picture with their initials.
+        // `view()` is called after every event the core processes. The
+        // per-keystroke optimization below assumes `ComposeChanged` fires on
+        // every keystroke, but the Swift shell only sends it before `SendText`
+        // — so in practice this path runs once per message, not per keypress.
+        // The optimization is still correct (it withholds avatars on the chat
+        // page regardless of how often `view` runs), just the original comment
+        // overstated the frequency.
         let chat_open = model.page == Page::Chat;
 
         let mut contacts: Vec<ContactVM> = model
@@ -1535,6 +1530,20 @@ impl Skrepka {
         if body.is_empty() {
             return render();
         }
+
+        // Check the contact cap *before* mutating anything. The old order
+        // cleared `compose` and inserted the message into `model.messages`
+        // first, then hit the cap and returned early — so the user's text was
+        // gone (compose cleared), the message sat in an invisible orphan
+        // conversation (no contact entry to click on), and nothing was
+        // persisted (no `persist_messages` before the early return). On next
+        // launch the message was silently lost.
+        let was_new = !model.contacts.contains_key(&peer);
+        if was_new && model.contacts.len() >= MAX_CONTACTS {
+            model.error = Some("contact list is full".into());
+            return render();
+        }
+
         model.compose.clear();
         let ts = now_ms();
         let id = uuid::Uuid::new_v4().to_string();
@@ -1559,11 +1568,6 @@ impl Skrepka {
         // the same `MAX_CONTACTS` cap `ingest_poll` enforces. This is
         // user-driven (not an attack vector), but the cap exists to bound the
         // `contacts` kv blob, which is rewritten in full on every change.
-        let was_new = !model.contacts.contains_key(&peer);
-        if was_new && model.contacts.len() >= MAX_CONTACTS {
-            model.error = Some("contact list is full".into());
-            return render();
-        }
         if was_new {
             model
                 .contacts
@@ -3307,6 +3311,41 @@ mod tests {
         m.compose = "   ".into();
         let _ = app.update(Event::SendText, &mut m); // whitespace only
         assert!(m.outbox.is_empty());
+    }
+
+    /// The contact cap must be checked *before* mutating anything. The old
+    /// order cleared `compose` and inserted the message into `model.messages`
+    /// first, then hit the cap and returned early — losing the user's text and
+    /// leaving an invisible orphan conversation that was never persisted.
+    #[test]
+    fn send_text_to_a_new_peer_at_the_contact_cap_preserves_compose() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        // Fill the contact list to the cap.
+        for i in 0..MAX_CONTACTS {
+            let k = format!("{i:064x}");
+            m.contacts.insert(k.clone(), Contact::new(k, String::new(), 0));
+        }
+        let new_peer = peer_hex(9);
+        m.active_peer = Some(new_peer.clone());
+        m.compose = "hello new friend".into();
+
+        let _ = app.update(Event::SendText, &mut m);
+
+        assert_eq!(
+            m.compose, "hello new friend",
+            "compose must not be cleared on rejection"
+        );
+        assert!(
+            m.messages.get(&new_peer).is_none_or(Vec::is_empty),
+            "no orphan conversation must be created"
+        );
+        assert!(m.outbox.is_empty(), "nothing must be queued");
+        assert!(!m.contacts.contains_key(&new_peer), "no contact created");
+        assert!(
+            m.error.as_ref().is_some_and(|e| e.contains("full")),
+            "the user is told why"
+        );
     }
 
     #[test]

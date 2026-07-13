@@ -161,6 +161,34 @@ struct BlockToggle: View {
     }
 }
 
+/// Permanently removes a contact, their conversation history, and any queued
+/// outbox items for them. Unlike blocking (which silences but keeps the entry),
+/// deletion is irreversible — so a confirmation prompt gates the action.
+struct DeleteContactButton: View {
+    @ObservedObject var core: Core
+    let peer: String
+
+    @State private var confirming = false
+
+    var body: some View {
+        Button(role: .destructive) {
+            confirming = true
+        } label: {
+            Label("Delete contact", systemImage: "trash")
+        }
+        .confirmationDialog(
+            "Delete this contact? Their message history will be removed and cannot be recovered.",
+            isPresented: $confirming,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                core.update(.deleteContact(peer: peer))
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+    }
+}
+
 struct ConversationsView: View {
     @ObservedObject var core: Core
 
@@ -218,6 +246,7 @@ struct ConversationsView: View {
         }
         .contextMenu {
             BlockToggle(core: core, peer: contact.pubkey, blocked: contact.blocked)
+            DeleteContactButton(core: core, peer: contact.pubkey)
         }
     }
 }
@@ -259,6 +288,7 @@ struct ChatView: View {
                     peer: core.view.activePeer,
                     blocked: core.view.activePeerBlocked
                 )
+                DeleteContactButton(core: core, peer: core.view.activePeer)
             } label: {
                 Image(systemName: "ellipsis.circle")
             }

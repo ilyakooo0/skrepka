@@ -260,7 +260,7 @@ fn derive_key(
 
 fn compress(plaintext: &[u8]) -> Vec<u8> {
     // zstd frame with embedded content size; decodable without a capacity hint.
-    zstd::encode_all(plaintext, 0).expect("zstd compression is infallible for in-memory input")
+    zstd::encode_all(plaintext, 3).expect("zstd compression is infallible for in-memory input")
 }
 
 /// Decompress a zstd frame, refusing to produce more than `MAX_PLAINTEXT_LEN`.

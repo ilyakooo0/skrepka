@@ -136,12 +136,13 @@ The wire-visible "envelope" carries only the recipient and the opaque blob. The 
    ```
 8. Emit the on-wire blob:
    ```
-   blob = ephemeral_public || nonce || ciphertext
+   blob = version_byte || ephemeral_public || nonce || ciphertext
    ```
+   where `version_byte` is `0x01` (see *Cryptographic Versioning* below).
 
 **Decryption flow:**
 
-1. Split the blob: 32-byte `ephemeral_public`, 24-byte `nonce`, remainder is `ciphertext`.
+1. Read the leading version byte (reject the blob if it is not recognized). Split the rest: 32-byte `ephemeral_public`, 24-byte `nonce`, remainder is `ciphertext`.
 2. Derive the recipient's X25519 private key from the recipient's Ed25519 private key, compute the raw shared secret with `ephemeral_public`, and HKDF-derive the same `key`.
 3. AEAD-decrypt the ciphertext to recover the inner buffer.
 4. Split: 32-byte `sender_ed25519_public`, 64-byte `signature`, 4-byte `compressed_len` (big-endian u32), then `compressed_len` bytes of `compressed` (the remainder is padding).
