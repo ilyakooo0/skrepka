@@ -983,11 +983,13 @@ pruneExpired = \t -> atomic do
   ses <- *sessions
   *sessions = filter (\x -> x.expiresAt > t) ses
   msgs <- *messages
-  *messages = filter (\m -> t - m.receivedAt < messageMaxAge) msgs
+  let surviving = filter (\m -> t - m.receivedAt < messageMaxAge) msgs
+  *messages = surviving
   -- Prune forwards whose message was removed by the TTL sweep above.
-  -- ForwardEntry carries no timestamp, so match against the surviving messages.
+  -- ForwardEntry carries no timestamp, so match against the surviving
+  -- messages (the post-sweep list, not the pre-sweep snapshot).
   fw <- *forwards
-  *forwards = filter (\f -> any (\m -> m.toKey == f.toKey && m.encryptedBlob == f.encryptedBlob) msgs) fw
+  *forwards = filter (\f -> any (\m -> m.toKey == f.toKey && m.encryptedBlob == f.encryptedBlob) surviving) fw
   ff <- *forwardFailures
   *forwardFailures = filter (\f -> t - f.failedAt < forwardFailureMaxAge) ff
   -- presence: remember locally-expired keys for offline gossip

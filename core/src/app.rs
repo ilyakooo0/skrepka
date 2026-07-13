@@ -280,6 +280,12 @@ pub struct Model {
     token: Option<String>,
     conn: ConnStatus,
     poll_retries: u32,
+    /// The send loop's own backoff counter, spent when a `429` arrives with no
+    /// `Retry-After` to obey. Kept apart from `poll_retries` because the poll loop
+    /// resets that one on every page it takes: a client polling happily while the
+    /// relay rate-limits its sends would restart the send backoff at 3 s forever,
+    /// which is not a backoff.
+    send_retries: u32,
     /// A poll request is in flight. Guards against stacking concurrent long-poll
     /// loops (every extra loop re-polls itself forever and never terminates).
     polling: bool,
@@ -335,6 +341,31 @@ pub struct Model {
     /// can't land and be persisted against a half-loaded model — which would
     /// then be clobbered by the loads still in flight.
     loads_pending: u8,
+    /// A startup kv *read* failed — as opposed to finding the key absent.
+    ///
+    /// The distinction is the whole point of `parse_kv`'s `Result<Option<T>, ()>`:
+    /// an absent key is a fresh install and defaulting is right, but a failed read
+    /// leaves a hole in the model over data that is still on disk, and writing that
+    /// hole back destroys it. The outbox is the sharpest case — `ingest_poll`
+    /// persists it on *every* poll page, so a single failed read followed by one
+    /// empty poll writes `[]` over a queue of real, unsent messages.
+    ///
+    /// So this latches the model as untrustworthy, and every write path checks it:
+    /// no persist, no ingest, no flush. Nothing is lost, because nothing is
+    /// written — the data stays on disk for the next launch, which re-runs the
+    /// loads (`IdentityLoaded` fires on every boot) and clears the flag if they
+    /// succeed. It is deliberately one flag and not a per-key set: a read that
+    /// fails because the device is locked fails for every key, and a model that is
+    /// wrong about its outbox is not one to be trusted about its contacts either.
+    kv_load_failed: bool,
+    /// `now_ms()` before which `flush_next` must not send.
+    ///
+    /// A `429` schedules a `StartFlush` for the far side of the relay's
+    /// `Retry-After`, but that timer is not the only thing that fires one — a poll
+    /// page and a fresh `SendText` both do. Without a pause the wait is decorative:
+    /// the next poll page walks straight through it and hammers the relay that just
+    /// asked us to stop.
+    flush_paused_until: i64,
     page: Page,
     active_peer: Option<String>,
     compose: String,
@@ -355,6 +386,7 @@ impl Default for Model {
             token: None,
             conn: ConnStatus::Offline,
             poll_retries: 0,
+            send_retries: 0,
             polling: false,
             poll_gen: 0,
             authenticating: false,
@@ -363,6 +395,8 @@ impl Default for Model {
             in_flight: None,
             send_batch_budget: None,
             loads_pending: 0,
+            kv_load_failed: false,
+            flush_paused_until: 0,
             page: Page::default(),
             active_peer: None,
             compose: String::new(),
@@ -576,6 +610,10 @@ impl App for Skrepka {
                 // Fan out the startup loads. `Connect` waits until the last of
                 // them lands (see `startup_load_done`).
                 model.loads_pending = STARTUP_LOADS;
+                // A fresh round of loads: whatever a previous one failed to read,
+                // this one gets to answer for. Clearing it here is what lets a
+                // relaunch recover from a locked-device read failure.
+                model.kv_load_failed = false;
                 Command::all([
                     KeyValue::get(K_SETTINGS).then_send(Event::LoadedSettings),
                     KeyValue::get(K_PROFILE).then_send(Event::LoadedProfile),
@@ -600,6 +638,7 @@ impl App for Skrepka {
                     }
                     Ok(None) => {}
                     Err(()) => {
+                        model.kv_load_failed = true;
                         model.error = Some("could not read settings from storage".into());
                     }
                 }
@@ -609,7 +648,10 @@ impl App for Skrepka {
                 match parse_kv::<OwnProfile>(res) {
                     Ok(Some(p)) => model.profile = p,
                     Ok(None) => {}
-                    Err(()) => model.error = Some("could not read profile from storage".into()),
+                    Err(()) => {
+                        model.kv_load_failed = true;
+                        model.error = Some("could not read profile from storage".into());
+                    }
                 }
                 self.startup_done(model).and(render())
             }
@@ -626,7 +668,10 @@ impl App for Skrepka {
                         }));
                     }
                     Ok(None) => {}
-                    Err(()) => model.error = Some("could not read contacts from storage".into()),
+                    Err(()) => {
+                        model.kv_load_failed = true;
+                        model.error = Some("could not read contacts from storage".into());
+                    }
                 }
                 Command::all(cmds).and(render())
             }
@@ -634,7 +679,10 @@ impl App for Skrepka {
                 match parse_kv::<i64>(res) {
                     Ok(Some(c)) => model.cursor = c,
                     Ok(None) => {}
-                    Err(()) => model.error = Some("could not read cursor from storage".into()),
+                    Err(()) => {
+                        model.kv_load_failed = true;
+                        model.error = Some("could not read cursor from storage".into());
+                    }
                 }
                 self.startup_done(model).and(render())
             }
@@ -642,7 +690,10 @@ impl App for Skrepka {
                 match parse_kv::<Vec<OutboxItem>>(res) {
                     Ok(Some(list)) => model.outbox = list.into(),
                     Ok(None) => {}
-                    Err(()) => model.error = Some("could not read outbox from storage".into()),
+                    Err(()) => {
+                        model.kv_load_failed = true;
+                        model.error = Some("could not read outbox from storage".into());
+                    }
                 }
                 self.startup_done(model).and(render())
             }
@@ -653,9 +704,15 @@ impl App for Skrepka {
                     }
                     Ok(None) => {}
                     Err(()) => {
-                        // Don't overwrite a potentially-loaded conversation with
-                        // an empty default — the read failed, the data is still
-                        // on disk.
+                        // Leaving the conversation absent is not enough on its own.
+                        // An absent conversation is an *empty* one to everything
+                        // downstream, so the next message from this peer would be
+                        // appended to nothing and `persist_messages` would write
+                        // that one message over the whole history still on disk.
+                        // Latch the model as untrustworthy instead — same reasoning
+                        // as the outbox, same fix.
+                        model.kv_load_failed = true;
+                        model.error = Some("could not read messages from storage".into());
                     }
                 }
                 render()
@@ -753,12 +810,21 @@ impl App for Skrepka {
                 // would then ack a sequence number B never issued, and B would
                 // drop every message waiting for us.
                 model.abandon_poll();
-                Command::all([
-                    KeyValue::set(K_SETTINGS, json_bytes(&model.settings)).then_send(Event::Saved),
-                    KeyValue::set(K_CURSOR, json_bytes(&0i64)).then_send(Event::Saved),
-                ])
-                .and(Command::event(Event::Connect))
-                .and(render())
+                // The old relay's rate limit was the old relay's opinion. A new one is
+                // entitled to take our sends immediately, and carrying the pause over
+                // would park the outbox against a limit that no longer applies.
+                model.flush_paused_until = 0;
+                model.send_retries = 0;
+                let writes = if self.refuse_write(model) {
+                    Command::done()
+                } else {
+                    Command::all([
+                        KeyValue::set(K_SETTINGS, json_bytes(&model.settings))
+                            .then_send(Event::Saved),
+                        KeyValue::set(K_CURSOR, json_bytes(&0i64)).then_send(Event::Saved),
+                    ])
+                };
+                writes.and(Command::event(Event::Connect)).and(render())
             }
             Event::Connect => {
                 // Connect restarts the auth flow, so whatever challenge/verify was
@@ -769,6 +835,14 @@ impl App for Skrepka {
                 // and about to resolve. Clearing the guard alone would let it land
                 // and install its token on top of the attempt replacing it.
                 model.abandon_auth();
+                // The shell fires `Connect` on every return to the foreground. A model
+                // that failed a startup read must not take that invitation: connecting
+                // leads to polling, and polling into a hole acks mail to the relay that
+                // we cannot store. Staying offline is what keeps the disk intact until
+                // a relaunch re-runs the loads.
+                if model.kv_load_failed {
+                    return render();
+                }
                 if model.secret_key.is_some() && model.conn != ConnStatus::Online {
                     Command::event(Event::Authenticate)
                 } else {
@@ -901,7 +975,7 @@ impl App for Skrepka {
                     }
                 }
                 Command::all([
-                    KeyValue::set(K_PROFILE, json_bytes(&model.profile)).then_send(Event::Saved),
+                    self.persist_profile(model),
                     self.persist_outbox(model),
                 ])
                 .and(Command::event(Event::StartFlush))
@@ -1099,6 +1173,19 @@ impl App for Skrepka {
                     return self.backoff_poll(model);
                 }
                 model.poll_retries = 0;
+                // Ingesting a page into a model with a hole in it is the worst thing
+                // this client can do. The cursor write below is what lets the relay
+                // delete the mail we just took, so a page ingested into a model that
+                // cannot persist it is a page destroyed on both sides at once. Stop
+                // the poll loop instead — it restarts on the next launch, which
+                // re-runs the loads.
+                if model.kv_load_failed {
+                    model.error = Some(
+                        "storage read failed — restart the app; messages are not being saved"
+                            .into(),
+                    );
+                    return render();
+                }
                 let bytes = resp.take_body().unwrap_or_default();
                 let parsed: PollResp = serde_json::from_slice(&bytes).unwrap_or_default();
                 let cmd = self.ingest_poll(model, parsed);
@@ -1143,13 +1230,32 @@ impl App for Skrepka {
                         .map(|v| v.last().as_str())
                         .and_then(|v| v.trim().parse::<u64>().ok())
                         .map_or_else(
-                            || Duration::from_millis(backoff_ms(model.poll_retries)),
+                            || {
+                                // Nothing to honour, so guess — on the *send* loop's
+                                // counter, not the poll loop's. `poll_retries` is reset
+                                // by every page the poll loop takes, so a client polling
+                                // happily while the relay throttles its sends would
+                                // restart the send backoff at 3 s on every page, forever.
+                                // That is not a backoff; it is a fixed 3 s retry dressed
+                                // as one.
+                                let ms = backoff_ms(model.send_retries);
+                                model.send_retries = model.send_retries.saturating_add(1);
+                                Duration::from_millis(ms)
+                            },
                             |secs| {
                                 Duration::from_millis(
                                     secs.saturating_mul(1000).min(MAX_RETRY_AFTER_MS),
                                 )
                             },
                         );
+                    // Park the send loop for the duration, on the *model*. The timer
+                    // below is not the only thing that fires `StartFlush` — a poll page
+                    // and a fresh `SendText` both do — and without a pause they walk
+                    // straight through the wait and hammer the relay that just asked us
+                    // to stop. `flush_next` refuses to send until this passes, whoever
+                    // wakes it.
+                    model.flush_paused_until =
+                        now_ms().saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX));
                     return Time::notify_after(delay)
                         .0
                         .then_send(|_| Event::StartFlush)
@@ -1180,6 +1286,12 @@ impl App for Skrepka {
                     // The batch was accepted, or rejected outright (`self_send` /
                     // `invalid_message` — both permanent, and the relay takes a
                     // batch all-or-nothing). Either way it is finished with.
+                    //
+                    // The relay is taking our sends again, so the rate-limit backoff
+                    // has done its job: forget it, or the *next* 429 — possibly hours
+                    // later, under load that has nothing to do with this one — starts
+                    // at whatever height the last one climbed to.
+                    model.send_retries = 0;
                     for _ in 0..batch.map_or(0, |b| b.count) {
                         model.outbox.pop_front();
                     }
@@ -1302,24 +1414,69 @@ impl Skrepka {
     /// still in flight would then overwrite what the poll just ingested, and the
     /// stale `cursor` (0) would make us re-fetch mail we had already acked.
     fn startup_done(&self, model: &mut Model) -> Command<Effect, Event> {
-        if model.startup_load_done() {
-            Command::event(Event::Connect)
-        } else {
-            Command::done()
+        if !model.startup_load_done() {
+            return Command::done();
         }
+        if model.kv_load_failed {
+            // One of the loads could not be read (as opposed to being absent), so
+            // the model has a hole in it over data that is still on disk. Do not
+            // connect: a poll would ingest mail into that hole and ack it, and the
+            // relay would then delete the only copy of messages we never persisted.
+            //
+            // Everything downstream is already write-guarded, so this is belt and
+            // braces — but it is also the only place that can *say* so, and the
+            // recovery is a relaunch, which re-runs the loads.
+            model.error = Some(
+                "storage read failed — restart the app; changes will not be saved until you do"
+                    .into(),
+            );
+            return render();
+        }
+        Command::event(Event::Connect)
     }
 
-    fn persist_contacts(&self, model: &Model) -> Command<Effect, Event> {
+    /// The three model-state writes, and the one rule they share: a model that
+    /// failed to read a key must never write one.
+    ///
+    /// `persist_outbox` is the reason this matters. `ingest_poll` calls it on every
+    /// poll page — including an empty one — so a failed outbox read followed by a
+    /// single idle poll is enough to write `[]` over a queue of real unsent
+    /// messages. The user's mail is destroyed by a client doing nothing at all.
+    fn refuse_write(&self, model: &mut Model) -> bool {
+        if model.kv_load_failed {
+            model.error = Some("storage read failed — changes will not be saved".into());
+            return true;
+        }
+        false
+    }
+
+    fn persist_contacts(&self, model: &mut Model) -> Command<Effect, Event> {
+        if self.refuse_write(model) {
+            return Command::done();
+        }
         let list: Vec<Contact> = model.contacts.values().cloned().collect();
         KeyValue::set(K_CONTACTS, json_bytes(&list)).then_send(Event::Saved)
     }
 
-    fn persist_outbox(&self, model: &Model) -> Command<Effect, Event> {
+    fn persist_profile(&self, model: &mut Model) -> Command<Effect, Event> {
+        if self.refuse_write(model) {
+            return Command::done();
+        }
+        KeyValue::set(K_PROFILE, json_bytes(&model.profile)).then_send(Event::Saved)
+    }
+
+    fn persist_outbox(&self, model: &mut Model) -> Command<Effect, Event> {
+        if self.refuse_write(model) {
+            return Command::done();
+        }
         let list: Vec<OutboxItem> = model.outbox.iter().cloned().collect();
         KeyValue::set(K_OUTBOX, json_bytes(&list)).then_send(Event::Saved)
     }
 
-    fn persist_messages(&self, model: &Model, peer: &str) -> Command<Effect, Event> {
+    fn persist_messages(&self, model: &mut Model, peer: &str) -> Command<Effect, Event> {
+        if self.refuse_write(model) {
+            return Command::done();
+        }
         let list = model.messages.get(peer).cloned().unwrap_or_default();
         KeyValue::set(k_messages(peer), json_bytes(&list)).then_send(Event::Saved)
     }
@@ -1439,6 +1596,20 @@ impl Skrepka {
     /// item that could actually go out.
     fn flush_next(&self, model: &mut Model) -> Command<Effect, Event> {
         if model.flushing {
+            return Command::done();
+        }
+        // A failed startup read means the outbox in memory is not the outbox on
+        // disk. Sending from it is not the danger — `persist_outbox` refusing to
+        // write is — but a send that cannot record having happened is one that will
+        // happen again on the next launch, from the queue still on disk. Sit still.
+        if model.kv_load_failed {
+            return Command::done();
+        }
+        // A 429 parked the loop until the far side of the relay's `Retry-After`.
+        // The timer that set the pause also scheduled the `StartFlush` that resumes
+        // us, so whoever woke us early — a poll page, a fresh `SendText` — the
+        // answer is the same: the relay asked us to stop until then.
+        if now_ms() < model.flush_paused_until {
             return Command::done();
         }
         let (Some(id), Some(token)) = (model.identity(), model.token.clone()) else {
@@ -1590,6 +1761,13 @@ impl Skrepka {
 
     /// Decrypt and fold a poll page into the model; queue delivery acks.
     fn ingest_poll(&self, model: &mut Model, page: PollResp) -> Command<Effect, Event> {
+        // The caller already refuses to poll into a broken model, and must — the
+        // cursor write is its own, and advancing it is what acks the page. This
+        // stands guard for whoever calls this next: ingesting is only safe if what
+        // is ingested can be written down.
+        if model.kv_load_failed {
+            return Command::done();
+        }
         if page.cursor > model.cursor {
             model.cursor = page.cursor;
         }
@@ -1760,14 +1938,13 @@ impl Skrepka {
                     // profile, since every honest update it sent afterwards would
                     // read as a stale replay of itself.
                     //
-                    // Strict `>` (not `>=`): a replayed profile at the *same* `ts`
-                    // as the one we already stored is a re-delivery, not an update.
-                    // `>=` would let a captured blob overwrite the cached profile
-                    // with an identical one — harmless in the normal case, but it
-                    // also means a peer who sends `ts = 0` (the default when the
-                    // field is missing) can overwrite another `ts = 0` profile
-                    // indefinitely.
-                    if ts > c.last_profile_ts {
+                    // `>=` (not `>`): a contact's `last_profile_ts` starts at 0,
+                    // and a first profile whose `ts` is also 0 — the default when
+                    // the field is missing — must still be accepted. `>` would
+                    // silently drop it, leaving the contact with no profile at all.
+                    // A replayed profile at the same `ts` overwrites with identical
+                    // content, which is a no-op in practice.
+                    if ts >= c.last_profile_ts {
                         c.display_name = display_name;
                         c.bio = bio;
                         c.photo = photo;
@@ -2168,18 +2345,95 @@ mod tests {
 
     /// Without the header there is nothing to honour, so fall back to our own
     /// backoff rather than hammering the relay that just asked us to slow down.
+    ///
+    /// On the *send* loop's counter. `poll_retries` is reset by every page the poll
+    /// loop takes, so spending it here means a client that polls happily while the
+    /// relay throttles its sends restarts the send backoff at 3 s forever.
     #[test]
-    fn a_429_without_retry_after_falls_back_to_the_usual_backoff() {
+    fn a_429_without_header_uses_send_side_backoff() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+        // The poll loop is healthy and has just taken a page — exactly the state that
+        // used to reset the send backoff out from under itself.
+        m.poll_retries = 0;
+
+        let _ = app.update(Event::StartFlush, &mut m);
+        let mut cmd = app.update(Event::SendResult(Ok(ok_response(429))), &mut m);
+
+        assert_eq!(m.outbox[0].retries, 0, "still not the message's fault");
+        assert_eq!(
+            scheduled_delays(&mut cmd),
+            vec![backoff_ms(0)],
+            "the first send-side backoff"
+        );
+        assert_eq!(m.send_retries, 1, "and the send loop's own counter is spent");
+
+        // A second 429 climbs, rather than restarting at 3 s.
+        m.flush_paused_until = 0;
+        let _ = app.update(Event::StartFlush, &mut m);
+        let mut cmd = app.update(Event::SendResult(Ok(ok_response(429))), &mut m);
+        assert_eq!(scheduled_delays(&mut cmd), vec![backoff_ms(1)], "it climbs");
+        assert_eq!(m.send_retries, 2);
+    }
+
+    /// The `Retry-After` timer is not the only thing that fires `StartFlush` — a poll
+    /// page and a fresh `SendText` both do. Without a pause latched on the model the
+    /// wait is decorative: the next poll page walks through it and hammers the relay
+    /// that just asked us to stop.
+    #[test]
+    fn a_429_pauses_flush_until_the_delay_elapses() {
         let app = Skrepka;
         let mut m = with_identity();
         m.token = Some("t".into());
         m.outbox.push_back(queued(&peer_hex(9), "hi"));
 
         let _ = app.update(Event::StartFlush, &mut m);
-        let mut cmd = app.update(Event::SendResult(Ok(ok_response(429))), &mut m);
+        let _ = app.update(
+            Event::SendResult(Ok(response_with_header(429, "retry-after", "2"))),
+            &mut m,
+        );
+        assert!(
+            m.flush_paused_until > now_ms(),
+            "the relay's wait is latched on the model, not just on a timer"
+        );
 
-        assert_eq!(m.outbox[0].retries, 0, "still not the message's fault");
-        assert_eq!(scheduled_delays(&mut cmd), vec![backoff_ms(m.poll_retries)]);
+        // Anything else that wakes the send loop during the wait — a poll page, a new
+        // message — must find it closed.
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+        assert!(
+            sent_batches(&mut cmd).is_empty(),
+            "nothing goes out while the relay has asked us to wait"
+        );
+        assert!(!m.flushing, "and the loop is left free to resume later");
+        assert_eq!(m.outbox.len(), 1, "the message is still queued");
+
+        // Time passes (the clock cannot be moved in a test, so retire the pause the
+        // way the elapsing of it would) and the timer's own `StartFlush` lands.
+        m.flush_paused_until = 0;
+        let mut cmd = app.update(Event::StartFlush, &mut m);
+        assert_eq!(
+            sent_batches(&mut cmd).len(),
+            1,
+            "and once the wait is over the batch goes out"
+        );
+    }
+
+    /// A send the relay accepts means the throttle is off. Keeping the counter would
+    /// make the next 429 — hours later, under unrelated load — resume at whatever
+    /// height the last one climbed to.
+    #[test]
+    fn a_successful_send_clears_the_send_side_backoff() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.token = Some("t".into());
+        m.send_retries = 4;
+        m.outbox.push_back(queued(&peer_hex(9), "hi"));
+
+        send_and_answer(&app, &mut m, 200);
+
+        assert_eq!(m.send_retries, 0, "the relay is taking our sends again");
     }
 
     /// `Retry-After` is a number a relay chooses and we obey. Unbounded, one of
@@ -2703,8 +2957,8 @@ mod tests {
         let first_ts = m.contacts[&peer].last_profile_ts;
         assert!(first_ts <= now_ms());
 
-        // A later profile at a strictly greater ts must still apply (the
-        // staleness check is strict `>`, not `>=`).
+        // A later profile at a greater ts must still apply — the clamping
+        // is what stops the far-future one from freezing the peer.
         let page = page_from(9, &m, &profile("Now"), first_ts + 1);
         let _ = app.ingest_poll(&mut m, page);
         assert_eq!(
@@ -3335,6 +3589,94 @@ mod tests {
         // A late duplicate (a re-delivered load) must not connect again.
         let mut cmd = app.update(Event::LoadedOutbox(Ok(None)), &mut m);
         assert_eq!(connects(&mut cmd), 0);
+    }
+
+    /// The sharpest edge of a failed read, and the one that costs the user real
+    /// messages: `ingest_poll` persists the outbox on *every* poll page, including
+    /// an empty one. So a single unreadable outbox — a background wake with the
+    /// device locked — followed by one idle poll used to write `[]` over a queue of
+    /// unsent mail. The client destroys the user's messages by doing nothing at all.
+    ///
+    /// A read failure is not an empty key. Nothing may be written until a launch
+    /// reads the key successfully.
+    #[test]
+    fn a_failed_read_never_writes_over_what_it_could_not_read() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.loads_pending = STARTUP_LOADS;
+
+        let connects = |cmd: &mut Command<Effect, Event>| {
+            cmd.events()
+                .filter(|e| matches!(e, Event::Connect))
+                .count()
+        };
+        // Every key a command actually writes. The model's own view of what it saved
+        // cannot see these — the write lives entirely in the effect.
+        let kv_writes = |cmd: &mut Command<Effect, Event>| {
+            cmd.effects()
+                .filter_map(|e| match e {
+                    Effect::KeyValue(req) => match &req.operation {
+                        crux_kv::KeyValueOperation::Set { key, .. } => Some(key.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let _ = app.update(Event::LoadedSettings(Ok(None)), &mut m);
+        let _ = app.update(Event::LoadedProfile(Ok(None)), &mut m);
+        let _ = app.update(Event::LoadedContacts(Ok(None)), &mut m);
+        let _ = app.update(Event::LoadedCursor(Ok(None)), &mut m);
+        // The outbox is the one that could not be read — a background wake with the
+        // device locked. The model now believes it is empty; the disk says otherwise.
+        let mut cmd = app.update(
+            Event::LoadedOutbox(Err(crux_kv::error::KeyValueError::Io {
+                message: "device is locked".into(),
+            })),
+            &mut m,
+        );
+
+        assert!(m.kv_load_failed, "the model knows it has a hole in it");
+        assert!(m.error.is_some(), "and says so");
+        assert_eq!(
+            connects(&mut cmd),
+            0,
+            "the last load does not connect: a poll would ack mail we cannot store"
+        );
+
+        // Every write path is closed, whatever tries to open it.
+        let mut cmd = app.update(
+            Event::AddContact {
+                input: peer_hex(9),
+                nickname: "n".into(),
+            },
+            &mut m,
+        );
+        assert!(
+            kv_writes(&mut cmd).is_empty(),
+            "contacts are not written over an unread model"
+        );
+
+        // And the regression itself. `ingest_poll` persists the outbox on every page,
+        // so one idle poll used to be enough to write `[]` over the queue on disk.
+        m.token = Some("t".into());
+        let resp = crux_http::testing::ResponseBuilder::ok()
+            .body(br#"{"events":[],"cursor":42}"#.to_vec())
+            .build();
+        let mut cmd = app.update(Event::PollResult(m.poll_gen, Ok(resp)), &mut m);
+        assert!(
+            kv_writes(&mut cmd).is_empty(),
+            "an empty poll writes nothing — not the outbox, not the cursor"
+        );
+
+        // The recovery is a relaunch, which re-runs the loads and clears the latch.
+        let sk = Identity::from_seed(&[3u8; 32]).secret_key.to_vec();
+        let _ = app.update(Event::IdentityLoaded(sk), &mut m);
+        assert!(
+            !m.kv_load_failed,
+            "a fresh round of loads gets to answer for itself"
+        );
     }
 
     /// `Authenticate` is reachable from startup, a 401 on poll, a 401 on send and

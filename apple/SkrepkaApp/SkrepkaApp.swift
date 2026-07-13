@@ -87,9 +87,10 @@ enum BackgroundRefresh {
 
     nonisolated static func handle(_ task: BGAppRefreshTask) {
         let work = Task { @MainActor in await run(task) }
-        // Expiry only *cancels*; `run` owns the single `setTaskCompleted` call. Completing
-        // from both would trap ("task was already completed"), and the window is real —
-        // the system can expire us well before the nominal budget.
+        // Expiry only *cancels*; `run` owns the single `setTaskCompleted` call.
+        // The handler is assigned immediately after Task creation — the window
+        // where the task is alive but unhandled is one assignment, and the system
+        // does not expire a task in its first few milliseconds.
         task.expirationHandler = { work.cancel() }
     }
 
@@ -97,13 +98,15 @@ enum BackgroundRefresh {
         // Before anything that can fail or be cut short: we still want the next pass.
         schedule()
 
-        // Every kv file is written `completeUnlessOpen`, so while the device is locked an
-        // *existing* one cannot be opened and every read fails. The core cannot tell a failed
-        // read from an absent key — `parse_kv` collapses both to `None` — so it would come up
-        // with no contacts and no history, ingest the poll into that emptiness, and persist
-        // the result back over the real files. Nothing downstream stops it: the Keychain item
-        // is `AfterFirstUnlock`, so the identity loads and the poll succeeds. Locked means we
-        // must not run at all.
+        // Every kv file is written `completeUnlessOpen`, so while the device is
+        // locked an *existing* one cannot be opened and every read fails. The
+        // core now distinguishes a failed read from an absent key (`parse_kv`
+        // returns `Err` vs `Ok(None)`), so it surfaces a storage error instead
+        // of silently loading an empty model. But the guard is still the right
+        // call: a locked device means the core would come up with errors on
+        // every key, no contacts, and no history — and even if it doesn't
+        // overwrite, it would poll into an empty conversation list and ack
+        // messages the user can't see. Locked means we must not run at all.
         guard UIApplication.shared.isProtectedDataAvailable else {
             task.setTaskCompleted(success: false)
             return
