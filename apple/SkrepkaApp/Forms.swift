@@ -158,6 +158,15 @@ struct EditProfileView: View {
                 }
                 Section("Name") { TextField("Display name", text: $name) }
                 Section("Bio") { TextField("About you", text: $bio, axis: .vertical) }
+                // SaveProfile sets model.error on validation failures ("display name
+                // too long", "bio too long", "photo too large") but leaves the page
+                // open. Without displaying it the user taps Save, nothing happens, and
+                // they have no idea why.
+                if !core.view.error.isEmpty {
+                    Section {
+                        Text(core.view.error).foregroundColor(.red)
+                    }
+                }
             }
             .navigationTitle("Edit profile")
             .toolbar {

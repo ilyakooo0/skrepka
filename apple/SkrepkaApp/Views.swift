@@ -319,22 +319,45 @@ struct ChatView: View {
     }
 
     private var composer: some View {
-        HStack(spacing: 8) {
-            TextField("Message", text: $draft, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...4)
-                .disabled(core.view.activePeerBlocked)
-            Button {
-                let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty else { return }
-                core.update(.composeChanged(text))
-                core.update(.sendText)
-                draft = ""
-            } label: {
-                Image(systemName: "arrow.up.circle.fill").font(.title)
+        VStack(spacing: 0) {
+            // Errors from send_text ("message too long", "contact list is full",
+            // "gave up sending …", "invalid key") are set on model.error and rendered
+            // into view.error, but without this the chat page swallowed them — the
+            // user tapped send, it failed, and they saw nothing.
+            if !core.view.error.isEmpty {
+                Text(core.view.error)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.top, 4)
             }
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      || core.view.activePeerBlocked)
+            HStack(spacing: 8) {
+                TextField("Message", text: $draft, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...4)
+                    .disabled(core.view.activePeerBlocked)
+                Button {
+                    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else { return }
+                    core.update(.composeChanged(text))
+                    core.update(.sendText)
+                    // Only clear the local draft when the core actually accepted the
+                    // message. send_text refuses (and sets error) on a blocked peer,
+                    // an oversized body, or a full contact list — and it preserves
+                    // model.compose on those paths so the user's text is not lost.
+                    // Clearing draft unconditionally wiped it from the UI even though
+                    // the core kept it, so the failure was both invisible and
+                    // destructive: the text was gone with no explanation.
+                    if core.view.error.isEmpty {
+                        draft = ""
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill").font(.title)
+                }
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || core.view.activePeerBlocked)
+            }
         }
         .padding(.horizontal).padding(.vertical, 8)
         .background(.bar)

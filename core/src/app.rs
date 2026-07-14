@@ -959,6 +959,8 @@ impl App for Skrepka {
                 bio,
                 photo,
             } => {
+                // Clear a stale error from a previous failed save.
+                model.error = None;
                 // The recipient's `parse_payload` enforces these caps and
                 // silently drops oversized profiles. Without these checks the
                 // sender's local profile would be saved, broadcast to every
@@ -1574,6 +1576,9 @@ impl Skrepka {
         let Some(peer) = model.active_peer.clone() else {
             return render();
         };
+        // Clear a stale error from a previous failed send, so the error display
+        // does not persist after the user fixes the issue and sends again.
+        model.error = None;
         // Blocking cuts the peer off in both directions (PROTOCOL.md §4). The
         // ingest side drops their messages; the send side must refuse too, or
         // a blocked peer still receives our texts, acks, and the liveness
@@ -4433,6 +4438,25 @@ mod tests {
         assert!(m.messages.get(&peer).is_none_or(Vec::is_empty), "nothing stored");
         assert!(!m.compose.is_empty(), "compose is preserved");
         assert!(m.error.as_ref().is_some_and(|e| e.contains("too long")));
+    }
+
+    /// A stale error from a previous failed send must be cleared on the next
+    /// attempt, so the error display does not persist after the user fixes the
+    /// issue and sends again successfully.
+    #[test]
+    fn send_text_clears_a_stale_error_on_success() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        m.active_peer = Some(peer.clone());
+        // Simulate a prior failure that left an error behind.
+        m.error = Some("message too long".into());
+
+        m.compose = "hello".into();
+        let _ = app.update(Event::SendText, &mut m);
+
+        assert!(m.error.is_none(), "a successful send clears the stale error");
+        assert!(!m.outbox.is_empty(), "the message was queued");
     }
 
     // -----------------------------------------------------------------------
