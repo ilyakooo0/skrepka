@@ -917,6 +917,9 @@ impl App for Skrepka {
                 if let Some(c) = model.contacts.get_mut(&peer) {
                     c.blocked = blocked;
                 }
+                // Clear a stale error (e.g. "cannot send to a blocked contact")
+                // when the user unblocks — the block that caused it is now lifted.
+                model.error = None;
                 if blocked {
                     // Gating *ingest* on the block only stops the acks we have not
                     // queued yet. Anything already sitting in the outbox for this
@@ -3440,6 +3443,30 @@ mod tests {
         assert!(m.contacts[&peer].blocked);
         let vm = app.view(&m);
         assert!(vm.contacts.iter().any(|c| c.pubkey == peer && c.blocked));
+    }
+
+    /// Unblocking clears a stale "cannot send to a blocked contact" error, so the
+    /// chat error display does not persist after the user lifts the block.
+    #[test]
+    fn unblocking_clears_the_stale_send_error() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        let peer = peer_hex(9);
+        let mut contact = Contact::new(peer.clone(), "Bob".into(), 0);
+        contact.blocked = true;
+        m.contacts.insert(peer.clone(), contact);
+        m.error = Some("cannot send to a blocked contact".into());
+
+        let _ = app.update(
+            Event::SetBlocked {
+                peer: peer.clone(),
+                blocked: false,
+            },
+            &mut m,
+        );
+
+        assert!(!m.contacts[&peer].blocked);
+        assert!(m.error.is_none(), "unblocking clears the stale error");
     }
 
     /// Gating ingest stops the acks we have not queued yet — but the ack for the
