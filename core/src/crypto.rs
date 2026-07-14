@@ -327,7 +327,13 @@ pub fn encrypt(
     let signature = sender.signing_key().sign(&signed);
 
     // inner = sender_pub(32) || sig(64) || compressed_len(4) || compressed || padding
-    let mut inner = Vec::with_capacity(32 + 64 + 4 + compressed.len() + padding.len());
+    //
+    // `Zeroizing` so the sender's pubkey, signature, and the compressed plaintext
+    // are wiped from memory even on the AEAD failure path — the `?` below returns
+    // early, and a plain `Vec` would be dropped without zeroization. Every other
+    // sensitive intermediate here (`compressed`, `signed`, `padding`) is already
+    // `Zeroizing`; `inner` holds copies of all of them plus the sender identity.
+    let mut inner = Zeroizing::new(Vec::with_capacity(32 + 64 + 4 + compressed.len() + padding.len()));
     inner.extend_from_slice(&sender_pub);
     inner.extend_from_slice(&signature.to_bytes());
     inner.extend_from_slice(&compressed_len_bytes);

@@ -199,7 +199,7 @@ jobs:
             -X POST http://127.0.0.1:8080/federation/forward -H "$J" \
             -d "{\"toKey\":\"$PK\",\"encryptedBlob\":\"$BLOB\"}"
 
-          # Below the 336-hex-char (168-byte) minimum envelope: rejected by BlobHex
+          # Below the 346-hex-char (173-byte) minimum envelope: rejected by BlobHex
           # at the route boundary, before the federation gate.
           expect 400 "federation/forward (undersized blob rejected)" \
             -X POST http://127.0.0.1:8080/federation/forward -H "$J" \

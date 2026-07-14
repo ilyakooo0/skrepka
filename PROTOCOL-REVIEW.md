@@ -395,3 +395,22 @@ and retries the flush after `FLUSH_WATCHDOG_MS` (90 s).
 The `nickname` in `AddContact` was stored without any length bound. A user could
 set a megabyte-long nickname, bloating the contacts kv blob (rewritten in full on
 every change). `nickname.len()` is now checked against `MAX_DISPLAY_NAME_LEN`.
+
+---
+
+## Fixed in seventh-pass audit (2026-07-14)
+
+### ✅ P. `encrypt`'s `inner` buffer not zeroized on AEAD failure
+
+**Severity: low — fixed.**
+
+The `inner` buffer in `crypto::encrypt` (sender pubkey || signature ||
+compressed_len || compressed || padding) was a plain `Vec<u8>`. It was
+explicitly `zeroize()`d on the success path, but if `cipher.encrypt()`
+returned `Err`, the `?` operator returned early and `inner` was dropped
+without zeroization — the sender's identity, signature, and compressed
+plaintext remained in freed memory. Every other sensitive intermediate in
+`encrypt` (`compressed`, `signed`, `padding`, `eph_priv`, `raw_secret`,
+`key`) was already `Zeroizing`; `inner` was the sole exception. Now
+`Zeroizing<Vec<u8>>`, matching the pattern established for `decrypt`'s
+`inner` and `signed` in the fourth-pass audit.

@@ -526,9 +526,9 @@ capForwards = \fwds -> take maxForwardsTotal (sortBy (\f -> f.retries) fwds)
 -- Session bearers, /auth challenges, and federation auth nonces all use n=48
 -- (192 bits of entropy, well beyond birthday bound).
 -- Tail-recursive: builds the string left-to-right via an accumulator (`acc`),
--- appending one hex char per call. Each `acc ++ ...` still copies the accumulator,
--- but the total work is O(n) rather than O(n²) because characters are appended
--- in forward order instead of prepended at every return.
+-- appending one hex char per call. Each `acc ++ ...` copies the accumulator,
+-- so the total work is O(n²) in the length — but n is 48 (192 bits), so this
+-- is a fixed ~1 KB of copying and not worth a more complex builder.
 genToken : Int -> Text -> IO {random} Text
 genToken = \n acc -> if n <= 0
 then yield acc
