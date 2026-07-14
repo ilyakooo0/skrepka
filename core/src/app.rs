@@ -224,11 +224,12 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     StartFlush,
-    /// Fires `FLUSH_WATCHDOG_MS` after a flush is issued; a no-op unless the
-    /// send is somehow still in flight — same pattern as `PollWatchdog`.
+    /// Fires `FLUSH_WATCHDOG_MS` after generation `n`'s flush is issued; a no-op
+    /// unless that exact send is somehow still in flight — same pattern as
+    /// `PollWatchdog`.
     #[serde(skip)]
     #[facet(skip)]
-    FlushWatchdog,
+    FlushWatchdog(u64),
     #[serde(skip)]
     #[facet(skip)]
     ChallengeResult(u64, #[facet(opaque)] HttpResult),
@@ -240,7 +241,7 @@ pub enum Event {
     PollResult(u64, #[facet(opaque)] HttpResult),
     #[serde(skip)]
     #[facet(skip)]
-    SendResult(#[facet(opaque)] HttpResult),
+    SendResult(u64, #[facet(opaque)] HttpResult),
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +337,12 @@ pub struct Model {
     /// items it sent off the head of the outbox, so two overlapping sends would
     /// pop each other's messages.
     flushing: bool,
+    /// Which flush the in-flight `SendResult` / `FlushWatchdog` is allowed to
+    /// belong to. Same pattern as `poll_gen`: bumped every time a flush is
+    /// issued and every time one is abandoned, so a `SendResult` or watchdog
+    /// from a superseded send cannot clear the guard or pop items belonging to
+    /// the replacement.
+    flush_gen: u64,
     /// What the in-flight send will pop off the head of the outbox when it
     /// succeeds — see `InFlight`. `None` while nothing is in flight, and also
     /// while a send is in flight whose items have since been removed from under
@@ -411,6 +418,7 @@ impl Default for Model {
             authenticating: false,
             auth_gen: 0,
             flushing: false,
+            flush_gen: 0,
             in_flight: None,
             send_batch_budget: None,
             loads_pending: 0,
@@ -460,6 +468,24 @@ impl Model {
     fn next_auth_gen(&mut self) -> u64 {
         self.auth_gen = self.auth_gen.wrapping_add(1);
         self.auth_gen
+    }
+
+    /// Open a new flush generation and return it. Same pattern as
+    /// `next_poll_gen`: a `SendResult` or `FlushWatchdog` whose generation no
+    /// longer matches is dropped, so a late result from a superseded send
+    /// cannot clear the guard or pop items belonging to the replacement.
+    fn next_flush_gen(&mut self) -> u64 {
+        self.flush_gen = self.flush_gen.wrapping_add(1);
+        self.flush_gen
+    }
+
+    /// Abandon the in-flight flush, if any: release the guard and retire the
+    /// generation so a late `SendResult` cannot clear the *replacement* flush's
+    /// guard or pop its items.
+    fn abandon_flush(&mut self) {
+        self.flushing = false;
+        self.in_flight = None;
+        self.flush_gen = self.flush_gen.wrapping_add(1);
     }
 
     /// Abandon the in-flight auth round-trip (either leg).
@@ -829,6 +855,12 @@ impl App for Skrepka {
                 // would then ack a sequence number B never issued, and B would
                 // drop every message waiting for us.
                 model.abandon_poll();
+                // ...and retire the send that is still in flight *to relay A*,
+                // for the same reason: its `SendResult` carries A's acceptance,
+                // and popping items here would eat whatever the new relay's
+                // send is about to carry. The generation check in `SendResult`
+                // is what makes the late result a no-op.
+                model.abandon_flush();
                 // The old relay's rate limit was the old relay's opinion. A new one is
                 // entitled to take our sends immediately, and carrying the pause over
                 // would park the outbox against a limit that no longer applies.
@@ -1264,20 +1296,30 @@ impl App for Skrepka {
 
             // ---------------- outbox ----------------
             Event::StartFlush => self.flush_next(model),
-            Event::FlushWatchdog => {
-                // The send request never came back — the shell dropped the HTTP
-                // effect (backgrounded app, bug), and `flushing` has been stuck
-                // ever since. Release the guard and retry the flush. The late
-                // `SendResult`, if it ever arrives, finds `in_flight` already
-                // cleared and pops nothing.
-                if !model.flushing {
+            Event::FlushWatchdog(gen) => {
+                // Only the flush this watchdog was armed for, and only while it
+                // is still the current one and still in flight. A watchdog whose
+                // send already completed (or was superseded) is a stale timer and
+                // must not touch a healthy successor — same pattern as
+                // `PollWatchdog`.
+                if gen != model.flush_gen || !model.flushing {
                     return Command::done();
                 }
-                model.flushing = false;
-                model.in_flight = None;
+                // Retire it as we give up on it. The request itself is not
+                // cancelled, so if it eventually resolves the generation check
+                // in `SendResult` is what stops it from popping the replacement's
+                // items.
+                model.abandon_flush();
                 self.flush_next(model)
             }
-            Event::SendResult(Ok(resp)) => {
+            Event::SendResult(gen, Ok(resp)) => {
+                // A result for a send we already abandoned (a watchdog gave up
+                // on it, or a server change invalidated it). Dropping it is safe
+                // and required: its items were re-queued, so popping by count
+                // here would eat whichever messages slid into their place.
+                if gen != model.flush_gen {
+                    return Command::done();
+                }
                 // The in-flight send is over; `flush_next` refuses to run while
                 // this is set, so it must be cleared before *any* branch below.
                 model.flushing = false;
@@ -1375,8 +1417,11 @@ impl App for Skrepka {
                 // A transient failure: a 5xx, a rate limit, a relay restarting.
                 self.retry_batch(model, batch)
             }
-            Event::SendResult(Err(_)) => {
+            Event::SendResult(gen, Err(_)) => {
                 // A transport error is the same transient failure as a 5xx.
+                if gen != model.flush_gen {
+                    return Command::done();
+                }
                 model.flushing = false;
                 let batch = model.in_flight.take();
                 self.retry_batch(model, batch)
@@ -1798,6 +1843,7 @@ impl Skrepka {
         };
 
         model.flushing = true;
+        let gen = model.next_flush_gen();
         model.in_flight = Some(InFlight {
             recipient,
             count: messages.len(),
@@ -1808,11 +1854,11 @@ impl Skrepka {
             .header("authorization", format!("Bearer {token}"))
             .body_json(&SendBatch { messages })
         {
-            Ok(req) => persist.and(req.build().then_send(Event::SendResult))
+            Ok(req) => persist.and(req.build().then_send(move |r| Event::SendResult(gen, r)))
                 .and(
                     Time::notify_after(Duration::from_millis(FLUSH_WATCHDOG_MS))
                         .0
-                        .then_send(|_| Event::FlushWatchdog),
+                        .then_send(move |_| Event::FlushWatchdog(gen)),
                 ),
             Err(_) => {
                 // Not a dead loop: the next StartFlush (from a poll page or a
@@ -2309,7 +2355,8 @@ mod tests {
     /// One full send round-trip: flush the outbox, then answer with `status`.
     fn send_and_answer(app: &Skrepka, m: &mut Model, status: u16) {
         let _ = app.update(Event::StartFlush, m);
-        let _ = app.update(Event::SendResult(Ok(ok_response(status))), m);
+        let gen = m.flush_gen;
+        let _ = app.update(Event::SendResult(gen, Ok(ok_response(status))), m);
     }
 
     // -----------------------------------------------------------------------
@@ -2338,7 +2385,7 @@ mod tests {
         // The last one exhausts the budget: the head goes, and what was stuck
         // behind it goes out.
         let _ = app.update(Event::StartFlush, &mut m);
-        let mut cmd = app.update(Event::SendResult(Ok(ok_response(503))), &mut m);
+        let mut cmd = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(503))), &mut m);
 
         assert_eq!(m.outbox.len(), 1, "the undeliverable item is dropped");
         assert_eq!(m.outbox[0].recipient, behind, "and the queue moves on");
@@ -2457,7 +2504,7 @@ mod tests {
 
         let _ = app.update(Event::StartFlush, &mut m);
         let mut cmd = app.update(
-            Event::SendResult(Ok(response_with_header(429, "retry-after", "2"))),
+            Event::SendResult(m.flush_gen, Ok(response_with_header(429, "retry-after", "2"))),
             &mut m,
         );
 
@@ -2488,7 +2535,7 @@ mod tests {
         m.poll_retries = 0;
 
         let _ = app.update(Event::StartFlush, &mut m);
-        let mut cmd = app.update(Event::SendResult(Ok(ok_response(429))), &mut m);
+        let mut cmd = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(429))), &mut m);
 
         assert_eq!(m.outbox[0].retries, 0, "still not the message's fault");
         assert_eq!(
@@ -2501,7 +2548,7 @@ mod tests {
         // A second 429 climbs, rather than restarting at 3 s.
         m.flush_paused_until = 0;
         let _ = app.update(Event::StartFlush, &mut m);
-        let mut cmd = app.update(Event::SendResult(Ok(ok_response(429))), &mut m);
+        let mut cmd = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(429))), &mut m);
         assert_eq!(scheduled_delays(&mut cmd), vec![backoff_ms(1)], "it climbs");
         assert_eq!(m.send_retries, 2);
     }
@@ -2519,7 +2566,7 @@ mod tests {
 
         let _ = app.update(Event::StartFlush, &mut m);
         let _ = app.update(
-            Event::SendResult(Ok(response_with_header(429, "retry-after", "2"))),
+            Event::SendResult(m.flush_gen, Ok(response_with_header(429, "retry-after", "2"))),
             &mut m,
         );
         assert!(
@@ -2575,7 +2622,7 @@ mod tests {
 
         let _ = app.update(Event::StartFlush, &mut m);
         let mut cmd = app.update(
-            Event::SendResult(Ok(response_with_header(429, "retry-after", "999999999"))),
+            Event::SendResult(m.flush_gen, Ok(response_with_header(429, "retry-after", "999999999"))),
             &mut m,
         );
 
@@ -2610,7 +2657,7 @@ mod tests {
         assert!(batches[0].iter().all(|e| e.to == peer));
 
         // ...and its success clears the whole batch, not just the head.
-        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(200))), &mut m);
         assert!(m.outbox.is_empty());
     }
 
@@ -2635,7 +2682,7 @@ mod tests {
         assert_eq!(batches[0].len(), 2, "only the run at the head");
         assert!(batches[0].iter().all(|e| e.to == a));
 
-        let mut cmd = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        let mut cmd = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(200))), &mut m);
         assert_eq!(m.outbox.len(), 2);
         let batches = sent_batches(&mut cmd);
         assert_eq!(batches[0].len(), 1, "then b's single message");
@@ -2658,7 +2705,7 @@ mod tests {
         let batches = sent_batches(&mut cmd);
         assert_eq!(batches[0].len(), MAX_SEND_BATCH);
 
-        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(200))), &mut m);
         assert_eq!(m.outbox.len(), 20, "the rest stays queued for the next batch");
     }
 
@@ -2720,7 +2767,7 @@ mod tests {
         let sent_bytes: usize = first[0].iter().map(|e| e.encrypted_blob.len()).sum();
 
         // ...and the relay says that was too big.
-        let mut cmd = app.update(Event::SendResult(Ok(ok_response(413))), &mut m);
+        let mut cmd = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(413))), &mut m);
 
         assert_eq!(
             m.send_batch_budget,
@@ -2741,7 +2788,7 @@ mod tests {
         assert!(shrunk > 0, "but not an empty one");
 
         // The relay takes the smaller batch, and exactly it is popped.
-        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(200))), &mut m);
         assert_eq!(m.outbox.len(), 5 - shrunk, "exactly the batch that landed is gone");
         assert_eq!(
             m.send_batch_budget,
@@ -2889,7 +2936,7 @@ mod tests {
         );
         assert_eq!(m.outbox.len(), 2, "the in-flight item is left alone");
 
-        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(200))), &mut m);
         assert_eq!(m.outbox.len(), 1, "the sent one is popped");
         let parsed = protocol::parse_payload(m.outbox[0].envelope_json.as_bytes()).unwrap();
         match parsed.payload {
@@ -2935,7 +2982,7 @@ mod tests {
         assert_eq!(m.outbox.len(), 1);
 
         // The send lands. It must pop nothing.
-        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(200))), &mut m);
         assert_eq!(m.outbox.len(), 1, "the friend's message is untouched");
         assert_eq!(m.outbox[0].recipient, friend);
     }
@@ -3612,7 +3659,7 @@ mod tests {
         assert!(m.flushing);
 
         let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
-        let _ = app.update(Event::SendResult(Ok(resp)), &mut m);
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(resp)), &mut m);
 
         assert!(!m.flushing, "flushing must be cleared on the success path");
         assert!(m.outbox.is_empty(), "the sent item is dropped from the outbox");
@@ -3634,7 +3681,7 @@ mod tests {
 
         // Its success must both drop the item and let the *next* one go out.
         let resp = crux_http::testing::ResponseBuilder::ok().body(Vec::new()).build();
-        let _ = app.update(Event::SendResult(Ok(resp)), &mut m);
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(resp)), &mut m);
         assert_eq!(m.outbox.len(), 1);
         assert!(m.flushing, "the second item is now in flight");
     }
@@ -4602,7 +4649,7 @@ mod tests {
 
         // The send never comes back. The watchdog fires, clears the stuck guard,
         // and retries the flush — the message goes out again.
-        let mut cmd = app.update(Event::FlushWatchdog, &mut m);
+        let mut cmd = app.update(Event::FlushWatchdog(m.flush_gen), &mut m);
 
         assert!(m.flushing, "a fresh send is in flight (the retry)");
         assert!(m.in_flight.is_some(), "in_flight is set for the retry");
@@ -4619,22 +4666,23 @@ mod tests {
         m.outbox.push_back(queued(&peer_hex(9), "hi"));
 
         let _ = app.update(Event::StartFlush, &mut m);
-        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(200))), &mut m);
         assert!(!m.flushing);
         assert!(m.outbox.is_empty());
 
         // The watchdog for the completed send fires late.
-        let _ = app.update(Event::FlushWatchdog, &mut m);
+        let _ = app.update(Event::FlushWatchdog(m.flush_gen), &mut m);
         assert!(!m.flushing, "a completed send is not re-armed");
         assert!(m.outbox.is_empty());
     }
 
-    /// A late `SendResult` after the watchdog has already retried sees the
-    /// retry's `in_flight` and pops its items. This is correct: the retry sent
-    /// the same items, and a 200 means they were accepted — whether by the
-    /// original request or the retry is irrelevant. The items are delivered.
+    /// A late `SendResult` from a superseded send is dropped by the generation
+    /// check. The watchdog abandoned the first send and retried under a new
+    /// generation; the late result's generation no longer matches, so it cannot
+    /// pop the retry's items or clear its guard. The retry's own `SendResult`
+    /// is what eventually pops them.
     #[test]
-    fn a_late_send_result_after_the_watchdog_pops_the_retrys_items() {
+    fn a_late_send_result_after_the_watchdog_is_dropped_by_generation() {
         let app = Skrepka;
         let mut m = with_identity();
         m.token = Some("t".into());
@@ -4642,15 +4690,23 @@ mod tests {
         m.outbox.push_back(queued(&peer, "stuck"));
 
         let _ = app.update(Event::StartFlush, &mut m);
-        // The watchdog fires and retries the flush.
-        let _ = app.update(Event::FlushWatchdog, &mut m);
+        let first_gen = m.flush_gen;
+        // The watchdog fires and retries the flush under a new generation.
+        let _ = app.update(Event::FlushWatchdog(first_gen), &mut m);
         assert_eq!(m.outbox.len(), 1, "the item is still queued (re-sent)");
+        assert_ne!(m.flush_gen, first_gen, "the generation was bumped");
+        assert!(m.flushing, "the retry is in flight");
 
-        // Now the original send's result arrives late. The retry's in_flight is
-        // set, so a 200 pops the item — which is correct, the message was
-        // accepted by one of the two sends.
-        let _ = app.update(Event::SendResult(Ok(ok_response(200))), &mut m);
-        assert!(m.outbox.is_empty(), "the late 200 pops the retry's items — the message was accepted");
+        // The original send's result arrives late. Its generation no longer
+        // matches, so it is dropped — it cannot pop the retry's items or
+        // clear the retry's guard.
+        let _ = app.update(Event::SendResult(first_gen, Ok(ok_response(200))), &mut m);
+        assert!(m.flushing, "the retry's guard is untouched");
+        assert_eq!(m.outbox.len(), 1, "the late result popped nothing");
+
+        // The retry's own result arrives and pops the items.
+        let _ = app.update(Event::SendResult(m.flush_gen, Ok(ok_response(200))), &mut m);
+        assert!(m.outbox.is_empty(), "the retry's result pops the items");
         assert!(!m.flushing, "and the guard is released");
     }
 }
