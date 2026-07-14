@@ -881,6 +881,8 @@ impl App for Skrepka {
                 }
             }
             Event::AddContact { input, nickname } => {
+                // Clear a stale error from a previous failed add.
+                model.error = None;
                 // A nickname is stored in the contacts kv blob, which is
                 // rewritten in full on every change. An unbounded nickname
                 // bloats the blob and every subsequent write.
@@ -3352,6 +3354,28 @@ mod tests {
             &mut m,
         );
         assert!(m.error.is_some());
+    }
+
+    /// A stale error from a previous failed add is cleared on the next attempt,
+    /// so the AddContact form does not show an old error after the user fixes
+    /// the input and tries again.
+    #[test]
+    fn add_contact_clears_a_stale_error_on_success() {
+        let app = Skrepka;
+        let mut m = with_identity();
+        m.error = Some("invalid public key".into());
+
+        let peer = peer_hex(9);
+        let _ = app.update(
+            Event::AddContact {
+                input: peer.clone(),
+                nickname: "Bob".into(),
+            },
+            &mut m,
+        );
+
+        assert!(m.error.is_none(), "a successful add clears the stale error");
+        assert!(m.contacts.contains_key(&peer));
     }
 
     #[test]
