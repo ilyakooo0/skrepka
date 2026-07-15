@@ -58,6 +58,24 @@ const MAX_CONTACTS: usize = 500;
 /// the budget is dropped exactly like an undecryptable blob would be.
 const MAX_POLL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
+/// Cap on the number of events we will attempt to decrypt out of a single poll
+/// page, independent of the byte budget. Minimum-size blobs (173 bytes decoded)
+/// would otherwise permit ~388K events within the 64 MiB byte budget, each
+/// costing a full scalar mult + SHA-512 + AEAD pass — enough to freeze the app
+/// for tens of seconds per poll. An honest relay caps at 50 events
+/// (`maxPollEvents`); this is a hostile-relay bound. Set above `MAX_ACK_IDS`
+/// (1024) so a legitimate large page from one sender still fully processes.
+const MAX_POLL_EVENTS: usize = 2000;
+
+/// Upper bound on a poll response body we will buffer and parse, in bytes.
+///
+/// Before the per-blob byte/count budgets in `ingest_poll` ever run, the client
+/// reads the entire response body into a `Vec<u8>` and deserializes it. A
+/// multi-gigabyte response from a hostile relay would OOM the app before
+/// `ingest_poll`'s defenses are consulted. This cap (generously above what 50
+/// max-size blobs + JSON envelope could cost) bounds the allocation.
+const MAX_POLL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// How long a poll may stay in flight before we assume the shell lost it.
 ///
 /// `polling` gates the whole long-poll loop, and it is only cleared by a
@@ -1281,15 +1299,33 @@ impl App for Skrepka {
                     return render();
                 }
                 let bytes = resp.take_body().unwrap_or_default();
+                // Bound the response before parsing: a hostile relay can return
+                // a multi-gigabyte body that OOMs the app before `ingest_poll`'s
+                // per-blob budgets are even consulted.
+                if bytes.len() > MAX_POLL_RESPONSE_BYTES {
+                    model.error = Some("relay sent an oversized poll response".into());
+                    return self.backoff_poll(model);
+                }
                 let parsed: PollResp = serde_json::from_slice(&bytes).unwrap_or_default();
                 let cmd = self.ingest_poll(model, parsed);
                 // The re-poll hangs off the *cursor write*, not off this event.
                 // Polling again is what acks the batch we just took — the server
                 // deletes everything up to `cursor` — so it must not happen until
                 // the batch is durable on our side. `SavedCursor` re-polls.
+                //
+                // Arm a watchdog alongside the cursor write: if the shell ever
+                // drops the KV effect (suspension, bug), `SavedCursor` never fires,
+                // `polling` stays `false`, and the loop is dead until the next
+                // foreground `Connect`. The watchdog fires `Poll` if the loop is
+                // still idle — same pattern as the poll/send HTTP watchdogs.
                 cmd.and(
                     KeyValue::set(K_CURSOR, json_bytes(&model.cursor))
                         .then_send(Event::SavedCursor),
+                )
+                .and(
+                    Time::notify_after(Duration::from_millis(POLL_WATCHDOG_MS))
+                        .0
+                        .then_send(|_| Event::Poll),
                 )
                 .and(render())
             }
@@ -1929,8 +1965,13 @@ impl Skrepka {
             return Command::done();
         }
         let prev_cursor = model.cursor;
-        if page.cursor > model.cursor {
-            model.cursor = page.cursor;
+        // Clamp the relay-supplied cursor: honest cursors are wall-clock-seeded
+        // sequence numbers, so anything far in the future is a hostile or buggy
+        // relay. Adopting `i64::MAX` would ack (delete) all queued mail on the
+        // next poll and persist that poison across relaunches.
+        let clamped_cursor = page.cursor.min(now_ms().saturating_add(60_000));
+        if clamped_cursor > model.cursor {
+            model.cursor = clamped_cursor;
         }
         let Some(id) = model.identity() else {
             return Command::done();
@@ -1945,6 +1986,7 @@ impl Skrepka {
         let mut seen_ids: HashMap<String, HashSet<String>> = HashMap::new();
 
         let mut budget = MAX_POLL_TOTAL_BYTES;
+        let mut events_processed = 0usize;
         for ev in page.events {
             // Reject an oversized blob on its hex length, before it costs us a
             // decode. No conforming sender produces one (the relay caps blobs at
@@ -1952,6 +1994,17 @@ impl Skrepka {
             if ev.encrypted_blob.len() > MAX_BLOB_LEN * 2 {
                 continue;
             }
+            // Event count cap: the byte budget alone permits ~388K minimum-size
+            // events, each costing a full decrypt attempt. A hostile relay can
+            // freeze the app for tens of seconds per poll with a page of small
+            // junk blobs. Stop processing past this count, with the same cursor
+            // restoration as the byte budget exhaustion.
+            if events_processed >= MAX_POLL_EVENTS {
+                model.cursor = prev_cursor;
+                model.error = Some("relay sent too many poll events".into());
+                break;
+            }
+            events_processed += 1;
             match budget.checked_sub(ev.encrypted_blob.len() / 2) {
                 Some(left) => budget = left,
                 None => {

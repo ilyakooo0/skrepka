@@ -4,6 +4,8 @@
 //! millisecond `ts`. Unknown types are ignored (return `None`).
 
 use serde::{Deserialize, Serialize};
+use base64::prelude::*;
+use base64::Engine;
 
 /// Caps on the attacker-chosen fields of an incoming payload.
 ///
@@ -142,6 +144,12 @@ pub fn parse_payload(bytes: &[u8]) -> Option<ParsedPayload> {
             if display_name.chars().count() > MAX_DISPLAY_NAME_LEN
                 || bio.chars().count() > MAX_BIO_LEN
                 || photo.as_ref().is_some_and(|p| p.len() > MAX_PHOTO_LEN)
+                || photo.as_ref().is_some_and(|p| {
+                    // Reject a photo that isn't valid base64 — a peer can put
+                    // any string in the field, and the shell attempts to decode
+                    // it as an image on every render.
+                    BASE64_STANDARD.decode(p).is_err()
+                })
             {
                 return None;
             }

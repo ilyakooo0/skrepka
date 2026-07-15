@@ -1797,6 +1797,7 @@ name = "skrepka_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "boltffi",
  "chacha20poly1305",
  "clap",

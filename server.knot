@@ -744,7 +744,7 @@ isBadServerName : Text -> Bool
 isBadServerName = \raw ->
   let sn = stripTrailingDot raw in
   let host = beforeColon sn in
-  sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || isNumericHost host || isReservedOctetPrefix host || isReservedIPv4 host || hasLeadingZeroOctet host || hasPrefix "0x" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [".", ":", "192.0.2.", "203.0.113."] || any (\s -> hasSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
+  sn == "" || sn == "localhost" || hasPrefix "localhost:" sn || isNumericHost host || isReservedOctetPrefix host || isReservedIPv4 host || hasLeadingZeroOctet host || hasPrefix "0x" sn || any (\c -> not contains c "0123456789abcdefghijklmnopqrstuvwxyz-.:") (chars sn) || countChar ":" sn > 1 || any (\p -> hasPrefix p sn) [".", ":", "192.0.2.", "198.51.100.", "203.0.113."] || any (\s -> hasSuffix s sn) [".localhost", ".local", ".internal", ".arpa", ".onion"]
 
 -- ============================================
 -- Auth helpers

@@ -18,7 +18,7 @@ use std::io::Read;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use curve25519_dalek::edwards::CompressedEdwardsY;
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand_core::{CryptoRng, RngCore};
 use sha2::{Digest, Sha256, Sha512};
@@ -127,9 +127,17 @@ impl std::error::Error for CryptoError {}
 ///
 /// `ZeroizeOnDrop` wipes the seed when the value goes away. `Identity` is cloned
 /// freely (once per encrypt/decrypt), so each of those copies is wiped too.
+///
+/// The derived X25519 keys (`x25519_priv`, `x25519_pub`) are computed once at
+/// construction and cached: `decrypt` is called per-blob in a poll page, and
+/// recomputing the SHA-512 + Edwards decompress on every call is a measurable
+/// CPU multiplier under a flood of small blobs. Both are `Zeroizing` so the
+/// private half is wiped on drop alongside the seed.
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct Identity {
     pub secret_key: [u8; ED25519_SECRET_LEN],
+    x25519_priv: [u8; 32],
+    x25519_pub: [u8; 32],
 }
 
 impl Identity {
@@ -154,7 +162,7 @@ impl Identity {
             return Err(CryptoError::BadKeyLength);
         }
 
-        Ok(Identity { secret_key })
+        Ok(Identity::with_x25519(secret_key))
     }
 
     /// Generate a fresh identity from a CSPRNG.
@@ -171,7 +179,7 @@ impl Identity {
         let mut secret_key = [0u8; ED25519_SECRET_LEN];
         secret_key[..32].copy_from_slice(seed);
         secret_key[32..].copy_from_slice(public.as_bytes());
-        Identity { secret_key }
+        Identity::with_x25519(secret_key)
     }
 
     pub fn public_key(&self) -> [u8; ED25519_PUBLIC_LEN] {
@@ -188,6 +196,29 @@ impl Identity {
         let mut seed = Zeroizing::new([0u8; 32]);
         seed.copy_from_slice(&self.secret_key[..32]);
         SigningKey::from_bytes(&seed)
+    }
+
+    /// Compute the cached X25519 keys from the Ed25519 secret key.
+    fn with_x25519(secret_key: [u8; ED25519_SECRET_LEN]) -> Self {
+        let x25519_priv = *ed25519_sk_to_x25519(&secret_key);
+        let x25519_pub = x25519_dalek::x25519(x25519_priv, x25519_dalek::X25519_BASEPOINT_BYTES);
+        Identity {
+            secret_key,
+            x25519_priv,
+            x25519_pub,
+        }
+    }
+
+    /// Cached X25519 private key derived from the Ed25519 seed (libsodium
+    /// `crypto_sign_ed25519_sk_to_curve25519`). Avoids a per-decrypt SHA-512.
+    fn x25519_private(&self) -> &[u8; 32] {
+        &self.x25519_priv
+    }
+
+    /// Cached X25519 public key derived from the Ed25519 public key (libsodium
+    /// `crypto_sign_ed25519_pk_to_curve25519`). Avoids a per-decrypt decompress.
+    fn x25519_public(&self) -> &[u8; 32] {
+        &self.x25519_pub
     }
 
     /// Sign the auth challenge: `ed25519(sk, "skrepka-auth-v1:" + host + ":" + challenge)`.
@@ -271,6 +302,14 @@ fn compress(plaintext: &[u8]) -> Vec<u8> {
 /// *would* overrun is detected rather than silently truncated.
 fn decompress(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let mut decoder = zstd::stream::Decoder::new(data).map_err(|_| CryptoError::Decompress)?;
+    // Cap the decoder's window buffer so a crafted frame declaring a huge
+    // windowLog (up to 27 = 128 MiB by default) cannot force a matching
+    // allocation before the output-size cap even applies. 2^21 = 2 MiB is
+    // comfortably above `MAX_PLAINTEXT_LEN` (1 MiB), so every legitimate frame
+    // still decodes; frames declaring a larger window are rejected.
+    decoder
+        .window_log_max(21)
+        .map_err(|_| CryptoError::Decompress)?;
     let mut out = Vec::new();
     (&mut decoder)
         .take(MAX_PLAINTEXT_LEN as u64 + 1)
@@ -386,10 +425,10 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     nonce.copy_from_slice(&blob[33..33 + NONCE_LEN]);
     let ciphertext = &blob[33 + NONCE_LEN..];
 
-    let recip_x_priv = ed25519_sk_to_x25519(&recipient.secret_key);
-    let raw_secret = x25519(&recip_x_priv, &eph_pub)?;
-    let recip_x_pub = ed25519_pk_to_x25519(&recipient.public_key())?;
-    let key = derive_key(&raw_secret, &eph_pub, &recip_x_pub);
+    let recip_x_priv = recipient.x25519_private();
+    let raw_secret = x25519(recip_x_priv, &eph_pub)?;
+    let recip_x_pub = recipient.x25519_public();
+    let key = derive_key(&raw_secret, &eph_pub, recip_x_pub);
 
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*key));
     let mut inner = Zeroizing::new(
@@ -427,7 +466,7 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     signed.extend_from_slice(&recipient.public_key());
     signed.extend_from_slice(&inner[96..]);
     verifying
-        .verify(&signed, &signature)
+        .verify_strict(&signed, &signature)
         .map_err(|_| CryptoError::BadSignature)?;
 
     let plaintext = decompress(compressed)?;
