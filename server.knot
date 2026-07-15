@@ -1199,45 +1199,67 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   -- The client signs (target host, challenge) under a domain-separation tag so a
   -- relay server cannot replay the signature to a different server. We verify
   -- against our own configured hostname (port stripped), which a relay cannot forge.
-  -- Computed outside the atomic block: `verify` is not a DB effect, and computing
-  -- it here avoids re-running crypto on every STM retry.
+  --
+  -- Signature verification is deferred until *after* the challenge lookup confirms
+  -- a matching challenge exists (inside the atomic below).  This avoids spending
+  -- expensive Ed25519 CPU on /auth/verify calls that have no matching challenge,
+  -- which would otherwise be a cheap CPU-DoS vector.  The trade-off is that
+  -- `verify` runs inside the STM transaction and may re-run on retries — but
+  -- retries only happen on concurrent writes to *challenges/*sessions, which
+  -- are rare, so the expected retry count is ~1.
   let signedText = "skrepka-auth-v1:" ++ authHost serverHost ++ ":" ++ challenge
-  let sigValid = case bytesFromHex pubkey of
-    Just {value: pk} -> case bytesFromHex signature of
-      Just {value: sigBytes} -> verify pk (textToBytes signedText) sigBytes
-      _ -> False {}
-    _ -> False {}
   result <- atomic (do
     ch <- *challenges
     let same = \c -> c.pubkey == pubkey && c.challenge == challenge
-    let valid = any (\c -> same c && c.expiresAt > t && matchIp clientIp c.ip) ch && sigValid
-    if not valid
-    then yield (Nothing {})
-    else do
-      *challenges = filter (\c -> not same c) ch
-      ses <- *sessions
-      let pruned = if revokeOthers
-      then filter (\s -> s.pubkey != pubkey) ses
-      else capPerKey ses pubkey maxSessionsPerKey
-      let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
-      -- LRU-evicts the soonest-to-expire session when the pool is full; this global
-      -- eviction is Sybil-floodable, see the LIMITATION note on `maxSessions`.
-      let pooled = union pruned [newSession]
-      -- Count what `capList` is about to shed, so the handler can warn about it
-      -- below. That flood has no other observable signature: evicted users just
-      -- start seeing 401s and silently re-authenticate, which looks like normal
-      -- traffic in the access log. A sustained nonzero rate here is the alert.
-      let evicted = max 0 (count pooled - maxSessions)
-      *sessions = capList pooled maxSessions
-      peers <- refreshLocalPresence pubkey expiry
-      yield (Just {value: {peers, evicted}}))
+    let matchingChallenge = findFirst same ch
+    case matchingChallenge of
+      Nothing {} -> yield (Nothing {})
+      Just {value: c} -> do
+        if not (c.expiresAt > t && matchIp clientIp c.ip)
+        then yield (Nothing {})
+        else do
+          -- Verify the signature only now that a matching, unexpired, IP-bound
+          -- challenge exists.
+          let sigValid = case bytesFromHex pubkey of
+            Just {value: pk} -> case bytesFromHex signature of
+              Just {value: sigBytes} -> verify pk (textToBytes signedText) sigBytes
+              _ -> False {}
+            _ -> False {}
+          if not sigValid
+          then yield (Nothing {})
+          else do
+            -- Consume the challenge and optionally revoke other sessions + challenges.
+            -- When `revokeOthers` is set, drop all other sessions AND outstanding
+            -- challenges for this pubkey, so a captured challenge cannot be
+            -- redeemed for a new session after revocation (Q35).
+            *challenges = if revokeOthers
+              then filter (\x -> not (x.pubkey == pubkey)) ch
+              else filter (\x -> not same x) ch
+            ses <- *sessions
+            let pruned = if revokeOthers
+              then filter (\s -> s.pubkey != pubkey) ses
+              else capPerKey ses pubkey maxSessionsPerKey
+            let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
+            -- LRU-evicts the soonest-to-expire session when the pool is full; this global
+            -- eviction is Sybil-floodable, see the LIMITATION note on `maxSessions`.
+            let pooled = union pruned [newSession]
+            -- Count what `capList` is about to shed, so the handler can warn about it
+            -- below. That flood has no other observable signature: evicted users just
+            -- start seeing 401s and silently re-authenticate, which looks like normal
+            -- traffic in the access log. A sustained nonzero rate here is the alert.
+            let evicted = max 0 (count pooled - maxSessions)
+            *sessions = capList pooled maxSessions
+            peers <- refreshLocalPresence pubkey expiry
+            yield (Just {value: {peers, evicted}}))
   case result of
     Nothing {} -> yield (Err {error: {status: 401, message: "invalid"}})
     Just {value: r} -> do
       -- Warn outside the `atomic` block, never inside: an STM transaction can
       -- retry, and a console write is not rolled back with it — logging inside
       -- would emit one line per retry attempt rather than one per eviction.
-      when (r.evicted > 0) (logWarn ("session pool full: evicted " ++ show r.evicted ++ " session(s) to seat a new login (maxSessions=" ++ show maxSessions ++ ")"))
+      -- Include the requesting pubkey and IP for audit (Q38): an operator
+      -- investigating a Sybil flood needs to know which identities are responsible.
+      when (r.evicted > 0) (logWarn ("session pool full: evicted " ++ show r.evicted ++ " session(s) to seat a new login (pubkey=" ++ pubkey ++ ", ip=" ++ clientIp ++ ", maxSessions=" ++ show maxSessions ++ ")"))
       when federationEnabled (fork (sendBatchedGossip r.peers [{eventType: "online", pubkey: Just {value: pubkey}}]))
       yield (Ok {value: {token, expiresAt: expiry}})
 

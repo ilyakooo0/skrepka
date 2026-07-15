@@ -199,9 +199,21 @@ impl Identity {
     }
 
     /// Compute the cached X25519 keys from the Ed25519 secret key.
+    ///
+    /// Q49: Also checks that the derived X25519 public key is not an all-zero
+    /// (low-order) point.  The probability of generating such a key is negligible,
+    /// but if it ever happened every encryption to this identity would fail with
+    /// `InvalidEphemeralKey` and the user would be unable to receive messages
+    /// with no indication of why.  Catching it at construction time gives a
+    /// clear error instead.
     fn with_x25519(secret_key: [u8; ED25519_SECRET_LEN]) -> Self {
         let x25519_priv = *ed25519_sk_to_x25519(&secret_key);
         let x25519_pub = x25519_dalek::x25519(x25519_priv, x25519_dalek::X25519_BASEPOINT_BYTES);
+        debug_assert!(
+            !x25519_pub.iter().all(|b| *b == 0),
+            "derived X25519 public key is all-zero (low-order point) — \
+             this identity cannot receive messages"
+        );
         Identity {
             secret_key,
             x25519_priv,

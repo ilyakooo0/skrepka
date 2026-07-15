@@ -138,6 +138,7 @@ const K_PROFILE: &str = "profile";
 const K_CONTACTS: &str = "contacts";
 const K_CURSOR: &str = "cursor";
 const K_OUTBOX: &str = "outbox";
+const K_SEEN_IDS: &str = "seen_ids";
 fn k_messages(peer: &str) -> String {
     format!("messages:{peer}")
 }
@@ -207,6 +208,9 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     LoadedOutbox(#[facet(opaque)] KvData),
+    #[serde(skip)]
+    #[facet(skip)]
+    LoadedSeenIds(#[facet(opaque)] KvData),
     #[serde(skip)]
     #[facet(skip)]
     LoadedMessages(String, #[facet(opaque)] KvData),
@@ -285,9 +289,9 @@ pub enum Page {
     EditProfile,
 }
 
-/// The five kv keys loaded at startup (`settings`, `profile`, `contacts`,
-/// `cursor`, `outbox`). `Connect` waits for all of them.
-const STARTUP_LOADS: u8 = 5;
+/// The six kv keys loaded at startup (`settings`, `profile`, `contacts`,
+/// `cursor`, `outbox`, `seen_ids`). `Connect` waits for all of them.
+const STARTUP_LOADS: u8 = 6;
 
 /// The batch a live `/messages` request is carrying: the first `count` items of
 /// the outbox, all bound for `recipient`.
@@ -313,6 +317,12 @@ pub struct Model {
     profile: OwnProfile,
     contacts: BTreeMap<String, Contact>,
     messages: BTreeMap<String, Vec<StoredMessage>>,
+    /// Q18: Per-peer dedup ID set, independent of the trimmed conversation.
+    /// Without this, a replayed blob whose `id` was aged out by `trim_history`
+    /// (past the 1000-message cap) passes the dedup check and re-enters the
+    /// conversation.  This set is loaded from and persisted to kv alongside
+    /// messages, so it survives restarts.
+    seen_ids: BTreeMap<String, HashSet<String>>,
     outbox: VecDeque<OutboxItem>,
     cursor: i64,
     token: Option<String>,
@@ -425,6 +435,7 @@ impl Default for Model {
             profile: OwnProfile::default(),
             contacts: BTreeMap::new(),
             messages: BTreeMap::new(),
+            seen_ids: BTreeMap::new(),
             outbox: VecDeque::new(),
             cursor: 0,
             token: None,
@@ -640,6 +651,16 @@ struct PollEvent {
     #[serde(rename = "encryptedBlob")]
     encrypted_blob: String,
 }
+
+/// Q17: Deferred delivery-ack accumulator.  Collects ack_ids and the max `ts`
+/// across all `delivery.ack` payloads from one sender in a single poll page,
+/// so the staleness check and watermark update run once per sender after the
+/// event loop — immune to relay page ordering.
+#[derive(Default)]
+struct PendingAck {
+    ts: i64,
+    ids: HashSet<String>,
+}
 #[derive(Serialize)]
 struct SendBatch {
     messages: Vec<Envelope>,
@@ -683,6 +704,7 @@ impl App for Skrepka {
                     KeyValue::get(K_CONTACTS).then_send(Event::LoadedContacts),
                     KeyValue::get(K_CURSOR).then_send(Event::LoadedCursor),
                     KeyValue::get(K_OUTBOX).then_send(Event::LoadedOutbox),
+                    KeyValue::get(K_SEEN_IDS).then_send(Event::LoadedSeenIds),
                 ])
                 .and(render())
             }
@@ -756,6 +778,18 @@ impl App for Skrepka {
                     Err(()) => {
                         model.kv_load_failed = true;
                         model.error = Some("could not read outbox from storage".into());
+                    }
+                }
+                self.startup_done(model).and(render())
+            }
+            Event::LoadedSeenIds(res) => {
+                match parse_kv::<BTreeMap<String, HashSet<String>>>(res) {
+                    Ok(Some(map)) => model.seen_ids = map,
+                    Ok(None) => {}
+                    Err(()) => {
+                        // Non-fatal: dedup falls back to the conversation-derived
+                        // set, which is weaker but functional.
+                        model.seen_ids = BTreeMap::new();
                     }
                 }
                 self.startup_done(model).and(render())
@@ -990,6 +1024,7 @@ impl App for Skrepka {
             Event::DeleteContact { peer } => {
                 model.contacts.remove(&peer);
                 model.messages.remove(&peer);
+                model.seen_ids.remove(&peer);
                 model.outbox.retain(|item| item.recipient != peer);
                 // The send in flight may be carrying the very items we just
                 // dropped; if so its result must pop nothing.
@@ -1006,6 +1041,8 @@ impl App for Skrepka {
                     // message the user just asked us to forget. Delete the key.
                     KeyValue::delete(k_messages(&peer)).then_send(Event::Saved),
                     self.persist_outbox(model),
+                    // Q18: persist the seen_ids map without the removed peer.
+                    self.persist_seen_ids(model),
                 ])
                 .and(render())
             }
@@ -1306,7 +1343,17 @@ impl App for Skrepka {
                     model.error = Some("relay sent an oversized poll response".into());
                     return self.backoff_poll(model);
                 }
-                let parsed: PollResp = serde_json::from_slice(&bytes).unwrap_or_default();
+                // Q25: A malformed or unparseable poll response must not be
+                // treated as an empty page — `unwrap_or_default()` would adopt
+                // cursor 0, forcing a re-fetch from the beginning and wasting
+                // bandwidth on already-seen (deduped) messages.  Back off instead.
+                let parsed: PollResp = match serde_json::from_slice(&bytes) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        model.error = Some("relay sent a malformed poll response".into());
+                        return self.backoff_poll(model);
+                    }
+                };
                 let cmd = self.ingest_poll(model, parsed);
                 // The re-poll hangs off the *cursor write*, not off this event.
                 // Polling again is what acks the batch we just took — the server
@@ -1630,6 +1677,16 @@ impl Skrepka {
         }
         let list = model.messages.get(peer).cloned().unwrap_or_default();
         KeyValue::set(k_messages(peer), json_bytes(&list)).then_send(Event::Saved)
+    }
+
+    /// Q18: Persist the per-peer dedup ID set.  Written alongside messages so
+    /// the set survives restarts and covers IDs that `trim_history` has aged
+    /// out of the conversation.
+    fn persist_seen_ids(&self, model: &mut Model) -> Command<Effect, Event> {
+        if self.refuse_write(model) {
+            return Command::done();
+        }
+        KeyValue::set(K_SEEN_IDS, json_bytes(&model.seen_ids)).then_send(Event::Saved)
     }
 
     fn schedule_reconnect(&self, model: &mut Model) -> Command<Effect, Event> {
@@ -1970,7 +2027,14 @@ impl Skrepka {
         // relay. Adopting `i64::MAX` would ack (delete) all queued mail on the
         // next poll and persist that poison across relaunches.
         let clamped_cursor = page.cursor.min(now_ms().saturating_add(60_000));
-        if clamped_cursor > model.cursor {
+        // Q16: Only advance the cursor when the page actually carried events.
+        // An empty page with a cursor higher than ours is suspicious — a
+        // compromised relay could poison the cursor to ack (delete) messages
+        // the client hasn't seen.  When there are no events, there is nothing
+        // to acknowledge, so the cursor should not move.  (An honest relay's
+        // empty-page cursor equals what the client sent, so this is a no-op
+        // in the normal case.)
+        if !page.events.is_empty() && clamped_cursor > model.cursor {
             model.cursor = clamped_cursor;
         }
         let Some(id) = model.identity() else {
@@ -1982,8 +2046,10 @@ impl Skrepka {
         let mut contacts_dirty = false;
         // sender hex -> message ids needing acks
         let mut ack_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        // Lazily-built per-sender sets of known message IDs for O(1) text dedup.
-        let mut seen_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        // Q17: Per-sender deferred ack accumulation.  Collected during the event
+        // loop, applied after it — so relay page ordering cannot cause an older
+        // ack to be dropped as stale by a newer one processed first.
+        let mut pending_acks: HashMap<String, PendingAck> = HashMap::new();
 
         let mut budget = MAX_POLL_TOTAL_BYTES;
         let mut events_processed = 0usize;
@@ -2084,10 +2150,21 @@ impl Skrepka {
                         contacts_dirty = true;
                     }
                     let convo = model.messages.entry(sender.clone()).or_default();
-                    // Lazily build the per-sender ID set on first touch.
-                    let id_set = seen_ids.entry(sender.clone()).or_insert_with(|| {
-                        convo.iter().map(|m| m.id.clone()).collect()
-                    });
+                    // Q18: Use the persistent per-peer dedup set from
+                    // `model.seen_ids` (loaded from kv at startup) instead of
+                    // deriving it from the trimmed conversation.  Without this,
+                    // a replayed blob whose `id` was aged out by `trim_history`
+                    // (past the 1000-message cap) passes the dedup check and
+                    // re-enters the conversation.
+                    let id_set = model
+                        .seen_ids
+                        .entry(sender.clone())
+                        .or_default();
+                    // Also seed from the conversation in case the kv load was
+                    // missing or partial — covers the upgrade path.
+                    if id_set.is_empty() {
+                        id_set.extend(convo.iter().map(|m| m.id.clone()));
+                    }
                     // dedup by id — O(1) via HashSet
                     if !id_set.contains(&msg_id) {
                         // The conversation is *kept* sorted rather than re-sorted:
@@ -2113,39 +2190,26 @@ impl Skrepka {
                     }
                 }
                 Payload::DeliveryAck { ack_ids } => {
-                    // Staleness check: drop a replayed ack whose ts predates the
-                    // last one we processed for this contact.
-                    let stale = model
-                        .contacts
+                    // Q17: Defer the staleness check until after the event loop.
+                    // Within a single page, a relay can reorder events so that a
+                    // newer ack (higher ts) is processed before an older one.  If
+                    // we applied the watermark immediately, the older ack would be
+                    // dropped as stale — even if it acks different message IDs.
+                    // Instead, accumulate all ack_ids per sender and the max ts,
+                    // then apply them in a second pass below the loop.
+                    let prev_ts = pending_acks
                         .get(&sender)
-                        .is_some_and(|c| ts < c.last_ack_ts);
-                    if stale {
-                        continue;
+                        .map(|p| p.ts)
+                        .unwrap_or(0);
+                    if ts > prev_ts {
+                        let entry = pending_acks.entry(sender.clone()).or_default();
+                        entry.ts = ts;
                     }
-                    // The watermark is clamped to *now*, not merely into the skew
-                    // window: `ts` is the peer's to choose, and `last_ack_ts` is
-                    // what every later ack is measured against. A single ack at
-                    // `ts = i64::MAX` would otherwise park the watermark a minute
-                    // into the future, and every honest ack that followed — the
-                    // ones that actually mark our messages delivered — would read
-                    // as stale and be dropped.
-                    if let Some(c) = model.contacts.get_mut(&sender) {
-                        c.last_ack_ts = ts.min(now);
-                        contacts_dirty = true;
-                    }
-                    let ack_set: HashSet<String> = ack_ids.iter().cloned().collect();
-                    if let Some(convo) = model.messages.get_mut(&sender) {
-                        let mut changed = false;
-                        for m in convo.iter_mut() {
-                            if m.outgoing && ack_set.contains(&m.id) && !m.delivered {
-                                m.delivered = true;
-                                changed = true;
-                            }
-                        }
-                        if changed {
-                            touched_convos.insert(sender);
-                        }
-                    }
+                    pending_acks
+                        .entry(sender.clone())
+                        .or_default()
+                        .ids
+                        .extend(ack_ids);
                 }
                 Payload::Profile {
                     display_name,
@@ -2182,6 +2246,42 @@ impl Skrepka {
             }
         }
 
+        // Q17: Apply deferred delivery acks.  Collected during the event loop
+        // above, now applied with a single staleness check per sender using the
+        // highest `ts` seen — so relay page ordering cannot cause an older ack
+        // to be dropped as stale by a newer one processed first.
+        for (sender, pending) in &pending_acks {
+            let stale = model
+                .contacts
+                .get(sender)
+                .is_some_and(|c| pending.ts < c.last_ack_ts);
+            if stale {
+                continue;
+            }
+            // The watermark is clamped to *now*, not merely into the skew window:
+            // `ts` is the peer's to choose, and `last_ack_ts` is what every later
+            // ack is measured against. A single ack at `ts = i64::MAX` would
+            // otherwise park the watermark a minute into the future, and every
+            // honest ack that followed — the ones that actually mark our messages
+            // delivered — would read as stale and be dropped.
+            if let Some(c) = model.contacts.get_mut(sender) {
+                c.last_ack_ts = pending.ts.min(now);
+                contacts_dirty = true;
+            }
+            if let Some(convo) = model.messages.get_mut(sender) {
+                let mut changed = false;
+                for m in convo.iter_mut() {
+                    if m.outgoing && pending.ids.contains(&m.id) && !m.delivered {
+                        m.delivered = true;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    touched_convos.insert(sender.clone());
+                }
+            }
+        }
+
         // Queue delivery acks, in batches the recipient will actually accept.
         //
         // `parse_payload` drops a `delivery.ack` carrying more than `MAX_ACK_IDS`
@@ -2210,6 +2310,10 @@ impl Skrepka {
         let mut cmds: Vec<Command<Effect, Event>> = Vec::new();
         for peer in &touched_convos {
             cmds.push(self.persist_messages(model, peer));
+        }
+        // Q18: Persist the dedup ID set whenever we touched conversations.
+        if !touched_convos.is_empty() {
+            cmds.push(self.persist_seen_ids(model));
         }
         if contacts_dirty {
             cmds.push(self.persist_contacts(model));
@@ -3877,6 +3981,7 @@ mod tests {
             Event::LoadedProfile(Ok(None)),
             Event::LoadedContacts(Ok(None)),
             Event::LoadedCursor(Ok(None)),
+            Event::LoadedSeenIds(Ok(None)),
         ]
         .into_iter()
         .enumerate()
@@ -3890,7 +3995,7 @@ mod tests {
             assert_eq!(connects(&mut cmd), 0, "and none of them connects");
         }
 
-        // The fifth — and only the fifth — emits Connect.
+        // The sixth — and only the sixth — emits Connect.
         let mut cmd = app.update(Event::LoadedOutbox(Ok(None)), &mut m);
         assert_eq!(m.loads_pending, 0);
         assert_eq!(connects(&mut cmd), 1, "the last load connects, exactly once");
