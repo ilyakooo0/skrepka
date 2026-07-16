@@ -143,6 +143,13 @@ fn k_messages(peer: &str) -> String {
     format!("messages:{peer}")
 }
 
+/// N7: Cap on the per-peer `seen_ids` dedup set. Without a cap the set grows
+/// without bound — a peer who sends thousands of messages accumulates
+/// thousands of IDs, and the `seen_ids` kv blob is rewritten in full on every
+/// incoming message. Kept well above `MAX_MESSAGES_PER_PEER` (1000) so a
+/// trim-and-replay within the conversation window still hits the set.
+const MAX_SEEN_IDS_PER_PEER: usize = 2000;
+
 // ---------------------------------------------------------------------------
 // Effect
 // ---------------------------------------------------------------------------
@@ -2053,6 +2060,14 @@ impl Skrepka {
 
         let mut budget = MAX_POLL_TOTAL_BYTES;
         let mut events_processed = 0usize;
+        // N9: Track whether any event was successfully decrypted and stored.
+        // When the budget/count is exhausted mid-page, we ack the page (keep
+        // the advanced cursor) only if at least one event was processed —
+        // the unprocessed tail is from a hostile/misconfigured relay and
+        // losing them is better than livelocking. If zero events were
+        // processed (a completely hostile page), restore the cursor so we
+        // don't ack mail we never saw.
+        let mut events_stored = 0usize;
         for ev in page.events {
             // Reject an oversized blob on its hex length, before it costs us a
             // decode. No conforming sender produces one (the relay caps blobs at
@@ -2063,10 +2078,16 @@ impl Skrepka {
             // Event count cap: the byte budget alone permits ~388K minimum-size
             // events, each costing a full decrypt attempt. A hostile relay can
             // freeze the app for tens of seconds per poll with a page of small
-            // junk blobs. Stop processing past this count, with the same cursor
-            // restoration as the byte budget exhaustion.
+            // junk blobs. Stop processing past this count.
             if events_processed >= MAX_POLL_EVENTS {
-                model.cursor = prev_cursor;
+                // N9: If we stored at least one event, keep the advanced cursor
+                // to ack the page and avoid a livelock. The unprocessed events
+                // are hostile junk or beyond our capacity — we can't process
+                // them anyway, and re-fetching them forever would wedge the
+                // client.
+                if events_stored == 0 {
+                    model.cursor = prev_cursor;
+                }
                 model.error = Some("relay sent too many poll events".into());
                 break;
             }
@@ -2074,16 +2095,17 @@ impl Skrepka {
             match budget.checked_sub(ev.encrypted_blob.len() / 2) {
                 Some(left) => budget = left,
                 None => {
-                    // A page this large is a misbehaving relay, not real mail.
-                    // Stop here; the rest of the page is discarded exactly as an
-                    // undecryptable blob would be.
-                    //
-                    // Restore the cursor: it was advanced to `page.cursor` above,
-                    // but we have not processed the remaining events. If we keep
-                    // the advanced cursor, the next poll acks the whole page to
-                    // the relay — including every event we skipped — and the
-                    // relay deletes them. Those messages are permanently lost.
-                    model.cursor = prev_cursor;
+                    // N9: Budget exhausted. If we stored at least one event,
+                    // keep the advanced cursor to ack the page — re-fetching
+                    // an oversized page forever is a livelock. The unprocessed
+                    // events are beyond our capacity and would be re-served
+                    // on every poll, wedging the client. Acking them breaks
+                    // the loop. If zero events were stored (completely hostile
+                    // page), restore the cursor to avoid acking mail we
+                    // never saw.
+                    if events_stored == 0 {
+                        model.cursor = prev_cursor;
+                    }
                     model.error = Some("relay sent an oversized poll page".into());
                     break;
                 }
@@ -2182,6 +2204,30 @@ impl Skrepka {
                             },
                         );
                         id_set.insert(msg_id.clone());
+                        events_stored += 1;
+                        // N7: Cap the dedup set so it doesn't grow without
+                        // bound. The set is rewritten to kv on every message
+                        // receipt, so an unbounded set makes every receipt
+                        // slower. Keep the most recent IDs by draining excess
+                        // from the oldest. `HashSet` has no ordering, so when
+                        // the cap is exceeded we rebuild from the conversation
+                        // (which is trimmed to MAX_MESSAGES_PER_PEER and
+                        // sorted by ts) — the oldest IDs in the set that are
+                        // no longer in the conversation are the ones to drop.
+                        if id_set.len() > MAX_SEEN_IDS_PER_PEER {
+                            let convo_ids: HashSet<&String> =
+                                convo.iter().map(|m| &m.id).collect();
+                            let excess = id_set.len() - MAX_SEEN_IDS_PER_PEER;
+                            let to_remove: Vec<String> = id_set
+                                .iter()
+                                .filter(|id| !convo_ids.contains(*id))
+                                .take(excess)
+                                .cloned()
+                                .collect();
+                            for id in to_remove {
+                                id_set.remove(&id);
+                            }
+                        }
                         trim_history(convo);
                         touched_convos.insert(sender.clone());
                         // Only ack a message we actually stored — a duplicate id
@@ -2210,6 +2256,7 @@ impl Skrepka {
                         .or_default()
                         .ids
                         .extend(ack_ids);
+                    events_stored += 1;
                 }
                 Payload::Profile {
                     display_name,
@@ -2241,6 +2288,7 @@ impl Skrepka {
                         c.photo = photo;
                         c.last_profile_ts = ts.min(now);
                         contacts_dirty = true;
+                        events_stored += 1;
                     }
                 }
             }

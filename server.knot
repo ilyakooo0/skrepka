@@ -87,6 +87,15 @@ maxBatchSize = 100
 -- Cap on gossip events accepted or emitted in a single federation exchange.
 maxGossipEvents : Int
 maxGossipEvents = 100
+-- N13: Cap on newly-online keys per gossip batch that trigger forward sweeps.
+-- Without this, a single gossip request with 100 `online` events triggers 100
+-- mailbox scans (O(100 × |messages|)). Capping at 10 limits the amplification
+-- while still allowing reasonable multi-key presence announcements. Remaining
+-- newly-online keys are still written to `*presence` — only the forward sweep
+-- is deferred until the next presence re-announce or a poll triggers
+-- `forwardQueuedToServer` naturally.
+maxNewlyOnlineForwards : Int
+maxNewlyOnlineForwards = 10
 -- Cap on events returned by one long-poll response.
 maxPollEvents : Int
 maxPollEvents = 50
@@ -518,8 +527,15 @@ capPerServer = \items server maxN -> union (filter (\x -> not (x.server == serve
 -- no timestamp (the same reason `retryPendingForwards` has to sort on the blob).
 -- Applied by both writers that grow `*forwards` (`forwardQueuedToServer` and
 -- `handleSendMessages`); the retry sweep only ever shrinks it.
+--
+-- N4: Sort by `(retries, encryptedBlob)` for determinism. Without the secondary
+-- key, a `sortBy retries` alone is unstable when many entries share `retries: 0`,
+-- and any of them could be dropped — including a fresh forward for a healthy
+-- peer. The blob is a unique secondary key (the dedup invariant guarantees
+-- `(toKey, encryptedBlob, toServer)` uniqueness), so the sort is total and
+-- deterministic.
 capForwards : [ForwardEntry] -> [ForwardEntry]
-capForwards = \fwds -> take maxForwardsTotal (sortBy (\f -> f.retries) fwds)
+capForwards = \fwds -> take maxForwardsTotal (sortBy (\f -> {retries: f.retries, blob: f.encryptedBlob}) fwds)
 
 -- Random hex token: one random hex char per recursive call. `n` is the
 -- desired length in characters (so n=48 yields 24 random bytes of entropy).
@@ -916,6 +932,13 @@ currentSeq = \rows -> fold (\acc r -> max acc r.value) (0 : Timestamp) rows
 -- and the fresh `seqTs` below would otherwise make `union` keep both rows and
 -- double-deliver. Re-reading `*messages` per call also collapses duplicate blobs
 -- appearing twice within one batch.
+--
+-- N3: This O(n) scan is a CPU amplification vector. A batch of 100 identical
+-- blobs to the same recipient triggers 100 × O(|messages|) comparisons. With
+-- |messages| = 10000, that's 1M comparisons per request, bounded by the 60/min
+-- rate limit. A real fix needs an index on (toKey, encryptedBlob) or a
+-- hash-based dedup set — both require runtime support not available in Knot
+-- today. Documented as an accepted DoS surface.
 appendMessage : PubkeyHex -> BlobHex -> Int<Ms> -> IO {rw *messages, rw *seqCounter} {}
 appendMessage = \toKey encryptedBlob t -> do
   msgs <- *messages
@@ -1557,12 +1580,13 @@ handleRecvGossip = \events fromServer -> do
           Ok {value: pk} -> if e.eventType == "online"
           then {
             touched: union acc.touched [pk],
-            added: union acc.added [{pubkey: pk, server: from, expiresAt: t + onlineGossipTtl}]
+            added: union acc.added [{pubkey: pk, server: from, expiresAt: t + onlineGossipTtl}],
+            offline: acc.offline
           }
           else if e.eventType == "offline"
-          then {acc.added, touched: union acc.touched [pk]}
+          then {acc.added, touched: union acc.touched [pk], offline: union acc.offline [pk]}
           else acc
-        Nothing {} -> acc) {touched: ([] : [PubkeyHex]), added: ([] : [PresenceEntry])} events
+        Nothing {} -> acc) {touched: ([] : [PubkeyHex]), added: ([] : [PresenceEntry]), offline: ([] : [PubkeyHex])} events
       let kept = filter (\p -> p.server != from || not elem p.pubkey collected.touched) pres
       let merged = union kept collected.added
       -- Cap the gossip-learned rows: per-peer first, so one peer cannot crowd every
@@ -1574,8 +1598,21 @@ handleRecvGossip = \events fromServer -> do
       let localRows = filter (\p -> isLocalServer p.server) merged
       let remoteRows = filter (\p -> not isLocalServer p.server) merged
       *presence = union localRows (capList (capPerServer remoteRows from maxPresencePerServer) maxPresence)
+      -- N14: Cancel pending forwards to `from` for offline keys. Without this,
+      -- forwards to a peer that just went offline retry for up to 80 minutes,
+      -- wasting maxForwardsPerServer slots and generating failed HTTP requests.
+      -- The message stays in *messages, so it's re-forwarded if the key
+      -- re-appears on another peer.
+      when (count collected.offline > 0) (do
+        fwds <- *forwards
+        *forwards = filter (\f -> not (f.toServer == from && elem f.toKey collected.offline)) fwds)
       yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == from && p.expiresAt > t) pres) (map (\p -> p.pubkey) collected.added)))
-    fork (forEach newlyOnline (\pk -> forwardQueuedToServer pk fromServer))
+    -- N13: Cap the number of newly-online keys that trigger forward sweeps.
+    -- Without this, 100 online events = 100 mailbox scans. The remaining keys
+    -- are still in `*presence` — their forwards will be staged when a poll
+    -- refreshes presence or the next gossip re-announces them.
+    let toForward = take maxNewlyOnlineForwards newlyOnline
+    fork (forEach toForward (\pk -> forwardQueuedToServer pk fromServer))
     yield (Ok {value: {}})
 
 -- POST /federation/forward: receive a single federated message destined for

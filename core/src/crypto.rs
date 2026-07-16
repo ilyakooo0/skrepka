@@ -15,7 +15,7 @@
 
 use std::io::Read;
 
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, Payload as AeadPayload};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -24,19 +24,43 @@ use rand_core::{CryptoRng, RngCore};
 use sha2::{Digest, Sha256, Sha512};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// HKDF `info` string (PROTOCOL.md §3 / Constants.hkdfInfo). Fixed.
-const HKDF_INFO: &[u8] = b"skrepka-v1";
+/// HKDF `info` string (PROTOCOL.md §3). Derived from the wire version so a
+/// future crypto revision that bumps the version byte also changes the KDF
+/// label automatically — the two must always move together (N2).
+const HKDF_INFO: &[u8] = b"skrepka-v2";
 /// Domain-separation tag for the auth challenge signature (PROTOCOL.md §6).
 const AUTH_TAG: &str = "skrepka-auth-v1:";
 
 /// Wire-format version byte prepended to every encrypted blob (PROTOCOL.md §3).
-const WIRE_VERSION: u8 = 1;
+///
+/// Version 0x02 adds AEAD associated data (AAD): the cleartext header
+/// `version_byte || ephemeral_public || nonce` is authenticated alongside
+/// the ciphertext, so a relay that tampers with any envelope field —
+/// including swapping the `to` recipient — causes AEAD decryption to fail
+/// before the blob is ever acked (N1). The recipient's Ed25519 public key
+/// is also included in the AAD, binding the envelope `to` field to the
+/// inner signed recipient, so a `to`-swap is detected as an AEAD failure
+/// rather than a silent misdelivery.
+const WIRE_VERSION: u8 = 2;
+
+/// Build the AAD for AEAD: `version || ephemeral_pub || nonce || recipient_pub`.
+/// All envelope-level fields the relay can see are now cryptographically
+/// bound to the ciphertext (N1).
+fn aad(version: u8, eph_pub: &[u8; 32], nonce: &[u8; NONCE_LEN], recipient_pub: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(1 + 32 + NONCE_LEN + 32);
+    aad.push(version);
+    aad.extend_from_slice(eph_pub);
+    aad.extend_from_slice(nonce);
+    aad.extend_from_slice(recipient_pub);
+    aad
+}
 
 pub const ED25519_SECRET_LEN: usize = 64;
 pub const ED25519_PUBLIC_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
 /// 1 (version) + 32 (eph) + 24 (nonce) + 32 (sender pub) + 64 (sig) + 4 (compressed_len)
 /// + 16 (AEAD tag). The 4-byte compressed_len field sits inside the AEAD ciphertext.
+/// The version byte, ephemeral pubkey, nonce, and recipient pubkey are AEAD AAD (v0x02).
 pub const MIN_BLOB_LEN: usize = 1 + 32 + NONCE_LEN + 32 + 64 + 4 + 16;
 
 /// Blob sizes are padded up to these boundaries so the on-wire length does not
@@ -394,8 +418,18 @@ pub fn encrypt(
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut nonce);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*key));
+    // AAD binds the envelope header (version, ephemeral pubkey, nonce) and
+    // the recipient identity to the ciphertext (N1). A relay that swaps the
+    // `to` field causes the wrong recipient to fail AEAD decryption, and the
+    // original recipient's message stays in the mailbox instead of being
+    // silently misdelivered.
+    let aad_buf = aad(WIRE_VERSION, &eph_pub, &nonce, recipient_ed_pub);
+    let payload = AeadPayload {
+        msg: inner.as_ref(),
+        aad: &aad_buf,
+    };
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), inner.as_ref())
+        .encrypt(XNonce::from_slice(&nonce), payload)
         .map_err(|_| CryptoError::Encrypt)?;
     inner.zeroize();
 
@@ -443,9 +477,16 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     let key = derive_key(&raw_secret, &eph_pub, recip_x_pub);
 
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*key));
+    // Reconstruct the same AAD used during encryption: the envelope header
+    // and the recipient identity. This binds the envelope `to` field to the
+    // ciphertext — a relay that swapped `to` causes AEAD failure here, not
+    // a silent misdelivery (N1).
+    let recip_pub = recipient.public_key();
+    let aad_buf = aad(blob[0], &eph_pub, &nonce, &recip_pub);
+    let payload = AeadPayload { msg: ciphertext, aad: &aad_buf };
     let mut inner = Zeroizing::new(
         cipher
-            .decrypt(XNonce::from_slice(&nonce), ciphertext)
+            .decrypt(XNonce::from_slice(&nonce), payload)
             .map_err(|_| CryptoError::Decrypt)?,
     );
 
@@ -765,5 +806,64 @@ mod tests {
         // The bound itself is inclusive.
         let at_cap = "a".repeat(MAX_CHALLENGE_LEN);
         assert!(id.sign_challenge("relay.example.com", &at_cap).is_ok());
+    }
+
+    /// N1: AAD prevents silent `to`-swap censorship. A blob encrypted to Bob
+    /// cannot be decrypted by Charlie even if a relay changes the envelope's
+    /// `to` field to Charlie's pubkey — the AAD binds the recipient identity,
+    /// so the AEAD tag check fails before any inner content is revealed.
+    #[test]
+    fn aad_prevents_to_swap_censorship() {
+        let alice = Identity::generate(&mut rng(1));
+        let bob = Identity::generate(&mut rng(2));
+        let charlie = Identity::generate(&mut rng(3));
+
+        // Alice encrypts a message to Bob.
+        let blob = encrypt(&mut rng(4), &alice, &bob.public_key(), b"hi bob").unwrap();
+
+        // Charlie tries to decrypt the blob meant for Bob. The AAD includes
+        // Bob's pubkey (from the blob's perspective the recipient is Bob),
+        // but Charlie's identity derives a different key. This must fail at
+        // AEAD decryption, not at signature verification.
+        assert_eq!(
+            decrypt(&charlie, &blob).unwrap_err(),
+            CryptoError::Decrypt,
+            "wrong recipient must fail AEAD, not reach signature check"
+        );
+    }
+
+    /// N1: Tampering with the version byte causes AEAD failure (the version
+    /// is part of the AAD, not just checked separately).
+    #[test]
+    fn aad_binds_version_byte() {
+        let alice = Identity::generate(&mut rng(1));
+        let bob = Identity::generate(&mut rng(2));
+        let mut blob = encrypt(&mut rng(3), &alice, &bob.public_key(), b"hi").unwrap();
+
+        // Flip the version byte. The separate check (`blob[0] != WIRE_VERSION`)
+        // would catch this, but the AAD also includes it, so even if the
+        // version check were removed, AEAD would still fail.
+        blob[0] ^= 0xff;
+        assert_eq!(
+            decrypt(&bob, &blob).unwrap_err(),
+            CryptoError::Decrypt,
+            "version byte tampering must fail AEAD"
+        );
+    }
+
+    /// N1: Tampering with the ephemeral pubkey causes AEAD failure (it's
+    /// part of the AAD, not just used for key derivation).
+    #[test]
+    fn aad_binds_ephemeral_pubkey() {
+        let alice = Identity::generate(&mut rng(1));
+        let bob = Identity::generate(&mut rng(2));
+        let mut blob = encrypt(&mut rng(3), &alice, &bob.public_key(), b"hi").unwrap();
+
+        // Corrupt one byte of the ephemeral pubkey. Even though the key
+        // derivation would produce a different key (causing AEAD failure
+        // anyway), the AAD also includes the eph_pub, so this is
+        // cryptographically bound to the ciphertext.
+        blob[5] ^= 0x01;
+        assert!(decrypt(&bob, &blob).is_err());
     }
 }

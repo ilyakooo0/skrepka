@@ -154,18 +154,21 @@ fetch_to "$DOWNLOAD_URL" "$TMP_BIN"
 # HTTPS, but that authenticates GitHub's CDN, not the artifact — a compromised or
 # swapped release asset would otherwise be installed and launched unquestioned.
 #
-# The check is best-effort by necessity: releases cut before CI began publishing
-# .sha256 files have no checksum to compare against, and refusing to install from
-# them would break upgrades from every existing deployment. So a *missing*
-# checksum warns and proceeds, while a checksum that is present and does *not*
-# match is fatal — the case that actually indicates tampering.
+# N15: Verification is mandatory. A missing checksum, a missing sha256sum tool,
+# or a mismatch are all fatal — the binary is refused.
+# N15: Checksum verification is mandatory for all installs. A missing
+# checksum file indicates either a pre-checksum release or a supply-chain
+# attack that removed the checksum. We refuse to install without verification
+# rather than silently proceeding.
 if fetch_to "$CHECKSUM_URL" "$TMP_SUM" 2>/dev/null; then
   EXPECTED=$(cut -d' ' -f1 < "$TMP_SUM")
   ACTUAL=$(sha256_of "$TMP_BIN")
   if [ -z "$ACTUAL" ]; then
-    echo "warning: no sha256sum/shasum available; skipping checksum verification" >&2
+    echo "error: no sha256sum/shasum available; cannot verify binary integrity" >&2
+    exit 1
   elif [ -z "$EXPECTED" ]; then
-    echo "warning: checksum file is empty; skipping verification" >&2
+    echo "error: checksum file is empty; refusing to install unverified binary" >&2
+    exit 1
   elif [ "$EXPECTED" != "$ACTUAL" ]; then
     echo "error: checksum verification FAILED for ${ASSET}" >&2
     echo "  expected: ${EXPECTED}" >&2
@@ -176,8 +179,9 @@ if fetch_to "$CHECKSUM_URL" "$TMP_SUM" 2>/dev/null; then
     echo "Checksum verified (${ACTUAL})"
   fi
 else
-  echo "warning: no published checksum at ${CHECKSUM_URL}; skipping verification" >&2
-  echo "         (releases predating checksum publication have none)" >&2
+  echo "error: no published checksum at ${CHECKSUM_URL}; refusing to install unverified binary" >&2
+  echo "       (releases predating checksum publication have none — install from a recent release)" >&2
+  exit 1
 fi
 
 chmod 755 "$TMP_BIN"

@@ -1,6 +1,6 @@
 # Skrepka Protocol Specification
 
-**Version:** 0.1 (Draft)
+**Version:** 0.2 (Draft)
 
 ---
 
@@ -110,7 +110,7 @@ The wire-visible "envelope" carries only the recipient and the opaque blob. The 
    key = hkdf_sha256(
      ikm   = raw_secret,
      salt  = ephemeral_public || recipient_x25519_public,
-     info  = "skrepka-v1",
+     info  = "skrepka-v2",
      len   = 32
    )
    ```
@@ -129,22 +129,32 @@ The wire-visible "envelope" carries only the recipient and the opaque blob. The 
    ```
    inner = sender_ed25519_public || signature || compressed_len || compressed || padding
    ```
-7. Generate a random 24-byte nonce and AEAD-encrypt the inner buffer:
+7. Generate a random 24-byte nonce and AEAD-encrypt the inner buffer with
+   associated data binding the envelope header and recipient identity:
    ```
    nonce      = random_bytes(24)
-   ciphertext = xchacha20_poly1305_encrypt(key, nonce, inner)   // no associated data
+   aad        = version_byte || ephemeral_public || nonce || recipient_ed25519_public
+   ciphertext = xchacha20_poly1305_encrypt(key, nonce, inner, aad)
    ```
+   The AAD authenticates every cleartext field a relay can see (version,
+   ephemeral public key, nonce) and the recipient's Ed25519 public key.
+   A relay that swaps the envelope `to` field to a different recipient causes
+   AEAD decryption to fail at the wrong recipient — the blob is dropped before
+   any cursor advance, and the original recipient's message stays in the
+   mailbox. Without AAD, a relay could silently misdeliver messages by
+   swapping `to`, making the censorship undetectable to both sender and
+   recipient.
 8. Emit the on-wire blob:
    ```
    blob = version_byte || ephemeral_public || nonce || ciphertext
    ```
-   where `version_byte` is `0x01` (see *Cryptographic Versioning* below).
+   where `version_byte` is `0x02` (see *Cryptographic Versioning* below).
 
 **Decryption flow:**
 
 1. Read the leading version byte (reject the blob if it is not recognized). Split the rest: 32-byte `ephemeral_public`, 24-byte `nonce`, remainder is `ciphertext`.
 2. Derive the recipient's X25519 private key from the recipient's Ed25519 private key, compute the raw shared secret with `ephemeral_public`, and HKDF-derive the same `key`.
-3. AEAD-decrypt the ciphertext to recover the inner buffer.
+3. Reconstruct the AAD: `version_byte || ephemeral_public || nonce || recipient_ed25519_public`. AEAD-decrypt the ciphertext with this AAD to recover the inner buffer.
 4. Split: 32-byte `sender_ed25519_public`, 64-byte `signature`, 4-byte `compressed_len` (big-endian u32), then `compressed_len` bytes of `compressed` (the remainder is padding).
 5. Verify the signature over `recipient_ed25519_public || inner[96..]` (i.e. `compressed_len || compressed || padding`) using `sender_ed25519_public`. Reject the message on failure.
 6. zstd-decompress the `compressed` bytes (only the `compressed_len`-length slice, not the trailing padding) to recover the plaintext payload.
@@ -192,7 +202,7 @@ A blob is rounded up to the smallest bucket ≥ its unpadded size. Above 65536 b
 
 ### Cryptographic Versioning
 
-The wire format carries a leading **version byte** (currently `0x01`) on every encrypted blob. A recipient that sees a version it does not recognise MUST reject the blob without attempting further processing (no AEAD decrypt, no key derivation, no decompression) — the reference client returns a decryption error and drops the blob. This ensures a future revision can introduce a new AEAD, KDF, or curve by bumping this byte without risk of misinterpreting an unknown format. Version 0x01 includes length padding (see *Length Padding* above): blobs are padded to fixed-size bucket boundaries, and the inner buffer carries a 4-byte `compressed_len` field so the recipient can separate the zstd frame from trailing padding. The HKDF `info` string remains the fixed constant `"skrepka-v1"` for version 0x01. The unknown-`type` rule (§4) gives forward compatibility for *payload* types; the version byte gives the same for the wire format, AEAD, KDF, and curve choices. A future revision that changes the crypto primitives should bump both the version byte and the HKDF `info` string together.
+The wire format carries a leading **version byte** (currently `0x02`) on every encrypted blob. A recipient that sees a version it does not recognise MUST reject the blob without attempting further processing (no AEAD decrypt, no key derivation, no decompression) — the reference client returns a decryption error and drops the blob. This ensures a future revision can introduce a new AEAD, KDF, or curve by bumping this byte without risk of misinterpreting an unknown format. Version 0x02 adds AEAD associated data (AAD): the cleartext header `version_byte || ephemeral_public || nonce` and the recipient's Ed25519 public key are authenticated alongside the ciphertext, so a relay that tampers with any envelope field — including swapping the `to` recipient — causes AEAD decryption to fail rather than silently misdelivering the blob. The HKDF `info` string is the fixed constant `"skrepka-v2"` for version 0x02. The unknown-`type` rule (§4) gives forward compatibility for *payload* types; the version byte gives the same for the wire format, AEAD, KDF, and curve choices. A future revision that changes the crypto primitives should bump both the version byte and the HKDF `info` string together — the reference implementation derives the info string from the version to ensure they cannot drift (see `crypto.rs`).
 
 ---
 
@@ -670,7 +680,7 @@ Skrepka protects message **content and sender identity** from servers and networ
 | Risk                              | Details                                             |
 |-----------------------------------|-----------------------------------------------------|
 | **No forward secrecy**            | A captured blob plus a later compromise of the recipient's long-term key **is enough to decrypt that message** — the per-message ephemeral key is the *sender's*, and the recipient's half of the exchange is their long-term identity key, which never rotates. So an adversary who records ciphertext today (a network observer, or any relay it passed through) and obtains the recipient's key at any point in the future can read everything it recorded. There is no ratchet, so there is also no post-compromise recovery: once the key leaks, future messages are readable too until the user rotates identity. Do not read the per-message ephemeral keys as forward secrecy; they are not. **Additionally**, because the HKDF salt (`ephemeral_public ‖ recipient_x25519_public`) omits the sender's identity, compromising the recipient's private key also enables a *key-compromise impersonation (KCI)* vector: the attacker can decrypt a captured blob, replace the sender identity and signature inside the inner buffer with their own, re-encrypt with the same derived key, and re-deliver. The recipient sees a valid message apparently from a different sender. Including the sender pubkey in the HKDF salt or info would close this by construction, but requires a wire-format change. The signature already prevents forgery *without* key compromise, so KCI is an additional consequence of an already-catastrophic key leak, not a standalone attack. |
-| **No AAD on AEAD — envelope fields unauthenticated** | XChaCha20-Poly1305 is called with no associated data (§3). The version byte, ephemeral public key, and nonce are in the clear and not cryptographically bound to the ciphertext. More importantly, the envelope's `to` field is not authenticated by the AEAD — a relay can swap `to` to a different recipient's pubkey. The new recipient cannot decrypt the blob (wrong key), but the *original* recipient's message is gone from the mailbox. This is message loss, which is equivalent in impact to dropping — a relay can already drop any message — so it is an accepted consequence of v0.1's lack of AAD. A future revision should include `version_byte ‖ ephemeral_public ‖ nonce ‖ recipient_ed25519_public` as AAD (wire-format change). |
+| **No AAD on AEAD — envelope fields unauthenticated** (v0.1, fixed in v0.2) | In v0.1, XChaCha20-Poly1305 was called with no associated data. The envelope's `to` field was not authenticated by the AEAD — a relay could swap `to` to a different recipient's pubkey, silently misdelivering and censoring messages with zero detectability. **v0.2 fixes this**: the AAD includes `version_byte ‖ ephemeral_public ‖ nonce ‖ recipient_ed25519_public`, binding the envelope to the ciphertext. A `to`-swap now causes AEAD failure at the wrong recipient, and the original recipient's message stays in the mailbox. |
 | **Recipient metadata exposure**   | Servers see the recipient pubkey and arrival time of every message, plus the rough size of each blob. They do **not** see the sender. **The relay can also infer delivery** by correlating a message's arrival time with the recipient's subsequent poll time — the gap between the two reveals whether the recipient was online and actively reading. |
 | **Blob size reveals message type** | The length-padding buckets (§3, *Length Padding*) are coarse enough that a relay can distinguish payload types: a `delivery.ack` with a single ID (~233 bytes) falls in the 256-byte bucket, a short `text` message falls in the 512-byte bucket, and a `profile` with a photo falls in the 65536-byte bucket. A relay observing the bucket pattern learns who acks whom and who updates their profile — without decrypting anything. Finer-grained padding (e.g., a single minimum bucket for all small messages) would reduce this leak. |
 | **Poll cursor reveals reading progress** | The client sends its cursor (last-seen `receivedAt`) on every poll, telling the relay exactly how far behind the recipient is. A relay can determine whether the recipient is actively reading (cursor advances each poll) or just polling (cursor stays the same), estimate reading speed, and detect device switches (cursor jumps backward). This is inherent to the long-poll model. |
@@ -683,8 +693,8 @@ Skrepka protects message **content and sender identity** from servers and networ
 | **Rate limit counts requests, not messages** | The per-IP send rate limit (60/min) counts requests, and each request can carry up to 100 messages. The effective message rate is therefore 60 × 100 = 6 000 messages/min per IP (bounded by the body-size cap), much higher than the per-request limit suggests. An attacker with multiple IPs can send millions of messages per minute. |
 | **Session pool Sybil-floodable** | The global session pool (`maxSessions`, default 10 000) uses LRU eviction. An attacker with enough IPs can generate thousands of keypairs, authenticate each one, and fill the pool — evicting legitimate users' sessions. Users re-authenticate automatically (they get `401` and retry), so this is a soft DoS adding latency and load. Per-IP session caps were considered and rejected because they collapse behind carrier-grade NAT. |
 | **Presence table fillable with fake keys** | The presence table (`maxPresence`, default 100 000) can be filled with fake keys via gossip (100 events per request, 60/min per IP). Local rows are exempt from the cap, so local users' presence is never evicted, but legitimate *remote* presence (from honest peers) can be evicted, causing forwards to those peers to fail. Requires federation to be enabled. |
-| **Gossip amplification** | A single `/federation/gossip` request with 100 `online` events triggers 100 mailbox scans and forward-staging operations. An attacker can repeatedly send batches of 100 online events, amplifying CPU and forward-queue load by 100× per request. Bounded by the per-IP rate limit (60/min), so 6 000 redirected keys per minute per IP. |
-| **`fromServer` not verified** | The `fromServer` field in gossip events is self-asserted and not verified against the connecting peer's actual network address. An attacker can claim `fromServer: "legit-relay.example.com"` from any IP, poisoning the presence table with the legitimate relay's hostname. Forwards go to the legitimate relay (which doesn't have the key online → 404), causing spurious forward requests. This is a variant of the gossip-redirect attack; the intended fix is reverse-DNS verification of the connecting peer. |
+| **Gossip amplification** | A single `/federation/gossip` request with 100 `online` events triggers up to 100 mailbox scans and forward-staging operations. The reference server caps the number of newly-online keys that trigger forward sweeps per batch (`maxNewlyOnlineForwards`, default 10), limiting the amplification to 10× per request. An attacker can still send 100 online events per request, but only 10 trigger forward sweeps; the remaining keys are written to `*presence` without a forward sweep. Bounded by the per-IP rate limit (60/min). |
+| **`fromServer` not verified** | The `fromServer` field in gossip events is self-asserted and not verified against the connecting peer's actual network address — the server has **no mechanism** to verify that the connecting peer is who it claims to be. An attacker can claim `fromServer: "legit-relay.example.com"` from any IP, poisoning the presence table with the legitimate relay's hostname. Forwards go to the legitimate relay (which doesn't have the key online → 404), causing spurious forward requests. This is a variant of the gossip-redirect attack; the intended fix is reverse-DNS verification of the connecting peer, which requires runtime DNS support not currently available. |
 | **No identity revocation**        | There is no in-protocol mechanism to revoke or invalidate a compromised identity key. A stolen key allows full takeover: decrypt all captured messages, send messages as the user, poll their mailbox, and receive their messages via presence redirect. The only defense is out-of-band communication. See §11 (Future Extensions — Key Rotation) for the intended direction. |
 | **Unauthenticated session relay** (mitigated) | The auth signature is bound to the target server's hostname under a domain-separation tag (§6), so a malicious/relay server can no longer forward another server's challenge and replay the resulting signature to impersonate the client elsewhere. Residual caveat: the binding is to the hostname the client dialed, so it assumes the client reaches each server under its true `serverHost` (DNS/TLS integrity). |
 | **Same-recipient replay**         | Nothing stops a captured blob from being re-delivered to its original recipient. The damage is bounded per payload type: `text` is deduplicated by `id` (the reference client maintains a persistent `seen_ids` set that survives `trim_history`), `delivery.ack` is idempotent, and `profile` is guarded by the per-contact `ts` staleness check of §4. |
@@ -693,7 +703,7 @@ Skrepka protects message **content and sender identity** from servers and networ
 | **Bearer token theft = full impersonation** | Sessions are bearer-token-based: anyone who obtains the token can use it. The token is bound to `(pubkey, ip, expiry)`, but the `pubkey` binding is for authorization (self-send rejection), not for authenticating the request. If an attacker steals a bearer token (e.g., from a compromised proxy's access log), they can poll the victim's mailbox and send messages as the victim — modulo IP binding. Token expiry (1 hour) is the only automatic recovery. Consider shorter token lifetimes or per-request signing. |
 | **Token entropy depends on runtime CSPRNG** | Session and challenge tokens are generated by the server's runtime random source. Implementations SHOULD verify that their RNG is cryptographically secure (e.g., backed by `/dev/urandom` or an OS-provided CSPRNG). |
 | **Non-curve-point `to` keys accepted** | The server validates that `to` is 64 lowercase hex chars but does not check that the decoded bytes form a valid Ed25519 curve point. Blobs addressed to non-existent keys are stored and forwarded normally, consuming storage until TTL expiry. |
-| **No crypto rotation performed**  | The wire format carries a version byte (§3, *Cryptographic Versioning*) and a fixed HKDF `info` (`"skrepka-v1"`), so a future revision *can* introduce new AEAD/KDF/curve choices by bumping both. No such rotation has been performed. |
+| **No crypto rotation performed**  | The wire format carries a version byte (§3, *Cryptographic Versioning*) and a fixed HKDF `info` (`"skrepka-v2"`), so a future revision *can* introduce new AEAD/KDF/curve choices by bumping both. Version 0x02 added AEAD associated data (AAD) to bind envelope fields to the ciphertext. No further rotation has been performed. |
 | **TOFU only — no verification UI** | A first-time public key is trusted on encounter; users must compare fingerprints out-of-band (e.g., @p syllables in person) to detect MITM at first contact. The reference client does not yet provide a UI for this out-of-band verification. Independent clients SHOULD implement such a UI. |
 
 ### Open Federation (accepted limitation of v0.1)
