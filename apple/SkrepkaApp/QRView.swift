@@ -21,6 +21,9 @@ func qrImage(_ string: String) -> UIImage? {
 /// A QR code carries whatever its author put there. Strip a leading scheme so a share
 /// link (`skrepka:<key>`, `https://…/<key>`) yields the bare key the core will accept,
 /// and so the pubkey field never silently fills with an unrelated URL.
+// NOTE: This URL scheme stripping is arguably business logic that belongs in
+// the core (see AGENTS.md). It is kept here for now because moving it requires
+// an FFI change. The core's `try_parse_pubkey` validates the result regardless.
 func scannedKeyPayload(_ raw: String) -> String {
     var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     let schemes = ["skrepka://", "skrepka:", "https://", "http://"]
@@ -75,6 +78,24 @@ final class ScannerVC: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
+
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        switch status {
+        case .authorized:
+            startSession()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    if granted { self?.startSession() }
+                    else { self?.showPermissionDenied() }
+                }
+            }
+        default:
+            showPermissionDenied()
+        }
+    }
+
+    private func startSession() {
         guard let device = AVCaptureDevice.default(for: .video),
               let input = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(input) else { return }
@@ -93,6 +114,19 @@ final class ScannerVC: UIViewController {
         previewLayer = preview
     }
 
+    private func showPermissionDenied() {
+        let label = UILabel()
+        label.text = "Camera permission required"
+        label.textAlignment = .center
+        label.textColor = .secondaryLabel
+        view.addSubview(label)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+        ])
+    }
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         previewLayer?.frame = view.bounds
@@ -100,7 +134,7 @@ final class ScannerVC: UIViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        if !session.isRunning {
+        if !session.isRunning && !session.inputs.isEmpty {
             DispatchQueue.global(qos: .userInitiated).async { self.session.startRunning() }
         }
     }

@@ -151,13 +151,15 @@ enum BackgroundRefresh {
     /// Waits for a condition on the view, or for the deadline (or expiry) to overtake it.
     ///
     /// The core has nothing to await — it publishes a `ViewModel` and that is the whole of
-    /// its output — so the shell watches that. A 200ms tick across the handful of transitions
+    /// its output — so the shell watches that. A 500ms tick across the handful of transitions
     /// this cares about is cheaper than threading a Combine subscription through an actor hop.
+    /// The previous 200ms interval was unnecessarily aggressive for a background task with a
+    /// 25s budget that only cares about a few state transitions.
     private static func settle(by deadline: Date, until condition: () -> Bool) async -> Bool {
         while !condition() {
             guard !Task.isCancelled, Date() < deadline else { return false }
             // Cancellation makes this throw at once; the guard above is what breaks the loop.
-            try? await Task.sleep(for: .milliseconds(200))
+            try? await Task.sleep(for: .milliseconds(500))
         }
         return true
     }

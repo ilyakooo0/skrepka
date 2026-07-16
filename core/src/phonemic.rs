@@ -96,6 +96,11 @@ fn suffix_index(s: &str) -> Option<u8> {
 /// Keys are always 32 bytes, so no caller is affected — but a display helper
 /// must not quietly invent a byte.
 pub fn to_ob(bytes: &[u8]) -> Option<String> {
+    // P1: Empty input produces an empty string, which is a valid but
+    // meaningless @p — return None instead so the round-trip is symmetric.
+    if bytes.is_empty() {
+        return None;
+    }
     if !bytes.len().is_multiple_of(2) {
         return None;
     }
@@ -151,7 +156,7 @@ pub fn try_parse_pubkey(input: &str) -> Option<String> {
     if let Some(hex) = from_ob(trimmed).as_deref().and_then(valid_pubkey_hex) {
         return Some(hex);
     }
-    if let Ok(bytes) = hex::decode(trimmed.to_lowercase()) {
+    if let Ok(bytes) = hex::decode(trimmed) {
         return valid_pubkey_hex(&bytes);
     }
     None
@@ -207,13 +212,13 @@ mod tests {
     fn odd_length_input_has_no_spelling() {
         assert_eq!(to_ob(&[7u8]), None);
         assert_eq!(to_ob(&[7u8, 0]), Some("hidzod".to_string()));
-        assert_eq!(to_ob(&[]), Some(String::new()));
+        assert_eq!(to_ob(&[]), None);
     }
 
     /// A real Ed25519 public key. `try_parse_pubkey` now checks that a key is a
     /// curve point, so tests can't use an arbitrary byte pattern.
     fn real_key() -> [u8; 32] {
-        crate::crypto::Identity::from_seed(&[7u8; 32]).public_key()
+        crate::crypto::Identity::from_seed(&[7u8; 32]).unwrap().public_key()
     }
 
     /// 32 bytes that decode fine but are *not* on the curve — the case that used

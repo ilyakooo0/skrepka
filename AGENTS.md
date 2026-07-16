@@ -11,7 +11,7 @@ Decentralized, end-to-end encrypted messenger. No accounts, no home servers — 
 - **Apple shell:** Swift + SwiftUI, **iOS 17+ only** (`include_macos = false` in `core/boltffi.toml`). The shell is a thin effect executor — it performs HTTP, key-value, and timer effects and renders the `ViewModel`. It contains no business logic.
 - **Crypto:** `ed25519-dalek` + `x25519-dalek` + `curve25519-dalek`, `chacha20poly1305` (XChaCha20-Poly1305), `hkdf` + `sha2` (HKDF-SHA256), `zstd` (plaintext compression). **No libsodium** — `core/src/crypto.rs` hand-reimplements libsodium's `crypto_sign_ed25519_{pk,sk}_to_curve25519` so blobs stay wire-compatible with any spec-following client.
 - **Server:** `server.knot`, written in [Knot](https://github.com/ilyakooo0/knot) — a custom functional language compiled to a native binary. Its runtime transparently persists every `*ref` to SQLite, so all server state (`*sessions`, `*messages`, `*presence`, …) survives restarts despite reading like in-memory lists.
-- **Persistence (client):** `crux_kv` — JSON blobs under the keys `settings`, `profile`, `contacts`, `cursor`, `outbox`, and `messages:<peer_hex>`. The Swift shell backs this with one file per key under Application Support. The 64-byte Ed25519 secret key lives in the iOS Keychain, never in kv.
+- **Persistence (client):** `crux_kv` — JSON blobs under the keys `settings`, `profile`, `contacts`, `cursor`, `outbox`, `seen_ids`, and `messages:<peer_hex>`. The Swift shell backs this with one file per key under Application Support. The 64-byte Ed25519 secret key lives in the iOS Keychain, never in kv.
 
 ## Project Layout
 
@@ -95,7 +95,7 @@ Two kinds of `Event` variants, and the distinction matters:
 
 The `ViewModel` is deliberately flat and stringly-typed (`page: String`, `conn_status: String`) so the Swift side switches on plain strings rather than needing generated enums for UI state.
 
-Runtime flow: `IdentityLoaded` (from the Keychain, at boot) fans out five kv loads → `LoadedSettings` triggers `Connect` → `Authenticate` (challenge/verify, signature bound to the server's bare hostname under the `skrepka-auth-v1:` tag) → on a token, `Poll` (server long-polls ~25 s, client re-polls immediately) and `StartFlush` (drains the outbox one message at a time, encrypting at send time). Failures back off via `crux_time` — 3 s doubling to a 30 s cap.
+Runtime flow: `IdentityLoaded` (from the Keychain, at boot) fans out six kv loads → `LoadedSettings` triggers `Connect` → `Authenticate` (challenge/verify, signature bound to the server's bare hostname under the `skrepka-auth-v1:` tag) → on a token, `Poll` (server long-polls ~25 s, client re-polls immediately) and `StartFlush` (drains the outbox one message at a time, encrypting at send time). Failures back off via `crux_time` — 3 s doubling to a 30 s cap.
 
 ## Code Conventions
 

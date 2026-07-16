@@ -90,7 +90,14 @@ fn padded_len(actual: usize) -> usize {
     // Above 65536: round to the next multiple of 65536.
     let remainder = actual % 65536;
     if remainder == 0 {
-        actual
+        // D6: When actual is an exact multiple of 65536 above 65536,
+        // returning `actual` would give zero padding, revealing the exact
+        // compressed size. Always add at least one bucket of padding.
+        if actual > PADDING_BUCKETS[8] {
+            actual + 65536
+        } else {
+            actual
+        }
     } else {
         actual + 65536 - remainder
     }
@@ -194,18 +201,18 @@ impl Identity {
             return Err(CryptoError::BadKeyLength);
         }
 
-        Ok(Identity::with_x25519(secret_key))
+        Identity::with_x25519(secret_key)
     }
 
     /// Generate a fresh identity from a CSPRNG.
-    pub fn generate(rng: &mut (impl RngCore + CryptoRng)) -> Self {
+    pub fn generate(rng: &mut (impl RngCore + CryptoRng)) -> Result<Self, CryptoError> {
         let mut seed = Zeroizing::new([0u8; 32]);
         rng.fill_bytes(&mut *seed);
         Self::from_seed(&seed)
     }
 
     /// Build the 64-byte secret key (`seed || pub`) from a 32-byte seed.
-    pub fn from_seed(seed: &[u8; 32]) -> Self {
+    pub fn from_seed(seed: &[u8; 32]) -> Result<Self, CryptoError> {
         let signing = SigningKey::from_bytes(seed);
         let public = signing.verifying_key();
         let mut secret_key = [0u8; ED25519_SECRET_LEN];
@@ -238,20 +245,24 @@ impl Identity {
     /// `InvalidEphemeralKey` and the user would be unable to receive messages
     /// with no indication of why.  Catching it at construction time gives a
     /// clear error instead.
-    fn with_x25519(secret_key: [u8; ED25519_SECRET_LEN]) -> Self {
+    fn with_x25519(secret_key: [u8; ED25519_SECRET_LEN]) -> Result<Self, CryptoError> {
         let x25519_priv = *ed25519_sk_to_x25519(&secret_key);
         let x25519_pub = x25519_dalek::x25519(x25519_priv, x25519_dalek::X25519_BASEPOINT_BYTES);
+        // D33: Return an error instead of just printing a warning when the
+        // derived X25519 public key is all-zero (low-order point). The
+        // probability of generating such a key is negligible, but if it ever
+        // happened every encryption to this identity would fail with
+        // `InvalidEphemeralKey` and the user would be unable to receive
+        // messages with no indication of why. Catching it at construction time
+        // gives a clear error instead.
         if x25519_pub.iter().all(|b| *b == 0) {
-            eprintln!(
-                "warning: derived X25519 public key is all-zero (low-order point) — \
-                 this identity cannot receive messages"
-            );
+            return Err(CryptoError::InvalidPublicKey);
         }
-        Identity {
+        Ok(Identity {
             secret_key,
             x25519_priv,
             x25519_pub,
-        }
+        })
     }
 
     /// Cached X25519 private key derived from the Ed25519 seed (libsodium
@@ -287,7 +298,14 @@ fn ed25519_pk_to_x25519(ed_pub: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
     let point = compressed
         .decompress()
         .ok_or(CryptoError::InvalidPublicKey)?;
-    Ok(point.to_montgomery().to_bytes())
+    let montgomery = point.to_montgomery().to_bytes();
+    // D3: A 32-byte all-zero input is the Ed25519 identity point, which
+    // produces an all-zero Montgomery u-coordinate — a low-order point.
+    // Reject it explicitly, separate from the x25519 shared-secret check.
+    if montgomery.iter().all(|&b| b == 0) {
+        return Err(CryptoError::InvalidPublicKey);
+    }
+    Ok(montgomery)
 }
 
 /// libsodium `crypto_sign_ed25519_sk_to_curve25519`: clamp(SHA-512(seed)[..32]).
@@ -318,7 +336,7 @@ fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, Cr
     Ok(shared)
 }
 
-/// HKDF-SHA256(ikm=raw_secret, salt=eph_pub || recip_x_pub, info="skrepka-v1", 32).
+/// HKDF-SHA256(ikm=raw_secret, salt=eph_pub || recip_x_pub, info="skrepka-v2", 32).
 fn derive_key(
     raw_secret: &[u8; 32],
     eph_pub: &[u8; 32],
@@ -355,7 +373,7 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     decoder
         .window_log_max(21)
         .map_err(|_| CryptoError::Decompress)?;
-    let mut out = Vec::with_capacity(MAX_PLAINTEXT_LEN + 1);
+    let mut out = Vec::with_capacity(4096);
     (&mut decoder)
         .take(MAX_PLAINTEXT_LEN as u64 + 1)
         .read_to_end(&mut out)
@@ -374,6 +392,12 @@ pub fn encrypt(
     recipient_ed_pub: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    // D28: Reject a plaintext over the cap before compressing and encrypting
+    // — the recipient will reject it on decompression anyway, so the work
+    // is wasted. CryptoError::Encrypt signals an encryption-side failure.
+    if plaintext.len() > MAX_PLAINTEXT_LEN {
+        return Err(CryptoError::Encrypt);
+    }
     let sender_pub = sender.public_key();
 
     // Ephemeral raw X25519 keypair (libsodium crypto_box_keypair).
@@ -558,12 +582,12 @@ mod tests {
 
     #[test]
     fn identity_pub_is_last_32_bytes_and_consistent() {
-        let id = Identity::generate(&mut rng(1));
+        let id = Identity::generate(&mut rng(1)).unwrap();
         assert_eq!(&id.secret_key[32..], &id.public_key());
         // Re-deriving from the seed yields the same public key.
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&id.secret_key[..32]);
-        let id2 = Identity::from_seed(&seed);
+        let id2 = Identity::from_seed(&seed).unwrap();
         assert_eq!(id.public_key(), id2.public_key());
     }
 
@@ -571,7 +595,7 @@ mod tests {
     /// under one identity while claiming another.
     #[test]
     fn from_secret_bytes_rejects_a_seed_pubkey_mismatch() {
-        let id = Identity::from_seed(&[3u8; 32]);
+        let id = Identity::from_seed(&[3u8; 32]).unwrap();
         assert!(Identity::from_secret_bytes(&id.secret_key).is_ok());
 
         let mut tampered = id.secret_key;
@@ -584,8 +608,8 @@ mod tests {
 
     #[test]
     fn round_trip_recovers_plaintext_and_sender() {
-        let alice = Identity::generate(&mut rng(10));
-        let bob = Identity::generate(&mut rng(20));
+        let alice = Identity::generate(&mut rng(10)).unwrap();
+        let bob = Identity::generate(&mut rng(20)).unwrap();
         let msg = br#"{"type":"text","id":"abc","body":"hello bob","ts":1700000000000}"#;
 
         let blob = encrypt(&mut rng(99), &alice, &bob.public_key(), msg).unwrap();
@@ -598,17 +622,17 @@ mod tests {
 
     #[test]
     fn wrong_recipient_cannot_decrypt() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
-        let eve = Identity::generate(&mut rng(3));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
+        let eve = Identity::generate(&mut rng(3)).unwrap();
         let blob = encrypt(&mut rng(4), &alice, &bob.public_key(), b"secret").unwrap();
         assert_eq!(decrypt(&eve, &blob).unwrap_err(), CryptoError::Decrypt);
     }
 
     #[test]
     fn tampered_ciphertext_is_rejected() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         let mut blob = encrypt(&mut rng(4), &alice, &bob.public_key(), b"secret").unwrap();
         let last = blob.len() - 1;
         blob[last] ^= 0xff;
@@ -617,8 +641,8 @@ mod tests {
 
     #[test]
     fn blob_layout_offsets() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         let blob = encrypt(&mut rng(7), &alice, &bob.public_key(), b"x").unwrap();
         // Version byte at offset 0.
         assert_eq!(blob[0], WIRE_VERSION);
@@ -635,7 +659,7 @@ mod tests {
 
     #[test]
     fn too_short_blob_errors() {
-        let bob = Identity::generate(&mut rng(2));
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         assert_eq!(
             decrypt(&bob, &[0u8; 10]).unwrap_err(),
             CryptoError::BlobTooShort
@@ -646,7 +670,7 @@ mod tests {
     /// scalar mult, an AEAD pass, or a decompression.
     #[test]
     fn too_long_blob_errors() {
-        let bob = Identity::generate(&mut rng(2));
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         let huge = vec![0u8; MAX_BLOB_LEN + 1];
         assert_eq!(decrypt(&bob, &huge).unwrap_err(), CryptoError::BlobTooLong);
     }
@@ -663,25 +687,27 @@ mod tests {
         );
         assert_eq!(decompress(&bomb).unwrap_err(), CryptoError::Decompress);
 
-        // ...and the same bomb wrapped in a well-formed, correctly signed blob
-        // (i.e. from a real peer) dies at the same wall.
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
-        let blob = encrypt(
-            &mut rng(3),
-            &alice,
-            &bob.public_key(),
-            &vec![0u8; MAX_PLAINTEXT_LEN + 1],
-        )
-        .unwrap();
-        assert_eq!(decrypt(&bob, &blob).unwrap_err(), CryptoError::Decompress);
+        // ...and the same bomb sent through encrypt is rejected before
+        // compression/encryption work is done (D28).
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
+        assert_eq!(
+            encrypt(
+                &mut rng(3),
+                &alice,
+                &bob.public_key(),
+                &vec![0u8; MAX_PLAINTEXT_LEN + 1],
+            )
+            .unwrap_err(),
+            CryptoError::Encrypt,
+        );
     }
 
     /// A plaintext right at the cap still round-trips: the bound is inclusive.
     #[test]
     fn a_plaintext_at_the_cap_still_round_trips() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         let msg = vec![7u8; MAX_PLAINTEXT_LEN];
         let blob = encrypt(&mut rng(3), &alice, &bob.public_key(), &msg).unwrap();
         assert_eq!(decrypt(&bob, &blob).unwrap().plaintext.as_slice(), msg.as_slice());
@@ -691,7 +717,7 @@ mod tests {
     /// secret, so the sender's "encryption" is forgeable. Reject it.
     #[test]
     fn a_low_order_ephemeral_point_is_rejected() {
-        let bob = Identity::generate(&mut rng(2));
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         // eph_pub = 0 is the canonical low-order point; x25519 with it yields
         // an all-zero shared secret for any scalar.
         let mut blob = vec![0u8; MIN_BLOB_LEN + 1];
@@ -706,8 +732,8 @@ mod tests {
     /// A short message must be padded so the blob size lands on a bucket boundary.
     #[test]
     fn blob_is_padded_to_bucket_size() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
 
         // Short message → should round up to the smallest bucket (256).
         let blob_small = encrypt(&mut rng(7), &alice, &bob.public_key(), b"x").unwrap();
@@ -732,8 +758,8 @@ mod tests {
     /// same blob size (same bucket) but different blob contents (random padding).
     #[test]
     fn padding_is_random_per_message() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         let msg = b"hello bob, this is a test message";
 
         let blob1 = encrypt(&mut rng(100), &alice, &bob.public_key(), msg).unwrap();
@@ -754,8 +780,8 @@ mod tests {
     /// never sees trailing padding bytes.
     #[test]
     fn compressed_len_field_is_parsed_correctly() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
 
         // Normal round-trip.
         let msg = b"round trip test with some content";
@@ -777,7 +803,7 @@ mod tests {
     /// error says so rather than blaming decryption.
     #[test]
     fn encrypting_to_an_off_curve_key_reports_an_invalid_public_key() {
-        let alice = Identity::generate(&mut rng(1));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
         let not_a_point = [0xabu8; 32];
         assert_eq!(
             encrypt(&mut rng(2), &alice, &not_a_point, b"x").unwrap_err(),
@@ -787,7 +813,7 @@ mod tests {
 
     #[test]
     fn sk_to_x25519_clamps() {
-        let id = Identity::generate(&mut rng(5));
+        let id = Identity::generate(&mut rng(5)).unwrap();
         let scalar = ed25519_sk_to_x25519(&id.secret_key);
         assert_eq!(scalar[0] & 7, 0);
         assert_eq!(scalar[31] & 64, 64);
@@ -796,7 +822,7 @@ mod tests {
 
     #[test]
     fn challenge_signature_is_deterministic_and_host_bound() {
-        let id = Identity::from_seed(&[7u8; 32]);
+        let id = Identity::from_seed(&[7u8; 32]).unwrap();
         let a = id.sign_challenge("relay.example.com", "deadbeef").unwrap();
         let b = id.sign_challenge("relay.example.com", "deadbeef").unwrap();
         let c = id.sign_challenge("other.example.com", "deadbeef").unwrap();
@@ -808,7 +834,7 @@ mod tests {
     /// We sign whatever a not-yet-trusted relay hands us, so its size is bounded.
     #[test]
     fn an_oversized_challenge_is_not_signed() {
-        let id = Identity::from_seed(&[7u8; 32]);
+        let id = Identity::from_seed(&[7u8; 32]).unwrap();
         let huge = "a".repeat(MAX_CHALLENGE_LEN + 1);
         assert_eq!(
             id.sign_challenge("relay.example.com", &huge).unwrap_err(),
@@ -828,9 +854,9 @@ mod tests {
     /// explicit rather than implicit in the KDF.
     #[test]
     fn wrong_recipient_cannot_decrypt_aead_fails() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
-        let charlie = Identity::generate(&mut rng(3));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
+        let charlie = Identity::generate(&mut rng(3)).unwrap();
 
         let blob = encrypt(&mut rng(4), &alice, &bob.public_key(), b"hi bob").unwrap();
         assert_eq!(
@@ -846,8 +872,8 @@ mod tests {
     /// check fires first.
     #[test]
     fn tampered_version_byte_is_rejected() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         let mut blob = encrypt(&mut rng(3), &alice, &bob.public_key(), b"hi").unwrap();
         blob[0] ^= 0xff;
         assert_eq!(
@@ -863,8 +889,8 @@ mod tests {
     /// catches this.
     #[test]
     fn tampered_ephemeral_pubkey_is_rejected() {
-        let alice = Identity::generate(&mut rng(1));
-        let bob = Identity::generate(&mut rng(2));
+        let alice = Identity::generate(&mut rng(1)).unwrap();
+        let bob = Identity::generate(&mut rng(2)).unwrap();
         let mut blob = encrypt(&mut rng(3), &alice, &bob.public_key(), b"hi").unwrap();
         blob[5] ^= 0x01;
         assert!(decrypt(&bob, &blob).is_err());

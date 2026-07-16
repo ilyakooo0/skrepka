@@ -164,7 +164,7 @@ The wire-visible "envelope" carries only the recipient and the opaque blob. The 
 On the wire (cleartext, server-visible):
 
 ```
-version                   (1 byte, currently 0x01)
+version                   (1 byte, currently 0x02)
 ephemeral_x25519_pubkey   (32 bytes)
 nonce                     (24 bytes)
 ciphertext                (variable, includes 16-byte AEAD tag)
@@ -194,11 +194,11 @@ The bucket boundaries are:
 
 A blob is rounded up to the smallest bucket ≥ its unpadded size. Above 65536 bytes, the blob is rounded up to the next multiple of 65536. The padding bytes are randomly generated per message, so two encryptions of the same plaintext produce the same blob size (same bucket) but different blob contents. The on-wire blob is therefore `173 + len(compressed) + len(padding)` bytes, and that padded size is all a relay or network observer sees.
 
-> **Compression before encryption leaks plaintext structure.** The payload is zstd-compressed *then* encrypted (steps 4–7), so the ciphertext length is a function of how *compressible* the plaintext was, not just how long it was. XChaCha20-Poly1305 is a stream cipher with no padding: without length padding the blob would be exactly `173 + len(compressed)` bytes, and that number would be visible to every relay and network observer. Version 0x01 adds length padding (see *Length Padding* above), which buckets blob sizes to fixed boundaries so the exact compressed size is hidden.
+> **Compression before encryption leaks plaintext structure.** The payload is zstd-compressed *then* encrypted (steps 4–7), so the ciphertext length is a function of how *compressible* the plaintext was, not just how long it was. XChaCha20-Poly1305 is a stream cipher with no padding: without length padding the blob would be exactly `173 + len(compressed)` bytes, and that number would be visible to every relay and network observer. Version 0x02 adds length padding (see *Length Padding* above), which buckets blob sizes to fixed boundaries so the exact compressed size is hidden.
 >
 > Two consequences. First, message length is only ever obscured *upward*: a long but repetitive message can produce a smaller blob than a short random-looking one, and blob size still distinguishes a one-word reply from a pasted document. Second — the more serious one — where an attacker can influence part of the plaintext that is compressed together with a secret, the compressed size reveals whether the two share structure. That is the CRIME/BREACH pattern, and it is a real (if narrow) concern for a format that compresses attacker-influenceable text alongside sensitive text in one frame.
 >
-> Skrepka accepts the remaining risk: payloads are small, each message is compressed independently (no cross-message compression context), and there is no adaptive-guessing oracle in the protocol — an attacker cannot make the client re-encrypt a chosen variant of a secret on demand. Implementations must **not** add one (e.g. by compressing several messages, or attacker-supplied and user-supplied text, into a shared frame). Length padding (version 0x01) obscures the exact compressed size by bucketing blob lengths, but does not eliminate the CRIME/BREACH side channel within a single bucket — it only makes the granularity coarser.
+> Skrepka accepts the remaining risk: payloads are small, each message is compressed independently (no cross-message compression context), and there is no adaptive-guessing oracle in the protocol — an attacker cannot make the client re-encrypt a chosen variant of a secret on demand. Implementations must **not** add one (e.g. by compressing several messages, or attacker-supplied and user-supplied text, into a shared frame). Length padding (version 0x02) obscures the exact compressed size by bucketing blob lengths, but does not eliminate the CRIME/BREACH side channel within a single bucket — it only makes the granularity coarser.
 
 ### Cryptographic Versioning
 
@@ -378,7 +378,7 @@ When a client connects, it proves ownership of its keypair:
    ```
    The challenge is a lowercase hex string of at least 32 chars (128 bits of entropy). The reference server uses 48 hex chars (192 bits). The challenge MUST be unique per challenge request and consumed on first use (verified).
 
-3. Client signs the **UTF-8 bytes of `"skrepka-auth-v1:" + server_host + ":" + challenge`** with its Ed25519 private key and submits. `server_host` is the bare lowercased hostname of the server the client dialed (no scheme, no port, no trailing dot). The `skrepka-auth-v1:` prefix is a domain-separation tag distinguishing auth signatures from message signatures (which begin with `"skrepka-msg-v2:"` and sign `recipientPub ++ compressed`, §3):
+3. Client signs the **UTF-8 bytes of `"skrepka-auth-v1:" + server_host + ":" + challenge`** with its Ed25519 private key and submits. `server_host` is the bare lowercased hostname of the server the client dialed (no scheme, no port, no trailing dot). For IPv6 literals, the host must include square brackets (e.g. `[::1]`), matching the URL host syntax — the server's `serverHost` configuration must also include brackets for IPv6. The `skrepka-auth-v1:` prefix is a domain-separation tag distinguishing auth signatures from message signatures (which begin with `"skrepka-msg-v2:"` and sign `recipientPub ++ compressed`, §3):
    ```
    POST /auth/verify
    {

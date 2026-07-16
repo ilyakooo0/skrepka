@@ -9,6 +9,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::prelude::*;
+use base64::Engine;
+
 use crux_core::{
     macros::effect,
     render::{render, RenderOperation},
@@ -581,7 +584,7 @@ fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .unwrap_or(1)
 }
 
 /// Bare lowercased hostname of a server URL (no scheme/port/trailing dot).
@@ -815,6 +818,13 @@ impl App for Skrepka {
             Event::LoadedMessages(peer, res) => {
                 match parse_kv::<Vec<StoredMessage>>(res) {
                     Ok(Some(list)) => {
+                        // D5: Add on-disk message IDs to seen_ids so future
+                        // replays don't pass dedup. Without this, a seen_ids
+                        // kv load failure leaves the set empty, and on-disk
+                        // messages aren't protected against replay.
+                        if let Some(id_set) = model.seen_ids.get_mut(&peer) {
+                            id_set.extend(list.iter().map(|m| m.id.clone()));
+                        }
                         // Merge: a poll that beat this lazy load may have already
                         // inserted messages for this peer. Overwriting with the
                         // on-disk list (which the GET read before the poll wrote)
@@ -958,6 +968,9 @@ impl App for Skrepka {
                 // would park the outbox against a limit that no longer applies.
                 model.flush_paused_until = 0;
                 model.send_retries = 0;
+                // D2: Reset poll retries too — the new relay's poll failures
+                // should start fresh, not inherit the old relay's backoff.
+                model.poll_retries = 0;
                 let writes = if self.refuse_write(model) {
                     Command::done()
                 } else {
@@ -1110,6 +1123,13 @@ impl App for Skrepka {
                     model.error = Some("photo too large".into());
                     return render();
                 }
+                // S6: Validate the photo is valid base64 before broadcasting —
+                // the recipient's parse_payload rejects invalid base64, so an
+                // invalid photo would be silently dropped by every recipient.
+                if photo.as_ref().is_some_and(|p| BASE64_STANDARD.decode(p).is_err()) {
+                    model.error = Some("photo is not valid base64".into());
+                    return render();
+                }
                 model.profile = OwnProfile {
                     display_name,
                     bio,
@@ -1118,8 +1138,8 @@ impl App for Skrepka {
                 model.page = Page::Conversations;
                 let ts = now_ms();
                 let payload = Payload::Profile {
-                    display_name: model.profile.display_name.clone(),
-                    bio: model.profile.bio.clone(),
+                    display_name: Some(model.profile.display_name.clone()),
+                    bio: Some(model.profile.bio.clone()),
                     photo: model.profile.photo.clone(),
                 };
                 // Broadcast the new profile to every contact we haven't blocked.
@@ -1554,8 +1574,13 @@ impl App for Skrepka {
                     // later, under load that has nothing to do with this one — starts
                     // at whatever height the last one climbed to.
                     model.send_retries = 0;
-                    for _ in 0..batch.map_or(0, |b| b.count) {
-                        model.outbox.pop_front();
+                    // D3-app: Don't pop if kv is broken — the persist would be
+                    // refused, and the items would be lost from memory but still
+                    // on disk, causing duplicate sends on relaunch.
+                    if !model.kv_load_failed {
+                        for _ in 0..batch.map_or(0, |b| b.count) {
+                            model.outbox.pop_front();
+                        }
                     }
                     return self.persist_outbox(model).and(self.flush_next(model));
                 }
@@ -1862,8 +1887,8 @@ impl Skrepka {
         // ingest drops profiles from non-contacts, so the profile was lost.)
         if was_new {
             let profile = Payload::Profile {
-                display_name: model.profile.display_name.clone(),
-                bio: model.profile.bio.clone(),
+                display_name: Some(model.profile.display_name.clone()),
+                bio: Some(model.profile.bio.clone()),
                 photo: model.profile.photo.clone(),
             };
             model.outbox.push_back(OutboxItem::profile(
@@ -2176,6 +2201,10 @@ impl Skrepka {
             let Some(parsed) = protocol::parse_payload(&dec.plaintext) else {
                 continue;
             };
+            // D1: Any event that was successfully decrypted AND parsed counts
+            // as "stored" for cursor advancement — the client has processed it
+            // even if it was a duplicate/stale/stranger that was dropped.
+            events_stored += 1;
             let sender = dec.sender_hex;
 
             // Mail from ourselves. A relay cannot forge this — the sender identity
@@ -2227,6 +2256,18 @@ impl Skrepka {
                             Contact::new(sender.clone(), String::new(), ts),
                         );
                         contacts_dirty = true;
+                        // D6-app: Send our profile to the new contact so they
+                        // see our display name and avatar, not just our @p.
+                        let profile = Payload::Profile {
+                            display_name: Some(model.profile.display_name.clone()),
+                            bio: Some(model.profile.bio.clone()),
+                            photo: model.profile.photo.clone(),
+                        };
+                        model.outbox.push_back(OutboxItem::profile(
+                            sender.clone(),
+                            Arc::new(protocol::serialize_payload(&profile, ts)),
+                        ));
+                        outbox_dirty = true;
                     }
                     let convo = model.messages.entry(sender.clone()).or_default();
                     // Q18: Use the persistent per-peer dedup set from
@@ -2261,7 +2302,6 @@ impl Skrepka {
                             },
                         );
                         id_set.insert(msg_id.clone());
-                        events_stored += 1;
                         // N7: Cap the dedup set so it doesn't grow without
                         // bound. The set is rewritten to kv on every message
                         // receipt, so an unbounded set makes every receipt
@@ -2313,7 +2353,6 @@ impl Skrepka {
                         .or_default()
                         .ids
                         .extend(ack_ids);
-                    events_stored += 1;
                 }
                 Payload::Profile {
                     display_name,
@@ -2340,12 +2379,17 @@ impl Skrepka {
                     // A replayed profile at the same `ts` overwrites with identical
                     // content, which is a no-op in practice.
                     if ts >= c.last_profile_ts {
-                        c.display_name = display_name;
-                        c.bio = bio;
+                        // D13: Only update fields that are present (Some).
+                        // An absent field (None) means "don't change".
+                        if let Some(name) = display_name {
+                            c.display_name = name;
+                        }
+                        if let Some(b) = bio {
+                            c.bio = b;
+                        }
                         c.photo = photo;
                         c.last_profile_ts = ts.min(now);
                         contacts_dirty = true;
-                        events_stored += 1;
                     }
                 }
             }
@@ -2499,7 +2543,7 @@ mod tests {
     use crate::model::{MAX_OUTBOX_RETRIES, OUTBOX_TTL_MS};
 
     fn with_identity() -> Model {
-        let id = Identity::from_seed(&[3u8; 32]);
+        let id = Identity::from_seed(&[3u8; 32]).unwrap();
         Model {
             secret_key: Some(Zeroizing::new(id.secret_key.to_vec())),
             my_pubkey: id.public_key_hex(),
@@ -2508,7 +2552,7 @@ mod tests {
     }
 
     fn peer_hex(seed: u8) -> String {
-        Identity::from_seed(&[seed; 32]).public_key_hex()
+        Identity::from_seed(&[seed; 32]).unwrap().public_key_hex()
     }
 
     /// `Command::event` *queues* an event; it does not run it. The runtime drains
@@ -2531,7 +2575,7 @@ mod tests {
 
     /// A poll page carrying one payload, encrypted from `sender_seed` to `me`.
     fn page_from(sender_seed: u8, me: &Model, payload: &Payload, ts: i64) -> PollResp {
-        let sender = Identity::from_seed(&[sender_seed; 32]);
+        let sender = Identity::from_seed(&[sender_seed; 32]).unwrap();
         let recipient = Identity::from_secret_bytes(me.secret_key.as_ref().unwrap()).unwrap();
         let json = protocol::serialize_payload(payload, ts);
         let blob = crate::crypto::encrypt(
@@ -3158,7 +3202,7 @@ mod tests {
             let parsed = protocol::parse_payload(item.envelope_json.as_bytes()).unwrap();
             match parsed.payload {
                 Payload::Profile { display_name, .. } => {
-                    assert_eq!(display_name, "Three", "and it is the latest one");
+                    assert_eq!(display_name, Some("Three".to_string()), "and it is the latest one");
                 }
                 _ => panic!("expected a profile"),
             }
@@ -3206,7 +3250,7 @@ mod tests {
         let parsed = protocol::parse_payload(m.outbox[0].envelope_json.as_bytes()).unwrap();
         match parsed.payload {
             Payload::Profile { display_name, .. } => assert_eq!(
-                display_name, "New",
+                display_name, Some("New".to_string()),
                 "and the newer profile survives to be sent"
             ),
             _ => panic!("expected a profile"),
@@ -3388,8 +3432,8 @@ mod tests {
             .insert(peer.clone(), Contact::new(peer.clone(), String::new(), 0));
 
         let profile = |name: &str| Payload::Profile {
-            display_name: name.into(),
-            bio: String::new(),
+            display_name: Some(name.to_string()),
+            bio: Some(String::new()),
             photo: None,
         };
         let page = page_from(9, &m, &profile("Far"), i64::MAX);
@@ -3486,8 +3530,11 @@ mod tests {
         let (m, peer) = ingest_one_text_from_an_unblocked_peer();
         assert_eq!(m.messages[&peer].len(), 1);
         assert_eq!(m.messages[&peer][0].body, "hi");
-        assert_eq!(m.outbox.len(), 1, "one delivery.ack is queued");
+        // D6-app: A profile broadcast is queued alongside the delivery.ack
+        // so the new contact sees our display name and avatar.
+        assert_eq!(m.outbox.len(), 2, "one delivery.ack + one profile queued");
         assert_eq!(m.outbox[0].recipient, peer);
+        assert_eq!(m.outbox[1].recipient, peer);
     }
 
     /// A peer sending `ts = i64::MAX` used to pin itself to the top of the
@@ -4193,7 +4240,7 @@ mod tests {
         );
 
         // The recovery is a relaunch, which re-runs the loads and clears the latch.
-        let sk = Identity::from_seed(&[3u8; 32]).secret_key.to_vec();
+        let sk = Identity::from_seed(&[3u8; 32]).unwrap().secret_key.to_vec();
         let _ = app.update(Event::IdentityLoaded(sk), &mut m);
         assert!(
             !m.kv_load_failed,
@@ -4300,8 +4347,8 @@ mod tests {
         );
 
         let profile = Payload::Profile {
-            display_name: "Mallory".into(),
-            bio: "spam".into(),
+            display_name: Some("Mallory".into()),
+            bio: Some("spam".into()),
             photo: Some("aGk=".into()),
         };
         let page = page_from(9, &m, &profile, now_ms());
@@ -4382,8 +4429,8 @@ mod tests {
         let peer = peer_hex(9);
 
         let profile = Payload::Profile {
-            display_name: "Mallory".into(),
-            bio: String::new(),
+            display_name: Some("Mallory".into()),
+            bio: Some(String::new()),
             photo: Some("aGk=".into()),
         };
         let page = page_from(9, &m, &profile, now_ms());
@@ -4595,7 +4642,7 @@ mod tests {
 
         // One page holding more messages from one sender than fits in a single ack.
         let count = protocol::MAX_ACK_IDS + 5;
-        let sender = Identity::from_seed(&[9u8; 32]);
+        let sender = Identity::from_seed(&[9u8; 32]).unwrap();
         let me = Identity::from_secret_bytes(m.secret_key.as_ref().unwrap()).unwrap();
         let events = (0..count)
             .map(|i| {

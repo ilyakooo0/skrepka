@@ -26,16 +26,17 @@ final class Core: ObservableObject {
     private let store = KvStore()
 
     private init() {
-        // swiftlint:disable:next force_try
-        self.view = try! .bincodeDeserialize(input: [UInt8](core.view()))
+        // The FFI's guard returns empty bytes when the core panics; force-try
+        // on empty bytes crashes the app. Fall back to a default ViewModel instead.
+        self.view = (try? ViewModel.bincodeDeserialize(input: [UInt8](core.view()))) ?? ViewModel()
         bootIdentity()
     }
 
     // MARK: - Event/effect loop
 
     func update(_ event: Event) {
-        // swiftlint:disable:next force_try
-        let effects = [UInt8](core.update(data: Data(try! event.bincodeSerialize())))
+        guard let eventData = try? event.bincodeSerialize() else { return }
+        let effects = [UInt8](core.update(data: Data(eventData)))
         dispatch(effects)
     }
 
@@ -45,8 +46,7 @@ final class Core: ObservableObject {
     }
 
     private func dispatch(_ effects: [UInt8]) {
-        // swiftlint:disable:next force_try
-        let requests = try! Requests.bincodeDeserialize(input: effects).value
+        guard let requests = try? Requests.bincodeDeserialize(input: effects).value else { return }
         for request in requests {
             process(request)
         }
@@ -56,29 +56,27 @@ final class Core: ObservableObject {
         let id = request.id
         switch request.effect {
         case .render:
-            // swiftlint:disable:next force_try
-            self.view = try! .bincodeDeserialize(input: [UInt8](core.view()))
+            self.view = (try? ViewModel.bincodeDeserialize(input: [UInt8](core.view()))) ?? self.view
 
         case .http(let req):
             Task { [weak self] in
                 let result = await Http.perform(req)
-                // swiftlint:disable:next force_try
-                self?.resolve(id, try! result.bincodeSerialize())
+                guard let output = try? result.bincodeSerialize() else { return }
+                self?.resolve(id, output)
             }
 
         case .keyValue(let op):
             // The file I/O runs on the store's own serial queue; hop the result back to
             // the main actor, because the core is single-threaded and `.render` publishes.
             store.handle(op) { [weak self] result in
-                // swiftlint:disable:next force_try
-                let output = try! result.bincodeSerialize()
+                guard let output = try? result.bincodeSerialize() else { return }
                 Task { @MainActor in self?.resolve(id, output) }
             }
 
         case .time(let req):
             Time.handle(req) { [weak self] response in
-                // swiftlint:disable:next force_try
-                self?.resolve(id, try! response.bincodeSerialize())
+                guard let output = try? response.bincodeSerialize() else { return }
+                self?.resolve(id, output)
             }
         }
     }

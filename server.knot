@@ -102,6 +102,14 @@ maxPollEvents = 50
 -- Per-peer ceiling on outstanding forward attempts.
 maxForwardsPerServer : Int
 maxForwardsPerServer = 2000
+-- S9: Cap on distinct remote servers a single message is immediately forwarded
+-- to at send time. Separate from `maxForwardsPerServer` (which bounds outstanding
+-- forwards *per peer*), this bounds the fan-out breadth. A recipient is unlikely
+-- to be visible on more than 100 servers; the previous reuse of
+-- `maxForwardsPerServer` (2000) for this purpose was an overload that could
+-- spawn up to 2000 immediate HTTP forwards per message.
+maxRemoteServersPerMessage : Int
+maxRemoteServersPerMessage = 100
 -- Global ceiling on the `*forwards` outbox. `maxForwardsPerServer` bounds any one
 -- peer, but a recipient gossiped as present on many servers fans one blob out to
 -- all of them, so the total is bounded only by (peers x per-peer cap). This caps
@@ -959,13 +967,23 @@ appendMessage = \toKey encryptedBlob t -> do
     -- for this recipient so the post-append count lands exactly on the ceiling.
     -- `- 1` reserves the slot the new row is about to take.
     --
-    -- Eviction keys on `encryptedBlob` rather than the row itself because
-    -- (toKey, encryptedBlob) is unique by this function's own dedup invariant
-    -- (the `when` guard above), so a blob identifies at most one row per key.
+    -- S4: Instead of building an `evicted` list and checking membership (which
+    -- is O(|messages| × |evicted|)), compute the eviction threshold — the
+    -- receivedAt of the (maxMessagesPerRecipient - 1)th oldest message for this
+    -- recipient — and keep only messages newer than it. This is O(|messages|)
+    -- with no inner scan.
     let forRecipient = filter (\m -> m.toKey == toKey) msgs
     let excess = max 0 (count forRecipient - (maxMessagesPerRecipient - 1))
-    let evicted = map (\m -> m.encryptedBlob) (take excess (sortBy (\m -> m.receivedAt) forRecipient))
-    let kept = filter (\m -> not (m.toKey == toKey && elem m.encryptedBlob evicted)) msgs
+    let sortedRecipient = sortBy (\m -> m.receivedAt) forRecipient
+    -- The threshold: the receivedAt of the last row we want to evict.
+    -- Rows with receivedAt <= threshold are evicted; rows > threshold survive.
+    let evictionThreshold = if excess > 0
+      then case take excess sortedRecipient of
+        [] -> 0
+        xs -> case last xs of
+          {receivedAt: r} -> r
+      else 0
+    let kept = filter (\m -> not (m.toKey == toKey && m.receivedAt <= evictionThreshold && excess > 0)) msgs
     -- Global cap (S6): after the per-recipient eviction, bound the total mailbox
     -- across all recipients by dropping the globally-oldest rows. Only runs on
     -- overflow, so the O(n log n) sort is off the hot path. Dropped rows may
@@ -1028,6 +1046,12 @@ pruneExpired = \t -> atomic do
   -- Prune forwards whose message was removed by the TTL sweep above.
   -- ForwardEntry carries no timestamp, so match against the surviving
   -- messages (the post-sweep list, not the pre-sweep snapshot).
+  --
+  -- S5: This is O(|forwards| × |surviving|) — a quadratic scan. In practice
+  -- |forwards| is usually far below maxForwardsTotal (50000) and |surviving|
+  -- is bounded by maxMessagesTotal (1000000), so the cost is modest. A real
+  -- fix needs a set/index keyed on (toKey, encryptedBlob), which the Knot
+  -- runtime does not expose today. Documented as an accepted design tradeoff.
   fw <- *forwards
   *forwards = filter (\f -> any (\m -> m.toKey == f.toKey && m.encryptedBlob == f.encryptedBlob) surviving) fw
   ff <- *forwardFailures
@@ -1398,11 +1422,16 @@ handlePoll = \cursor authorization clientIp -> do
         -- so peers don't time us out mid-session.
         let stale = not any (\p -> p.pubkey == pubkey && isLocalServer p.server && p.expiresAt - t >= sessionExpiry / 2) pres
         refreshPeers <- if stale then refreshLocalPresence pubkey (t + sessionExpiry) else yield []
-        yield (Just {value: {pubkey, clampedCursor, refreshPeers}}))
+        -- S3: Track whether we actually refreshed so the gossip line below
+        -- only fires on a refresh, not on every poll. Without this, every
+        -- poll gossips to all seed peers via gossipTargets [], creating
+        -- O(clients × seeds) federation traffic per poll cycle.
+        yield (Just {value: {pubkey, clampedCursor, refreshPeers, didRefresh: stale}}))
   case setup of
     Nothing {} -> yield (Err {error: {status: 401, message: "unauthorized"}})
     Just {value: s} -> do
-      when federationEnabled (fork (sendBatchedGossip s.refreshPeers [{eventType: "online", pubkey: Just {value: s.pubkey}}]))
+      -- S3: Only gossip when we actually refreshed presence — not on every poll.
+      when (federationEnabled && s.didRefresh) (fork (sendBatchedGossip s.refreshPeers [{eventType: "online", pubkey: Just {value: s.pubkey}}]))
       pollResult <- doPoll s t
       yield (Ok {value: pollResult})
 
@@ -1521,7 +1550,7 @@ handleSendMessages = \messages authorization clientIp -> do
           let staged = map (\m -> {
             m.to,
             m.encryptedBlob,
-            remoteServers: take maxForwardsPerServer (collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server))
+            remoteServers: take maxRemoteServersPerMessage (collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server))
           }) messages
           forEach staged (\c -> do
             -- Read `*messages` *before* the append: `delivered` below must see the

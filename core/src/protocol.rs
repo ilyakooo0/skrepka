@@ -35,8 +35,8 @@ pub enum Payload {
         ack_ids: Vec<String>,
     },
     Profile {
-        display_name: String,
-        bio: String,
+        display_name: Option<String>,
+        bio: Option<String>,
         photo: Option<String>,
     },
 }
@@ -77,10 +77,16 @@ pub fn serialize_payload(payload: &Payload, ts: i64) -> String {
         } => {
             let mut obj = serde_json::json!({
                 "type": "profile",
-                "display_name": display_name,
-                "bio": bio,
                 "ts": ts,
             });
+            // D13: Only include the field when present — absent means
+            // "don't change", while present (even empty) means "set to this".
+            if let Some(name) = display_name {
+                obj["display_name"] = serde_json::Value::String(name.clone());
+            }
+            if let Some(b) = bio {
+                obj["bio"] = serde_json::Value::String(b.clone());
+            }
             // Omit `photo` entirely when there isn't one, rather than sending an
             // explicit null: "no photo" and "field absent" mean the same thing to
             // a reader, and the null costs bytes in every broadcast.
@@ -93,6 +99,38 @@ pub fn serialize_payload(payload: &Payload, ts: i64) -> String {
     value.to_string()
 }
 
+/// D14: Filter out control characters, bidirectional control characters, and
+/// zero-width characters from a received string. Applied on the receiving side
+/// (parse_payload) so the sender's input is preserved as-is on send, but the
+/// recipient is protected from invisible character tricks.
+///
+/// Filters:
+/// - Control characters U+0000–U+001F (except U+0009 tab, U+000A newline,
+///   U+000D carriage return)
+/// - Bidirectional control characters (U+200E LRM, U+200F RLM, U+202A–U+202E,
+///   U+2066–U+2069)
+/// - Zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
+fn sanitize_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let cp = *c as u32;
+            // Control characters U+0000–U+001F, except tab/newline/CR
+            if cp <= 0x001F && cp != 0x0009 && cp != 0x000A && cp != 0x000D {
+                return false;
+            }
+            // Bidirectional control characters
+            if matches!(cp, 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069) {
+                return false;
+            }
+            // Zero-width characters
+            if matches!(cp, 0x200B | 0x200C | 0x200D | 0xFEFF) {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 /// Parse a plaintext payload. Returns `None` for unknown/malformed types so the
 /// caller silently ignores them (forward compatibility, PROTOCOL.md §4).
 pub fn parse_payload(bytes: &[u8]) -> Option<ParsedPayload> {
@@ -102,7 +140,7 @@ pub fn parse_payload(bytes: &[u8]) -> Option<ParsedPayload> {
     let payload = match ty {
         "text" => {
             let id = v.get("id")?.as_str()?.to_string();
-            let body = v.get("body")?.as_str()?.to_string();
+            let body = sanitize_text(v.get("body")?.as_str()?);
             if id.len() > MAX_ID_LEN || body.len() > MAX_BODY_LEN {
                 return None;
             }
@@ -127,22 +165,17 @@ pub fn parse_payload(bytes: &[u8]) -> Option<ParsedPayload> {
             Payload::DeliveryAck { ack_ids }
         }
         "profile" => {
-            let display_name = v
-                .get("display_name")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            let bio = v
-                .get("bio")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
+            // D13: Use Option<String> — None when the field is absent (don't
+            // change the recipient's cached value), Some(value) when present
+            // (even if empty, meaning "set to this value").
+            let display_name = v.get("display_name").and_then(|x| x.as_str()).map(sanitize_text);
+            let bio = v.get("bio").and_then(|x| x.as_str()).map(sanitize_text);
             let photo = v
                 .get("photo")
                 .and_then(|x| x.as_str())
                 .map(str::to_string);
-            if display_name.chars().count() > MAX_DISPLAY_NAME_LEN
-                || bio.chars().count() > MAX_BIO_LEN
+            if display_name.as_ref().is_some_and(|d| d.chars().count() > MAX_DISPLAY_NAME_LEN)
+                || bio.as_ref().is_some_and(|b| b.chars().count() > MAX_BIO_LEN)
                 || photo.as_ref().is_some_and(|p| p.len() > MAX_PHOTO_LEN)
                 || photo.as_ref().is_some_and(|p| {
                     // Reject a photo that isn't valid base64 — a peer can put
@@ -195,14 +228,14 @@ mod tests {
     #[test]
     fn profile_round_trip_with_and_without_photo() {
         let with = Payload::Profile {
-            display_name: "Alice".into(),
-            bio: "writing".into(),
+            display_name: Some("Alice".into()),
+            bio: Some("writing".into()),
             photo: Some("aGVsbG8=".into()),
         };
         assert_eq!(reparse(&with, 1).payload, with);
         let without = Payload::Profile {
-            display_name: "Bob".into(),
-            bio: "".into(),
+            display_name: Some("Bob".into()),
+            bio: Some("".into()),
             photo: None,
         };
         assert_eq!(reparse(&without, 1).payload, without);
@@ -242,8 +275,8 @@ mod tests {
 
         let long_bio = serialize_payload(
             &Payload::Profile {
-                display_name: "A".into(),
-                bio: "b".repeat(MAX_BIO_LEN + 1),
+                display_name: Some("A".into()),
+                bio: Some("b".repeat(MAX_BIO_LEN + 1)),
                 photo: None,
             },
             1,
@@ -252,8 +285,8 @@ mod tests {
 
         let long_name = serialize_payload(
             &Payload::Profile {
-                display_name: "n".repeat(MAX_DISPLAY_NAME_LEN + 1),
-                bio: String::new(),
+                display_name: Some("n".repeat(MAX_DISPLAY_NAME_LEN + 1)),
+                bio: Some(String::new()),
                 photo: None,
             },
             1,
@@ -262,8 +295,8 @@ mod tests {
 
         let big_photo = serialize_payload(
             &Payload::Profile {
-                display_name: String::new(),
-                bio: String::new(),
+                display_name: Some(String::new()),
+                bio: Some(String::new()),
                 photo: Some("p".repeat(MAX_PHOTO_LEN + 1)),
             },
             1,
@@ -297,8 +330,8 @@ mod tests {
     fn a_photoless_profile_omits_the_field() {
         let json = serialize_payload(
             &Payload::Profile {
-                display_name: "A".into(),
-                bio: "B".into(),
+                display_name: Some("A".into()),
+                bio: Some("B".into()),
                 photo: None,
             },
             1,
@@ -309,8 +342,8 @@ mod tests {
     #[test]
     fn snake_case_field_names_on_wire() {
         let p = Payload::Profile {
-            display_name: "A".into(),
-            bio: "B".into(),
+            display_name: Some("A".into()),
+            bio: Some("B".into()),
             photo: None,
         };
         let json = serialize_payload(&p, 1);

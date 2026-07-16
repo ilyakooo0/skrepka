@@ -39,6 +39,11 @@ impl Default for CoreFFI {
 /// `AssertUnwindSafe` is sound here because a poisoned `Bridge` is never read
 /// again for correctness: the worst case is a dropped effect batch, and the next
 /// event starts a fresh `update`.
+///
+/// NOTE: A panic mid-`update` leaves the `Model` in a partially-mutated state.
+/// The next `update` call operates on this potentially-corrupted state. A
+/// proper fix requires snapshotting the Model before `update` and restoring on
+/// panic, or marking the Bridge as poisoned. This is an accepted limitation.
 fn guard(f: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_default()
 }

@@ -78,7 +78,13 @@ struct PhotoPicker: UIViewControllerRepresentable {
                 quality -= 0.1
             }
             // Last resort: the smallest quality that still produces something.
-            return image.jpegData(compressionQuality: 0.1)?.base64EncodedString()
+            // If even this exceeds the cap, return nil so onCancel fires rather
+            // than sending an oversized payload the core will reject.
+            let lastResort = image.jpegData(compressionQuality: 0.1)?.base64EncodedString()
+            if let result = lastResort, result.count <= maxBase64Len {
+                return result
+            }
+            return nil
         }
     }
 }

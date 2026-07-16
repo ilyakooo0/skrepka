@@ -19,10 +19,11 @@ private let maxResponseBytes = 64 * 1024 * 1024 // 64 MiB
 /// compromised) relay could answer `/poll` or `/messages` with a 302 to a host it chooses
 /// and harvest the bearer token from the request we would dutifully re-send there. Sessions
 /// are bound to a single relay by design (§6), so a cross-host redirect is never legitimate
-/// — refusing it costs nothing and closes the token-exfiltration path. Returning `nil` from
-/// the completion handler does not error the task: it stops the redirect and hands the 3xx
-/// response itself back to the caller, which the core sees as a non-2xx status and treats as
-/// a failed request.
+/// — refusing it costs nothing and closes the token-exfiltration path. Same-host redirects
+/// (e.g. HTTP → HTTPS upgrade on the same host) are allowed; the Authorization header stays
+/// within the relay's own host. Returning `nil` from the completion handler does not error
+/// the task: it stops the redirect and hands the 3xx response itself back to the caller,
+/// which the core sees as a non-2xx status and treats as a failed request.
 ///
 /// **Response size limiting.** As body chunks arrive we accumulate the byte count per task
 /// and cancel the task the moment it crosses `maxResponseBytes`, so a multi-gigabyte body
@@ -49,7 +50,17 @@ private final class HttpSessionDelegate: NSObject, URLSessionTaskDelegate, URLSe
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        completionHandler(nil)
+        // Allow same-host redirects (e.g. HTTP → HTTPS upgrade on the same host).
+        // Cancel cross-host redirects — a hostile relay could redirect to an
+        // attacker-controlled host and harvest the Authorization header.
+        if let originalURL = task.currentRequest?.url,
+           let redirectHost = request.url?.host?.lowercased(),
+           let originalHost = originalURL.host?.lowercased(),
+           redirectHost == originalHost {
+            completionHandler(request)
+        } else {
+            completionHandler(nil)
+        }
     }
 
     func urlSession(
@@ -101,7 +112,9 @@ enum Http {
     }()
 
     static func perform(_ req: HttpRequest) async -> HttpResult {
-        guard let url = URL(string: req.url) else {
+        guard let url = URL(string: req.url),
+              let scheme = url.scheme,
+              scheme == "http" || scheme == "https" else {
             return .err(.url(req.url))
         }
         var request = URLRequest(url: url)
