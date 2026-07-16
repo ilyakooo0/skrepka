@@ -105,6 +105,12 @@ const POLL_WATCHDOG_MS: u64 = 90_000;
 /// one costs a redundant request.
 const FLUSH_WATCHDOG_MS: u64 = 90_000;
 
+/// How long an auth round-trip may stay in flight before we assume the
+/// shell lost it. Same rationale as `POLL_WATCHDOG_MS`: `authenticating`
+/// gates the whole auth flow, and without a watchdog a dropped effect
+/// leaves it stuck forever. Kept above the 70 s shell HTTP timeout.
+const AUTH_WATCHDOG_MS: u64 = 90_000;
+
 /// Messages per `/messages` request.
 ///
 /// The relay rejects a longer batch outright (`413 batch_too_large`,
@@ -259,6 +265,11 @@ pub enum Event {
     #[serde(skip)]
     #[facet(skip)]
     FlushWatchdog(u64),
+    /// Fires `AUTH_WATCHDOG_MS` after generation `n`'s auth round-trip is
+    /// issued; a no-op unless that exact auth is somehow still in flight.
+    #[serde(skip)]
+    #[facet(skip)]
+    AuthWatchdog(u64),
     #[serde(skip)]
     #[facet(skip)]
     ChallengeResult(u64, #[facet(opaque)] HttpResult),
@@ -804,7 +815,29 @@ impl App for Skrepka {
             Event::LoadedMessages(peer, res) => {
                 match parse_kv::<Vec<StoredMessage>>(res) {
                     Ok(Some(list)) => {
-                        model.messages.insert(peer, list);
+                        // Merge: a poll that beat this lazy load may have already
+                        // inserted messages for this peer. Overwriting with the
+                        // on-disk list (which the GET read before the poll wrote)
+                        // would silently destroy the freshly-ingested messages.
+                        // Union by id, keeping both the on-disk history and any
+                        // in-memory additions.
+                        match model.messages.get_mut(&peer) {
+                            Some(existing) => {
+                                let existing_ids: HashSet<&String> =
+                                    existing.iter().map(|m| &m.id).collect();
+                                let new_msgs: Vec<StoredMessage> = list
+                                    .into_iter()
+                                    .filter(|m| !existing_ids.contains(&m.id))
+                                    .collect();
+                                existing.extend(new_msgs);
+                                // Re-sort by ts to maintain the invariant.
+                                existing.sort_by_key(|m| m.ts);
+                                trim_history(existing);
+                            }
+                            None => {
+                                model.messages.insert(peer, list);
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(()) => {
@@ -1165,6 +1198,11 @@ impl App for Skrepka {
                         let gen = model.next_auth_gen();
                         req.build()
                             .then_send(move |r| Event::ChallengeResult(gen, r))
+                            .and(
+                                Time::notify_after(Duration::from_millis(AUTH_WATCHDOG_MS))
+                                    .0
+                                    .then_send(move |_| Event::AuthWatchdog(gen)),
+                            )
                             .and(render())
                     }
                     Err(_) => {
@@ -1361,6 +1399,7 @@ impl App for Skrepka {
                         return self.backoff_poll(model);
                     }
                 };
+                let cursor_before = model.cursor;
                 let cmd = self.ingest_poll(model, parsed);
                 // The re-poll hangs off the *cursor write*, not off this event.
                 // Polling again is what acks the batch we just took — the server
@@ -1372,10 +1411,17 @@ impl App for Skrepka {
                 // `polling` stays `false`, and the loop is dead until the next
                 // foreground `Connect`. The watchdog fires `Poll` if the loop is
                 // still idle — same pattern as the poll/send HTTP watchdogs.
-                cmd.and(
+                //
+                // Skip the cursor write when the cursor did not advance (an empty
+                // or fully-deduped page): there is nothing new to persist, so
+                // re-poll directly. The watchdog is still armed as a fallback.
+                let cursor_advanced = model.cursor != cursor_before;
+                cmd.and(if cursor_advanced {
                     KeyValue::set(K_CURSOR, json_bytes(&model.cursor))
-                        .then_send(Event::SavedCursor),
-                )
+                        .then_send(Event::SavedCursor)
+                } else {
+                    Command::event(Event::Poll)
+                })
                 .and(
                     Time::notify_after(Duration::from_millis(POLL_WATCHDOG_MS))
                         .0
@@ -1401,6 +1447,15 @@ impl App for Skrepka {
                 // items.
                 model.abandon_flush();
                 self.flush_next(model)
+            }
+            Event::AuthWatchdog(gen) => {
+                // Only the auth this watchdog was armed for, and only while it is
+                // still the current one and still in flight.
+                if gen != model.auth_gen || !model.authenticating {
+                    return Command::done();
+                }
+                model.abandon_auth();
+                Command::event(Event::Authenticate)
             }
             Event::SendResult(gen, Ok(resp)) => {
                 // A result for a send we already abandoned (a watchdog gave up
@@ -1794,10 +1849,17 @@ impl Skrepka {
                 .insert(peer.clone(), Contact::new(peer.clone(), String::new(), ts));
         }
 
-        // On first contact, share our profile *before* the text so the
-        // recipient's first impression is a name and avatar, not a truncated
-        // @p that gets replaced a moment later. Both are queued behind any
-        // in-flight items, so the ordering is preserved through the outbox.
+        let text = Payload::Text { id, body };
+        model.outbox.push_back(OutboxItem::new(
+            peer.clone(),
+            Arc::new(protocol::serialize_payload(&text, ts)),
+        ));
+
+        // On first contact, share our profile *after* the text. The text
+        // auto-creates the contact on the recipient's side; the profile that
+        // follows in the same batch then applies to the now-existing contact.
+        // (Previously profile was queued before the text, but the recipient's
+        // ingest drops profiles from non-contacts, so the profile was lost.)
         if was_new {
             let profile = Payload::Profile {
                 display_name: model.profile.display_name.clone(),
@@ -1809,12 +1871,6 @@ impl Skrepka {
                 Arc::new(protocol::serialize_payload(&profile, ts)),
             ));
         }
-
-        let text = Payload::Text { id, body };
-        model.outbox.push_back(OutboxItem::new(
-            peer.clone(),
-            Arc::new(protocol::serialize_payload(&text, ts)),
-        ));
 
         Command::all([
             self.persist_messages(model, &peer),
@@ -2051,6 +2107,7 @@ impl Skrepka {
         let now = now_ms();
         let mut touched_convos: HashSet<String> = HashSet::new();
         let mut contacts_dirty = false;
+        let mut outbox_dirty = false;
         // sender hex -> message ids needing acks
         let mut ack_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
         // Q17: Per-sender deferred ack accumulation.  Collected during the event
@@ -2352,6 +2409,7 @@ impl Skrepka {
                     Arc::new(protocol::serialize_payload(&payload, ack_ts)),
                 ));
             }
+            outbox_dirty = true;
         }
 
         // Persist everything touched.
@@ -2366,7 +2424,9 @@ impl Skrepka {
         if contacts_dirty {
             cmds.push(self.persist_contacts(model));
         }
-        cmds.push(self.persist_outbox(model));
+        if outbox_dirty {
+            cmds.push(self.persist_outbox(model));
+        }
         cmds.push(Command::event(Event::StartFlush));
         Command::all(cmds)
     }

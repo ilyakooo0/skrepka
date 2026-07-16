@@ -189,6 +189,15 @@ maxPresencePerServer = 5000
 -- the same argument for sessions on `maxSessions`, and PROTOCOL.md §10.
 maxMessagesPerRecipient : Int
 maxMessagesPerRecipient = 10000
+-- Global ceiling on total stored messages across all recipients (S6). Every
+-- other state ref has a global cap (*sessions, *challenges, *presence,
+-- *forwards); *messages had only a per-recipient cap, so total storage was
+-- bounded only by (distinct recipient keys x maxMessagesPerRecipient), and an
+-- attacker minting fresh invalid pubkeys could fill the disk (bounded only by
+-- rate limits and the 30-day TTL). On overflow this evicts the globally-oldest
+-- rows, symmetric with the other refs. See PROTOCOL.md §10.
+maxMessagesTotal : Int
+maxMessagesTotal = 1000000
 -- Validity window for an auth challenge before it must be re-issued (1 min).
 challengeExpiry : Int<Ms>
 challengeExpiry = 60000
@@ -957,7 +966,15 @@ appendMessage = \toKey encryptedBlob t -> do
     let excess = max 0 (count forRecipient - (maxMessagesPerRecipient - 1))
     let evicted = map (\m -> m.encryptedBlob) (take excess (sortBy (\m -> m.receivedAt) forRecipient))
     let kept = filter (\m -> not (m.toKey == toKey && elem m.encryptedBlob evicted)) msgs
-    *messages = union kept [{toKey, encryptedBlob, receivedAt: seqTs, deliveredTo: []}])
+    -- Global cap (S6): after the per-recipient eviction, bound the total mailbox
+    -- across all recipients by dropping the globally-oldest rows. Only runs on
+    -- overflow, so the O(n log n) sort is off the hot path. Dropped rows may
+    -- belong to other recipients; their orphaned *forwards are reclaimed by
+    -- `pruneExpired`, and their lost `deliveredTo` is harmless (the blob is gone).
+    let globallyCapped = if count kept > maxMessagesTotal
+      then drop (count kept - maxMessagesTotal) (sortBy (\m -> m.receivedAt) kept)
+      else kept
+    *messages = union globallyCapped [{toKey, encryptedBlob, receivedAt: seqTs, deliveredTo: []}])
 
 -- Record that `server` has accepted a federated forward of this message, so a
 -- later presence re-announce of `toKey` doesn't re-forward the same blob to a peer
@@ -1073,56 +1090,70 @@ sendBatchedGossip = \peers events -> case localServerName of
 -- comes online: any messages already buffered for that pubkey are enqueued
 -- as forwards to the newly-known server.
 
--- Attempt every forward in `batch` to one peer, in order, and report whether any
--- attempt was a genuine peer failure. Drops successful entries from `*forwards` and
--- records the peer on the message's `deliveredTo`; on failure bumps the retry count
--- and gives up after `maxForwardRetries`.
+-- Attempt every forward in `batch` to one peer, in order, and report both whether
+-- any attempt was a genuine peer failure (`anyFailed`) and whether any attempt
+-- genuinely succeeded (`anySucceeded`). Drops successful entries from `*forwards`
+-- and records the peer on the message's `deliveredTo`; every attempt (success,
+-- failure, or 404) bumps the retry count and gives up after `maxForwardRetries`.
 --
 -- INVARIANT — this must not touch `*forwardFailures`. The caller records at most one
--- failure per peer per sweep, from the Bool returned here; recording per failing
--- *message* would let one unreachable peer with N buffered messages take N backoff
--- steps in a single sweep and pin itself at `retryBackoffMax` for `forwardFailureMaxAge`.
--- The counter counts consecutive failed *sweeps*.
+-- failure per peer per sweep, from the `anyFailed` flag returned here; recording per
+-- failing *message* would let one unreachable peer with N buffered messages take N
+-- backoff steps in a single sweep and pin itself at `retryBackoffMax` for
+-- `forwardFailureMaxAge`. The counter counts consecutive failed *sweeps*.
 --
 -- A 404 is NOT a peer failure. `handleForwardMessage` answers 404 `no_presence`
 -- whenever the recipient is not *currently* online at that peer, which is an
 -- expected, retryable outcome (PROTOCOL.md §7) — the peer is healthy and answering.
--- But `fetch` returns `Err` for every status >= 400, so treating any `Err` as a
--- failure would feed a routine 404 into `recordFailure`, and `*forwardFailures` is
--- shared with gossip: one stale-presence 404 would suppress all forwards *and* all
--- gossip to that peer for a full backoff step (30 s–8 min). So a 404 leaves the peer
--- unpenalized and the forward row untouched — no retry bump either, since the row is
--- waiting on the recipient's presence, not on a delivery that went wrong.
+-- `fetch` returns `Err` for every status >= 400, so treating any `Err` as a failure
+-- would feed a routine 404 into `recordFailure`, and `*forwardFailures` is shared
+-- with gossip: one stale-presence 404 would suppress all forwards *and* all gossip to
+-- that peer for a full backoff step (30 s–8 min). So a 404 leaves the peer's backoff
+-- untouched (`anyFailed` stays false for it) and never clears it (`anySucceeded`
+-- stays false too).
+--
+-- But a 404 DOES bump the forward's retry count now (S1). It previously left the row
+-- entirely untouched, so a forward whose recipient never came online at the peer was
+-- retried every sweep for the full 30-day message TTL — the counter never advanced,
+-- so `maxForwardRetries` was never reached. Counting the attempt (without charging
+-- the peer's backoff) lets the forward hit the cap and be dropped after
+-- `maxForwardRetries` sweeps while still not penalizing a healthy peer.
 --
 -- Recursive rather than `forEach` because the result has to be accumulated across
 -- iterations; `sortBy` fixes the iteration order that `head`/`drop 1` then walk.
-retryForwardsTo : Text -> [ForwardEntry] -> IO {rw *forwards, rw *messages, network} Bool
+retryForwardsTo : Text -> [ForwardEntry] -> IO {rw *forwards, rw *messages, network} {anyFailed: Bool, anySucceeded: Bool}
 retryForwardsTo = \server batch -> case head batch of
-  Nothing {} -> yield (False {})
+  Nothing {} -> yield {anyFailed: False {}, anySucceeded: False {}}
   Just {value: f} -> do
     result <- fetch (federationUrl server) (ForwardMessage {f.toKey, f.encryptedBlob})
     let status = case result of
       Err {error: e} -> e.status
       Ok _ -> 200
     let success = status < 400
-    -- Recipient simply isn't online at the peer yet: hold the row, blame no one.
+    -- Recipient simply isn't online at the peer yet: hold the peer blameless, but
+    -- still count the attempt so the row can't outlive the message TTL (S1).
     let deferred = status == 404
     let isMatch = forwardMatches f.toKey f.encryptedBlob server
     let isDone = \x -> isMatch x && (success || x.retries + 1 >= maxForwardRetries)
     atomic (do
-      when (not deferred) (do
-        cur <- *forwards
-        *forwards = map (\x -> if isMatch x
-        then {x.toServer, x.toKey, x.encryptedBlob, retries: x.retries + 1}
-        else x) (filter (\x -> not isDone x) cur))
+      cur <- *forwards
+      -- Count the attempt regardless of outcome: a 404 still consumes a retry slot
+      -- so a forward that never finds the recipient online is eventually dropped
+      -- (S1). On success or after `maxForwardRetries`, `isDone` filters the row out
+      -- first, so the increment then no-ops on an absent row.
+      *forwards = map (\x -> if isMatch x
+      then {x.toServer, x.toKey, x.encryptedBlob, retries: x.retries + 1}
+      else x) (filter (\x -> not isDone x) cur)
       when success (markDelivered f.toKey f.encryptedBlob server))
-    restFailed <- retryForwardsTo server (drop 1 batch)
-    yield ((not success && not deferred) || restFailed)
+    rest <- retryForwardsTo server (drop 1 batch)
+    yield {anyFailed: (not success && not deferred) || rest.anyFailed, anySucceeded: success || rest.anySucceeded}
 
 -- Walk pending forwards grouped by destination and retry each peer's backlog (up
 -- to maxBatchSize per peer) via `/federation/forward`. One failure record per peer
--- per sweep: a sweep in which every attempt succeeded clears the peer's backoff, a
--- sweep with any failure takes exactly one backoff step (see `retryForwardsTo`).
+-- per sweep: a sweep with any genuine failure takes exactly one backoff step; a
+-- sweep with at least one genuine success clears the peer's backoff; an all-404
+-- sweep leaves the backoff untouched, neither charging nor clearing it (S1). See
+-- `retryForwardsTo`.
 retryPendingForwards : IO {rw *forwardFailures, rw *forwards, rw *messages, network, clock} {}
 retryPendingForwards = do
   t <- now
@@ -1144,13 +1175,17 @@ retryPendingForwards = do
     -- `maxForwardRetries` (dropped). `ForwardEntry` carries no timestamp, so key on
     -- the unique blob.
     let batch = take maxBatchSize (sortBy (\f -> f.encryptedBlob) (filter (\f -> f.toServer == server) fwds))
-    anyFailed <- retryForwardsTo server batch
-    -- `count batch > 0` guards the clear: `maxBatchSize` is startup-overridable,
-    -- and at 0 every batch is empty — an empty sweep must not be read as a
-    -- success and reset a failing peer's backoff.
-    if anyFailed
+    result <- retryForwardsTo server batch
+    -- Clear the peer's backoff only on a sweep with at least one genuine success
+    -- (S1). An all-404 sweep (recipient not online at the peer) is neither a
+    -- failure nor a success: clearing backoff on it would reset the peer to
+    -- "fresh" every sweep, firing a retry every `backgroundPruneInterval` for the
+    -- full 30-day message TTL. `count batch > 0` also guards against reading an
+    -- empty sweep (possible with a startup-overridden `maxBatchSize` of 0) as
+    -- meaningful.
+    if result.anyFailed
     then recordFailure server t
-    else when (count batch > 0) (clearFailure server t)))
+    else when (count batch > 0 && result.anySucceeded) (clearFailure server t)))
 
 -- Forward queued messages to a server when a remote key comes online.
 -- Skips messages already delivered to `server` (tracked via Message.deliveredTo)
@@ -1170,6 +1205,32 @@ forwardQueuedToServer = \pubkey serverName -> atomic (do
   let notYetForwarded = \m -> not any (forwardMatches m.toKey m.encryptedBlob server) fwds
   let notYetDelivered = \m -> not any (\d -> d.server == server) m.deliveredTo
   let candidates = filter (\m -> m.toKey == pubkey && notYetForwarded m && notYetDelivered m) msgs
+  let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget (sortBy (\m -> m.receivedAt) candidates))
+  *forwards = capForwards (union fwds newFwds))
+
+-- Batched version of `forwardQueuedToServer`: stage forwards for *all* newly-online
+-- keys in a single mailbox scan (S4). Calling `forwardQueuedToServer` per key scans
+-- `*messages` once per key, which is why `handleRecvGossip` previously capped the
+-- number of keys at `maxNewlyOnlineForwards` (N13) — but that cap silently deferred
+-- delivery past the 10th key, and a re-announce within the TTL never recovered it
+-- (the `deliveredTo`/presence state made the key look already-handled). A single
+-- pass bounds the cost to O(|messages|) regardless of how many keys came online.
+--
+-- SECURITY: shares `forwardQueuedToServer`'s exposure — it routes on gossip-written
+-- presence. The same `deliveredTo` / `notYetForwarded` / per-peer budget guards
+-- apply; do not widen them without revisiting the gossip-redirect note above.
+forwardQueuedToAll : [PubkeyHex] -> ServerName -> IO {rw *forwards, r *messages} {}
+forwardQueuedToAll = \pubkeys serverName -> atomic (do
+  let server = (serverName : Text)
+  msgs <- *messages
+  fwds <- *forwards
+  let existing = countWhere (\f -> f.toServer == server) fwds
+  let budget = max 0 (maxForwardsPerServer - existing)
+  let notYetForwarded = \m -> not any (forwardMatches m.toKey m.encryptedBlob server) fwds
+  let notYetDelivered = \m -> not any (\d -> d.server == server) m.deliveredTo
+  -- `elem m.toKey pubkeys` is O(|pubkeys|), but `pubkeys` is bounded by
+  -- `maxGossipEvents` (100), so the scan stays O(|messages|) overall.
+  let candidates = filter (\m -> elem m.toKey pubkeys && notYetForwarded m && notYetDelivered m) msgs
   let newFwds = map (\m -> {toServer: server, m.toKey, m.encryptedBlob, retries: 0}) (take budget (sortBy (\m -> m.receivedAt) candidates))
   *forwards = capForwards (union fwds newFwds))
 
@@ -1223,68 +1284,82 @@ handleVerifyAuth = \pubkey challenge signature revokeOthers clientIp -> do
   -- relay server cannot replay the signature to a different server. We verify
   -- against our own configured hostname (port stripped), which a relay cannot forge.
   --
-  -- Signature verification is deferred until *after* the challenge lookup confirms
-  -- a matching challenge exists (inside the atomic below).  This avoids spending
-  -- expensive Ed25519 CPU on /auth/verify calls that have no matching challenge,
-  -- which would otherwise be a cheap CPU-DoS vector.  The trade-off is that
-  -- `verify` runs inside the STM transaction and may re-run on retries — but
-  -- retries only happen on concurrent writes to *challenges/*sessions, which
-  -- are rare, so the expected retry count is ~1.
+  -- Signature verification is split out of the session-install transaction (S7).
+  -- Phase 1 is a cheap read-only atomic that confirms a matching, unexpired,
+  -- IP-bound challenge exists — the original CPU-DoS guard, which still spends no
+  -- Ed25519 CPU on /auth/verify calls that have no matching challenge. Phase 2 runs
+  -- the expensive `verify` *outside* any atomic, so an STM retry on the phase-3
+  -- install transaction (triggered by concurrent writes to *challenges/*sessions)
+  -- never re-executes it — previously `verify` sat inside that transaction and every
+  -- retry re-ran the Ed25519 check. Phase 3 re-checks the challenge before consuming
+  -- it, closing the TOCTOU window opened between phases 1 and 3.
   let signedText = "skrepka-auth-v1:" ++ authHost serverHost ++ ":" ++ challenge
-  result <- atomic (do
+  challengeOk <- atomic (do
     ch <- *challenges
     let same = \c -> c.pubkey == pubkey && c.challenge == challenge
-    let matchingChallenge = findFirst same ch
-    case matchingChallenge of
-      Nothing {} -> yield (Nothing {})
-      Just {value: c} -> do
-        if not (c.expiresAt > t && matchIp clientIp c.ip)
-        then yield (Nothing {})
-        else do
-          -- Verify the signature only now that a matching, unexpired, IP-bound
-          -- challenge exists.
-          let sigValid = case bytesFromHex pubkey of
-            Just {value: pk} -> case bytesFromHex signature of
-              Just {value: sigBytes} -> verify pk (textToBytes signedText) sigBytes
-              _ -> False {}
-            _ -> False {}
-          if not sigValid
-          then yield (Nothing {})
-          else do
-            -- Consume the challenge and optionally revoke other sessions + challenges.
-            -- When `revokeOthers` is set, drop all other sessions AND outstanding
-            -- challenges for this pubkey, so a captured challenge cannot be
-            -- redeemed for a new session after revocation (Q35).
-            *challenges = if revokeOthers
-              then filter (\x -> not (x.pubkey == pubkey)) ch
-              else filter (\x -> not same x) ch
-            ses <- *sessions
-            let pruned = if revokeOthers
-              then filter (\s -> s.pubkey != pubkey) ses
-              else capPerKey ses pubkey maxSessionsPerKey
-            let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
-            -- LRU-evicts the soonest-to-expire session when the pool is full; this global
-            -- eviction is Sybil-floodable, see the LIMITATION note on `maxSessions`.
-            let pooled = union pruned [newSession]
-            -- Count what `capList` is about to shed, so the handler can warn about it
-            -- below. That flood has no other observable signature: evicted users just
-            -- start seeing 401s and silently re-authenticate, which looks like normal
-            -- traffic in the access log. A sustained nonzero rate here is the alert.
-            let evicted = max 0 (count pooled - maxSessions)
-            *sessions = capList pooled maxSessions
-            peers <- refreshLocalPresence pubkey expiry
-            yield (Just {value: {peers, evicted}}))
-  case result of
-    Nothing {} -> yield (Err {error: {status: 401, message: "invalid"}})
-    Just {value: r} -> do
-      -- Warn outside the `atomic` block, never inside: an STM transaction can
-      -- retry, and a console write is not rolled back with it — logging inside
-      -- would emit one line per retry attempt rather than one per eviction.
-      -- Include the requesting pubkey and IP for audit (Q38): an operator
-      -- investigating a Sybil flood needs to know which identities are responsible.
-      when (r.evicted > 0) (logWarn ("session pool full: evicted " ++ show r.evicted ++ " session(s) to seat a new login (pubkey=" ++ pubkey ++ ", ip=" ++ clientIp ++ ", maxSessions=" ++ show maxSessions ++ ")"))
-      when federationEnabled (fork (sendBatchedGossip r.peers [{eventType: "online", pubkey: Just {value: pubkey}}]))
-      yield (Ok {value: {token, expiresAt: expiry}})
+    case findFirst ch same of
+      Nothing {} -> yield (False {})
+      Just {value: c} -> yield (c.expiresAt > t && matchIp clientIp c.ip))
+  if not challengeOk
+  then yield (Err {error: {status: 401, message: "invalid"}})
+  else do
+    -- Phase 2: verify OUTSIDE any atomic. Expensive, and must not be re-executed on
+    -- an STM retry of the install transaction below (S7).
+    let sigValid = case bytesFromHex pubkey of
+      Just {value: pk} -> case bytesFromHex signature of
+        Just {value: sigBytes} -> verify pk (textToBytes signedText) sigBytes
+        _ -> False {}
+      _ -> False {}
+    if not sigValid
+    then yield (Err {error: {status: 401, message: "invalid"}})
+    else do
+      -- Phase 3: re-check the challenge (it may have expired or been consumed by a
+      -- concurrent verify since phase 1), consume it, and install the session. The
+      -- body is cheap, so an STM retry here costs almost nothing.
+      result <- atomic (do
+        ch <- *challenges
+        let same = \c -> c.pubkey == pubkey && c.challenge == challenge
+        let matchingChallenge = findFirst ch same
+        case matchingChallenge of
+          Nothing {} -> yield (Nothing {})
+          Just {value: c} -> do
+            if not (c.expiresAt > t && matchIp clientIp c.ip)
+            then yield (Nothing {})
+            else do
+              -- Consume the challenge and optionally revoke other sessions + challenges.
+              -- When `revokeOthers` is set, drop all other sessions AND outstanding
+              -- challenges for this pubkey, so a captured challenge cannot be
+              -- redeemed for a new session after revocation (Q35).
+              *challenges = if revokeOthers
+                then filter (\x -> not (x.pubkey == pubkey)) ch
+                else filter (\x -> not same x) ch
+              ses <- *sessions
+              let pruned = if revokeOthers
+                then filter (\s -> s.pubkey != pubkey) ses
+                else capPerKey ses pubkey maxSessionsPerKey
+              let newSession = {token, pubkey, expiresAt: expiry, ip: clientIp}
+              -- LRU-evicts the soonest-to-expire session when the pool is full; this global
+              -- eviction is Sybil-floodable, see the LIMITATION note on `maxSessions`.
+              let pooled = union pruned [newSession]
+              -- Count what `capList` is about to shed, so the handler can warn about it
+              -- below. That flood has no other observable signature: evicted users just
+              -- start seeing 401s and silently re-authenticate, which looks like normal
+              -- traffic in the access log. A sustained nonzero rate here is the alert.
+              let evicted = max 0 (count pooled - maxSessions)
+              *sessions = capList pooled maxSessions
+              peers <- refreshLocalPresence pubkey expiry
+              yield (Just {value: {peers, evicted}}))
+      case result of
+        Nothing {} -> yield (Err {error: {status: 401, message: "invalid"}})
+        Just {value: r} -> do
+          -- Warn outside the `atomic` block, never inside: an STM transaction can
+          -- retry, and a console write is not rolled back with it — logging inside
+          -- would emit one line per retry attempt rather than one per eviction.
+          -- Include the requesting pubkey and IP for audit (Q38): an operator
+          -- investigating a Sybil flood needs to know which identities are responsible.
+          when (r.evicted > 0) (logWarn ("session pool full: evicted " ++ show r.evicted ++ " session(s) to seat a new login (pubkey=" ++ pubkey ++ ", ip=" ++ clientIp ++ ", maxSessions=" ++ show maxSessions ++ ")"))
+          when federationEnabled (fork (sendBatchedGossip r.peers [{eventType: "online", pubkey: Just {value: pubkey}}]))
+          yield (Ok {value: {token, expiresAt: expiry}})
 
 -- ============================================
 -- Handler: poll
@@ -1438,10 +1513,15 @@ handleSendMessages = \messages authorization clientIp -> do
       Nothing {} -> do
         committed <- atomic (do
           pres <- *presence
+          -- S2: cap the immediate fan-out at `maxForwardsPerServer` servers per
+          -- recipient. The post-commit `forkForwardsTo` fires against this list
+          -- directly (bypassing the `*forwards` queue and its per-peer cap), so
+          -- without a bound here a recipient gossiped as present on thousands of
+          -- servers would spawn one immediate HTTP forward per server per message.
           let staged = map (\m -> {
             m.to,
             m.encryptedBlob,
-            remoteServers: collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server)
+            remoteServers: take maxForwardsPerServer (collectPeers (filter (\p -> p.pubkey == m.to && p.expiresAt > t) pres) (\p -> p.server))
           }) messages
           forEach staged (\c -> do
             -- Read `*messages` *before* the append: `delivered` below must see the
@@ -1546,7 +1626,7 @@ forkForwardsTo = \to encryptedBlob servers -> forEach servers (\server -> when (
 -- fromServer) row touched by this batch, then re-adds fresh-TTL rows for
 -- pubkeys with an `online` event (so Online wins on collision). For keys
 -- that transition offline → online, flushes any locally-buffered messages via
--- `forwardQueuedToServer`. Events with an unrecognized `eventType` or no
+-- `forwardQueuedToAll`. Events with an unrecognized `eventType` or no
 -- `pubkey` are skipped (forward-compat) rather than rejecting the batch.
 --
 -- SECURITY: this is the gossip-redirect ingress described in the section header
@@ -1557,7 +1637,7 @@ handleRecvGossip : [GossipEvent] -> ServerName -> IO {r *messages, rw *forwards,
 handleRecvGossip = \events fromServer -> do
   t <- now
   -- Widen the peer-supplied `ServerName` once (see `type ServerName`);
-  -- `forwardQueuedToServer` below still takes the refined name.
+  -- `forwardQueuedToAll` below still takes the refined name.
   let from = (fromServer : Text)
   if not federationEnabled
   then yield (Err {error: {status: 403, message: "federation_disabled"}})
@@ -1598,21 +1678,28 @@ handleRecvGossip = \events fromServer -> do
       let localRows = filter (\p -> isLocalServer p.server) merged
       let remoteRows = filter (\p -> not isLocalServer p.server) merged
       *presence = union localRows (capList (capPerServer remoteRows from maxPresencePerServer) maxPresence)
+      -- S8: Make online+offline for the same key mutually exclusive within one
+      -- batch. If a batch carries both events for a key, online wins — the presence
+      -- merge above already added the online row — so that key must NOT also travel
+      -- the offline path and cancel its own freshly-staged forwards.
+      let onlineKeys = map (\p -> p.pubkey) collected.added
+      let offlineOnly = filter (\pk -> not elem pk onlineKeys) collected.offline
       -- N14: Cancel pending forwards to `from` for offline keys. Without this,
       -- forwards to a peer that just went offline retry for up to 80 minutes,
       -- wasting maxForwardsPerServer slots and generating failed HTTP requests.
       -- The message stays in *messages, so it's re-forwarded if the key
       -- re-appears on another peer.
-      when (count collected.offline > 0) (do
+      when (count offlineOnly > 0) (do
         fwds <- *forwards
-        *forwards = filter (\f -> not (f.toServer == from && elem f.toKey collected.offline)) fwds)
+        *forwards = filter (\f -> not (f.toServer == from && elem f.toKey offlineOnly)) fwds)
       yield (filter (\pk -> not any (\p -> p.pubkey == pk && p.server == from && p.expiresAt > t) pres) (map (\p -> p.pubkey) collected.added)))
-    -- N13: Cap the number of newly-online keys that trigger forward sweeps.
-    -- Without this, 100 online events = 100 mailbox scans. The remaining keys
-    -- are still in `*presence` — their forwards will be staged when a poll
-    -- refreshes presence or the next gossip re-announces them.
-    let toForward = take maxNewlyOnlineForwards newlyOnline
-    fork (forEach toForward (\pk -> forwardQueuedToServer pk fromServer))
+    -- S4: forward queued mail for ALL newly-online keys in one mailbox pass. The
+    -- old per-key cap (maxNewlyOnlineForwards, N13) bounded amplification but
+    -- silently deferred delivery past the 10th key, and a re-announce within the
+    -- TTL never recovered it (the deliveredTo/presence state made the key look
+    -- already-handled). `forwardQueuedToAll` bounds the cost to O(|messages|)
+    -- regardless of how many keys came online.
+    fork (forwardQueuedToAll newlyOnline fromServer)
     yield (Ok {value: {}})
 
 -- POST /federation/forward: receive a single federated message destined for

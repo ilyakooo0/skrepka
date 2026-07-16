@@ -31,6 +31,13 @@ const HKDF_INFO: &[u8] = b"skrepka-v2";
 /// Domain-separation tag for the auth challenge signature (PROTOCOL.md §6).
 const AUTH_TAG: &str = "skrepka-auth-v1:";
 
+/// Domain-separation tag for per-message signatures (PROTOCOL.md §3).
+/// Prevents cross-protocol signature reuse: an auth challenge signature
+/// begins with "skrepka-auth-v1:" while a message signature begins with
+/// this tag, so the same key cannot sign in one context and have it
+/// validate in another.
+const MSG_TAG: &[u8] = b"skrepka-msg-v2:";
+
 /// Wire-format version byte prepended to every encrypted blob (PROTOCOL.md §3).
 ///
 /// Version 0x02 adds AEAD associated data (AAD): the cleartext header
@@ -58,9 +65,10 @@ fn aad(version: u8, eph_pub: &[u8; 32], nonce: &[u8; NONCE_LEN], recipient_pub: 
 pub const ED25519_SECRET_LEN: usize = 64;
 pub const ED25519_PUBLIC_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
-/// 1 (version) + 32 (eph) + 24 (nonce) + 32 (sender pub) + 64 (sig) + 4 (compressed_len)
-/// + 16 (AEAD tag). The 4-byte compressed_len field sits inside the AEAD ciphertext.
-/// The version byte, ephemeral pubkey, nonce, and recipient pubkey are AEAD AAD (v0x02).
+/// `1+32+24+32+64+4+16` bytes = version, eph pubkey, nonce, sender pub, sig,
+/// compressed_len, AEAD tag. The 4-byte compressed_len field sits inside the AEAD
+/// ciphertext. The version byte, ephemeral pubkey, nonce, and recipient pubkey are
+/// AEAD AAD (v0x02).
 pub const MIN_BLOB_LEN: usize = 1 + 32 + NONCE_LEN + 32 + 64 + 4 + 16;
 
 /// Blob sizes are padded up to these boundaries so the on-wire length does not
@@ -233,11 +241,12 @@ impl Identity {
     fn with_x25519(secret_key: [u8; ED25519_SECRET_LEN]) -> Self {
         let x25519_priv = *ed25519_sk_to_x25519(&secret_key);
         let x25519_pub = x25519_dalek::x25519(x25519_priv, x25519_dalek::X25519_BASEPOINT_BYTES);
-        debug_assert!(
-            !x25519_pub.iter().all(|b| *b == 0),
-            "derived X25519 public key is all-zero (low-order point) — \
-             this identity cannot receive messages"
-        );
+        if x25519_pub.iter().all(|b| *b == 0) {
+            eprintln!(
+                "warning: derived X25519 public key is all-zero (low-order point) — \
+                 this identity cannot receive messages"
+            );
+        }
         Identity {
             secret_key,
             x25519_priv,
@@ -346,7 +355,7 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     decoder
         .window_log_max(21)
         .map_err(|_| CryptoError::Decompress)?;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(MAX_PLAINTEXT_LEN + 1);
     (&mut decoder)
         .take(MAX_PLAINTEXT_LEN as u64 + 1)
         .read_to_end(&mut out)
@@ -394,7 +403,8 @@ pub fn encrypt(
 
     // Sign recipient_pub || compressed_len_bytes || compressed || padding
     // (i.e. recipient_pub || everything after the 96-byte header in inner).
-    let mut signed = Zeroizing::new(Vec::with_capacity(32 + 4 + compressed.len() + padding.len()));
+    let mut signed = Zeroizing::new(Vec::with_capacity(MSG_TAG.len() + 32 + 4 + compressed.len() + padding.len()));
+    signed.extend_from_slice(MSG_TAG);
     signed.extend_from_slice(recipient_ed_pub);
     signed.extend_from_slice(&compressed_len_bytes);
     signed.extend_from_slice(&compressed);
@@ -505,7 +515,7 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
         inner[98],
         inner[99],
     ]) as usize;
-    if 100 + compressed_len > inner.len() {
+    if compressed_len > inner.len().saturating_sub(100) {
         inner.zeroize();
         return Err(CryptoError::Decrypt);
     }
@@ -515,7 +525,8 @@ pub fn decrypt(recipient: &Identity, blob: &[u8]) -> Result<Decrypted, CryptoErr
     // (covers compressed_len_bytes || compressed || padding).
     let verifying = VerifyingKey::from_bytes(&sender_pub).map_err(|_| CryptoError::BadSignature)?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    let mut signed = Zeroizing::new(Vec::with_capacity(32 + (inner.len() - 96)));
+    let mut signed = Zeroizing::new(Vec::with_capacity(MSG_TAG.len() + 32 + (inner.len() - 96)));
+    signed.extend_from_slice(MSG_TAG);
     signed.extend_from_slice(&recipient.public_key());
     signed.extend_from_slice(&inner[96..]);
     verifying
@@ -808,61 +819,53 @@ mod tests {
         assert!(id.sign_challenge("relay.example.com", &at_cap).is_ok());
     }
 
-    /// N1: AAD prevents silent `to`-swap censorship. A blob encrypted to Bob
-    /// cannot be decrypted by Charlie even if a relay changes the envelope's
-    /// `to` field to Charlie's pubkey — the AAD binds the recipient identity,
-    /// so the AEAD tag check fails before any inner content is revealed.
+    /// A blob encrypted to Bob cannot be decrypted by Charlie — the key
+    /// derivation itself binds the recipient (the AEAD key is a function
+    /// of the recipient's private key and the ephemeral public key). The
+    /// AAD additionally authenticates the recipient pubkey, but the tag
+    /// check would fail even without it, because Charlie derives a
+    /// different key. The AAD is defense-in-depth: it makes the binding
+    /// explicit rather than implicit in the KDF.
     #[test]
-    fn aad_prevents_to_swap_censorship() {
+    fn wrong_recipient_cannot_decrypt_aead_fails() {
         let alice = Identity::generate(&mut rng(1));
         let bob = Identity::generate(&mut rng(2));
         let charlie = Identity::generate(&mut rng(3));
 
-        // Alice encrypts a message to Bob.
         let blob = encrypt(&mut rng(4), &alice, &bob.public_key(), b"hi bob").unwrap();
-
-        // Charlie tries to decrypt the blob meant for Bob. The AAD includes
-        // Bob's pubkey (from the blob's perspective the recipient is Bob),
-        // but Charlie's identity derives a different key. This must fail at
-        // AEAD decryption, not at signature verification.
         assert_eq!(
             decrypt(&charlie, &blob).unwrap_err(),
             CryptoError::Decrypt,
-            "wrong recipient must fail AEAD, not reach signature check"
+            "wrong recipient must fail AEAD — key derivation binds the recipient"
         );
     }
 
-    /// N1: Tampering with the version byte causes AEAD failure (the version
-    /// is part of the AAD, not just checked separately).
+    /// Tampering with the version byte causes failure via the explicit
+    /// version check (`blob[0] != WIRE_VERSION`) before the AEAD even runs.
+    /// The AAD includes the version as defense-in-depth, but the explicit
+    /// check fires first.
     #[test]
-    fn aad_binds_version_byte() {
+    fn tampered_version_byte_is_rejected() {
         let alice = Identity::generate(&mut rng(1));
         let bob = Identity::generate(&mut rng(2));
         let mut blob = encrypt(&mut rng(3), &alice, &bob.public_key(), b"hi").unwrap();
-
-        // Flip the version byte. The separate check (`blob[0] != WIRE_VERSION`)
-        // would catch this, but the AAD also includes it, so even if the
-        // version check were removed, AEAD would still fail.
         blob[0] ^= 0xff;
         assert_eq!(
             decrypt(&bob, &blob).unwrap_err(),
             CryptoError::Decrypt,
-            "version byte tampering must fail AEAD"
+            "version byte tampering is rejected"
         );
     }
 
-    /// N1: Tampering with the ephemeral pubkey causes AEAD failure (it's
-    /// part of the AAD, not just used for key derivation).
+    /// Tampering with the ephemeral pubkey causes key derivation to produce
+    /// a different key, so the AEAD tag check fails. The AAD additionally
+    /// authenticates the eph_pub, but the KDF mismatch is what actually
+    /// catches this.
     #[test]
-    fn aad_binds_ephemeral_pubkey() {
+    fn tampered_ephemeral_pubkey_is_rejected() {
         let alice = Identity::generate(&mut rng(1));
         let bob = Identity::generate(&mut rng(2));
         let mut blob = encrypt(&mut rng(3), &alice, &bob.public_key(), b"hi").unwrap();
-
-        // Corrupt one byte of the ephemeral pubkey. Even though the key
-        // derivation would produce a different key (causing AEAD failure
-        // anyway), the AAD also includes the eph_pub, so this is
-        // cryptographically bound to the ciphertext.
         blob[5] ^= 0x01;
         assert!(decrypt(&bob, &blob).is_err());
     }

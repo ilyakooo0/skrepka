@@ -62,7 +62,23 @@ struct PhotoPicker: UIViewControllerRepresentable {
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
                   let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
             else { return nil }
-            return UIImage(cgImage: thumb).jpegData(compressionQuality: 0.7)?.base64EncodedString()
+            let image = UIImage(cgImage: thumb)
+            // Reduce quality until the base64 fits within the protocol cap (MAX_PHOTO_LEN,
+            // 64 KiB). A high-detail 256px frame can exceed the cap even at q0.7; without
+            // this loop `SaveProfile` rejects the whole profile with no recourse for the user.
+            let maxBase64Len = 64 * 1024
+            var quality: CGFloat = 0.7
+            while quality > 0.1 {
+                if let jpegData = image.jpegData(compressionQuality: quality) {
+                    let base64 = jpegData.base64EncodedString()
+                    if base64.count <= maxBase64Len {
+                        return base64
+                    }
+                }
+                quality -= 0.1
+            }
+            // Last resort: the smallest quality that still produces something.
+            return image.jpegData(compressionQuality: 0.1)?.base64EncodedString()
         }
     }
 }
