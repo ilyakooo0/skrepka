@@ -157,7 +157,7 @@ jobs:
 
           PK=$(printf '0%.0s' $(seq 1 64))          # 64 hex chars: a well-formed pubkey
           SIG=$(printf '0%.0s' $(seq 1 128))        # 128 hex chars: a well-formed signature
-          BLOB=$(printf 'ab%.0s' $(seq 1 200))      # 400 hex chars: over the 336-char floor
+          BLOB=$(printf 'ab%.0s' $(seq 1 200))      # 400 hex chars: over the 346-char floor
 
           # $1 = expected status, $2 = label, rest = curl args
           expect() {

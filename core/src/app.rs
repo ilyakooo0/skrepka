@@ -2387,7 +2387,9 @@ impl Skrepka {
                         if let Some(b) = bio {
                             c.bio = b;
                         }
-                        c.photo = photo;
+                        if let Some(p) = photo {
+                            c.photo = Some(p);
+                        }
                         c.last_profile_ts = ts.min(now);
                         contacts_dirty = true;
                     }

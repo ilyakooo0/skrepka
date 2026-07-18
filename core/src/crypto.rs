@@ -93,11 +93,7 @@ fn padded_len(actual: usize) -> usize {
         // D6: When actual is an exact multiple of 65536 above 65536,
         // returning `actual` would give zero padding, revealing the exact
         // compressed size. Always add at least one bucket of padding.
-        if actual > PADDING_BUCKETS[8] {
-            actual + 65536
-        } else {
-            actual
-        }
+        actual + 65536
     } else {
         actual + 65536 - remainder
     }
